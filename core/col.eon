@@ -1,0 +1,1686 @@
+module core.col;
+
+// ---------------------------------------------------------------------------
+// Internal hashing, power-of-two sizing, and SwissTable SIMD probe helpers
+// ---------------------------------------------------------------------------
+
+@inline
+fn hash_u64(x: u64) -> u64 {
+    let z = (x ^ (x >> 30_u64)) *% 0xBF58476D1CE4E5B9_u64;
+    return z ^ (z >> 27_u64);
+}
+
+@inline
+fn hash_bytes(bytes: *[u8]) -> u64 {
+    var h: u64 = 0xCBF29CE484222325_u64 ^ bytes.len.widen.[u64]();
+    var i: usize = 0_usize;
+    while i + 3_usize < bytes.len {
+        let w = bytes[i].widen.[u64]()
+            | (bytes[i + 1_usize].widen.[u64]() <<% 8_u64)
+            | (bytes[i + 2_usize].widen.[u64]() <<% 16_u64)
+            | (bytes[i + 3_usize].widen.[u64]() <<% 24_u64);
+        h = (h ^ w) *% 0x9E3779B97F4A7C15_u64;
+        i = i + 4_usize;
+    }
+    while i < bytes.len {
+        h = (h ^ bytes[i].widen.[u64]()) *% 0x100000001B3_u64;
+        i = i + 1_usize;
+    }
+    return h ^ (h >> 31_u64);
+}
+
+fn next_pow2_ge16(cap: usize) -> usize {
+    var p: usize = 16_usize;
+    while p < cap && p <= 0x20000000_usize {
+        p = p *% 2_usize;
+    }
+    return p;
+}
+
+@inline
+fn load_ctrl_group(ctrl: *[u8], base: usize) -> u8x16 {
+    if base < ctrl.len {
+        let end = base + 15_usize;
+        if end < ctrl.len {
+            let grp: u8x16 = .{
+                ctrl[base],
+                ctrl[base + 1_usize],
+                ctrl[base + 2_usize],
+                ctrl[base + 3_usize],
+                ctrl[base + 4_usize],
+                ctrl[base + 5_usize],
+                ctrl[base + 6_usize],
+                ctrl[base + 7_usize],
+                ctrl[base + 8_usize],
+                ctrl[base + 9_usize],
+                ctrl[base + 10_usize],
+                ctrl[base + 11_usize],
+                ctrl[base + 12_usize],
+                ctrl[base + 13_usize],
+                ctrl[base + 14_usize],
+                ctrl[end],
+            };
+            return grp;
+        }
+    }
+    return u8x16.splat(0x80_u8);
+}
+
+struct InsertSlot {
+    bucket: usize;
+    was_empty: bool;
+    found: bool;
+}
+
+fn find_insert_slot(ctrl: *[u8], group_mask: usize, h: u64) -> InsertSlot {
+    let empty_vec = u8x16.splat(0x80_u8);
+    let del_vec = u8x16.splat(0xFE_u8);
+    let num_groups = group_mask +% 1_usize;
+    var g = ((h >> 4_u64).trunc.[usize]()) & group_mask;
+    var first_del: usize = 0_usize;
+    var has_del = false;
+    var probes: usize = 0_usize;
+    while probes < num_groups {
+        let base = g <<% 4_usize;
+        let grp = load_ctrl_group(ctrl, base);
+        if !has_del {
+            let dm = grp.cmpeq(del_vec).bitmask();
+            if dm != 0_u64 {
+                let doff = (@tzcnt(dm) & 15_u64).trunc.[usize]();
+                first_del = base +% doff;
+                has_del = true;
+            }
+        }
+        let em = grp.cmpeq(empty_vec).bitmask();
+        if em != 0_u64 {
+            if has_del {
+                return InsertSlot.{ bucket: first_del, was_empty: false, found: true };
+            }
+            let eoff = (@tzcnt(em) & 15_u64).trunc.[usize]();
+            return InsertSlot.{ bucket: base +% eoff, was_empty: true, found: true };
+        }
+        g = (g +% 1_usize) & group_mask;
+        probes = probes +% 1_usize;
+    }
+    if has_del {
+        return InsertSlot.{ bucket: first_del, was_empty: false, found: true };
+    }
+    return InsertSlot.{ bucket: 0_usize, was_empty: false, found: false };
+}
+
+@inline
+fn entry_eq_bytes(data: *[u8], spans: *[u64], id: usize, bytes: *[u8]) -> bool {
+    if id >= spans.len {
+        return false;
+    }
+    let sp = spans[id];
+    let off = sp.trunc.[u32]().widen.[usize]();
+    let n = (sp >> 32_u64).trunc.[usize]();
+    if n != bytes.len {
+        return false;
+    }
+    let d = data.sub(off, off +% n) catch {
+        return false;
+    };
+    if d.len != bytes.len {
+        return false;
+    }
+    var i: usize = 0_usize;
+    while i +% 16_usize <= n {
+        let end = i + 15_usize;
+        if end >= d.len || end >= bytes.len {
+            break;
+        }
+        let va: u8x16 = .{
+            d[i],
+            d[i + 1_usize],
+            d[i + 2_usize],
+            d[i + 3_usize],
+            d[i + 4_usize],
+            d[i + 5_usize],
+            d[i + 6_usize],
+            d[i + 7_usize],
+            d[i + 8_usize],
+            d[i + 9_usize],
+            d[i + 10_usize],
+            d[i + 11_usize],
+            d[i + 12_usize],
+            d[i + 13_usize],
+            d[i + 14_usize],
+            d[end],
+        };
+        let vb: u8x16 = .{
+            bytes[i],
+            bytes[i + 1_usize],
+            bytes[i + 2_usize],
+            bytes[i + 3_usize],
+            bytes[i + 4_usize],
+            bytes[i + 5_usize],
+            bytes[i + 6_usize],
+            bytes[i + 7_usize],
+            bytes[i + 8_usize],
+            bytes[i + 9_usize],
+            bytes[i + 10_usize],
+            bytes[i + 11_usize],
+            bytes[i + 12_usize],
+            bytes[i + 13_usize],
+            bytes[i + 14_usize],
+            bytes[end],
+        };
+        if !va.cmpeq(vb).all() {
+            return false;
+        }
+        i = i + 16_usize;
+    }
+    while i < bytes.len {
+        if d[i] != bytes[i] {
+            return false;
+        }
+        i = i + 1_usize;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Generic SIMD SwissTable HashMap[V] (`u64 -> V`)
+// ---------------------------------------------------------------------------
+
+/// Freestanding linear open-addressed SwissTable hash map using `u8x16` group probes.
+pub linear struct HashMap[V] {
+    ctrl: Buf[u8];
+    slots: Buf[u32];
+    keys: Buf[u64];
+    vals: Buf[V];
+    used: usize;
+    cap: usize;
+    group_mask: usize;
+}
+
+impl[V] HashMap[V] {
+    pub fn init(alloc: *mut AllocCap, initial_cap: usize) -> HashMap[V] ! OutOfMemory {
+        let real_cap = next_pow2_ge16(initial_cap);
+        var ctrl = try Buf.[u8].init(alloc, real_cap);
+        errdefer ctrl.destroy(alloc);
+        var slots = try Buf.[u32].init(alloc, real_cap);
+        errdefer slots.destroy(alloc);
+        let keys = try Buf.[u64].init(alloc, real_cap);
+        errdefer keys.destroy(alloc);
+        let vals = try Buf.[V].init(alloc, real_cap);
+        errdefer vals.destroy(alloc);
+
+        var i: usize = 0_usize;
+        while i < real_cap {
+            try ctrl.push(0x80_u8);
+            try slots.push(0_u32);
+            i = i + 1_usize;
+        }
+
+        let res: HashMap[V] = HashMap.{
+            ctrl: ctrl,
+            slots: slots,
+            keys: keys,
+            vals: vals,
+            used: 0_usize,
+            cap: real_cap,
+            group_mask: (real_cap >> 4_usize) -% 1_usize,
+        };
+        return res;
+    }
+
+    pub fn len(self: *Self) -> usize {
+        return self.keys.len();
+    }
+
+    pub fn cap(self: *Self) -> usize {
+        return self.cap;
+    }
+
+    pub fn is_empty(self: *Self) -> bool {
+        return self.keys.len() == 0_usize;
+    }
+
+    pub view fn keys_slice(self: *Self) -> *[u64] {
+        return self.keys.as_slice();
+    }
+
+    pub view fn vals_slice(self: *Self) -> *[V] {
+        return self.vals.as_slice();
+    }
+
+    pub fn clear(self: *mut Self) {
+        if self.used == 0_usize {
+            return;
+        }
+        let ctrl = self.ctrl.as_mut_slice();
+        var i: usize = 0_usize;
+        if ctrl.len >= 8_usize {
+            let lim = ctrl.len - 7_usize;
+            while i < lim {
+                ctrl[i] = 0x80_u8;
+                ctrl[i + 1_usize] = 0x80_u8;
+                ctrl[i + 2_usize] = 0x80_u8;
+                ctrl[i + 3_usize] = 0x80_u8;
+                ctrl[i + 4_usize] = 0x80_u8;
+                ctrl[i + 5_usize] = 0x80_u8;
+                ctrl[i + 6_usize] = 0x80_u8;
+                ctrl[i + 7_usize] = 0x80_u8;
+                i = i + 8_usize;
+            }
+        }
+        while i < ctrl.len {
+            ctrl[i] = 0x80_u8;
+            i = i + 1_usize;
+        }
+        self.keys.clear();
+        self.vals.clear();
+        self.used = 0_usize;
+    }
+
+    pub fn reserve(self: *mut Self, alloc: *mut AllocCap, needed_elems: usize) -> !OutOfMemory {
+        let req_cap = if needed_elems <= 14_usize {
+            16_usize
+        } else {
+            ((needed_elems *% 8_usize) / 7_usize) +% 2_usize
+        };
+        if req_cap <= self.cap {
+            return;
+        }
+        try self.rehash(alloc, req_cap);
+        return;
+    }
+
+    pub fn copy_from(self: *mut Self, alloc: *mut AllocCap, src: *Self) -> !OutOfMemory {
+        let sc = src.cap;
+        if self.ctrl.cap() < sc
+            || self.slots.cap() < sc
+            || self.keys.cap() < sc
+            || self.vals.cap() < sc
+        {
+            var new_ctrl = try Buf.[u8].init(alloc, sc);
+            errdefer new_ctrl.destroy(alloc);
+            var new_slots = try Buf.[u32].init(alloc, sc);
+            errdefer new_slots.destroy(alloc);
+            var new_keys = try Buf.[u64].init(alloc, sc);
+            errdefer new_keys.destroy(alloc);
+            var new_vals = try Buf.[V].init(alloc, sc);
+            errdefer new_vals.destroy(alloc);
+            try new_ctrl.push_slice(src.ctrl.as_slice());
+            try new_slots.push_slice(src.slots.as_slice());
+            try new_keys.push_slice(src.keys.as_slice());
+            try new_vals.push_slice(src.vals.as_slice());
+            self.ctrl.destroy(alloc);
+            self.ctrl = new_ctrl;
+            self.slots.destroy(alloc);
+            self.slots = new_slots;
+            self.keys.destroy(alloc);
+            self.keys = new_keys;
+            self.vals.destroy(alloc);
+            self.vals = new_vals;
+        } else {
+            self.ctrl.clear();
+            try self.ctrl.push_slice(src.ctrl.as_slice());
+            self.slots.clear();
+            try self.slots.push_slice(src.slots.as_slice());
+            self.keys.clear();
+            try self.keys.push_slice(src.keys.as_slice());
+            self.vals.clear();
+            try self.vals.push_slice(src.vals.as_slice());
+        }
+        self.used = src.used;
+        self.cap = sc;
+        self.group_mask = src.group_mask;
+        return;
+    }
+
+    @inline
+    fn find_bucket(self: *Self, key: u64) -> ?usize {
+        let h = hash_u64(key);
+        let h2 = ((h >> 57_u64) & 0x7F_u64).trunc.[u8]();
+        let needle = u8x16.splat(h2);
+        let empty_vec = u8x16.splat(0x80_u8);
+        let ctrl = self.ctrl.as_slice();
+        let slots = self.slots.as_slice();
+        let keys = self.keys.as_slice();
+        let num_groups = self.group_mask +% 1_usize;
+        var g = ((h >> 4_u64).trunc.[usize]()) & self.group_mask;
+        var probes: usize = 0_usize;
+        while probes < num_groups {
+            let base = g <<% 4_usize;
+            let grp = load_ctrl_group(ctrl, base);
+            var m = grp.cmpeq(needle).bitmask();
+            while m != 0_u64 {
+                let off = (@tzcnt(m) & 15_u64).trunc.[usize]();
+                let bucket = base +% off;
+                if bucket < slots.len {
+                    let idx = slots[bucket].widen.[usize]();
+                    if idx < keys.len {
+                        if keys[idx] == key {
+                            return bucket;
+                        }
+                    }
+                }
+                m = m & (m -% 1_u64);
+            }
+            if grp.cmpeq(empty_vec).any() {
+                return null;
+            }
+            g = (g +% 1_usize) & self.group_mask;
+            probes = probes +% 1_usize;
+        }
+        return null;
+    }
+
+    pub fn contains(self: *Self, key: u64) -> bool {
+        if let _ = self.find_bucket(key) {
+            return true;
+        }
+        return false;
+    }
+
+    pub fn get(self: *Self, key: u64) -> ?V {
+        if let bucket = self.find_bucket(key) {
+            let slots = self.slots.as_slice();
+            if bucket < slots.len {
+                let idx = slots[bucket].widen.[usize]();
+                let vals = self.vals.as_slice();
+                if idx < vals.len {
+                    return vals[idx];
+                }
+            }
+        }
+        return null;
+    }
+
+    pub view fn get_ref(self: *Self, key: u64) -> ?*V {
+        if let bucket = self.find_bucket(key) {
+            let slots = self.slots.as_slice();
+            if bucket < slots.len {
+                let idx = slots[bucket].widen.[usize]();
+                return self.vals.get(idx);
+            }
+        }
+        return null;
+    }
+
+    pub view fn get_mut(self: *mut Self, key: u64) -> ?*mut V {
+        if let bucket = self.find_bucket(key) {
+            let slots = self.slots.as_slice();
+            if bucket < slots.len {
+                let idx = slots[bucket].widen.[usize]();
+                return self.vals.get_mut(idx);
+            }
+        }
+        return null;
+    }
+
+    pub view fn keys_slice(self: *Self) -> *[u64] {
+        return self.keys.as_slice();
+    }
+
+    pub view fn vals_slice(self: *Self) -> *[V] {
+        return self.vals.as_slice();
+    }
+
+    fn rehash(self: *mut Self, alloc: *mut AllocCap, req_cap: usize) -> !OutOfMemory {
+        let new_cap = next_pow2_ge16(req_cap);
+        var new_ctrl = try Buf.[u8].init(alloc, new_cap);
+        errdefer new_ctrl.destroy(alloc);
+        var new_slots = try Buf.[u32].init(alloc, new_cap);
+        errdefer new_slots.destroy(alloc);
+        var new_keys = try Buf.[u64].init(alloc, new_cap);
+        errdefer new_keys.destroy(alloc);
+        var new_vals = try Buf.[V].init(alloc, new_cap);
+        errdefer new_vals.destroy(alloc);
+
+        var i: usize = 0_usize;
+        while i < new_cap {
+            try new_ctrl.push(0x80_u8);
+            try new_slots.push(0_u32);
+            i = i + 1_usize;
+        }
+        try new_keys.push_slice(self.keys.as_slice());
+        try new_vals.push_slice(self.vals.as_slice());
+
+        let new_gmask = (new_cap >> 4_usize) -% 1_usize;
+        let kslice = new_keys.as_slice();
+        var ki: usize = 0_usize;
+        while ki < kslice.len {
+            let h = hash_u64(kslice[ki]);
+            let h2 = ((h >> 57_u64) & 0x7F_u64).trunc.[u8]();
+            let ins = find_insert_slot(new_ctrl.as_slice(), new_gmask, h);
+            let bucket = ins.bucket;
+            if ins.found {
+                let nc_mut = new_ctrl.as_mut_slice();
+                let ns_mut = new_slots.as_mut_slice();
+                if bucket < nc_mut.len && bucket < ns_mut.len {
+                    nc_mut[bucket] = h2;
+                    ns_mut[bucket] = ki.trunc.[u32]();
+                }
+            }
+            ki = ki + 1_usize;
+        }
+
+        self.ctrl.destroy(alloc);
+        self.ctrl = new_ctrl;
+        self.slots.destroy(alloc);
+        self.slots = new_slots;
+        self.keys.destroy(alloc);
+        self.keys = new_keys;
+        self.vals.destroy(alloc);
+        self.vals = new_vals;
+        self.used = self.keys.len();
+        self.cap = new_cap;
+        self.group_mask = new_gmask;
+        return;
+    }
+
+    pub fn insert_unique_fresh(self: *mut Self, alloc: *mut AllocCap, key: u64, val: V) -> !OutOfMemory {
+        if self.used >= ((self.cap *% 7_usize) >> 3_usize) {
+            try self.rehash(alloc, self.cap *% 2_usize);
+        }
+        let h = hash_u64(key);
+        let h2 = ((h >> 57_u64) & 0x7F_u64).trunc.[u8]();
+        let ins = find_insert_slot(self.ctrl.as_slice(), self.group_mask, h);
+        if !ins.found {
+            return .OutOfMemory;
+        }
+        let new_idx = self.keys.len();
+        try self.keys.push(key);
+        self.vals.push(val) catch {
+            _ = self.keys.pop();
+            return .OutOfMemory;
+        };
+        let bucket = ins.bucket;
+        let ctrl = self.ctrl.as_mut_slice();
+        let slots = self.slots.as_mut_slice();
+        if bucket < ctrl.len && bucket < slots.len {
+            ctrl[bucket] = h2;
+            slots[bucket] = new_idx.trunc.[u32]();
+            if ins.was_empty {
+                self.used = self.used +% 1_usize;
+            }
+        }
+        return;
+    }
+
+    pub fn insert(self: *mut Self, alloc: *mut AllocCap, key: u64, val: V) -> !OutOfMemory {
+        let h = hash_u64(key);
+        let h2 = ((h >> 57_u64) & 0x7F_u64).trunc.[u8]();
+        let needle = u8x16.splat(h2);
+        let empty_vec = u8x16.splat(0x80_u8);
+        let del_vec = u8x16.splat(0xFE_u8);
+        var found_existing = false;
+        var existing_idx: usize = 0_usize;
+        var has_ins = false;
+        var ins_bucket: usize = 0_usize;
+        var ins_was_empty = false;
+
+        let ctrl_ro = self.ctrl.as_slice();
+        let slots_ro = self.slots.as_slice();
+        let keys_ro = self.keys.as_slice();
+        let num_groups = self.group_mask +% 1_usize;
+        var g = ((h >> 4_u64).trunc.[usize]()) & self.group_mask;
+        var probes: usize = 0_usize;
+        while probes < num_groups {
+            let base = g <<% 4_usize;
+            let grp = load_ctrl_group(ctrl_ro, base);
+            var m = grp.cmpeq(needle).bitmask();
+            while m != 0_u64 {
+                let off = (@tzcnt(m) & 15_u64).trunc.[usize]();
+                let bucket = base +% off;
+                if bucket < slots_ro.len {
+                    let idx = slots_ro[bucket].widen.[usize]();
+                    if idx < keys_ro.len && keys_ro[idx] == key {
+                        found_existing = true;
+                        existing_idx = idx;
+                        break;
+                    }
+                }
+                m = m & (m -% 1_u64);
+            }
+            if found_existing {
+                break;
+            }
+            if !has_ins {
+                let dm = grp.cmpeq(del_vec).bitmask();
+                if dm != 0_u64 {
+                    let doff = (@tzcnt(dm) & 15_u64).trunc.[usize]();
+                    ins_bucket = base +% doff;
+                    ins_was_empty = false;
+                    has_ins = true;
+                }
+            }
+            let em = grp.cmpeq(empty_vec).bitmask();
+            if em != 0_u64 {
+                if !has_ins {
+                    let eoff = (@tzcnt(em) & 15_u64).trunc.[usize]();
+                    ins_bucket = base +% eoff;
+                    ins_was_empty = true;
+                    has_ins = true;
+                }
+                break;
+            }
+            g = (g +% 1_usize) & self.group_mask;
+            probes = probes +% 1_usize;
+        }
+
+        if found_existing {
+            let vals = self.vals.as_mut_slice();
+            if existing_idx < vals.len {
+                vals[existing_idx] = val;
+            }
+            return;
+        }
+
+        if !has_ins || self.used >= ((self.cap *% 7_usize) >> 3_usize) {
+            let live = self.keys.len();
+            let next_cap: usize = if (live *% 2_usize) <= self.cap {
+                self.cap
+            } else {
+                self.cap *% 2_usize
+            };
+            try self.rehash(alloc, next_cap);
+            let ins = find_insert_slot(self.ctrl.as_slice(), self.group_mask, h);
+            if !ins.found {
+                return .OutOfMemory;
+            }
+            ins_bucket = ins.bucket;
+            ins_was_empty = ins.was_empty;
+        }
+
+        let new_idx = self.keys.len();
+        try self.keys.push(key);
+        self.vals.push(val) catch {
+            _ = self.keys.pop();
+            return .OutOfMemory;
+        };
+
+        let ctrl = self.ctrl.as_mut_slice();
+        let slots = self.slots.as_mut_slice();
+        if ins_bucket < ctrl.len && ins_bucket < slots.len {
+            ctrl[ins_bucket] = h2;
+            slots[ins_bucket] = new_idx.trunc.[u32]();
+            if ins_was_empty {
+                self.used = self.used +% 1_usize;
+            }
+        }
+        return;
+    }
+
+    pub fn remove(self: *mut Self, key: u64) -> ?V {
+        if let bucket = self.find_bucket(key) {
+            var idx: usize = 0_usize;
+            var have_idx = false;
+            let slots_ro = self.slots.as_slice();
+            if bucket < slots_ro.len {
+                idx = slots_ro[bucket].widen.[usize]();
+                have_idx = true;
+            }
+            if !have_idx {
+                return null;
+            }
+            let vals_ro = self.vals.as_slice();
+            if idx >= vals_ro.len {
+                return null;
+            }
+            let removed_val = vals_ro[idx];
+
+            let ctrl = self.ctrl.as_mut_slice();
+            if bucket < ctrl.len {
+                ctrl[bucket] = 0xFE_u8;
+            }
+
+            let cur_len = self.keys.len();
+            if cur_len > 0_usize {
+                let last_idx = cur_len - 1_usize;
+                if idx != last_idx {
+                    var moved_key: u64 = 0_u64;
+                    var have_moved_key = false;
+                    let keys_ro = self.keys.as_slice();
+                    if last_idx < keys_ro.len {
+                        moved_key = keys_ro[last_idx];
+                        have_moved_key = true;
+                    }
+                    if have_moved_key {
+                        if let mb = self.find_bucket(moved_key) {
+                            let slots_mut = self.slots.as_mut_slice();
+                            if mb < slots_mut.len {
+                                slots_mut[mb] = idx.trunc.[u32]();
+                            }
+                        }
+                        let vals_ro2 = self.vals.as_slice();
+                        if last_idx < vals_ro2.len {
+                            let moved_val = vals_ro2[last_idx];
+                            let keys_mut = self.keys.as_mut_slice();
+                            let vals_mut = self.vals.as_mut_slice();
+                            if idx < keys_mut.len && idx < vals_mut.len {
+                                keys_mut[idx] = moved_key;
+                                vals_mut[idx] = moved_val;
+                            }
+                        }
+                    }
+                }
+                _ = self.keys.pop();
+                _ = self.vals.pop();
+            }
+            return removed_val;
+        }
+        return null;
+    }
+
+    pub fn destroy(self: HashMap[V], alloc: *mut AllocCap) {
+        let HashMap.{ ctrl, slots, keys, vals, used: _, cap: _, group_mask: _ } = self;
+        ctrl.destroy(alloc);
+        slots.destroy(alloc);
+        keys.destroy(alloc);
+        vals.destroy(alloc);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dense BitSet backed by Buf[u64]
+// ---------------------------------------------------------------------------
+
+/// Freestanding linear bitset backed by `Buf[u64]` with `@popcnt` and `@tzcnt` acceleration.
+pub linear struct BitSet {
+    words: Buf[u64];
+    nbits: usize;
+}
+
+impl BitSet {
+    pub fn init(alloc: *mut AllocCap, num_bits: usize) -> BitSet ! OutOfMemory {
+        let word_count: usize = if num_bits == 0_usize {
+            0_usize
+        } else {
+            ((num_bits - 1_usize) >> 6_usize) +% 1_usize
+        };
+        var words = try Buf.[u64].init(alloc, word_count);
+        errdefer words.destroy(alloc);
+
+        var i: usize = 0_usize;
+        while i < word_count {
+            try words.push(0_u64);
+            i = i + 1_usize;
+        }
+
+        return BitSet.{
+            words: words,
+            nbits: num_bits,
+        };
+    }
+
+    pub fn len(self: *Self) -> usize {
+        return self.nbits;
+    }
+
+    pub fn word_len(self: *Self) -> usize {
+        return self.words.len();
+    }
+
+    pub fn clear(self: *mut Self) {
+        let w = self.words.as_mut_slice();
+        var i: usize = 0_usize;
+        while i < w.len {
+            w[i] = 0_u64;
+            i = i + 1_usize;
+        }
+    }
+
+    pub fn set(self: *mut Self, bit: usize) {
+        if bit >= self.nbits {
+            return;
+        }
+        let wi = bit >> 6_usize;
+        let bi = (bit & 63_usize).trunc.[u64]();
+        let w = self.words.as_mut_slice();
+        if wi < w.len {
+            w[wi] = w[wi] | (1_u64 <<% bi);
+        }
+    }
+
+    pub fn set_grow(self: *mut Self, alloc: *mut AllocCap, bit: usize) -> !OutOfMemory {
+        if bit >= self.nbits {
+            let need_words = (bit >> 6_usize) +% 1_usize;
+            if need_words > self.words.len() {
+                if need_words > self.words.cap() {
+                    var new_cap = if self.words.cap() == 0_usize {
+                        4_usize
+                    } else {
+                        self.words.cap()
+                    };
+                    while new_cap < need_words {
+                        if new_cap >= 0x20000000_usize {
+                            new_cap = need_words;
+                            break;
+                        }
+                        new_cap = new_cap *% 2_usize;
+                    }
+                    var new_words = try Buf.[u64].init(alloc, new_cap);
+                    errdefer new_words.destroy(alloc);
+                    try new_words.push_slice(self.words.as_slice());
+                    while new_words.len() < need_words {
+                        try new_words.push(0_u64);
+                    }
+                    self.words.destroy(alloc);
+                    self.words = new_words;
+                } else {
+                    while self.words.len() < need_words {
+                        try self.words.push(0_u64);
+                    }
+                }
+            }
+            self.nbits = bit +% 1_usize;
+        }
+        self.set(bit);
+        return;
+    }
+
+    pub fn unset(self: *mut Self, bit: usize) {
+        if bit >= self.nbits {
+            return;
+        }
+        let wi = bit >> 6_usize;
+        let bi = (bit & 63_usize).trunc.[u64]();
+        let w = self.words.as_mut_slice();
+        if wi < w.len {
+            w[wi] = w[wi] & (~(1_u64 <<% bi));
+        }
+    }
+
+    pub fn test(self: *Self, bit: usize) -> bool {
+        if bit >= self.nbits {
+            return false;
+        }
+        let wi = bit >> 6_usize;
+        let bi = (bit & 63_usize).trunc.[u64]();
+        let w = self.words.as_slice();
+        if wi < w.len {
+            return ((w[wi] >> (bi & 63_u64)) & 1_u64) != 0_u64;
+        }
+        return false;
+    }
+
+    pub fn contains(self: *Self, bit: usize) -> bool {
+        return self.test(bit);
+    }
+
+    pub fn count_ones(self: *Self) -> usize {
+        let w = self.words.as_slice();
+        var total: usize = 0_usize;
+        var i: usize = 0_usize;
+        while i < w.len {
+            total = total +% @popcnt(w[i]).trunc.[usize]();
+            i = i + 1_usize;
+        }
+        return total;
+    }
+
+    pub fn first_set(self: *Self) -> ?usize {
+        let w = self.words.as_slice();
+        var i: usize = 0_usize;
+        while i < w.len {
+            let word = w[i];
+            if word != 0_u64 {
+                let tz = (@tzcnt(word) & 63_u64).trunc.[usize]();
+                let bit = (i *% 64_usize) +% tz;
+                if bit < self.nbits {
+                    return bit;
+                }
+                return null;
+            }
+            i = i + 1_usize;
+        }
+        return null;
+    }
+
+    pub fn union_with(self: *mut Self, other: *Self) {
+        let dst = self.words.as_mut_slice();
+        let src = other.words.as_slice();
+        let n = if dst.len < src.len { dst.len } else { src.len };
+        var i: usize = 0_usize;
+        while i < n {
+            dst[i] = dst[i] | src[i];
+            i = i + 1_usize;
+        }
+        let rem = self.nbits & 63_usize;
+        if rem != 0_usize && dst.len > 0_usize {
+            let last = dst.len - 1_usize;
+            let mask = (1_u64 <<% rem.trunc.[u64]()) -% 1_u64;
+            dst[last] = dst[last] & mask;
+        }
+    }
+
+    pub fn intersect_with(self: *mut Self, other: *Self) {
+        let dst = self.words.as_mut_slice();
+        let src = other.words.as_slice();
+        var i: usize = 0_usize;
+        while i < dst.len {
+            if i < src.len {
+                dst[i] = dst[i] & src[i];
+            } else {
+                dst[i] = 0_u64;
+            }
+            i = i + 1_usize;
+        }
+    }
+
+    pub fn next_set(self: *Self, start: usize) -> ?usize {
+        if start >= self.nbits {
+            return null;
+        }
+        let w = self.words.as_slice();
+        let start_wi = start >> 6_usize;
+        if start_wi >= w.len {
+            return null;
+        }
+        let start_bi = (start & 63_usize).trunc.[u64]();
+        let first_mask = (~0_u64) <<% start_bi;
+        let first_word = w[start_wi] & first_mask;
+        if first_word != 0_u64 {
+            let tz = (@tzcnt(first_word) & 63_u64).trunc.[usize]();
+            let bit = (start_wi *% 64_usize) +% tz;
+            if bit < self.nbits {
+                return bit;
+            }
+            return null;
+        }
+        var i = start_wi +% 1_usize;
+        while i < w.len {
+            let word = w[i];
+            if word != 0_u64 {
+                let tz = (@tzcnt(word) & 63_u64).trunc.[usize]();
+                let bit = (i *% 64_usize) +% tz;
+                if bit < self.nbits {
+                    return bit;
+                }
+                return null;
+            }
+            i = i + 1_usize;
+        }
+        return null;
+    }
+
+    pub fn difference_with(self: *mut Self, other: *Self) {
+        let dst = self.words.as_mut_slice();
+        let src = other.words.as_slice();
+        let n = if dst.len < src.len { dst.len } else { src.len };
+        var i: usize = 0_usize;
+        while i < n {
+            dst[i] = dst[i] & (~src[i]);
+            i = i + 1_usize;
+        }
+    }
+
+    pub fn union_row_words_into(self: *Self, row_word_off: usize, word_count: usize, dst: *mut Self) {
+        let sw = self.words.as_slice();
+        let dw = dst.words.as_mut_slice();
+        var i: usize = 0_usize;
+        while i < word_count && i < dw.len {
+            let si = row_word_off +% i;
+            if si < sw.len {
+                dw[i] = dw[i] | sw[si];
+            }
+            i = i +% 1_usize;
+        }
+    }
+
+    pub fn write_row_words_diff(self: *mut Self, row_word_off: usize, word_count: usize, src: *Self) -> bool {
+        let dw = self.words.as_mut_slice();
+        let sw = src.words.as_slice();
+        var diff = false;
+        var i: usize = 0_usize;
+        while i < word_count && i < sw.len {
+            let di = row_word_off +% i;
+            if di < dw.len {
+                let want = sw[i];
+                if dw[di] != want {
+                    dw[di] = want;
+                    diff = true;
+                }
+            }
+            i = i +% 1_usize;
+        }
+        return diff;
+    }
+
+    pub fn copy_row_words_from(self: *mut Self, row_word_off: usize, word_count: usize, src: *Self) {
+        let dw = self.words.as_mut_slice();
+        let sw = src.words.as_slice();
+        var i: usize = 0_usize;
+        while i < word_count && i < sw.len {
+            let di = row_word_off +% i;
+            if di < dw.len {
+                dw[di] = sw[i];
+            }
+            i = i +% 1_usize;
+        }
+    }
+
+    pub fn equals(self: *Self, other: *Self) -> bool {
+        let a = self.words.as_slice();
+        let b = other.words.as_slice();
+        let common = if a.len < b.len { a.len } else { b.len };
+        var i: usize = 0_usize;
+        while i < common {
+            if a[i] != b[i] {
+                return false;
+            }
+            i = i + 1_usize;
+        }
+        var ia = common;
+        while ia < a.len {
+            if a[ia] != 0_u64 {
+                return false;
+            }
+            ia = ia + 1_usize;
+        }
+        var ib = common;
+        while ib < b.len {
+            if b[ib] != 0_u64 {
+                return false;
+            }
+            ib = ib + 1_usize;
+        }
+        return true;
+    }
+
+    pub fn destroy(self: BitSet, alloc: *mut AllocCap) {
+        let BitSet.{ words, nbits: _ } = self;
+        words.destroy(alloc);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic String / Byte-Slice Interner (`*[u8] -> u32`)
+// ---------------------------------------------------------------------------
+
+/// Freestanding linear string/byte interner assigning dense `u32` IDs (`0, 1, 2, ...`).
+/// Packs `(off: u32, len: u32)` into a single `spans: Buf[u64]` column for 1 fewer cache miss per lookup.
+pub linear struct Interner {
+    data: Buf[u8];
+    spans: Buf[u64];
+    ctrl: Buf[u8];
+    slots: Buf[u32];
+    used: usize;
+    cap: usize;
+    group_mask: usize;
+}
+
+struct InternProbe {
+    found: bool;
+    id: u32;
+    empty_bucket: usize;
+    has_empty: bool;
+}
+
+impl Interner {
+    pub fn init(alloc: *mut AllocCap, initial_cap: usize) -> Interner ! OutOfMemory {
+        let table_cap = next_pow2_ge16(initial_cap);
+        let data_cap = table_cap *% 16_usize;
+        let data = try Buf.[u8].init(alloc, data_cap);
+        errdefer data.destroy(alloc);
+        let spans = try Buf.[u64].init(alloc, table_cap);
+        errdefer spans.destroy(alloc);
+        var ctrl = try Buf.[u8].init(alloc, table_cap);
+        errdefer ctrl.destroy(alloc);
+        var slots = try Buf.[u32].init(alloc, table_cap);
+        errdefer slots.destroy(alloc);
+
+        var i: usize = 0_usize;
+        while i < table_cap {
+            try ctrl.push(0x80_u8);
+            try slots.push(0_u32);
+            i = i + 1_usize;
+        }
+
+        return Interner.{
+            data: data,
+            spans: spans,
+            ctrl: ctrl,
+            slots: slots,
+            used: 0_usize,
+            cap: table_cap,
+            group_mask: (table_cap >> 4_usize) -% 1_usize,
+        };
+    }
+
+    pub fn len(self: *Self) -> usize {
+        return self.spans.len();
+    }
+
+    pub fn clone(self: *Self, alloc: *mut AllocCap) -> Interner ! OutOfMemory {
+        let data_cap = self.data.len() +% 512_usize;
+        var data = try Buf.[u8].init(alloc, data_cap);
+        errdefer data.destroy(alloc);
+        try data.push_slice(self.data.as_slice());
+        var spans = try Buf.[u64].init(alloc, self.cap);
+        errdefer spans.destroy(alloc);
+        try spans.push_slice(self.spans.as_slice());
+        var ctrl = try Buf.[u8].init(alloc, self.cap);
+        errdefer ctrl.destroy(alloc);
+        try ctrl.push_slice(self.ctrl.as_slice());
+        var slots = try Buf.[u32].init(alloc, self.cap);
+        errdefer slots.destroy(alloc);
+        try slots.push_slice(self.slots.as_slice());
+        return Interner.{
+            data: data,
+            spans: spans,
+            ctrl: ctrl,
+            slots: slots,
+            used: self.used,
+            cap: self.cap,
+            group_mask: self.group_mask,
+        };
+    }
+
+    pub fn is_empty(self: *Self) -> bool {
+        return self.spans.len() == 0_usize;
+    }
+
+    pub fn clear(self: *mut Self) {
+        let ctrl = self.ctrl.as_mut_slice();
+        var i: usize = 0_usize;
+        while i < ctrl.len {
+            ctrl[i] = 0x80_u8;
+            i = i + 1_usize;
+        }
+        self.data.clear();
+        self.spans.clear();
+        self.used = 0_usize;
+    }
+
+    fn probe_with_hash(self: *Self, h: u64, bytes: *[u8]) -> InternProbe {
+        let h2 = ((h >> 57_u64) & 0x7F_u64).trunc.[u8]();
+        let needle = u8x16.splat(h2);
+        let ctrl = self.ctrl.as_slice();
+        let slots = self.slots.as_slice();
+        let gmask = self.group_mask;
+        let num_groups = gmask +% 1_usize;
+        var g = ((h >> 4_u64).trunc.[usize]()) & gmask;
+        var probes: usize = 0_usize;
+        while probes < num_groups {
+            let base = g <<% 4_usize;
+            let grp = load_ctrl_group(ctrl, base);
+            var m = grp.cmpeq(needle).bitmask();
+            while m != 0_u64 {
+                let off = (@tzcnt(m) & 15_u64).trunc.[usize]();
+                let bucket = base +% off;
+                if bucket < slots.len {
+                    let id_u32 = slots[bucket];
+                    if entry_eq_bytes(self.data.as_slice(), self.spans.as_slice(), id_u32.widen.[usize](), bytes) {
+                        return InternProbe.{ found: true, id: id_u32, empty_bucket: bucket, has_empty: false };
+                    }
+                }
+                m = m & (m -% 1_u64);
+            }
+            let em = grp.cmpeq(u8x16.splat(0x80_u8)).bitmask();
+            if em != 0_u64 {
+                let eoff = (@tzcnt(em) & 15_u64).trunc.[usize]();
+                return InternProbe.{ found: false, id: 0_u32, empty_bucket: base +% eoff, has_empty: true };
+            }
+            g = (g +% 1_usize) & gmask;
+            probes = probes +% 1_usize;
+        }
+        return InternProbe.{ found: false, id: 0_u32, empty_bucket: 0_usize, has_empty: false };
+    }
+
+    fn lookup_with_hash(self: *Self, h: u64, bytes: *[u8]) -> ?u32 {
+        let h2 = ((h >> 57_u64) & 0x7F_u64).trunc.[u8]();
+        let needle = u8x16.splat(h2);
+        let ctrl = self.ctrl.as_slice();
+        let slots = self.slots.as_slice();
+        let gmask = self.group_mask;
+        let num_groups = gmask +% 1_usize;
+        var g = ((h >> 4_u64).trunc.[usize]()) & gmask;
+        var probes: usize = 0_usize;
+        while probes < num_groups {
+            let base = g <<% 4_usize;
+            let grp = load_ctrl_group(ctrl, base);
+            var m = grp.cmpeq(needle).bitmask();
+            while m != 0_u64 {
+                let off = (@tzcnt(m) & 15_u64).trunc.[usize]();
+                let bucket = base +% off;
+                if bucket < slots.len {
+                    let id_u32 = slots[bucket];
+                    if entry_eq_bytes(self.data.as_slice(), self.spans.as_slice(), id_u32.widen.[usize](), bytes) {
+                        return id_u32;
+                    }
+                }
+                m = m & (m -% 1_u64);
+            }
+            if grp.cmpeq(u8x16.splat(0x80_u8)).bitmask() != 0_u64 {
+                return null;
+            }
+            g = (g +% 1_usize) & gmask;
+            probes = probes +% 1_usize;
+        }
+        return null;
+    }
+
+    pub fn lookup(self: *Self, bytes: *[u8]) -> ?u32 {
+        return self.lookup_with_hash(hash_bytes(bytes), bytes);
+    }
+
+    pub fn lookup_str(self: *Self, s: *str) -> ?u32 {
+        return self.lookup(s.as_bytes());
+    }
+
+    fn rehash(self: *mut Self, alloc: *mut AllocCap, req_cap: usize) -> !OutOfMemory {
+        let new_cap = next_pow2_ge16(req_cap);
+        var new_ctrl = try Buf.[u8].init(alloc, new_cap);
+        errdefer new_ctrl.destroy(alloc);
+        var new_slots = try Buf.[u32].init(alloc, new_cap);
+        errdefer new_slots.destroy(alloc);
+        var new_spans = try Buf.[u64].init(alloc, new_cap);
+        errdefer new_spans.destroy(alloc);
+
+        var i: usize = 0_usize;
+        while i < new_cap {
+            try new_ctrl.push(0x80_u8);
+            try new_slots.push(0_u32);
+            i = i + 1_usize;
+        }
+        try new_spans.push_slice(self.spans.as_slice());
+
+        let new_gmask = (new_cap >> 4_usize) -% 1_usize;
+        let sps = new_spans.as_slice();
+        var id: usize = 0_usize;
+        while id < sps.len {
+            let sp = sps[id];
+            let off = sp.trunc.[u32]().widen.[usize]();
+            let n = (sp >> 32_u64).trunc.[usize]();
+            let sub = self.data.sub(off, off +% n) catch {
+                return .OutOfMemory;
+            };
+            let h = hash_bytes(sub);
+            let h2 = ((h >> 57_u64) & 0x7F_u64).trunc.[u8]();
+            let ins = find_insert_slot(new_ctrl.as_slice(), new_gmask, h);
+            let bucket = ins.bucket;
+            if ins.found {
+                let nc_mut = new_ctrl.as_mut_slice();
+                let ns_mut = new_slots.as_mut_slice();
+                if bucket < nc_mut.len && bucket < ns_mut.len {
+                    nc_mut[bucket] = h2;
+                    ns_mut[bucket] = id.trunc.[u32]();
+                }
+            }
+            id = id + 1_usize;
+        }
+
+        self.ctrl.destroy(alloc);
+        self.ctrl = new_ctrl;
+        self.slots.destroy(alloc);
+        self.slots = new_slots;
+        self.spans.destroy(alloc);
+        self.spans = new_spans;
+        self.used = self.spans.len();
+        self.cap = new_cap;
+        self.group_mask = new_gmask;
+        return;
+    }
+
+    pub fn intern(self: *mut Self, alloc: *mut AllocCap, bytes: *[u8]) -> u32 ! OutOfMemory {
+        let h = hash_bytes(bytes);
+        if let existing = self.lookup_with_hash(h, bytes) {
+            return existing;
+        }
+        return try self.intern_miss_cold(alloc, h, bytes);
+    }
+
+    fn intern_miss_cold(self: *mut Self, alloc: *mut AllocCap, h: u64, bytes: *[u8]) -> u32 ! OutOfMemory {
+        let pr = self.probe_with_hash(h, bytes);
+        if pr.found {
+            return pr.id;
+        }
+
+        var bucket = pr.empty_bucket;
+        var need_find = !pr.has_empty;
+        if self.used >= ((self.cap *% 7_usize) >> 3_usize) {
+            try self.rehash(alloc, self.cap *% 2_usize);
+            need_find = true;
+        }
+
+        if bytes.len > (0x3FFFFFFF_usize -% self.data.len()) {
+            return .OutOfMemory;
+        }
+        let avail = self.data.cap() -% self.data.len();
+        if bytes.len > avail {
+            let need = self.data.len() +% bytes.len;
+            var new_dcap = if self.data.cap() == 0_usize {
+                256_usize
+            } else {
+                self.data.cap()
+            };
+            while new_dcap < need {
+                if new_dcap >= 0x20000000_usize {
+                    new_dcap = need;
+                    break;
+                }
+                new_dcap = new_dcap *% 2_usize;
+            }
+            var new_data = try Buf.[u8].init(alloc, new_dcap);
+            errdefer new_data.destroy(alloc);
+            try new_data.push_slice(self.data.as_slice());
+            self.data.destroy(alloc);
+            self.data = new_data;
+        }
+
+        let h2 = ((h >> 57_u64) & 0x7F_u64).trunc.[u8]();
+        if need_find {
+            let ins = find_insert_slot(self.ctrl.as_slice(), self.group_mask, h);
+            if !ins.found {
+                return .OutOfMemory;
+            }
+            bucket = ins.bucket;
+        }
+
+        let new_id_usize = self.spans.len();
+        let new_id = new_id_usize.trunc.[u32]();
+        let off_u64 = self.data.len().trunc.[u32]().widen.[u64]();
+        let len_u64 = bytes.len.trunc.[u32]().widen.[u64]();
+
+        try self.data.push_slice(bytes);
+        try self.spans.push(off_u64 | (len_u64 <<% 32_u64));
+
+        let ctrl = self.ctrl.as_mut_slice();
+        let slots = self.slots.as_mut_slice();
+        if bucket < ctrl.len && bucket < slots.len {
+            ctrl[bucket] = h2;
+            slots[bucket] = new_id;
+            self.used = self.used +% 1_usize;
+        }
+        return new_id;
+    }
+
+    pub fn intern_str(self: *mut Self, alloc: *mut AllocCap, s: *str) -> u32 ! OutOfMemory {
+        return try self.intern(alloc, s.as_bytes());
+    }
+
+    pub view fn get(self: *Self, id: u32) -> ?*[u8] {
+        let idx = id.widen.[usize]();
+        let spans = self.spans.as_slice();
+        if idx >= spans.len {
+            return null;
+        }
+        let sp = spans[idx];
+        let off = sp.trunc.[u32]().widen.[usize]();
+        let n = (sp >> 32_u64).trunc.[usize]();
+        let s = self.data.sub(off, off +% n) catch {
+            return null;
+        };
+        return s;
+    }
+
+    pub fn destroy(self: Interner, alloc: *mut AllocCap) {
+        let Interner.{ data, spans, ctrl, slots, used: _, cap: _, group_mask: _ } = self;
+        data.destroy(alloc);
+        spans.destroy(alloc);
+        ctrl.destroy(alloc);
+        slots.destroy(alloc);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Direct-Addressed SwissTable FlatMapU64 (`u64 -> u64`, 2 cache lines / lookup)
+// ---------------------------------------------------------------------------
+
+pub struct FlatEntryU64 {
+    pub key: u64;
+    pub val: u64;
+}
+
+/// High-throughput direct-addressed SwissTable `u64 -> u64` map:
+/// stores `(key, val)` directly at `entries[bucket]` (eliminating `slots` indirection
+/// and placing key + value in the same 16B cache line for 2x fewer LLC misses!).
+pub linear struct FlatMapU64 {
+    ctrl: Buf[u8];
+    entries: Buf[FlatEntryU64];
+    count: usize;
+    used: usize;
+    cap: usize;
+    group_mask: usize;
+}
+
+impl FlatMapU64 {
+    pub fn init(alloc: *mut AllocCap, initial_cap: usize) -> FlatMapU64 ! OutOfMemory {
+        let real_cap = next_pow2_ge16(initial_cap);
+        var ctrl = try Buf.[u8].init(alloc, real_cap);
+        errdefer ctrl.destroy(alloc);
+        var entries = try Buf.[FlatEntryU64].init(alloc, real_cap);
+        errdefer entries.destroy(alloc);
+
+        var i: usize = 0_usize;
+        while i < real_cap {
+            try ctrl.push(0x80_u8);
+            try entries.push(FlatEntryU64.{ key: 0_u64, val: 0_u64 });
+            i = i + 1_usize;
+        }
+        return FlatMapU64.{
+            ctrl: ctrl,
+            entries: entries,
+            count: 0_usize,
+            used: 0_usize,
+            cap: real_cap,
+            group_mask: (real_cap >> 4_usize) -% 1_usize,
+        };
+    }
+
+    pub fn len(self: *Self) -> usize {
+        return self.count;
+    }
+
+    pub fn get(self: *Self, key: u64) -> ?u64 {
+        let h = hash_u64(key);
+        let h2 = ((h >> 57_u64) & 0x7F_u64).trunc.[u8]();
+        let needle = u8x16.splat(h2);
+        let ctrl = self.ctrl.as_slice();
+        let entries = self.entries.as_slice();
+        let num_groups = self.group_mask +% 1_usize;
+        var g = ((h >> 4_u64).trunc.[usize]()) & self.group_mask;
+        var probes: usize = 0_usize;
+        while probes < num_groups {
+            let base = g <<% 4_usize;
+            let grp = load_ctrl_group(ctrl, base);
+            var m = grp.cmpeq(needle).bitmask();
+            while m != 0_u64 {
+                let off = (@tzcnt(m) & 15_u64).trunc.[usize]();
+                let bucket = base +% off;
+                if bucket < entries.len && entries[bucket].key == key {
+                    return entries[bucket].val;
+                }
+                m = m & (m -% 1_u64);
+            }
+            if grp.cmpeq(u8x16.splat(0x80_u8)).bitmask() != 0_u64 {
+                return null;
+            }
+            g = (g +% 1_usize) & self.group_mask;
+            probes = probes +% 1_usize;
+        }
+        return null;
+    }
+
+    fn rehash(self: *mut Self, alloc: *mut AllocCap, req_cap: usize) -> !OutOfMemory {
+        let new_cap = next_pow2_ge16(req_cap);
+        var new_ctrl = try Buf.[u8].init(alloc, new_cap);
+        errdefer new_ctrl.destroy(alloc);
+        var new_entries = try Buf.[FlatEntryU64].init(alloc, new_cap);
+        errdefer new_entries.destroy(alloc);
+
+        var i: usize = 0_usize;
+        while i < new_cap {
+            try new_ctrl.push(0x80_u8);
+            try new_entries.push(FlatEntryU64.{ key: 0_u64, val: 0_u64 });
+            i = i + 1_usize;
+        }
+
+        let new_gmask = (new_cap >> 4_usize) -% 1_usize;
+        let old_ctrl = self.ctrl.as_slice();
+        let old_entries = self.entries.as_slice();
+        var oi: usize = 0_usize;
+        while oi < old_ctrl.len && oi < old_entries.len {
+            if (old_ctrl[oi] & 0x80_u8) == 0_u8 {
+                let ent = old_entries[oi];
+                let h = hash_u64(ent.key);
+                let h2 = ((h >> 57_u64) & 0x7F_u64).trunc.[u8]();
+                let ins = find_insert_slot(new_ctrl.as_slice(), new_gmask, h);
+                if ins.found {
+                    let b = ins.bucket;
+                    let nc = new_ctrl.as_mut_slice();
+                    let ne = new_entries.as_mut_slice();
+                    if b < nc.len && b < ne.len {
+                        nc[b] = h2;
+                        ne[b] = ent;
+                    }
+                }
+            }
+            oi = oi + 1_usize;
+        }
+
+        self.ctrl.destroy(alloc);
+        self.ctrl = new_ctrl;
+        self.entries.destroy(alloc);
+        self.entries = new_entries;
+        self.used = self.count;
+        self.cap = new_cap;
+        self.group_mask = new_gmask;
+        return;
+    }
+
+    fn try_add_existing(self: *mut Self, h: u64, key: u64, delta: u64) -> bool {
+        let h2 = ((h >> 57_u64) & 0x7F_u64).trunc.[u8]();
+        let needle = u8x16.splat(h2);
+        let ctrl_ro = self.ctrl.as_slice();
+        let entries_mut = self.entries.as_mut_slice();
+        let gmask = self.group_mask;
+        let num_groups = gmask +% 1_usize;
+        var g = ((h >> 4_u64).trunc.[usize]()) & gmask;
+        var probes: usize = 0_usize;
+        while probes < num_groups {
+            let base = g <<% 4_usize;
+            let grp = load_ctrl_group(ctrl_ro, base);
+            var m = grp.cmpeq(needle).bitmask();
+            while m != 0_u64 {
+                let off = (@tzcnt(m) & 15_u64).trunc.[usize]();
+                let bucket = base +% off;
+                if bucket < entries_mut.len && entries_mut[bucket].key == key {
+                    entries_mut[bucket].val = entries_mut[bucket].val +% delta;
+                    return true;
+                }
+                m = m & (m -% 1_u64);
+            }
+            if grp.cmpeq(u8x16.splat(0x80_u8)).bitmask() != 0_u64 {
+                return false;
+            }
+            g = (g +% 1_usize) & gmask;
+            probes = probes +% 1_usize;
+        }
+        return false;
+    }
+
+    fn upsert_miss_cold(self: *mut Self, alloc: *mut AllocCap, h: u64, key: u64, init_val: u64) -> !OutOfMemory {
+        let h2 = ((h >> 57_u64) & 0x7F_u64).trunc.[u8]();
+        if self.used >= ((self.cap *% 7_usize) >> 3_usize) {
+            let next_cap: usize = if (self.count *% 2_usize) <= self.cap {
+                self.cap
+            } else {
+                self.cap *% 2_usize
+            };
+            try self.rehash(alloc, next_cap);
+        }
+        let ins = find_insert_slot(self.ctrl.as_slice(), self.group_mask, h);
+        if !ins.found {
+            return .OutOfMemory;
+        }
+        let b = ins.bucket;
+        let ctrl_m = self.ctrl.as_mut_slice();
+        let ent_m = self.entries.as_mut_slice();
+        if b < ctrl_m.len && b < ent_m.len {
+            ctrl_m[b] = h2;
+            ent_m[b] = FlatEntryU64.{ key: key, val: init_val };
+            self.count = self.count +% 1_usize;
+            if ins.was_empty {
+                self.used = self.used +% 1_usize;
+            }
+        }
+        return;
+    }
+
+    /// Single-probe upsert: if `key` exists, adds `delta` to its value; otherwise inserts `init_val`.
+    pub fn upsert_add(self: *mut Self, alloc: *mut AllocCap, key: u64, delta: u64, init_val: u64) -> !OutOfMemory {
+        let h = hash_u64(key);
+        if self.try_add_existing(h, key, delta) {
+            return;
+        }
+        return try self.upsert_miss_cold(alloc, h, key, init_val);
+    }
+
+    pub fn remove(self: *mut Self, key: u64) -> ?u64 {
+        let h = hash_u64(key);
+        let h2 = ((h >> 57_u64) & 0x7F_u64).trunc.[u8]();
+        let needle = u8x16.splat(h2);
+        let empty_vec = u8x16.splat(0x80_u8);
+        let ctrl_ro = self.ctrl.as_slice();
+        let entries_ro = self.entries.as_slice();
+        let num_groups = self.group_mask +% 1_usize;
+        var g = ((h >> 4_u64).trunc.[usize]()) & self.group_mask;
+        var probes: usize = 0_usize;
+        while probes < num_groups {
+            let base = g <<% 4_usize;
+            let grp = load_ctrl_group(ctrl_ro, base);
+            var m = grp.cmpeq(needle).bitmask();
+            while m != 0_u64 {
+                let off = (@tzcnt(m) & 15_u64).trunc.[usize]();
+                let bucket = base +% off;
+                if bucket < entries_ro.len && entries_ro[bucket].key == key {
+                    let old_v = entries_ro[bucket].val;
+                    let ctrl_m = self.ctrl.as_mut_slice();
+                    if bucket < ctrl_m.len {
+                        ctrl_m[bucket] = 0xFE_u8;
+                    }
+                    if self.count > 0_usize {
+                        self.count = self.count - 1_usize;
+                    }
+                    return old_v;
+                }
+                m = m & (m -% 1_u64);
+            }
+            if grp.cmpeq(empty_vec).any() {
+                return null;
+            }
+            g = (g +% 1_usize) & self.group_mask;
+            probes = probes +% 1_usize;
+        }
+        return null;
+    }
+
+    pub fn destroy(self: FlatMapU64, alloc: *mut AllocCap) {
+        let FlatMapU64.{ ctrl, entries, count: _, used: _, cap: _, group_mask: _ } = self;
+        ctrl.destroy(alloc);
+        entries.destroy(alloc);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Growable Linear Generic Vector `DynBuf[T]` backed by `Buf[T]`
+// ---------------------------------------------------------------------------
+
+/// Freestanding growable linear vector wrapping `Buf[T]`.
+pub linear struct DynBuf[T] {
+    buf: Buf[T];
+}
+
+impl[T] DynBuf[T] {
+    pub fn init(alloc: *mut AllocCap, initial_cap: usize) -> DynBuf[T] ! OutOfMemory {
+        if initial_cap > 0x3FFFFFFF_usize {
+            return .OutOfMemory;
+        }
+        let real_cap: usize = if initial_cap < 4_usize { 4_usize } else { initial_cap };
+        let buf = try Buf.[T].init(alloc, real_cap);
+        let res: DynBuf[T] = DynBuf.{ buf: buf };
+        return res;
+    }
+
+    pub fn len(self: *Self) -> usize {
+        return self.buf.len();
+    }
+
+    pub fn cap(self: *Self) -> usize {
+        return self.buf.cap();
+    }
+
+    pub fn is_empty(self: *Self) -> bool {
+        return self.buf.len() == 0_usize;
+    }
+
+    pub fn clear(self: *mut Self) {
+        self.buf.clear();
+    }
+
+    pub fn reserve(self: *mut Self, alloc: *mut AllocCap, additional: usize) -> !OutOfMemory {
+        let cur_len = self.buf.len();
+        let cur_cap = self.buf.cap();
+        if cur_cap >= cur_len {
+            let avail = cur_cap - cur_len;
+            if additional <= avail {
+                return;
+            }
+        }
+        let need = (cur_len +? additional) catch {
+            return .OutOfMemory;
+        };
+        if need > 0x3FFFFFFF_usize {
+            return .OutOfMemory;
+        }
+        var new_cap: usize = if cur_cap < 4_usize { 4_usize } else { cur_cap };
+        while new_cap < need {
+            if new_cap >= 0x20000000_usize {
+                new_cap = need;
+                break;
+            }
+            new_cap = new_cap *% 2_usize;
+        }
+        var new_buf = try Buf.[T].init(alloc, new_cap);
+        errdefer new_buf.destroy(alloc);
+        try new_buf.push_slice(self.buf.as_slice());
+        self.buf.destroy(alloc);
+        self.buf = new_buf;
+        return;
+    }
+
+    pub fn reserve_exact(self: *mut Self, alloc: *mut AllocCap, total_len: usize) -> !OutOfMemory {
+        if total_len <= self.buf.cap() {
+            return;
+        }
+        if total_len > 0x3FFFFFFF_usize {
+            return .OutOfMemory;
+        }
+        var new_buf = try Buf.[T].init(alloc, total_len);
+        errdefer new_buf.destroy(alloc);
+        try new_buf.push_slice(self.buf.as_slice());
+        self.buf.destroy(alloc);
+        self.buf = new_buf;
+        return;
+    }
+
+    pub fn push(self: *mut Self, alloc: *mut AllocCap, val: T) -> !OutOfMemory {
+        if self.buf.len() >= self.buf.cap() {
+            try self.reserve(alloc, 1_usize);
+        }
+        try self.buf.push(val);
+        return;
+    }
+
+    pub fn push_slice(self: *mut Self, alloc: *mut AllocCap, src: *[T]) -> !OutOfMemory {
+        if src.len == 0_usize {
+            return;
+        }
+        try self.reserve(alloc, src.len);
+        try self.buf.push_slice(src);
+        return;
+    }
+
+    pub fn pop(self: *mut Self) -> ?T {
+        return self.buf.pop();
+    }
+
+    pub view fn get(self: *Self, idx: usize) -> ?*T {
+        return self.buf.get(idx);
+    }
+
+    pub view fn get_mut(self: *mut Self, idx: usize) -> ?*mut T {
+        return self.buf.get_mut(idx);
+    }
+
+    pub view fn as_slice(self: *Self) -> *[T] {
+        return self.buf.as_slice();
+    }
+
+    pub view fn as_mut_slice(self: *mut Self) -> *mut [T] {
+        return self.buf.as_mut_slice();
+    }
+
+    pub fn destroy(self: DynBuf[T], alloc: *mut AllocCap) {
+        let DynBuf.{ buf } = self;
+        buf.destroy(alloc);
+    }
+}

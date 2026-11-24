@@ -1,0 +1,28 @@
+name: Bug Report
+description: Report a compiler crash, miscompilation, or unexpected behavior
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Clear summary of what happened vs what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal Reproducer
+      description: Paste a minimal self-contained `.eon` program and exact command line.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      description: Compiler stage (`eonc0` / `eonc2_rel`), flags, OS/kernel, and CPU.
+      placeholder: "eonc2_rel --release, Linux 6.x x86_64"
+    validations:
+      required: true

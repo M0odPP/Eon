@@ -1,0 +1,7 @@
+module fail.u128_match;
+
+pub fn bad_u128_match_i128_max(x: u128) -> u32 {
+    return match x { //~ ERROR E0104
+        0_u128..=170141183460469231731687303715884105727_u128 => 1_u32,
+    };
+}

@@ -1,0 +1,25 @@
+module platform.win32.mem @hal;
+
+extern "C" struct SystemInfo {
+    oem_id: u32;
+    page_size: u32;
+}
+
+extern "C" union RawWord {
+    as_u32: u32;
+    as_bytes: [4]u8;
+}
+
+extern "C" fn VirtualAlloc(
+    addr: rawptr_mut[void],
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+) -> ?rawptr_mut[void];
+
+@extern("C")
+pub fn wnd_proc(hwnd: usize, msg: u32) -> isize {
+    _ = hwnd;
+    _ = msg;
+    return 0_isize;
+}

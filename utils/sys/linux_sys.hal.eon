@@ -1,0 +1,682 @@
+module utils.linux @hal;
+
+/// Zero-libc direct Linux x86_64 syscall HAL for `utils/` (`ewc`, `egrep`, `ehttpd`).
+/// Every syscall invokes the Linux kernel directly via `syscall` — ZERO `libc`, ZERO `DT_NEEDED`.
+
+pub error SysError {
+    OpenFailed,
+    StatFailed,
+    MmapFailed,
+    SocketFailed,
+    BindFailed,
+    ListenFailed,
+    UringFailed,
+    CloneFailed,
+}
+
+// Linux x86_64 syscall numbers
+const SYS_READ: u64 = 0_u64;
+const SYS_WRITE: u64 = 1_u64;
+const SYS_CLOSE: u64 = 3_u64;
+const SYS_FSTAT: u64 = 5_u64;
+const SYS_MMAP: u64 = 9_u64;
+const SYS_MUNMAP: u64 = 11_u64;
+const SYS_SOCKET: u64 = 41_u64;
+const SYS_BIND: u64 = 49_u64;
+const SYS_LISTEN: u64 = 50_u64;
+const SYS_SETSOCKOPT: u64 = 54_u64;
+const SYS_OPENAT: u64 = 257_u64;
+const SYS_SCHED_SETAFFINITY: u64 = 203_u64;
+const SYS_IO_URING_SETUP: u64 = 425_u64;
+const SYS_IO_URING_ENTER: u64 = 426_u64;
+
+const AT_FDCWD: i64 = -100_i64;
+const O_RDONLY: u64 = 0_u64;
+const PROT_READ: u64 = 1_u64;
+const PROT_WRITE: u64 = 2_u64;
+const MAP_SHARED: u64 = 1_u64;
+const MAP_PRIVATE: u64 = 2_u64;
+const MAP_ANONYMOUS: u64 = 0x20_u64;
+const MAP_POPULATE: u64 = 0x8000_u64;
+
+const AF_INET: u64 = 2_u64;
+const SOCK_STREAM: u64 = 1_u64;
+const SOL_SOCKET: u64 = 1_u64;
+const SO_REUSEADDR: u64 = 2_u64;
+const SO_REUSEPORT: u64 = 15_u64;
+const IPPROTO_TCP: u64 = 6_u64;
+const TCP_NODELAY: u64 = 1_u64;
+
+// Linux io_uring ABI constants (verified against <linux/io_uring.h>)
+pub const IORING_OP_NOP: u8 = 0_u8;
+pub const IORING_OP_ACCEPT: u8 = 13_u8;
+pub const IORING_OP_CLOSE: u8 = 19_u8;
+pub const IORING_OP_SEND: u8 = 26_u8;
+pub const IORING_OP_RECV: u8 = 27_u8;
+
+const IORING_OFF_SQ_RING: u64 = 0_u64;
+const IORING_OFF_CQ_RING: u64 = 0x8000000_u64;
+const IORING_OFF_SQES: u64 = 0x10000000_u64;
+const IORING_ENTER_GETEVENTS: u64 = 1_u64;
+
+const CLONE_THREAD_FLAGS: u64 = 0x00010F00_u64; // CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD
+
+// ---------------------------------------------------------------------------
+// Direct Linux x86_64 Syscall Trampolines (EonCall: rdi,rsi,rdx,rcx,r8,r9,r10)
+// ---------------------------------------------------------------------------
+
+@naked
+pub fn syscall3(_nr: u64, _a0: u64, _a1: u64, _a2: u64) -> i64 {
+    raw {
+        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; syscall; ret", options(noreturn));
+    }
+    return 0_i64;
+}
+
+@naked
+pub fn syscall6(_nr: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> i64 {
+    raw {
+        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r11, r10; mov r10, r8; mov r8, r9; mov r9, r11; syscall; ret", options(noreturn));
+    }
+    return 0_i64;
+}
+
+@naked
+pub fn slice_ptr(_s: *[u8]) -> usize {
+    raw {
+        asm("mov rax, rdi; ret", options(noreturn));
+    }
+    return 0_usize;
+}
+
+@naked
+pub fn mut_slice_ptr(_s: *mut [u8]) -> usize {
+    raw {
+        asm("mov rax, rdi; ret", options(noreturn));
+    }
+    return 0_usize;
+}
+
+@naked
+fn closure1_code_ptr(_f: fn(usize)) -> usize {
+    raw {
+        asm("mov rax, rdi; ret", options(noreturn));
+    }
+    return 0_usize;
+}
+
+@naked
+fn clone_thread_raw(_flags: u64, _child_stack: usize) -> i64 {
+    raw {
+        asm(
+            ".byte 0x48, 0xC7, 0xC0, 0x38, 0x00, 0x00, 0x00; .byte 0x48, 0x31, 0xD2; .byte 0x4D, 0x31, 0xD2; .byte 0x4D, 0x31, 0xC0; .byte 0x0F, 0x05; .byte 0x48, 0x85, 0xC0; .byte 0x75, 0x12; .byte 0x41, 0x5C; .byte 0x5F; .byte 0x41, 0xFF, 0xD4; .byte 0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00; .byte 0x48, 0x31, 0xFF; .byte 0x0F, 0x05; ret",
+            options(noreturn),
+        );
+    }
+    return 0_i64;
+}
+
+pub fn raw_read_u8(addr: usize) -> u8 {
+    var v: u8 = 0_u8;
+    raw { v = rawptr_mut.[u8].from_usize(addr).*; }
+    return v;
+}
+
+pub fn raw_write_u8(addr: usize, v: u8) {
+    raw { rawptr_mut.[u8].from_usize(addr).* = v; }
+}
+
+pub fn raw_read_u32(addr: usize) -> u32 {
+    var v: u32 = 0_u32;
+    raw { v = rawptr_mut.[u32].from_usize(addr).*; }
+    return v;
+}
+
+pub fn raw_write_u32(addr: usize, v: u32) {
+    raw { rawptr_mut.[u32].from_usize(addr).* = v; }
+}
+
+pub fn raw_read_i32(addr: usize) -> i32 {
+    var v: i32 = 0_i32;
+    raw { v = rawptr_mut.[i32].from_usize(addr).*; }
+    return v;
+}
+
+pub fn raw_write_i32(addr: usize, v: i32) {
+    raw { rawptr_mut.[i32].from_usize(addr).* = v; }
+}
+
+pub fn raw_read_u64(addr: usize) -> u64 {
+    var v: u64 = 0_u64;
+    raw { v = rawptr_mut.[u64].from_usize(addr).*; }
+    return v;
+}
+
+pub fn raw_write_u64(addr: usize, v: u64) {
+    raw { rawptr_mut.[u64].from_usize(addr).* = v; }
+}
+
+pub fn atomic_load_u32_acq(addr: usize) -> u32 {
+    var v: u32 = 0_u32;
+    raw {
+        let p = rawptr_mut.[Atomic[u32]].from_usize(addr);
+        v = p.*.load(.Acquire);
+    }
+    return v;
+}
+
+pub fn atomic_store_u32_rel(addr: usize, val: u32) {
+    raw {
+        let p = rawptr_mut.[Atomic[u32]].from_usize(addr);
+        p.*.store(val, .Release);
+    }
+}
+
+pub fn atomic_load_u64_seq(addr: usize) -> u64 {
+    var v: u64 = 0_u64;
+    raw {
+        let p = rawptr_mut.[Atomic[u64]].from_usize(addr);
+        v = p.*.load(.SeqCst);
+    }
+    return v;
+}
+
+pub fn atomic_add_u64_seq(addr: usize, delta: u64) -> u64 {
+    var prev: u64 = 0_u64;
+    raw {
+        let p = rawptr_mut.[Atomic[u64]].from_usize(addr);
+        prev = p.*.fetch_add(delta, .SeqCst);
+    }
+    return prev;
+}
+
+pub fn atomic_store_u64_seq(addr: usize, val: u64) {
+    raw {
+        let p = rawptr_mut.[Atomic[u64]].from_usize(addr);
+        p.*.store(val, .SeqCst);
+    }
+}
+
+pub fn cpu_pause() {
+    raw { asm("pause"); }
+}
+
+pub fn sys_close(fd: i32) {
+    _ = syscall3(SYS_CLOSE, fd.widen.[i64]().bitcast.[u64](), 0_u64, 0_u64);
+}
+
+pub fn sys_write_all(fd: i32, data: *[u8]) -> usize {
+    let base = slice_ptr(data);
+    var off: usize = 0_usize;
+    while off < data.len {
+        let n = syscall3(
+            SYS_WRITE,
+            fd.widen.[i64]().bitcast.[u64](),
+            (base +% off).widen.[u64](),
+            (data.len -% off).widen.[u64](),
+        );
+        if n <= 0_i64 {
+            break;
+        }
+        off = off +% n.trunc.[usize]();
+    }
+    return off;
+}
+
+pub fn sys_mmap_anon(size: usize) -> usize ! SysError {
+    let r = syscall6(
+        SYS_MMAP,
+        0_u64,
+        size.widen.[u64](),
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        0xFFFFFFFFFFFFFFFF_u64,
+        0_u64,
+    );
+    if r < 0_i64 && r >= -4095_i64 {
+        return .MmapFailed;
+    }
+    return r.bitcast.[u64]().trunc.[usize]();
+}
+
+pub fn sys_munmap(addr: usize, size: usize) {
+    if addr != 0_usize && size > 0_usize {
+        _ = syscall3(SYS_MUNMAP, addr.widen.[u64](), size.widen.[u64](), 0_u64);
+    }
+}
+
+pub fn pin_to_core(core_idx: usize) {
+    var mask_bytes: [128]u8 = [0_u8; 128];
+    let byte_idx = (core_idx / 8_usize) & 127_usize;
+    let bit_idx = (core_idx & 7_usize).trunc.[u8]();
+    mask_bytes[byte_idx] = 1_u8 <<% bit_idx;
+    let ptr = slice_ptr(&mask_bytes);
+    _ = syscall3(SYS_SCHED_SETAFFINITY, 0_u64, 128_u64, ptr.widen.[u64]());
+}
+
+fn unwrap_fnref_thunk(thunk_addr: usize) -> usize {
+    let op = raw_read_u8(thunk_addr +% 21_usize);
+    if op == 0xE9_u8 {
+        let rel_u = raw_read_u32(thunk_addr +% 22_usize).widen.[u64]();
+        let rel_sext = if (rel_u & 0x80000000_u64) != 0_u64 {
+            rel_u | 0xFFFFFFFF00000000_u64
+        } else {
+            rel_u
+        };
+        return (thunk_addr.widen.[u64]() +% 26_u64 +% rel_sext).trunc.[usize]();
+    }
+    return thunk_addr;
+}
+
+/// Linear OS thread handle owning its `mmap`'d stack.
+pub linear struct OsThread {
+    pub stack_base: usize;
+    pub stack_size: usize;
+    pub tid: i64;
+}
+
+impl OsThread {
+    pub fn spawn(entry: fn(usize), arg: usize) -> OsThread ! SysError {
+        let stack_size: usize = 262144_usize; // 256 KiB stack
+        let stack_base = try sys_mmap_anon(stack_size);
+        let top = (stack_base +% stack_size) & (~15_usize);
+        let fn_addr = unwrap_fnref_thunk(closure1_code_ptr(entry));
+        let child_sp = top -% 16_usize;
+        raw_write_u64(child_sp, fn_addr.widen.[u64]());
+        raw_write_u64(child_sp +% 8_usize, arg.widen.[u64]());
+        let tid = clone_thread_raw(CLONE_THREAD_FLAGS, child_sp);
+        if tid < 0_i64 {
+            sys_munmap(stack_base, stack_size);
+            return .CloneFailed;
+        }
+        return OsThread.{
+            stack_base: stack_base,
+            stack_size: stack_size,
+            tid: tid,
+        };
+    }
+
+    pub fn release_stack(self: OsThread) {
+        let OsThread.{ stack_base, stack_size, tid: _ } = self;
+        sys_munmap(stack_base, stack_size);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Zero-Copy Linear `MmapFile` (Direct `openat` + `fstat` + `mmap` + `munmap`)
+// ---------------------------------------------------------------------------
+
+pub linear struct MmapFile {
+    pub ptr: usize;
+    pub len: usize;
+}
+
+@naked
+view fn bytes_from_raw_borrow(_anchor: *MmapFile, _ptr: usize, _len: usize) -> *[u8] {
+    raw {
+        asm("mov rax, rsi; ret", options(noreturn));
+    }
+    let empty: *str = "";
+    return empty.as_bytes();
+}
+
+impl MmapFile {
+    pub fn open_readonly(path: *str) -> MmapFile ! SysError {
+        let pb = path.as_bytes();
+        if pb.len >= 4095_usize {
+            return .OpenFailed;
+        }
+        var cpath: [4096]u8 = [0_u8; 4096];
+        var i: usize = 0_usize;
+        while i < pb.len {
+            cpath[i] = pb[i];
+            i = i +% 1_usize;
+        }
+        cpath[pb.len] = 0_u8;
+        let p_addr = slice_ptr(&cpath);
+        let fd_r = syscall6(
+            SYS_OPENAT,
+            AT_FDCWD.bitcast.[u64](),
+            p_addr.widen.[u64](),
+            O_RDONLY,
+            0_u64,
+            0_u64,
+            0_u64,
+        );
+        if fd_r < 0_i64 {
+            return .OpenFailed;
+        }
+        let fd = fd_r.trunc.[i32]();
+
+        var st_buf: [144]u8 = [0_u8; 144];
+        let st_addr = mut_slice_ptr(&mut st_buf);
+        let sr = syscall3(SYS_FSTAT, fd.widen.[i64]().bitcast.[u64](), st_addr.widen.[u64](), 0_u64);
+        if sr < 0_i64 {
+            sys_close(fd);
+            return .StatFailed;
+        }
+        let fsize = raw_read_u64(st_addr +% 48_usize).trunc.[usize]();
+        if fsize == 0_usize {
+            sys_close(fd);
+            return MmapFile.{ ptr: 0_usize, len: 0_usize };
+        }
+
+        let mr = syscall6(
+            SYS_MMAP,
+            0_u64,
+            fsize.widen.[u64](),
+            PROT_READ,
+            MAP_PRIVATE | MAP_POPULATE,
+            fd.widen.[i64]().bitcast.[u64](),
+            0_u64,
+        );
+        sys_close(fd);
+        if mr < 0_i64 && mr >= -4095_i64 {
+            return .MmapFailed;
+        }
+        return MmapFile.{
+            ptr: mr.bitcast.[u64]().trunc.[usize](),
+            len: fsize,
+        };
+    }
+
+    pub view fn as_bytes(self: *Self) -> *[u8] {
+        if self.len == 0_usize {
+            let empty: *str = "";
+            return empty.as_bytes();
+        }
+        return bytes_from_raw_borrow(self, self.ptr, self.len);
+    }
+
+    pub fn close(self: MmapFile) {
+        let MmapFile.{ ptr, len } = self;
+        sys_munmap(ptr, len);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Direct TCP Listener (`SO_REUSEADDR` + `SO_REUSEPORT` + `TCP_NODELAY`)
+// ---------------------------------------------------------------------------
+
+pub fn tcp_listen_reuseport(port: u16, backlog: i32) -> i32 ! SysError {
+    let sfd_r = syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM, 0_u64);
+    if sfd_r < 0_i64 {
+        return .SocketFailed;
+    }
+    let sfd = sfd_r.trunc.[i32]();
+
+    let one: [4]u8 = [1_u8, 0_u8, 0_u8, 0_u8];
+    let one_ptr = slice_ptr(&one).widen.[u64]();
+    _ = syscall6(SYS_SETSOCKOPT, sfd.widen.[i64]().bitcast.[u64](), SOL_SOCKET, SO_REUSEADDR, one_ptr, 4_u64, 0_u64);
+    _ = syscall6(SYS_SETSOCKOPT, sfd.widen.[i64]().bitcast.[u64](), SOL_SOCKET, SO_REUSEPORT, one_ptr, 4_u64, 0_u64);
+    _ = syscall6(SYS_SETSOCKOPT, sfd.widen.[i64]().bitcast.[u64](), IPPROTO_TCP, TCP_NODELAY, one_ptr, 4_u64, 0_u64);
+
+    // sockaddr_in: family=AF_INET(2), port=htons(port), addr=0.0.0.0
+    var sa: [16]u8 = [0_u8; 16];
+    sa[0_usize] = 2_u8;
+    sa[1_usize] = 0_u8;
+    sa[2_usize] = ((port >> 8_u16) & 0xFF_u16).trunc.[u8]();
+    sa[3_usize] = (port & 0xFF_u16).trunc.[u8]();
+    let sa_ptr = slice_ptr(&sa).widen.[u64]();
+
+    let br = syscall3(SYS_BIND, sfd.widen.[i64]().bitcast.[u64](), sa_ptr, 16_u64);
+    if br < 0_i64 {
+        sys_close(sfd);
+        return .BindFailed;
+    }
+    let lr = syscall3(SYS_LISTEN, sfd.widen.[i64]().bitcast.[u64](), backlog.widen.[i64]().bitcast.[u64](), 0_u64);
+    if lr < 0_i64 {
+        sys_close(sfd);
+        return .ListenFailed;
+    }
+    return sfd;
+}
+
+// ---------------------------------------------------------------------------
+// Direct Linux `io_uring` Engine (Zero `libc`, Zero `liburing`)
+// ---------------------------------------------------------------------------
+
+pub struct UringCqe {
+    pub user_data: u64;
+    pub res: i32;
+    pub flags: u32;
+}
+
+pub linear struct Uring {
+    pub ring_fd: i32;
+    pub sq_ptr: usize;
+    pub sq_mmap_len: usize;
+    pub cq_ptr: usize;
+    pub cq_mmap_len: usize;
+    pub sqes_ptr: usize;
+    pub sqes_mmap_len: usize;
+    pub sq_head_off: usize;
+    pub sq_tail_off: usize;
+    pub sq_mask: u32;
+    pub sq_array_off: usize;
+    pub cq_head_off: usize;
+    pub cq_tail_off: usize;
+    pub cq_mask: u32;
+    pub cq_cqes_off: usize;
+    pub pending_sqes: u32;
+}
+
+impl Uring {
+    pub fn init(entries: u32) -> Uring ! SysError {
+        var params: [120]u8 = [0_u8; 120];
+        let p_addr = mut_slice_ptr(&mut params);
+        let fd_r = syscall3(SYS_IO_URING_SETUP, entries.widen.[u64](), p_addr.widen.[u64](), 0_u64);
+        if fd_r < 0_i64 {
+            return .UringFailed;
+        }
+        let ring_fd = fd_r.trunc.[i32]();
+
+        let sq_entries = raw_read_u32(p_addr +% 0_usize);
+        let cq_entries = raw_read_u32(p_addr +% 4_usize);
+        // sq_off starts at +40
+        let sq_head_off = raw_read_u32(p_addr +% 40_usize).widen.[usize]();
+        let sq_tail_off = raw_read_u32(p_addr +% 44_usize).widen.[usize]();
+        let sq_mask_off = raw_read_u32(p_addr +% 48_usize).widen.[usize]();
+        let sq_array_off = raw_read_u32(p_addr +% 64_usize).widen.[usize]();
+        // cq_off starts at +80
+        let cq_head_off = raw_read_u32(p_addr +% 80_usize).widen.[usize]();
+        let cq_tail_off = raw_read_u32(p_addr +% 84_usize).widen.[usize]();
+        let cq_mask_off = raw_read_u32(p_addr +% 88_usize).widen.[usize]();
+        let cq_cqes_off = raw_read_u32(p_addr +% 100_usize).widen.[usize]();
+
+        let sq_sz = sq_array_off +% (sq_entries.widen.[usize]() *% 4_usize);
+        let cq_sz = cq_cqes_off +% (cq_entries.widen.[usize]() *% 16_usize);
+        let sqes_sz = sq_entries.widen.[usize]() *% 64_usize;
+
+        let sq_m = syscall6(SYS_MMAP, 0_u64, sq_sz.widen.[u64](), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, ring_fd.widen.[i64]().bitcast.[u64](), IORING_OFF_SQ_RING);
+        if sq_m < 0_i64 && sq_m >= -4095_i64 {
+            sys_close(ring_fd);
+            return .MmapFailed;
+        }
+        let sq_ptr = sq_m.bitcast.[u64]().trunc.[usize]();
+
+        let cq_m = syscall6(SYS_MMAP, 0_u64, cq_sz.widen.[u64](), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, ring_fd.widen.[i64]().bitcast.[u64](), IORING_OFF_CQ_RING);
+        if cq_m < 0_i64 && cq_m >= -4095_i64 {
+            sys_munmap(sq_ptr, sq_sz);
+            sys_close(ring_fd);
+            return .MmapFailed;
+        }
+        let cq_ptr = cq_m.bitcast.[u64]().trunc.[usize]();
+
+        let sqes_m = syscall6(SYS_MMAP, 0_u64, sqes_sz.widen.[u64](), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, ring_fd.widen.[i64]().bitcast.[u64](), IORING_OFF_SQES);
+        if sqes_m < 0_i64 && sqes_m >= -4095_i64 {
+            sys_munmap(cq_ptr, cq_sz);
+            sys_munmap(sq_ptr, sq_sz);
+            sys_close(ring_fd);
+            return .MmapFailed;
+        }
+        let sqes_ptr = sqes_m.bitcast.[u64]().trunc.[usize]();
+
+        let sq_mask = raw_read_u32(sq_ptr +% sq_mask_off);
+        let cq_mask = raw_read_u32(cq_ptr +% cq_mask_off);
+
+        return Uring.{
+            ring_fd: ring_fd,
+            sq_ptr: sq_ptr,
+            sq_mmap_len: sq_sz,
+            cq_ptr: cq_ptr,
+            cq_mmap_len: cq_sz,
+            sqes_ptr: sqes_ptr,
+            sqes_mmap_len: sqes_sz,
+            sq_head_off: sq_head_off,
+            sq_tail_off: sq_tail_off,
+            sq_mask: sq_mask,
+            sq_array_off: sq_array_off,
+            cq_head_off: cq_head_off,
+            cq_tail_off: cq_tail_off,
+            cq_mask: cq_mask,
+            cq_cqes_off: cq_cqes_off,
+            pending_sqes: 0_u32,
+        };
+    }
+
+    pub fn push_sqe(
+        self: *mut Self,
+        opcode: u8,
+        fd: i32,
+        addr: u64,
+        len: u32,
+        op_flags: u32,
+        user_data: u64,
+    ) -> bool {
+        let tail = raw_read_u32(self.sq_ptr +% self.sq_tail_off);
+        let head = atomic_load_u32_acq(self.sq_ptr +% self.sq_head_off);
+        if (tail -% head) > self.sq_mask {
+            return false;
+        }
+        let idx = tail & self.sq_mask;
+        let sqe = self.sqes_ptr +% (idx.widen.[usize]() *% 64_usize);
+        // Zero 64-byte SQE (8 u64s)
+        var zi: usize = 0_usize;
+        while zi < 64_usize {
+            raw_write_u64(sqe +% zi, 0_u64);
+            zi = zi +% 8_usize;
+        }
+        raw_write_u8(sqe +% 0_usize, opcode);
+        raw_write_i32(sqe +% 4_usize, fd);
+        raw_write_u64(sqe +% 16_usize, addr);
+        raw_write_u32(sqe +% 24_usize, len);
+        raw_write_u32(sqe +% 28_usize, op_flags);
+        raw_write_u64(sqe +% 32_usize, user_data);
+
+        raw_write_u32(self.sq_ptr +% self.sq_array_off +% (idx.widen.[usize]() *% 4_usize), idx);
+        atomic_store_u32_rel(self.sq_ptr +% self.sq_tail_off, tail +% 1_u32);
+        self.pending_sqes = self.pending_sqes +% 1_u32;
+        return true;
+    }
+
+    pub fn submit_and_wait(self: *mut Self, min_complete: u32) -> i64 {
+        let to_sub = self.pending_sqes;
+        self.pending_sqes = 0_u32;
+        let flags: u64 = if min_complete > 0_u32 { IORING_ENTER_GETEVENTS } else { 0_u64 };
+        return syscall6(
+            SYS_IO_URING_ENTER,
+            self.ring_fd.widen.[i64]().bitcast.[u64](),
+            to_sub.widen.[u64](),
+            min_complete.widen.[u64](),
+            flags,
+            0_u64,
+            0_u64,
+        );
+    }
+
+    pub fn pop_cqe(self: *mut Self) -> ?UringCqe {
+        let head = raw_read_u32(self.cq_ptr +% self.cq_head_off);
+        let tail = atomic_load_u32_acq(self.cq_ptr +% self.cq_tail_off);
+        if head == tail {
+            return null;
+        }
+        let idx = head & self.cq_mask;
+        let cqe_addr = self.cq_ptr +% self.cq_cqes_off +% (idx.widen.[usize]() *% 16_usize);
+        let ud = raw_read_u64(cqe_addr +% 0_usize);
+        let res = raw_read_i32(cqe_addr +% 8_usize);
+        let fl = raw_read_u32(cqe_addr +% 12_usize);
+        atomic_store_u32_rel(self.cq_ptr +% self.cq_head_off, head +% 1_u32);
+        return UringCqe.{ user_data: ud, res: res, flags: fl };
+    }
+
+    pub fn destroy(self: Uring) {
+        let Uring.{
+            ring_fd,
+            sq_ptr,
+            sq_mmap_len,
+            cq_ptr,
+            cq_mmap_len,
+            sqes_ptr,
+            sqes_mmap_len,
+            sq_head_off: _,
+            sq_tail_off: _,
+            sq_mask: _,
+            sq_array_off: _,
+            cq_head_off: _,
+            cq_tail_off: _,
+            cq_mask: _,
+            cq_cqes_off: _,
+            pending_sqes: _,
+        } = self;
+        sys_munmap(sqes_ptr, sqes_mmap_len);
+        sys_munmap(cq_ptr, cq_mmap_len);
+        sys_munmap(sq_ptr, sq_mmap_len);
+        sys_close(ring_fd);
+    }
+}
+
+/// Linear anonymous mmap slab for fixed-size per-worker fiber I/O buffers.
+pub linear struct MmapSlab {
+    pub ptr: usize;
+    pub len: usize;
+    pad: [1]u8;
+}
+
+@naked
+view fn slab_slice_borrow(_anchor: *MmapSlab, _ptr: usize, _len: usize) -> *[u8] {
+    raw {
+        asm("mov rax, rsi; ret", options(noreturn));
+    }
+    let empty: *str = "";
+    return empty.as_bytes();
+}
+
+@naked
+view fn slab_mut_slice_borrow(anchor: *mut MmapSlab, _ptr: usize, _len: usize) -> *mut [u8] {
+    raw {
+        asm("mov rax, rsi; ret", options(noreturn));
+    }
+    return anchor.pad.sub_mut(0_usize, 0_usize) catch { return &mut anchor.pad; };
+}
+
+impl MmapSlab {
+    pub fn init(len: usize) -> MmapSlab ! SysError {
+        let ptr = try sys_mmap_anon(len);
+        return MmapSlab.{ ptr: ptr, len: len, pad: [0_u8; 1] };
+    }
+
+    pub view fn slice_at(self: *Self, off: usize, n: usize) -> *[u8] {
+        if off > self.len || n > self.len - off {
+            let empty: *str = "";
+            return empty.as_bytes();
+        }
+        return slab_slice_borrow(self, self.ptr +% off, n);
+    }
+
+    pub view fn mut_slice_at(self: *mut Self, off: usize, n: usize) -> *mut [u8] {
+        if off > self.len || n > self.len - off {
+            return slab_mut_slice_borrow(self, self.ptr, 0_usize);
+        }
+        return slab_mut_slice_borrow(self, self.ptr +% off, n);
+    }
+
+    pub fn addr_at(self: *Self, off: usize) -> u64 {
+        return (self.ptr +% off).widen.[u64]();
+    }
+
+    pub fn destroy(self: MmapSlab) {
+        let MmapSlab.{ ptr, len, pad: _ } = self;
+        sys_munmap(ptr, len);
+    }
+}

@@ -1,0 +1,113 @@
+module std.rt @hal;
+
+import core.str;
+
+extern "C" fn eon_rt_print_str(s: *str);
+extern "C" fn eon_rt_print_bytes(b: *[u8]);
+extern "C" fn eon_rt_print_u64(v: u64);
+extern "C" fn eon_rt_print_i64(v: i64);
+extern "C" fn eon_rt_print_nl();
+extern "C" fn eon_rt_eprint_str(s: *str);
+extern "C" fn eon_rt_eprint_bytes(b: *[u8]);
+extern "C" fn eon_rt_eprint_nl();
+
+/// Print a UTF-8 string slice to standard output.
+pub fn print_str(s: *str) {
+    raw {
+        eon_rt_print_str(s);
+    }
+}
+
+/// Print a raw byte slice to standard output.
+pub fn print_bytes(b: *[u8]) {
+    raw {
+        eon_rt_print_bytes(b);
+    }
+}
+
+/// Print an unsigned 64-bit integer in decimal to standard output.
+pub fn print_u64(v: u64) {
+    raw {
+        eon_rt_print_u64(v);
+    }
+}
+
+/// Print a signed 64-bit integer in decimal to standard output.
+pub fn print_i64(v: i64) {
+    raw {
+        eon_rt_print_i64(v);
+    }
+}
+
+/// Print a newline to standard output.
+pub fn print_nl() {
+    raw {
+        eon_rt_print_nl();
+    }
+}
+
+/// Print a UTF-8 string slice to standard error.
+pub fn eprint_str(s: *str) {
+    raw {
+        eon_rt_eprint_str(s);
+    }
+}
+
+/// Print a raw byte slice to standard error.
+pub fn eprint_bytes(b: *[u8]) {
+    raw {
+        eon_rt_eprint_bytes(b);
+    }
+}
+
+/// Print a newline to standard error.
+pub fn eprint_nl() {
+    raw {
+        eon_rt_eprint_nl();
+    }
+}
+
+/// Read the monotonic clock timestamp in nanoseconds (via Linux vDSO on native x86_64).
+pub fn now_ns(clock: *ClockCap) -> u64 {
+    return clock.now_ns();
+}
+
+/// Return elapsed monotonic nanoseconds since `start_ns` (saturating at `0`).
+pub fn elapsed_since(clock: *ClockCap, start_ns: u64) -> u64 {
+    let end = clock.now_ns();
+    if end >= start_ns {
+        return end - start_ns;
+    }
+    return 0_u64;
+}
+
+/// Return the number of command-line arguments in `args`.
+pub fn arg_count(args: *ArgsCap) -> usize {
+    return args.len();
+}
+
+/// Return a borrowed view of argument `i`, or `null` if out of bounds.
+pub view fn arg_at(args: *ArgsCap, i: usize) -> ?*str {
+    return args.get(i);
+}
+
+/// Open a confined directory capability rooted at `path` under `fs`.
+pub fn open_dir_confined(fs: *FsCap, path: *str) -> DirCap ! IoError {
+    return try fs.sub_dir(path);
+}
+
+/// Read the contents of `rel` inside confined directory capability `dir`.
+pub fn read_confined(dir: *DirCap, alloc: *mut AllocCap, rel: *str) -> Buf[u8] ! OutOfMemory | IoError {
+    return try dir.read_file(alloc, rel);
+}
+
+/// Validate strict RFC 3629 UTF-8 over a byte slice.
+pub fn validate_utf8(bytes: *[u8]) -> !Utf8Error {
+    try str.validate_utf8(bytes);
+    return;
+}
+
+/// Compare two string slices for byte-wise equality.
+pub fn str_eq(a: *str, b: *str) -> bool {
+    return str.bytes_eq(a.as_bytes(), b.as_bytes());
+}

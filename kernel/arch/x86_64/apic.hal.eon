@@ -1,0 +1,213 @@
+module kernel.arch.x86_64.apic @hal;
+
+import kernel.arch.x86_64.cpu;
+
+/// Typed MMIO Local APIC register layout (`0xFEE00000`).
+pub struct LapicRegs {
+    pub id: MmioReg[u32, .ReadOnly]          @offset(0x020);
+    pub version: MmioReg[u32, .ReadOnly]     @offset(0x030);
+    pub tpr: MmioReg[u32, .ReadWrite]        @offset(0x080);
+    pub eoi: MmioReg[u32, .WriteOnly]        @offset(0x0B0);
+    pub svr: MmioReg[u32, .ReadWrite]        @offset(0x0F0);
+    pub icr_lo: MmioReg[u32, .ReadWrite]     @offset(0x300);
+    pub icr_hi: MmioReg[u32, .ReadWrite]     @offset(0x310);
+    pub lvt_timer: MmioReg[u32, .ReadWrite]  @offset(0x320);
+    pub timer_init: MmioReg[u32, .ReadWrite] @offset(0x380);
+    pub timer_cur: MmioReg[u32, .ReadOnly]   @offset(0x390);
+    pub timer_div: MmioReg[u32, .ReadWrite]  @offset(0x3E0);
+}
+
+/// Typed MMIO IOAPIC register layout (`0xFEC00000`).
+pub struct IoApicRegs {
+    pub ioregsel: MmioReg[u32, .ReadWrite] @offset(0x00);
+    pub iowin: MmioReg[u32, .ReadWrite]    @offset(0x10);
+}
+
+const LAPIC_BASE: usize  = 0xFEE00000_usize;
+const IOAPIC_BASE: usize = 0xFEC00000_usize;
+const AP_TRAMP_ADDR: usize = 0x00008000_usize;
+const IA32_APIC_BASE_MSR: u32 = 0x0000001B_u32;
+
+/// Mask legacy dual-8259 PIC so all IRQs route cleanly through APIC.
+pub fn mask_legacy_pic() @noalloc @noblock {
+    cpu.outb(0x00A1_u16, 0xFF_u8);
+    cpu.outb(0x0021_u16, 0xFF_u8);
+}
+
+/// Enable Local APIC on BSP via IA32_APIC_BASE MSR and SVR (`0x1FF`).
+pub fn lapic_init() -> u32 @noalloc @noblock {
+    mask_legacy_pic();
+    let base_msr = cpu.rdmsr(IA32_APIC_BASE_MSR);
+    cpu.wrmsr(IA32_APIC_BASE_MSR, base_msr | 0x800_u64); // APIC Global Enable
+
+    var lapic_id: u32 = 0_u32;
+    raw {
+        let apic = rawptr_mut.[LapicRegs].from_usize(LAPIC_BASE);
+        apic.*.tpr.write(0_u32);
+        apic.*.svr.write(0x000001FF_u32); // Enable APIC (bit 8) + Spurious vector 0xFF
+        lapic_id = apic.*.id.read() >> 24_u32;
+    }
+    return lapic_id;
+}
+
+/// Read current CPU's Local APIC ID via typed `MmioReg`.
+pub fn lapic_id() -> u32 @noalloc @noblock {
+    var id: u32 = 0_u32;
+    raw {
+        let apic = rawptr_mut.[LapicRegs].from_usize(LAPIC_BASE);
+        id = apic.*.id.read() >> 24_u32;
+    }
+    return id;
+}
+
+/// Signal End-Of-Interrupt (EOI) on Local APIC (safe to call from `@interrupt @noalloc @stack(512)`).
+pub fn lapic_eoi() @noalloc @noblock {
+    raw {
+        let apic = rawptr_mut.[LapicRegs].from_usize(LAPIC_BASE);
+        apic.*.eoi.write(0_u32);
+    }
+}
+
+/// Read IOAPIC version register (`reg 0x01`) via typed `MmioReg` to verify IOAPIC presence & max redirs.
+pub fn ioapic_read_version() -> u32 @noalloc @noblock {
+    var ver: u32 = 0_u32;
+    raw {
+        let ioa = rawptr_mut.[IoApicRegs].from_usize(IOAPIC_BASE);
+        ioa.*.ioregsel.write(0x01_u32);
+        ver = ioa.*.iowin.read();
+    }
+    return ver;
+}
+
+/// Start periodic LAPIC timer interrupt on `vector` with `init_count` ticks (divide-by-16).
+pub fn lapic_start_periodic_timer(vector: u8, init_count: u32) @noalloc @noblock {
+    raw {
+        let apic = rawptr_mut.[LapicRegs].from_usize(LAPIC_BASE);
+        apic.*.timer_div.write(0x00000003_u32); // Divide by 16
+        apic.*.lvt_timer.write(0x00020000_u32 | vector.widen.[u32]()); // Periodic mode | vector
+        apic.*.timer_init.write(init_count);
+    }
+}
+
+/// Mask and stop the LAPIC timer once verification completes.
+pub fn lapic_stop_timer() @noalloc @noblock {
+    raw {
+        let apic = rawptr_mut.[LapicRegs].from_usize(LAPIC_BASE);
+        apic.*.lvt_timer.write(0x00010000_u32); // Masked
+        apic.*.timer_init.write(0_u32);
+    }
+}
+
+fn delay_spins(n: u32) @noalloc @noblock {
+    var i: u32 = 0_u32;
+    while i < n {
+        cpu.pause();
+        i = i +% 1_u32;
+    }
+}
+
+fn write_bytes_at(base: usize, data: *[u8]) @noalloc @noblock {
+    var i: usize = 0_usize;
+    while i < data.len {
+        cpu.mem_write_u8(base +% i, data[i]);
+        i = i +% 1_usize;
+    }
+}
+
+/// Install the 16->32->64-bit SMP AP bootstrap trampoline at `0x8000` (SIPI page 0x08)
+/// and broadcast INIT-SIPI-SIPI via Local APIC ICR. Returns number of online CPUs.
+pub fn smp_bringup_aps(ap_entry: fn()) -> u32 @noalloc @noblock {
+    cpu.mem_zero(AP_TRAMP_ADDR, 256_usize);
+
+    // [0x00..0x1D]: 16-bit real mode entry (CS=0x0800, IP=0x0000) -> protected mode at 0x8020
+    let c16: [29]u8 = [
+        0xFA_u8, 0xFC_u8,                               // cli; cld
+        0x31_u8, 0xC0_u8,                               // xor ax, ax
+        0x8E_u8, 0xD8_u8, 0x8E_u8, 0xC0_u8, 0x8E_u8, 0xD0_u8, // mov ds/es/ss, ax
+        0x66_u8, 0x0F_u8, 0x01_u8, 0x16_u8, 0xF0_u8, 0x80_u8, // lgdtd [0x80F0]
+        0x0F_u8, 0x20_u8, 0xC0_u8,                      // mov eax, cr0
+        0x0C_u8, 0x01_u8,                               // or al, 1
+        0x0F_u8, 0x22_u8, 0xC0_u8,                      // mov cr0, eax
+        0xEA_u8, 0x20_u8, 0x80_u8, 0x08_u8, 0x00_u8,    // jmp far 0x08:0x8020
+    ];
+    write_bytes_at(AP_TRAMP_ADDR +% 0x00_usize, &c16);
+
+    // [0x20..0x60]: 32-bit protected mode -> shares BSP PML4 (0x80000) -> 64-bit long mode at 0x8060
+    let c32: [64]u8 = [
+        0x66_u8, 0xB8_u8, 0x18_u8, 0x00_u8,             // mov ax, 0x18
+        0x8E_u8, 0xD8_u8, 0x8E_u8, 0xC0_u8, 0x8E_u8, 0xD0_u8, // mov ds/es/ss, ax
+        0xB8_u8, 0x00_u8, 0x00_u8, 0x08_u8, 0x00_u8,    // mov eax, 0x80000 (CR3)
+        0x0F_u8, 0x22_u8, 0xD8_u8,                      // mov cr3, eax
+        0x0F_u8, 0x20_u8, 0xE0_u8,                      // mov eax, cr4
+        0x0D_u8, 0x20_u8, 0x06_u8, 0x00_u8, 0x00_u8,    // or eax, 0x620 (PAE|SSE)
+        0x0F_u8, 0x22_u8, 0xE0_u8,                      // mov cr4, eax
+        0xB9_u8, 0x80_u8, 0x00_u8, 0x00_u8, 0xC0_u8,    // mov ecx, IA32_EFER
+        0x0F_u8, 0x32_u8,                               // rdmsr
+        0x0D_u8, 0x00_u8, 0x09_u8, 0x00_u8, 0x00_u8,    // or eax, 0x900 (LME | NXE)
+        0x0F_u8, 0x30_u8,                               // wrmsr
+        0x0F_u8, 0x20_u8, 0xC0_u8,                      // mov eax, cr0
+        0x83_u8, 0xE0_u8, 0xFB_u8,                      // and eax, ~4
+        0x0D_u8, 0x03_u8, 0x00_u8, 0x00_u8, 0x80_u8,    // or eax, PG|MP|PE
+        0x0F_u8, 0x22_u8, 0xC0_u8,                      // mov cr0, eax
+        0xEA_u8, 0x60_u8, 0x80_u8, 0x00_u8, 0x00_u8, 0x10_u8, 0x00_u8, // jmp 0x10:0x8060
+    ];
+    write_bytes_at(AP_TRAMP_ADDR +% 0x20_usize, &c32);
+
+    // [0x60..0x83]: 64-bit long mode landing -> AP stack 0x90000 -> call [0x80F8]
+    let c64: [35]u8 = [
+        0x66_u8, 0xB8_u8, 0x18_u8, 0x00_u8,             // mov ax, 0x18
+        0x8E_u8, 0xD8_u8, 0x8E_u8, 0xC0_u8, 0x8E_u8, 0xD0_u8, 0x8E_u8, 0xE0_u8, 0x8E_u8, 0xE8_u8,
+        0x48_u8, 0xC7_u8, 0xC4_u8, 0x00_u8, 0x00_u8, 0x09_u8, 0x00_u8, // mov rsp, 0x90000
+        0x48_u8, 0x8B_u8, 0x04_u8, 0x25_u8, 0xF8_u8, 0x80_u8, 0x00_u8, 0x00_u8, // mov rax, [0x80F8]
+        0xFF_u8, 0xD0_u8,                               // call rax
+        0xFA_u8, 0xF4_u8, 0xEB_u8, 0xFC_u8,             // cli; hlt; jmp -4
+    ];
+    write_bytes_at(AP_TRAMP_ADDR +% 0x60_usize, &c64);
+
+    // [0xD0..0xF0]: AP GDT (null, 0x08 code32, 0x10 code64, 0x18 data)
+    cpu.mem_write_u64(AP_TRAMP_ADDR +% 0xD0_usize, 0_u64);
+    cpu.mem_write_u64(AP_TRAMP_ADDR +% 0xD8_usize, 0x00CF9A000000FFFF_u64);
+    cpu.mem_write_u64(AP_TRAMP_ADDR +% 0xE0_usize, 0x00AF9A000000FFFF_u64);
+    cpu.mem_write_u64(AP_TRAMP_ADDR +% 0xE8_usize, 0x00CF92000000FFFF_u64);
+
+    // [0xF0..0xF8]: GDTR (limit=31, base=0x80D0)
+    cpu.mem_write_u16(AP_TRAMP_ADDR +% 0xF0_usize, 31_u16);
+    cpu.mem_write_u32(AP_TRAMP_ADDR +% 0xF2_usize, 0x000080D0_u32);
+
+    // [0xF8..0x100]: 64-bit AP entry function address
+    let ap_addr = cpu.direct_fn0_addr(ap_entry);
+    cpu.mem_write_u64(AP_TRAMP_ADDR +% 0xF8_usize, ap_addr);
+    cpu.mfence();
+
+    // Send INIT IPI (all excluding self, assert, level)
+    raw {
+        let apic = rawptr_mut.[LapicRegs].from_usize(LAPIC_BASE);
+        apic.*.icr_hi.write(0_u32);
+        apic.*.icr_lo.write(0x000C4500_u32);
+    }
+    delay_spins(200000_u32);
+
+    // Send Startup IPI #1 (vector 0x08 -> physical 0x8000)
+    raw {
+        let apic = rawptr_mut.[LapicRegs].from_usize(LAPIC_BASE);
+        apic.*.icr_hi.write(0_u32);
+        apic.*.icr_lo.write(0x000C4608_u32);
+    }
+    delay_spins(100000_u32);
+
+    // If AP not online yet, send Startup IPI #2 per Intel SDM MP protocol
+    if cpu.get_cpus_online() < 2_u32 {
+        raw {
+            let apic = rawptr_mut.[LapicRegs].from_usize(LAPIC_BASE);
+            apic.*.icr_hi.write(0_u32);
+            apic.*.icr_lo.write(0x000C4608_u32);
+        }
+    }
+
+    var wait: u32 = 0_u32;
+    while cpu.get_cpus_online() < 2_u32 && wait < 20000000_u32 {
+        cpu.pause();
+        wait = wait +% 1_u32;
+    }
+    return cpu.get_cpus_online();
+}

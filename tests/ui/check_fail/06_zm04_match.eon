@@ -1,0 +1,25 @@
+module fail.zm04;
+
+enum Light: u8 {
+    Red,
+    Yellow,
+    Green,
+}
+
+pub fn bad_match(l: Light, flag: bool, opt: ?u32) -> u32 {
+    let a: u32 = match l { //~ ERROR E0104
+        .Red => 1_u32,
+        .Yellow => 2_u32,
+    };
+    let b: u32 = match flag { //~ ERROR E0104
+        true => 1_u32,
+    };
+    let c: u32 = match flag {
+        _ => 1_u32,
+        false => 2_u32, //~ ERROR E0114
+    };
+    let d: u32 = match opt { //~ ERROR E0104
+        null => 0_u32,
+    };
+    return a +% b +% c +% d;
+}

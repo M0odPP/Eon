@@ -1,0 +1,66 @@
+module fail.linearity;
+
+pub linear struct LockToken {
+    pub id: u32;
+}
+
+pub struct BadBufHolder {
+    pub items: Buf[LockToken]; //~ ERROR E0326
+}
+
+fn unlock(t: LockToken) {
+    let LockToken.{ id: _ } = t;
+}
+
+fn acquire() -> LockToken ! MemError {
+    return LockToken.{ id: 1_u32 };
+}
+
+fn step(should_fail: bool) -> !MemError {
+    if should_fail {
+        return .OutOfMemory;
+    }
+    return;
+}
+
+pub fn leak_on_exit(t: LockToken) { //~ ERROR E0109
+    let _ = t.id;
+}
+
+pub fn drop_wildcard(t: LockToken) {
+    let _ = t; //~ ERROR E0109
+}
+
+pub fn leak_on_try(flag: bool) -> !MemError {
+    let t = try acquire();
+    try step(flag); //~ ERROR E0109
+    unlock(t);
+    return;
+}
+
+pub fn double_consume(t: LockToken) {
+    unlock(t);
+    unlock(t); //~ ERROR E0321
+}
+
+pub fn branch_mismatch(t: LockToken, cond: bool) {
+    if cond { //~ ERROR E0323
+        unlock(t);
+    }
+}
+
+pub fn loop_consume(t: LockToken, n: u32) {
+    var i: u32 = 0_u32;
+    while i < n {
+        unlock(t); //~ ERROR E0324
+        i += 1_u32;
+    }
+}
+
+pub fn errdefer_then_move(flag: bool) -> !MemError {
+    let t = try acquire();
+    errdefer unlock(t);
+    unlock(t);
+    try step(flag); //~ ERROR E0325
+    return;
+}

@@ -1,0 +1,742 @@
+module bench.ui_layout;
+
+import core.mem;
+import std.rt;
+
+pub pool Widget {
+    pub tag: u32;
+    pub props: u64;
+    pub parent: ?Link[Self];
+    pub first_child: ?Link[Self];
+    pub next_sibling: ?Link[Self];
+}
+
+pub pool LayoutBox {
+    pub tag_flex: u64;
+    pub mwh: u64;
+    pub xy: u64;
+}
+
+@inline
+fn pack_u32x2(lo: u32, hi: u32) -> u64 {
+    return lo.widen.[u64]() | (hi.widen.[u64]() <<% 32_u64);
+}
+
+@inline
+fn pack_props(min_w: u32, min_h: u32, flex: u32, pad: u32, gap: u32, is_row: u8) -> u64 {
+    return (min_w.widen.[u64]() & 0xFFFF_u64)
+        | ((min_h.widen.[u64]() & 0xFFFF_u64) <<% 16_u64)
+        | ((pad.widen.[u64]() & 0xFF_u64) <<% 32_u64)
+        | ((gap.widen.[u64]() & 0xFF_u64) <<% 40_u64)
+        | ((flex.widen.[u64]() & 0xFF_u64) <<% 48_u64)
+        | (is_row.widen.[u64]() <<% 56_u64);
+}
+
+fn rng_next(state: *mut u64) -> u64 {
+    var x = state.*;
+    x = x ^ (x <<% 13_u64);
+    x = x ^ (x >> 7_u64);
+    x = x ^ (x <<% 17_u64);
+    state.* = x;
+    return x;
+}
+
+fn unlink_child(tree: *mut SlotPool[Widget], parent_id: GenId[Widget], target: GenId[Widget]) {
+    var first_opt: ?GenId[Widget] = null;
+    if let prow = tree.get(parent_id) {
+        first_opt = prow.first_child;
+    }
+    var target_next: ?GenId[Widget] = null;
+    if let trow = tree.get(target) {
+        target_next = trow.next_sibling;
+    }
+
+    let first = first_opt orelse return;
+    if first == target {
+        tree.first_child[parent_id] = target_next;
+        return;
+    }
+
+    var prev = first;
+    loop {
+        var next_opt: ?GenId[Widget] = null;
+        if let cur_row = tree.get(prev) {
+            next_opt = cur_row.next_sibling;
+        }
+        let next_id = next_opt orelse break;
+        if next_id == target {
+            tree.next_sibling[prev] = target_next;
+            return;
+        }
+        prev = next_id;
+    }
+}
+
+/// Container-only BFS snapshot into flat pre-allocated scalar queues:
+/// - Compact 3-column `LayoutBox` (`tag_flex`, `mwh`, `xy` = 24B/box, fits L2!)
+/// - Container-only metadata (`cq_boxes`, `cq_props`, `cq_children`, `cq_wchild`) stays in L1!
+/// - Pre-computes leaf `mwh` directly during push (zero leaf visits in `measure` & `place`!)
+fn snapshot_bfs(
+    tree: *SlotPool[Widget],
+    root: GenId[Widget],
+    boxes: *mut ArenaPool[LayoutBox],
+    cq_boxes: *mut [u32],
+    cq_props: *mut [u64],
+    cq_children: *mut [u64],
+    cq_wchild: *mut [GenId[Widget]],
+) -> usize ! MemError | BoundsError {
+    var cq_len: usize = 0_usize;
+    if let rrow = tree.get(root) {
+        let rtag = rrow.tag;
+        let p = rrow.props;
+        let tf = rtag.widen.[u64]() | (((p >> 48_u64) & 0xFF_u64) <<% 32_u64);
+        var init_mwh: u64 = 0_u64;
+        if let fc = rrow.first_child {
+            if cq_len < cq_boxes.len && cq_len < cq_props.len && cq_len < cq_wchild.len {
+                cq_boxes[cq_len] = 0_u32;
+                cq_props[cq_len] = p;
+                cq_wchild[cq_len] = fc;
+                cq_len = cq_len + 1_usize;
+            }
+        } else {
+            let mw = (p & 0xFFFF_u64).trunc.[u32]();
+            let mh = ((p >> 16_u64) & 0xFFFF_u64).trunc.[u32]();
+            init_mwh = pack_u32x2(mw, mh);
+        }
+        let _ = try boxes.push(.{
+            tag_flex: tf,
+            mwh: init_mwh,
+            xy: 0_u64,
+        });
+    }
+
+    var qi: usize = 0_usize;
+    while qi < cq_len && qi < cq_children.len && qi < cq_wchild.len {
+        let c_start = boxes.len().trunc.[u32]();
+        var cur_opt: ?GenId[Widget] = cq_wchild[qi];
+        loop {
+            let cid = cur_opt orelse break;
+            if let crow = tree.get(cid) {
+                let ctag = crow.tag;
+                let p = crow.props;
+                let tf = ctag.widen.[u64]() | (((p >> 48_u64) & 0xFF_u64) <<% 32_u64);
+                var init_mwh: u64 = 0_u64;
+                if let fc = crow.first_child {
+                    let cidx = boxes.len().trunc.[u32]();
+                    if cq_len < cq_boxes.len && cq_len < cq_props.len && cq_len < cq_wchild.len {
+                        cq_boxes[cq_len] = cidx;
+                        cq_props[cq_len] = p;
+                        cq_wchild[cq_len] = fc;
+                        cq_len = cq_len + 1_usize;
+                    }
+                } else {
+                    let pad = ((p >> 32_u64) & 0xFF_u64).trunc.[u32]();
+                    let min_w = (p & 0xFFFF_u64).trunc.[u32]();
+                    let min_h = ((p >> 16_u64) & 0xFFFF_u64).trunc.[u32]();
+                    if pad == 0_u32 {
+                        init_mwh = pack_u32x2(min_w, min_h);
+                    } else {
+                        let pad2 = pad *% 2_u32;
+                        let mw = if pad2 > min_w { pad2 } else { min_w };
+                        let mh = if pad2 > min_h { pad2 } else { min_h };
+                        init_mwh = pack_u32x2(mw, mh);
+                    }
+                }
+                let _ = try boxes.push(.{
+                    tag_flex: tf,
+                    mwh: init_mwh,
+                    xy: 0_u64,
+                });
+                cur_opt = crow.next_sibling;
+            } else {
+                break;
+            }
+        }
+        let c_end = boxes.len().trunc.[u32]();
+        cq_children[qi] = pack_u32x2(c_start, c_end);
+        qi = qi +% 1_usize;
+    }
+    return cq_len;
+}
+
+/// Bottom-up measure over ONLY the `~4096` container boxes (leaves already measured in `snapshot_bfs`!).
+/// Reads linear `cq_props[rev]` & `cq_children[rev]`, packs `(total_main, total_flex)` into `cq_totals[rev]`.
+fn measure_bottom_up(
+    boxes: *mut ArenaPool[LayoutBox],
+    cq_boxes: *[u32],
+    cq_props: *[u64],
+    cq_children: *[u64],
+    cq_totals: *mut [u64],
+    cq_len: usize,
+) -> !BoundsError {
+    var rev: usize = cq_len;
+    while rev > 0_usize && rev <= cq_boxes.len && rev <= cq_props.len && rev <= cq_children.len && rev <= cq_totals.len {
+        rev = rev - 1_usize;
+        let bi = try boxes.id_at(cq_boxes[rev].widen.[usize]());
+        let ch_range = cq_children[rev];
+        let c_start = ch_range.trunc.[u32]().widen.[usize]();
+        let c_end = (ch_range >> 32_u64).trunc.[usize]();
+        let p = cq_props[rev];
+        let is_row = (p >> 56_u64).trunc.[u8]();
+        let nboxes = boxes.len();
+        let lim = if c_end < nboxes { c_end } else { nboxes };
+
+        var content_w: u32 = 0_u32;
+        var content_h: u32 = 0_u32;
+        var total_flex: u32 = 0_u32;
+        var flex_or: u32 = 0_u32;
+        var ci = c_start;
+
+        if is_row == 1_u8 {
+            while ci < lim {
+                let cid = try boxes.id_at(ci);
+                let cm = boxes.mwh[cid];
+                content_w = content_w +% cm.trunc.[u32]();
+                let cmh = (cm >> 32_u64).trunc.[u32]();
+                if cmh > content_h {
+                    content_h = cmh;
+                }
+                let cf = (boxes.tag_flex[cid] >> 32_u64).trunc.[u32]();
+                total_flex = total_flex +% cf;
+                flex_or = flex_or | cf;
+                ci = ci +% 1_usize;
+            }
+            let child_count = (c_end -% c_start).trunc.[u32]();
+            if child_count > 1_u32 {
+                let gap = ((p >> 40_u64) & 0xFF_u64).trunc.[u32]();
+                content_w = content_w +% ((child_count -% 1_u32) *% gap);
+            }
+            let big_flag: u64 = if flex_or > 3_u32 { 0x0080000000000000_u64 } else { 0_u64 };
+            cq_totals[rev] = pack_u32x2(content_w, total_flex) | big_flag;
+        } else {
+            while ci < lim {
+                let cid = try boxes.id_at(ci);
+                let cm = boxes.mwh[cid];
+                let cmw = cm.trunc.[u32]();
+                if cmw > content_w {
+                    content_w = cmw;
+                }
+                content_h = content_h +% (cm >> 32_u64).trunc.[u32]();
+                let cf = (boxes.tag_flex[cid] >> 32_u64).trunc.[u32]();
+                total_flex = total_flex +% cf;
+                flex_or = flex_or | cf;
+                ci = ci +% 1_usize;
+            }
+            let child_count = (c_end -% c_start).trunc.[u32]();
+            if child_count > 1_u32 {
+                let gap = ((p >> 40_u64) & 0xFF_u64).trunc.[u32]();
+                content_h = content_h +% ((child_count -% 1_u32) *% gap);
+            }
+            let big_flag: u64 = if flex_or > 3_u32 { 0x0080000000000000_u64 } else { 0_u64 };
+            cq_totals[rev] = pack_u32x2(content_h, total_flex) | big_flag;
+        }
+
+        let min_w = (p & 0xFFFF_u64).trunc.[u32]();
+        let min_h = ((p >> 16_u64) & 0xFFFF_u64).trunc.[u32]();
+        let pad2 = ((p >> 32_u64) & 0xFF_u64).trunc.[u32]() *% 2_u32;
+        let req_w = content_w +% pad2;
+        let req_h = content_h +% pad2;
+        let mw = if req_w > min_w { req_w } else { min_w };
+        let mh = if req_h > min_h { req_h } else { min_h };
+        boxes.mwh[bi] = pack_u32x2(mw, mh);
+    }
+    return;
+}
+
+fn place_row_general(
+    boxes: *mut ArenaPool[LayoutBox],
+    c_start: usize,
+    lim: usize,
+    inner_xy: u64,
+    inner_h: u32,
+    gap: u32,
+    extra_u64: u64,
+    total_flex_u64: u64,
+) -> !BoundsError {
+    if total_flex_u64 == 0_u64 { return; }
+    let inner_y_hi = inner_xy & 0xFFFFFFFF00000000_u64;
+    var cur = inner_xy.trunc.[u32]();
+    var ci = c_start;
+    while ci < lim && ci < boxes.len() {
+        let cid = try boxes.id_at(ci);
+        let cf = boxes.tag_flex[cid] >> 32_u64;
+        let bonus = ((extra_u64 *% cf) / total_flex_u64).trunc.[u32]();
+        let cm = boxes.mwh[cid];
+        let cw = cm.trunc.[u32]() +% bonus;
+        let cmh = (cm >> 32_u64).trunc.[u32]();
+        let ch = if inner_h > cmh { inner_h } else { cmh };
+        boxes.xy[cid] = cur.widen.[u64]() | inner_y_hi;
+        boxes.mwh[cid] = pack_u32x2(cw, ch);
+        cur = cur +% cw +% gap;
+        ci = ci +% 1_usize;
+    }
+    return;
+}
+
+fn place_col_general(
+    boxes: *mut ArenaPool[LayoutBox],
+    c_start: usize,
+    lim: usize,
+    inner_xy: u64,
+    inner_w: u32,
+    gap: u32,
+    extra_u64: u64,
+    total_flex_u64: u64,
+) -> !BoundsError {
+    if total_flex_u64 == 0_u64 { return; }
+    let inner_x_u64 = inner_xy & 0xFFFFFFFF_u64;
+    var cur = (inner_xy >> 32_u64).trunc.[u32]();
+    var ci = c_start;
+    while ci < lim && ci < boxes.len() {
+        let cid = try boxes.id_at(ci);
+        let cf = boxes.tag_flex[cid] >> 32_u64;
+        let bonus = ((extra_u64 *% cf) / total_flex_u64).trunc.[u32]();
+        let cm = boxes.mwh[cid];
+        let cmw = cm.trunc.[u32]();
+        let cw = if inner_w > cmw { inner_w } else { cmw };
+        let ch = (cm >> 32_u64).trunc.[u32]() +% bonus;
+        boxes.xy[cid] = inner_x_u64 | (cur.widen.[u64]() <<% 32_u64);
+        boxes.mwh[cid] = pack_u32x2(cw, ch);
+        cur = cur +% ch +% gap;
+        ci = ci +% 1_usize;
+    }
+    return;
+}
+
+fn place_row_children(
+    boxes: *mut ArenaPool[LayoutBox],
+    ch_range: u64,
+    inner_xy: u64,
+    inner_wh: u64,
+    totals_gap: u64,
+) -> !BoundsError {
+    let c_start = ch_range.trunc.[u32]().widen.[usize]();
+    let c_end = (ch_range >> 32_u64).trunc.[usize]();
+    let nboxes = boxes.len();
+    let lim = if c_end < nboxes { c_end } else { nboxes };
+    let total_main = (totals_gap & 0xFFFFFFFF_u64).trunc.[u32]();
+    let total_flex_u32 = ((totals_gap >> 32_u64) & 0x7FFFFF_u64).trunc.[u32]();
+    let has_big_flex = (totals_gap & 0x0080000000000000_u64) != 0_u64;
+    let gap = (totals_gap >> 56_u64).trunc.[u32]();
+    let inner_w = inner_wh.trunc.[u32]();
+    let inner_h = (inner_wh >> 32_u64).trunc.[u32]();
+    let extra_u32 = if inner_w > total_main { inner_w -% total_main } else { 0_u32 };
+    let inner_y_hi = inner_xy & 0xFFFFFFFF00000000_u64;
+    var cur = inner_xy.trunc.[u32]();
+    var ci = c_start;
+    if extra_u32 > 0_u32 && total_flex_u32 > 0_u32 {
+        let uq = extra_u32 / total_flex_u32;
+        let ur = extra_u32 -% (uq *% total_flex_u32);
+        let ur2 = ur +% ur;
+        let ur3 = ur2 +% ur;
+        let tf2 = total_flex_u32 +% total_flex_u32;
+        let b2 = (uq <<% 1_u32) +% (if ur2 >= total_flex_u32 { 1_u32 } else { 0_u32 });
+        let b3 = (uq *% 3_u32)
+            +% (if ur3 >= total_flex_u32 { 1_u32 } else { 0_u32 })
+            +% (if ur3 >= tf2 { 1_u32 } else { 0_u32 });
+        if has_big_flex || b3 > 0xFFFF_u32 || total_flex_u32 >= 0x55555555_u32 {
+            try place_row_general(boxes, c_start, lim, inner_xy, inner_h, gap, extra_u32.widen.[u64](), total_flex_u32.widen.[u64]());
+            return;
+        }
+        let b_pack: u64 = (uq.widen.[u64]() <<% 16_u64)
+            | (b2.widen.[u64]() <<% 32_u64)
+            | (b3.widen.[u64]() <<% 48_u64);
+        while ci < lim {
+            let cid = try boxes.id_at(ci);
+            let sh = (boxes.tag_flex[cid] >> 28_u64) & 48_u64;
+            let bonus = ((b_pack >> sh) & 0xFFFF_u64).trunc.[u32]();
+            let cm = boxes.mwh[cid];
+            let cw = cm.trunc.[u32]() +% bonus;
+            let cmh = (cm >> 32_u64).trunc.[u32]();
+            let ch = if inner_h > cmh { inner_h } else { cmh };
+            boxes.xy[cid] = cur.widen.[u64]() | inner_y_hi;
+            boxes.mwh[cid] = pack_u32x2(cw, ch);
+            cur = cur +% cw +% gap;
+            ci = ci +% 1_usize;
+        }
+    } else {
+        while ci < lim {
+            let cid = try boxes.id_at(ci);
+            let cm = boxes.mwh[cid];
+            let cw = cm.trunc.[u32]();
+            let cmh = (cm >> 32_u64).trunc.[u32]();
+            let ch = if inner_h > cmh { inner_h } else { cmh };
+            boxes.xy[cid] = cur.widen.[u64]() | inner_y_hi;
+            boxes.mwh[cid] = pack_u32x2(cw, ch);
+            cur = cur +% cw +% gap;
+            ci = ci +% 1_usize;
+        }
+    }
+    return;
+}
+
+fn place_col_children(
+    boxes: *mut ArenaPool[LayoutBox],
+    ch_range: u64,
+    inner_xy: u64,
+    inner_wh: u64,
+    totals_gap: u64,
+) -> !BoundsError {
+    let c_start = ch_range.trunc.[u32]().widen.[usize]();
+    let c_end = (ch_range >> 32_u64).trunc.[usize]();
+    let nboxes = boxes.len();
+    let lim = if c_end < nboxes { c_end } else { nboxes };
+    let total_main = (totals_gap & 0xFFFFFFFF_u64).trunc.[u32]();
+    let total_flex_u32 = ((totals_gap >> 32_u64) & 0x7FFFFF_u64).trunc.[u32]();
+    let has_big_flex = (totals_gap & 0x0080000000000000_u64) != 0_u64;
+    let gap = (totals_gap >> 56_u64).trunc.[u32]();
+    let inner_w = inner_wh.trunc.[u32]();
+    let inner_h = (inner_wh >> 32_u64).trunc.[u32]();
+    let extra_u32 = if inner_h > total_main { inner_h -% total_main } else { 0_u32 };
+    let inner_x_u64 = inner_xy & 0xFFFFFFFF_u64;
+    var cur = (inner_xy >> 32_u64).trunc.[u32]();
+    var ci = c_start;
+    if extra_u32 > 0_u32 && total_flex_u32 > 0_u32 {
+        let uq = extra_u32 / total_flex_u32;
+        let ur = extra_u32 -% (uq *% total_flex_u32);
+        let ur2 = ur +% ur;
+        let ur3 = ur2 +% ur;
+        let tf2 = total_flex_u32 +% total_flex_u32;
+        let b2 = (uq <<% 1_u32) +% (if ur2 >= total_flex_u32 { 1_u32 } else { 0_u32 });
+        let b3 = (uq *% 3_u32)
+            +% (if ur3 >= total_flex_u32 { 1_u32 } else { 0_u32 })
+            +% (if ur3 >= tf2 { 1_u32 } else { 0_u32 });
+        if has_big_flex || b3 > 0xFFFF_u32 || total_flex_u32 >= 0x55555555_u32 {
+            try place_col_general(boxes, c_start, lim, inner_xy, inner_w, gap, extra_u32.widen.[u64](), total_flex_u32.widen.[u64]());
+            return;
+        }
+        let b_pack: u64 = (uq.widen.[u64]() <<% 16_u64)
+            | (b2.widen.[u64]() <<% 32_u64)
+            | (b3.widen.[u64]() <<% 48_u64);
+        while ci < lim {
+            let cid = try boxes.id_at(ci);
+            let sh = (boxes.tag_flex[cid] >> 28_u64) & 48_u64;
+            let bonus = ((b_pack >> sh) & 0xFFFF_u64).trunc.[u32]();
+            let cm = boxes.mwh[cid];
+            let cmw = cm.trunc.[u32]();
+            let cw = if inner_w > cmw { inner_w } else { cmw };
+            let ch = (cm >> 32_u64).trunc.[u32]() +% bonus;
+            boxes.xy[cid] = inner_x_u64 | (cur.widen.[u64]() <<% 32_u64);
+            boxes.mwh[cid] = pack_u32x2(cw, ch);
+            cur = cur +% ch +% gap;
+            ci = ci +% 1_usize;
+        }
+    } else {
+        while ci < lim {
+            let cid = try boxes.id_at(ci);
+            let cm = boxes.mwh[cid];
+            let cmw = cm.trunc.[u32]();
+            let cw = if inner_w > cmw { inner_w } else { cmw };
+            let ch = (cm >> 32_u64).trunc.[u32]();
+            boxes.xy[cid] = inner_x_u64 | (cur.widen.[u64]() <<% 32_u64);
+            boxes.mwh[cid] = pack_u32x2(cw, ch);
+            cur = cur +% ch +% gap;
+            ci = ci +% 1_usize;
+        }
+    }
+    return;
+}
+
+/// Top-down placement over ONLY the `~4096` containers (single-pass child placement using cached totals!).
+fn place_top_down(
+    boxes: *mut ArenaPool[LayoutBox],
+    cq_boxes: *[u32],
+    cq_props: *[u64],
+    cq_children: *[u64],
+    cq_totals: *[u64],
+    cq_len: usize,
+    view_w: u32,
+    view_h: u32,
+) -> !BoundsError {
+    let nboxes = boxes.len();
+    if nboxes > 0_usize {
+        let root_box = try boxes.id_at(0_usize);
+        let rm = boxes.mwh[root_box];
+        let rmw = rm.trunc.[u32]();
+        let rmh = (rm >> 32_u64).trunc.[u32]();
+        boxes.xy[root_box] = 0_u64;
+        let rw = if rmw > view_w { rmw } else { view_w };
+        let rh = if rmh > view_h { rmh } else { view_h };
+        boxes.mwh[root_box] = pack_u32x2(rw, rh);
+    }
+
+    var qi: usize = 0_usize;
+    while qi < cq_len && qi < cq_boxes.len && qi < cq_props.len && qi < cq_children.len && qi < cq_totals.len {
+        let bi = try boxes.id_at(cq_boxes[qi].widen.[usize]());
+        let ch_range = cq_children[qi];
+        let bxy = boxes.xy[bi];
+        let bx = bxy.trunc.[u32]();
+        let by = (bxy >> 32_u64).trunc.[u32]();
+        let bwh = boxes.mwh[bi];
+        let bw = bwh.trunc.[u32]();
+        let bh = (bwh >> 32_u64).trunc.[u32]();
+        let p = cq_props[qi];
+        let pad = ((p >> 32_u64) & 0xFF_u64).trunc.[u32]();
+        let gap = (p >> 40_u64) & 0xFF_u64;
+        let is_row = (p >> 56_u64).trunc.[u8]();
+        let pad2 = pad *% 2_u32;
+        let inner_xy = pack_u32x2(bx +% pad, by +% pad);
+        let inner_w: u32 = if bw > pad2 { bw -% pad2 } else { 0_u32 };
+        let inner_h: u32 = if bh > pad2 { bh -% pad2 } else { 0_u32 };
+        let inner_wh = pack_u32x2(inner_w, inner_h);
+        let tot = cq_totals[qi];
+        let totals_gap = (tot & 0x00FFFFFFFFFFFFFF_u64) | (gap <<% 56_u64);
+        if is_row == 1_u8 {
+            try place_row_children(boxes, ch_range, inner_xy, inner_wh, totals_gap);
+        } else {
+            try place_col_children(boxes, ch_range, inner_xy, inner_wh, totals_gap);
+        }
+        qi = qi +% 1_usize;
+    }
+    return;
+}
+
+fn hash_layout_boxes(boxes: *ArenaPool[LayoutBox]) -> u64 ! BoundsError {
+    let nboxes = boxes.len();
+    var frame_hash: u64 = 0x9E3779B97F4A7C15_u64;
+    for i in 0_usize..nboxes {
+        let bi = try boxes.id_at(i);
+        let bxy = boxes.xy[bi];
+        let bwh = boxes.mwh[bi];
+        let bx = bxy.trunc.[u32]().widen.[u64]();
+        let by = bxy >> 32_u64;
+        let bw = bwh.trunc.[u32]().widen.[u64]();
+        let bh = bwh >> 32_u64;
+        let tag = boxes.tag_flex[bi].trunc.[u32]().widen.[u64]();
+        let v1 = (tag <<% 32_u64) | bx;
+        let v2 = (by <<% 32_u64) | bw;
+        frame_hash = (frame_hash ^ v1) *% 0x100000001B3_u64;
+        frame_hash = (frame_hash ^ v2) *% 0x100000001B3_u64;
+        frame_hash = (frame_hash ^ bh) *% 0x100000001B3_u64;
+    }
+    return frame_hash;
+}
+
+pub fn main(env: *mut Env) -> i32 ! OutOfMemory | MemError | BoundsError | StaleId | ArithError {
+    let alloc = &mut env.alloc;
+    let num_containers: usize = 4096_usize;
+    let num_leaves: usize = 12288_usize;
+    let total_widgets: usize = 16384_usize;
+    let num_frames: usize = 120_usize;
+    let churn_per_frame: usize = 64_usize;
+    let mutations_per_frame: usize = 128_usize;
+    let view_w: u32 = 1920_u32;
+    let view_h: u32 = 1080_u32;
+    let keep_mask: u64 = 0xFF00FFFF00000000_u64;
+
+    var tree = try mem.init_slot_pool.[Widget](alloc, total_widgets);
+    errdefer tree.destroy(alloc);
+
+    var containers = try Buf.[GenId[Widget]].init(alloc, num_containers);
+    errdefer containers.destroy(alloc);
+
+    var leaves = try Buf.[GenId[Widget]].init(alloc, num_leaves);
+    errdefer leaves.destroy(alloc);
+
+    var cq_boxes = try Buf.[u32].init(alloc, num_containers);
+    errdefer cq_boxes.destroy(alloc);
+    for _ in 0_usize..num_containers { try cq_boxes.push(0_u32); }
+
+    var cq_props = try Buf.[u64].init(alloc, num_containers);
+    errdefer cq_props.destroy(alloc);
+    for _ in 0_usize..num_containers { try cq_props.push(0_u64); }
+
+    var cq_children = try Buf.[u64].init(alloc, num_containers);
+    errdefer cq_children.destroy(alloc);
+    for _ in 0_usize..num_containers { try cq_children.push(0_u64); }
+
+    var cq_totals = try Buf.[u64].init(alloc, num_containers);
+    errdefer cq_totals.destroy(alloc);
+    for _ in 0_usize..num_containers { try cq_totals.push(0_u64); }
+
+    var cq_wchild = try Buf.[GenId[Widget]].init(alloc, num_containers);
+    errdefer cq_wchild.destroy(alloc);
+
+    var frame_arena = try mem.FrameArena.init(alloc, 4194304_usize);
+    errdefer frame_arena.destroy(alloc);
+
+    var rng: u64 = 0xD1B54A32D192ED03_u64;
+    var next_tag: u32 = 1_u32;
+
+    for i in 0_usize..num_containers {
+        let r = rng_next(&mut rng);
+        let min_w = 24_u32 +% (r & 63_u64).trunc.[u32]();
+        let min_h = 16_u32 +% ((r >> 6_u64) & 31_u64).trunc.[u32]();
+        let pad = ((r >> 12_u64) & 3_u64).trunc.[u32]() +% 1_u32;
+        let gap = ((r >> 14_u64) & 3_u64).trunc.[u32]();
+        let flex = ((r >> 16_u64) & 3_u64).trunc.[u32]();
+        let is_row: u8 = if (i & 1_usize) == 0_usize { 0_u8 } else { 1_u8 };
+        let tag = next_tag;
+        next_tag = next_tag +% 1_u32;
+
+        var parent_opt: ?GenId[Widget] = null;
+        if i > 0_usize {
+            let pidx = (i - 1_usize) >> 2_usize;
+            let cslice = containers.as_slice();
+            if pidx < cslice.len {
+                parent_opt = cslice[pidx];
+            }
+        }
+
+        let wid = try tree.insert(alloc, .{
+            tag: tag,
+            props: pack_props(min_w, min_h, flex, pad, gap, is_row),
+            parent: parent_opt,
+            first_child: null,
+            next_sibling: null,
+        });
+
+        if let pid = parent_opt {
+            let old_first = tree.first_child[pid];
+            tree.next_sibling[wid] = old_first;
+            tree.first_child[pid] = wid;
+        }
+        try containers.push(wid);
+        try cq_wchild.push(wid);
+    }
+
+    for k in 0_usize..num_leaves {
+        let r = rng_next(&mut rng);
+        let min_w = 16_u32 +% (r & 63_u64).trunc.[u32]();
+        let min_h = 12_u32 +% ((r >> 6_u64) & 31_u64).trunc.[u32]();
+        let flex = ((r >> 12_u64) & 3_u64).trunc.[u32]();
+        let tag = next_tag;
+        next_tag = next_tag +% 1_u32;
+
+        let pidx = k & 4095_usize;
+        let pid = (try containers.at(pidx)).*;
+        let old_first = tree.first_child[pid];
+        let wid = try tree.insert(alloc, .{
+            tag: tag,
+            props: pack_props(min_w, min_h, flex, 0_u32, 0_u32, 0_u8),
+            parent: pid,
+            first_child: null,
+            next_sibling: old_first,
+        });
+        tree.first_child[pid] = wid;
+        try leaves.push(wid);
+    }
+
+    let root = (try containers.at(0_usize)).*;
+
+    let t0 = rt.now_ns(&env.clock);
+    var checksum: u64 = 0xCBF29CE484222325_u64;
+
+    for _frame in 0_usize..num_frames {
+        for _c in 0_usize..churn_per_frame {
+            let li = (rng_next(&mut rng).trunc.[usize]()) % num_leaves;
+            let old_id = (try leaves.at(li)).*;
+
+            var old_parent_opt: ?GenId[Widget] = null;
+            if let old_row = tree.get(old_id) {
+                old_parent_opt = old_row.parent;
+            }
+            if let old_pid = old_parent_opt {
+                unlink_child(&mut tree, old_pid, old_id);
+            }
+            let _ = try tree.remove(old_id);
+
+            if let _stale = tree.get(old_id) {
+                checksum = checksum ^ 0xDEAD_u64;
+            } else {
+                checksum = checksum +% 1_u64;
+            }
+
+            let new_pidx = (rng_next(&mut rng).trunc.[usize]()) & 4095_usize;
+            let new_pid = (try containers.at(new_pidx)).*;
+            let r = rng_next(&mut rng);
+            let min_w = 16_u32 +% (r & 63_u64).trunc.[u32]();
+            let min_h = 12_u32 +% ((r >> 6_u64) & 31_u64).trunc.[u32]();
+            let flex = ((r >> 12_u64) & 3_u64).trunc.[u32]();
+            let tag = next_tag;
+            next_tag = next_tag +% 1_u32;
+
+            let old_first = tree.first_child[new_pid];
+            let new_id = try tree.insert(alloc, .{
+                tag: tag,
+                props: pack_props(min_w, min_h, flex, 0_u32, 0_u32, 0_u8),
+                parent: new_pid,
+                first_child: null,
+                next_sibling: old_first,
+            });
+            tree.first_child[new_pid] = new_id;
+            let slot_mut = try leaves.at_mut(li);
+            slot_mut.* = new_id;
+        }
+
+        for m in 0_usize..mutations_per_frame {
+            let r = rng_next(&mut rng);
+            if (m & 3_usize) == 0_usize {
+                let ci = (r.trunc.[usize]()) & 4095_usize;
+                let cid = (try containers.at(ci)).*;
+                let nw = 20_u64 +% ((r >> 16_u64) & 127_u64);
+                let nh = 16_u64 +% ((r >> 24_u64) & 63_u64);
+                let nf = (r >> 32_u64) & 3_u64;
+                tree.props[cid] = (tree.props[cid] & keep_mask) | nw | (nh <<% 16_u64) | (nf <<% 48_u64);
+            } else {
+                let li = (r.trunc.[usize]()) % num_leaves;
+                let lid = (try leaves.at(li)).*;
+                let nw = 12_u64 +% ((r >> 16_u64) & 95_u64);
+                let nh = 10_u64 +% ((r >> 24_u64) & 47_u64);
+                let nf = (r >> 32_u64) & 3_u64;
+                tree.props[lid] = (tree.props[lid] & keep_mask) | nw | (nh <<% 16_u64) | (nf <<% 48_u64);
+            }
+        }
+
+        frame_arena.reset();
+        var boxes = try mem.init_frame_pool.[LayoutBox](&mut frame_arena, total_widgets);
+
+        let cq_len = try snapshot_bfs(
+            &tree,
+            root,
+            &mut boxes,
+            cq_boxes.as_mut_slice(),
+            cq_props.as_mut_slice(),
+            cq_children.as_mut_slice(),
+            cq_wchild.as_mut_slice(),
+        );
+        try measure_bottom_up(
+            &mut boxes,
+            cq_boxes.as_slice(),
+            cq_props.as_slice(),
+            cq_children.as_slice(),
+            cq_totals.as_mut_slice(),
+            cq_len,
+        );
+        try place_top_down(
+            &mut boxes,
+            cq_boxes.as_slice(),
+            cq_props.as_slice(),
+            cq_children.as_slice(),
+            cq_totals.as_slice(),
+            cq_len,
+            view_w,
+            view_h,
+        );
+        let frame_hash = try hash_layout_boxes(&boxes);
+        checksum = (checksum ^ frame_hash) *% 0x100000001B3_u64;
+    }
+
+    let elapsed_ns = rt.elapsed_since(&env.clock, t0);
+
+    frame_arena.destroy(alloc);
+    cq_wchild.destroy(alloc);
+    cq_totals.destroy(alloc);
+    cq_children.destroy(alloc);
+    cq_props.destroy(alloc);
+    cq_boxes.destroy(alloc);
+    leaves.destroy(alloc);
+    containers.destroy(alloc);
+    tree.destroy(alloc);
+
+    if alloc.live_allocs() != 0_usize {
+        return 1_i32;
+    }
+
+    rt.print_str("RESULT ui_layout checksum=");
+    rt.print_u64(checksum);
+    rt.print_str(" elapsed_ns=");
+    rt.print_u64(elapsed_ns);
+    rt.print_nl();
+    return 0_i32;
+}

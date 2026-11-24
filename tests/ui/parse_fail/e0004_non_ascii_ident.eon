@@ -1,0 +1,4 @@
+module fail.non_ascii;
+pub fn f() {
+    let а = 1_u32; //~ ERROR E0004
+}

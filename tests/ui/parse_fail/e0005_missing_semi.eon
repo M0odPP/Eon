@@ -1,0 +1,5 @@
+module fail.semi;
+pub fn f() -> u32 {
+    let x = 1_u32 //~ ERROR E0005
+    return x;
+}

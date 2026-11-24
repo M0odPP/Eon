@@ -1,0 +1,16 @@
+module fail.zm02;
+
+error FooErr { Bad }
+
+fn compute() -> i32 {
+    return 7_i32;
+}
+
+fn fallible() -> i32 ! FooErr {
+    return .Bad;
+}
+
+pub fn run() {
+    compute(); //~ ERROR E0102
+    _ = fallible(); //~ ERROR E0102
+}

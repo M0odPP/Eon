@@ -1,0 +1,1344 @@
+module eonc.ui_test;
+
+import core.col;
+import core.str;
+import std.rt;
+import eonc.span;
+import eonc.diag;
+import eonc.ast;
+import eonc.parser;
+import eonc.resolve;
+import eonc.types;
+import eonc.ctvm;
+import eonc.check;
+import eonc.cfg;
+import eonc.borrow;
+import eonc.effects;
+import eonc.eir;
+import eonc.verify;
+
+// ---------------------------------------------------------------------------
+// Path comparison & flat path list helpers
+// ---------------------------------------------------------------------------
+
+const MODE_NONE: u8 = 0_u8;
+const MODE_PARSE: u8 = 1_u8;
+const MODE_CHECK: u8 = 2_u8;
+
+const CASE_PARSE_FILE: u8 = 0_u8;
+const CASE_CHECK_FILE: u8 = 1_u8;
+const CASE_CHECK_PKG: u8 = 2_u8;
+
+struct PathComp {
+    kind: u8; // 0 = End, 1 = RootDir, 2 = CurDir, 3 = ParentDir, 4 = Normal
+    start: usize;
+    end: usize;
+}
+
+struct PathCompIter {
+    pos: usize;
+    started: bool;
+}
+
+fn next_path_comp(p: *[u8], it: *mut PathCompIter) -> PathComp {
+    if !it.started {
+        it.started = true;
+        if p.len > 0_usize && p[0_usize] == b'/' {
+            var i: usize = 1_usize;
+            while i < p.len && p[i] == b'/' {
+                i = i +% 1_usize;
+            }
+            it.pos = i;
+            return PathComp.{ kind: 1_u8, start: 0_usize, end: 0_usize };
+        }
+        if p.len == 1_usize && p[0_usize] == b'.' {
+            it.pos = 1_usize;
+            return PathComp.{ kind: 2_u8, start: 0_usize, end: 0_usize };
+        }
+        if p.len >= 2_usize && p[0_usize] == b'.' && p[1_usize] == b'/' {
+            var i: usize = 1_usize;
+            while i < p.len && p[i] == b'/' {
+                i = i +% 1_usize;
+            }
+            it.pos = i;
+            return PathComp.{ kind: 2_u8, start: 0_usize, end: 0_usize };
+        }
+    }
+
+    while it.pos < p.len {
+        while it.pos < p.len && p[it.pos] == b'/' {
+            it.pos = it.pos +% 1_usize;
+        }
+        if it.pos >= p.len {
+            break;
+        }
+        let cstart = it.pos;
+        while it.pos < p.len && p[it.pos] != b'/' {
+            it.pos = it.pos +% 1_usize;
+        }
+        let cend = it.pos;
+        let clen = cend -% cstart;
+        if clen == 1_usize && p[cstart] == b'.' {
+            continue;
+        }
+        let next_i = cstart +% 1_usize;
+        if clen == 2_usize && next_i < p.len && p[cstart] == b'.' && p[next_i] == b'.' {
+            return PathComp.{ kind: 3_u8, start: cstart, end: cend };
+        }
+        return PathComp.{ kind: 4_u8, start: cstart, end: cend };
+    }
+    return PathComp.{ kind: 0_u8, start: 0_usize, end: 0_usize };
+}
+
+fn cmp_bytes_range(a: *[u8], as0: usize, ae0: usize, b: *[u8], bs0: usize, be0: usize) -> i32 {
+    let alen = if ae0 >= as0 { ae0 - as0 } else { 0_usize };
+    let blen = if be0 >= bs0 { be0 - bs0 } else { 0_usize };
+    let min_len = if alen < blen { alen } else { blen };
+    var i: usize = 0_usize;
+    while i < min_len {
+        let ai = as0 +% i;
+        let bi = bs0 +% i;
+        if ai < a.len && bi < b.len {
+            let ca = a[ai];
+            let cb = b[bi];
+            if ca < cb {
+                return -1_i32;
+            }
+            if ca > cb {
+                return 1_i32;
+            }
+        }
+        i = i +% 1_usize;
+    }
+    if alen < blen {
+        return -1_i32;
+    }
+    if alen > blen {
+        return 1_i32;
+    }
+    return 0_i32;
+}
+
+fn cmp_paths(a: *[u8], b: *[u8]) -> i32 {
+    var ita = PathCompIter.{ pos: 0_usize, started: false };
+    var itb = PathCompIter.{ pos: 0_usize, started: false };
+    loop {
+        let ca = next_path_comp(a, &mut ita);
+        let cb = next_path_comp(b, &mut itb);
+        if ca.kind != cb.kind {
+            if ca.kind < cb.kind {
+                return -1_i32;
+            }
+            return 1_i32;
+        }
+        if ca.kind == 0_u8 {
+            return 0_i32;
+        }
+        if ca.kind == 4_u8 {
+            let ord = cmp_bytes_range(a, ca.start, ca.end, b, cb.start, cb.end);
+            if ord != 0_i32 {
+                return ord;
+            }
+        }
+    }
+}
+
+view fn slice_off_len(src: *[u8], off: u32, len: u32) -> *[u8] {
+    let empty: *str = "";
+    let s0 = off.widen.[usize]();
+    let s1 = s0 +% len.widen.[usize]();
+    let s = src.sub(s0, s1) catch {
+        return empty.as_bytes();
+    };
+    return s;
+}
+
+fn sort_path_entries(data: *[u8], offs: *mut [u32], lens: *mut [u32]) {
+    let n = offs.len;
+    if n <= 1_usize || n != lens.len {
+        return;
+    }
+    var gap: usize = 1_usize;
+    let third = n / 3_usize;
+    while gap < third {
+        gap = (gap *% 3_usize) +% 1_usize;
+    }
+    while gap > 0_usize {
+        var i = gap;
+        while i < n {
+            let cur_off = offs[i];
+            let cur_len = lens[i];
+            let cur_slice = slice_off_len(data, cur_off, cur_len);
+            var j = i;
+            while j >= gap {
+                let prev = j - gap;
+                let prev_slice = slice_off_len(data, offs[prev], lens[prev]);
+                if cmp_paths(prev_slice, cur_slice) <= 0_i32 {
+                    break;
+                }
+                offs[j] = offs[prev];
+                lens[j] = lens[prev];
+                j = prev;
+            }
+            offs[j] = cur_off;
+            lens[j] = cur_len;
+            i = i +% 1_usize;
+        }
+        gap = gap / 3_usize;
+    }
+}
+
+linear struct UiPathList {
+    data: col.DynBuf[u8];
+    offs: col.DynBuf[u32];
+    lens: col.DynBuf[u32];
+}
+
+impl UiPathList {
+    fn init(alloc: *mut AllocCap) -> UiPathList ! OutOfMemory {
+        let data = try col.DynBuf.[u8].init(alloc, 256_usize);
+        errdefer data.destroy(alloc);
+        let offs = try col.DynBuf.[u32].init(alloc, 16_usize);
+        errdefer offs.destroy(alloc);
+        let lens = try col.DynBuf.[u32].init(alloc, 16_usize);
+        errdefer lens.destroy(alloc);
+        return UiPathList.{ data: data, offs: offs, lens: lens };
+    }
+
+    fn len(self: *Self) -> usize {
+        return self.offs.len();
+    }
+
+    fn push(self: *mut Self, alloc: *mut AllocCap, path: *[u8]) -> !OutOfMemory {
+        let off = self.data.len().trunc.[u32]();
+        let n = path.len.trunc.[u32]();
+        try self.data.push_slice(alloc, path);
+        try self.offs.push(alloc, off);
+        try self.lens.push(alloc, n);
+        return;
+    }
+
+    view fn get(self: *Self, idx: usize) -> *[u8] {
+        let empty: *str = "";
+        let os = self.offs.as_slice();
+        let ls = self.lens.as_slice();
+        if idx < os.len && idx < ls.len {
+            return slice_off_len(self.data.as_slice(), os[idx], ls[idx]);
+        }
+        return empty.as_bytes();
+    }
+
+    fn pop_into(self: *mut Self, alloc: *mut AllocCap, out: *mut str.StrBuf) -> bool ! OutOfMemory {
+        let n = self.offs.len();
+        if n == 0_usize {
+            return false;
+        }
+        let idx = n - 1_usize;
+        out.clear();
+        try out.push_bytes_grow(alloc, self.get(idx));
+        _ = self.offs.pop();
+        _ = self.lens.pop();
+        return true;
+    }
+
+    fn sort(self: *mut Self) {
+        sort_path_entries(self.data.as_slice(), self.offs.as_mut_slice(), self.lens.as_mut_slice());
+    }
+
+    fn destroy(self: UiPathList, alloc: *mut AllocCap) {
+        let UiPathList.{ data, offs, lens } = self;
+        data.destroy(alloc);
+        offs.destroy(alloc);
+        lens.destroy(alloc);
+    }
+}
+
+fn join_path(
+    alloc: *mut AllocCap,
+    dir: *[u8],
+    name: *[u8],
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    out.clear();
+    try out.push_bytes_grow(alloc, dir);
+    if dir.len > 0_usize && dir[dir.len - 1_usize] != b'/' {
+        try out.push_byte_grow(alloc, b'/');
+    }
+    try out.push_bytes_grow(alloc, name);
+    return;
+}
+
+view fn path_basename(path: *[u8]) -> *[u8] {
+    var end = path.len;
+    while end > 0_usize && path[end - 1_usize] == b'/' {
+        end = end - 1_usize;
+    }
+    var i = end;
+    while i > 0_usize {
+        if path[i - 1_usize] == b'/' {
+            let s = path.sub(i, end) catch {
+                return path;
+            };
+            return s;
+        }
+        i = i - 1_usize;
+    }
+    let s = path.sub(0_usize, end) catch {
+        return path;
+    };
+    return s;
+}
+
+fn dir_mode(path: *[u8]) -> u8 {
+    var pos: usize = 0_usize;
+    while pos < path.len {
+        while pos < path.len && path[pos] == b'/' {
+            pos = pos +% 1_usize;
+        }
+        if pos >= path.len {
+            break;
+        }
+        let start = pos;
+        while pos < path.len && path[pos] != b'/' {
+            pos = pos +% 1_usize;
+        }
+        let seg = path.sub(start, pos) catch {
+            continue;
+        };
+        if str.starts_with(seg, "check_".as_bytes()) {
+            return MODE_CHECK;
+        }
+        if str.starts_with(seg, "parse_".as_bytes()) {
+            return MODE_PARSE;
+        }
+    }
+    return MODE_NONE;
+}
+
+fn collect_eon_files_sorted(
+    alloc: *mut AllocCap,
+    fs: *FsCap,
+    root: *str,
+    out: *mut UiPathList,
+) -> bool ! OutOfMemory | Utf8Error {
+    if !fs.is_dir(root) {
+        try out.push(alloc, root.as_bytes());
+        return true;
+    }
+
+    var stack = try UiPathList.init(alloc);
+    errdefer stack.destroy(alloc);
+    var cur_dir = try str.StrBuf.init(alloc, 128_usize);
+    errdefer cur_dir.destroy(alloc);
+    var joined = try str.StrBuf.init(alloc, 256_usize);
+    errdefer joined.destroy(alloc);
+
+    try stack.push(alloc, root.as_bytes());
+    var head: usize = 0_usize;
+    while head < stack.len() {
+        cur_dir.clear();
+        try cur_dir.push_bytes_grow(alloc, stack.get(head));
+        head = head +% 1_usize;
+
+        let dir_str = try cur_dir.as_str();
+        let entries = fs.list_dir(alloc, dir_str) catch {
+            joined.destroy(alloc);
+            cur_dir.destroy(alloc);
+            stack.destroy(alloc);
+            return false;
+        };
+        errdefer entries.destroy(alloc);
+
+        let raw_entries = entries.as_slice();
+        var pos: usize = 0_usize;
+        while pos < raw_entries.len {
+            let nstart = pos;
+            while pos < raw_entries.len && raw_entries[pos] != b'\n' {
+                pos = pos +% 1_usize;
+            }
+            let nend = pos;
+            if pos < raw_entries.len && raw_entries[pos] == b'\n' {
+                pos = pos +% 1_usize;
+            }
+            if nend <= nstart {
+                continue;
+            }
+            let name = raw_entries.sub(nstart, nend) catch {
+                continue;
+            };
+            try join_path(alloc, cur_dir.as_bytes(), name, &mut joined);
+            let jstr = try joined.as_str();
+            if fs.is_dir(jstr) {
+                try stack.push(alloc, joined.as_bytes());
+            } else if str.ends_with(name, ".eon".as_bytes()) {
+                try out.push(alloc, joined.as_bytes());
+            }
+        }
+        entries.destroy(alloc);
+    }
+
+    out.sort();
+    joined.destroy(alloc);
+    cur_dir.destroy(alloc);
+    stack.destroy(alloc);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// UI Case Discovery (matching `compiler/src/ui_test.rs::collect_ui_cases`)
+// ---------------------------------------------------------------------------
+
+struct UiCaseEntry {
+    kind: u8;
+    path_off: u32;
+    path_len: u32;
+}
+
+linear struct UiCaseList {
+    data: col.DynBuf[u8];
+    cases: col.DynBuf[UiCaseEntry];
+}
+
+impl UiCaseList {
+    fn init(alloc: *mut AllocCap) -> UiCaseList ! OutOfMemory {
+        let data = try col.DynBuf.[u8].init(alloc, 1024_usize);
+        errdefer data.destroy(alloc);
+        let cases = try col.DynBuf.[UiCaseEntry].init(alloc, 64_usize);
+        errdefer cases.destroy(alloc);
+        return UiCaseList.{ data: data, cases: cases };
+    }
+
+    fn len(self: *Self) -> usize {
+        return self.cases.len();
+    }
+
+    fn push(self: *mut Self, alloc: *mut AllocCap, kind: u8, path: *[u8]) -> !OutOfMemory {
+        let off = self.data.len().trunc.[u32]();
+        let n = path.len.trunc.[u32]();
+        try self.data.push_slice(alloc, path);
+        try self.cases.push(alloc, UiCaseEntry.{ kind: kind, path_off: off, path_len: n });
+        return;
+    }
+
+    fn case_kind(self: *Self, idx: usize) -> u8 {
+        let cs = self.cases.as_slice();
+        if idx < cs.len {
+            return cs[idx].kind;
+        }
+        return CASE_PARSE_FILE;
+    }
+
+    view fn case_path(self: *Self, idx: usize) -> *[u8] {
+        let empty: *str = "";
+        let cs = self.cases.as_slice();
+        if idx < cs.len {
+            return slice_off_len(self.data.as_slice(), cs[idx].path_off, cs[idx].path_len);
+        }
+        return empty.as_bytes();
+    }
+
+    fn destroy(self: UiCaseList, alloc: *mut AllocCap) {
+        let UiCaseList.{ data, cases } = self;
+        data.destroy(alloc);
+        cases.destroy(alloc);
+    }
+}
+
+fn dir_has_any_eon(
+    alloc: *mut AllocCap,
+    fs: *FsCap,
+    dir: *str,
+) -> bool ! OutOfMemory | Utf8Error {
+    var tmp = try UiPathList.init(alloc);
+    errdefer tmp.destroy(alloc);
+    let ok = try collect_eon_files_sorted(alloc, fs, dir, &mut tmp);
+    let any = ok && tmp.len() > 0_usize;
+    tmp.destroy(alloc);
+    return any;
+}
+
+fn collect_ui_cases(
+    alloc: *mut AllocCap,
+    fs: *FsCap,
+    root: *str,
+    out: *mut UiCaseList,
+) -> bool ! OutOfMemory | Utf8Error {
+    if !fs.is_dir(root) {
+        let m = dir_mode(root.as_bytes());
+        let kind = if m == MODE_CHECK { CASE_CHECK_FILE } else { CASE_PARSE_FILE };
+        try out.push(alloc, kind, root.as_bytes());
+        return true;
+    }
+
+    var dir_stack = try UiPathList.init(alloc);
+    errdefer dir_stack.destroy(alloc);
+    var cur_dir = try str.StrBuf.init(alloc, 128_usize);
+    errdefer cur_dir.destroy(alloc);
+    var joined = try str.StrBuf.init(alloc, 256_usize);
+    errdefer joined.destroy(alloc);
+
+    try dir_stack.push(alloc, root.as_bytes());
+    loop {
+        let popped = try dir_stack.pop_into(alloc, &mut cur_dir);
+        if !popped {
+            break;
+        }
+        let dir_str = try cur_dir.as_str();
+        let entries = fs.list_dir(alloc, dir_str) catch {
+            joined.destroy(alloc);
+            cur_dir.destroy(alloc);
+            dir_stack.destroy(alloc);
+            return false;
+        };
+        errdefer entries.destroy(alloc);
+
+        var sorted = try UiPathList.init(alloc);
+        errdefer sorted.destroy(alloc);
+
+        let raw_entries = entries.as_slice();
+        var pos: usize = 0_usize;
+        while pos < raw_entries.len {
+            let nstart = pos;
+            while pos < raw_entries.len && raw_entries[pos] != b'\n' {
+                pos = pos +% 1_usize;
+            }
+            let nend = pos;
+            if pos < raw_entries.len && raw_entries[pos] == b'\n' {
+                pos = pos +% 1_usize;
+            }
+            if nend <= nstart {
+                continue;
+            }
+            let name = raw_entries.sub(nstart, nend) catch {
+                continue;
+            };
+            try join_path(alloc, cur_dir.as_bytes(), name, &mut joined);
+            try sorted.push(alloc, joined.as_bytes());
+        }
+        entries.destroy(alloc);
+        sorted.sort();
+
+        // Push subdirectories onto DFS stack in reverse order so traversal is lexicographical.
+        var sub_dirs = try UiPathList.init(alloc);
+        errdefer sub_dirs.destroy(alloc);
+
+        var si: usize = 0_usize;
+        while si < sorted.len() {
+            let p_bytes = sorted.get(si);
+            let p_str = try p_bytes.as_str();
+            let base = path_basename(p_bytes);
+            if fs.is_dir(p_str) {
+                if str.starts_with(base, "pkg_".as_bytes()) && dir_mode(p_bytes) == MODE_CHECK {
+                    if try dir_has_any_eon(alloc, fs, p_str) {
+                        try out.push(alloc, CASE_CHECK_PKG, p_bytes);
+                    }
+                } else {
+                    try sub_dirs.push(alloc, p_bytes);
+                }
+            } else if str.ends_with(base, ".eon".as_bytes()) {
+                let m = dir_mode(p_bytes);
+                let kind = if m == MODE_CHECK { CASE_CHECK_FILE } else { CASE_PARSE_FILE };
+                try out.push(alloc, kind, p_bytes);
+            }
+            si = si +% 1_usize;
+        }
+
+        var di = sub_dirs.len();
+        while di > 0_usize {
+            di = di - 1_usize;
+            try dir_stack.push(alloc, sub_dirs.get(di));
+        }
+
+        sub_dirs.destroy(alloc);
+        sorted.destroy(alloc);
+    }
+
+    joined.destroy(alloc);
+    cur_dir.destroy(alloc);
+    dir_stack.destroy(alloc);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Directive Parser (`//~[^*] ERROR EXXXX[: substr]`) & Actual Diag Parser
+// ---------------------------------------------------------------------------
+
+struct ExpectedDiag {
+    fid: u32;
+    line: u32;
+    code_off: u32;
+    code_len: u32;
+    sub_off: u32;
+    sub_len: u32;
+}
+
+linear struct ExpectedList {
+    data: col.DynBuf[u8];
+    items: col.DynBuf[ExpectedDiag];
+}
+
+impl ExpectedList {
+    fn init(alloc: *mut AllocCap) -> ExpectedList ! OutOfMemory {
+        let data = try col.DynBuf.[u8].init(alloc, 128_usize);
+        errdefer data.destroy(alloc);
+        let items = try col.DynBuf.[ExpectedDiag].init(alloc, 8_usize);
+        errdefer items.destroy(alloc);
+        return ExpectedList.{ data: data, items: items };
+    }
+
+    fn len(self: *Self) -> usize {
+        return self.items.len();
+    }
+
+    fn push(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        fid: u32,
+        line: u32,
+        code: *[u8],
+        sub: *[u8],
+    ) -> !OutOfMemory {
+        let code_off = self.data.len().trunc.[u32]();
+        let code_len = code.len.trunc.[u32]();
+        try self.data.push_slice(alloc, code);
+        let sub_off = self.data.len().trunc.[u32]();
+        let sub_len = sub.len.trunc.[u32]();
+        try self.data.push_slice(alloc, sub);
+        try self.items.push(
+            alloc,
+            ExpectedDiag.{
+                fid: fid,
+                line: line,
+                code_off: code_off,
+                code_len: code_len,
+                sub_off: sub_off,
+                sub_len: sub_len,
+            },
+        );
+        return;
+    }
+
+    view fn code_at(self: *Self, idx: usize) -> *[u8] {
+        let empty: *str = "";
+        let sl = self.items.as_slice();
+        if idx < sl.len {
+            return slice_off_len(self.data.as_slice(), sl[idx].code_off, sl[idx].code_len);
+        }
+        return empty.as_bytes();
+    }
+
+    view fn sub_at(self: *Self, idx: usize) -> *[u8] {
+        let empty: *str = "";
+        let sl = self.items.as_slice();
+        if idx < sl.len {
+            return slice_off_len(self.data.as_slice(), sl[idx].sub_off, sl[idx].sub_len);
+        }
+        return empty.as_bytes();
+    }
+
+    fn destroy(self: ExpectedList, alloc: *mut AllocCap) {
+        let ExpectedList.{ data, items } = self;
+        data.destroy(alloc);
+        items.destroy(alloc);
+    }
+}
+
+fn is_ascii_ws(b: u8) -> bool {
+    return b == b' ' || b == b'\t' || b == b'\r' || b == b'\n';
+}
+
+view fn trim_ascii(s: *[u8]) -> *[u8] {
+    var start: usize = 0_usize;
+    while start < s.len && is_ascii_ws(s[start]) {
+        start = start +% 1_usize;
+    }
+    var end = s.len;
+    while end > start && is_ascii_ws(s[end - 1_usize]) {
+        end = end - 1_usize;
+    }
+    let out = s.sub(start, end) catch {
+        return s;
+    };
+    return out;
+}
+
+fn find_bytes(hay: *[u8], needle: *[u8]) -> ?usize {
+    if needle.len == 0_usize {
+        return 0_usize;
+    }
+    if needle.len > hay.len {
+        return null;
+    }
+    let limit = hay.len - needle.len;
+    var i: usize = 0_usize;
+    while i <= limit {
+        var j: usize = 0_usize;
+        var ok = true;
+        while j < needle.len {
+            let hi = i +% j;
+            if hi >= hay.len || hay[hi] != needle[j] {
+                ok = false;
+                break;
+            }
+            j = j +% 1_usize;
+        }
+        if ok {
+            return i;
+        }
+        i = i +% 1_usize;
+    }
+    return null;
+}
+
+fn find_byte(hay: *[u8], needle: u8) -> ?usize {
+    var i: usize = 0_usize;
+    while i < hay.len {
+        if hay[i] == needle {
+            return i;
+        }
+        i = i +% 1_usize;
+    }
+    return null;
+}
+
+fn parse_expected_errors_for_file(
+    alloc: *mut AllocCap,
+    fid: u32,
+    bytes: *[u8],
+    out: *mut ExpectedList,
+) -> !OutOfMemory {
+    var pos: usize = 0_usize;
+    var line_no: u32 = 0_u32;
+    while pos < bytes.len {
+        line_no = line_no +% 1_u32;
+        let lstart = pos;
+        while pos < bytes.len && bytes[pos] != b'\n' {
+            pos = pos +% 1_usize;
+        }
+        var lend = pos;
+        if pos < bytes.len && bytes[pos] == b'\n' {
+            pos = pos +% 1_usize;
+        }
+        if lend > lstart && bytes[lend - 1_usize] == b'\r' {
+            lend = lend - 1_usize;
+        }
+        let raw_line = bytes.sub(lstart, lend) catch {
+            continue;
+        };
+        let marker = find_bytes(raw_line, "//~".as_bytes()) orelse {
+            continue;
+        };
+        var rpos = marker +% 3_usize;
+        var target_line = line_no;
+        while rpos < raw_line.len && raw_line[rpos] == b'^' {
+            if target_line > 0_u32 {
+                target_line = target_line - 1_u32;
+            }
+            rpos = rpos +% 1_usize;
+        }
+        let rest0 = raw_line.sub(rpos, raw_line.len) catch {
+            continue;
+        };
+        let rest = trim_ascii(rest0);
+        if !str.starts_with(rest, "ERROR".as_bytes()) {
+            continue;
+        }
+        let after0 = rest.sub(5_usize, rest.len) catch {
+            continue;
+        };
+        let after = trim_ascii(after0);
+        if after.len == 0_usize {
+            continue;
+        }
+        let empty: *str = "";
+        if let cpos = find_byte(after, b':') {
+            let cpart = after.sub(0_usize, cpos) catch {
+                continue;
+            };
+            let mpart = after.sub(cpos +% 1_usize, after.len) catch {
+                empty.as_bytes()
+            };
+            let code = trim_ascii(cpart);
+            let sub = trim_ascii(mpart);
+            if code.len > 0_usize {
+                try out.push(alloc, fid, target_line, code, sub);
+            }
+        } else {
+            var tok_end: usize = 0_usize;
+            while tok_end < after.len && !is_ascii_ws(after[tok_end]) {
+                tok_end = tok_end +% 1_usize;
+            }
+            let code = after.sub(0_usize, tok_end) catch {
+                continue;
+            };
+            if code.len > 0_usize {
+                try out.push(alloc, fid, target_line, code, empty.as_bytes());
+            }
+        }
+    }
+    return;
+}
+
+struct ActualDiag {
+    file_off: u32;
+    file_len: u32;
+    line: u32;
+    code_off: u32;
+    code_len: u32;
+    msg_off: u32;
+    msg_len: u32;
+}
+
+linear struct ActualList {
+    items: col.DynBuf[ActualDiag];
+}
+
+impl ActualList {
+    fn init(alloc: *mut AllocCap) -> ActualList ! OutOfMemory {
+        let items = try col.DynBuf.[ActualDiag].init(alloc, 8_usize);
+        return ActualList.{ items: items };
+    }
+
+    fn len(self: *Self) -> usize {
+        return self.items.len();
+    }
+
+    fn destroy(self: ActualList, alloc: *mut AllocCap) {
+        let ActualList.{ items } = self;
+        items.destroy(alloc);
+    }
+}
+
+fn parse_rendered_diags(
+    alloc: *mut AllocCap,
+    rendered: *[u8],
+    out: *mut ActualList,
+) -> !OutOfMemory {
+    var pos: usize = 0_usize;
+    while pos < rendered.len {
+        let lstart = pos;
+        while pos < rendered.len && rendered[pos] != b'\n' {
+            pos = pos +% 1_usize;
+        }
+        let lend = pos;
+        if pos < rendered.len && rendered[pos] == b'\n' {
+            pos = pos +% 1_usize;
+        }
+        let line = rendered.sub(lstart, lend) catch {
+            continue;
+        };
+        if !str.starts_with(line, "error[E".as_bytes()) {
+            continue;
+        }
+        let rb = find_byte(line, b']') orelse {
+            continue;
+        };
+        let colon_idx = rb +% 1_usize;
+        if rb <= 6_usize || colon_idx >= line.len {
+            continue;
+        }
+        if line[colon_idx] != b':' {
+            continue;
+        }
+        let code_off = (lstart +% 6_usize).trunc.[u32]();
+        let code_len = (rb - 6_usize).trunc.[u32]();
+        var msg_rel = rb +% 2_usize;
+        if msg_rel < line.len && line[msg_rel] == b' ' {
+            msg_rel = msg_rel +% 1_usize;
+        }
+        let msg_off = (lstart +% msg_rel).trunc.[u32]();
+        let msg_len = if line.len >= msg_rel {
+            (line.len - msg_rel).trunc.[u32]()
+        } else {
+            0_u32
+        };
+
+        var file_off: u32 = 0_u32;
+        var file_len: u32 = 0_u32;
+        var diag_line: u32 = 0_u32;
+
+        // Peek next line for `<spaces>--> <filename>:<line>:<col>`
+        if pos < rendered.len {
+            let nstart = pos;
+            var nend = pos;
+            while nend < rendered.len && rendered[nend] != b'\n' {
+                nend = nend +% 1_usize;
+            }
+            var sp = nstart;
+            while sp < nend && rendered[sp] == b' ' {
+                sp = sp +% 1_usize;
+            }
+            let nslice = rendered.sub(sp, nend) catch {
+                rendered.sub(0_usize, 0_usize) catch { rendered }
+            };
+            if str.starts_with(nslice, "--> ".as_bytes()) {
+                let loc_start = sp +% 4_usize;
+                var c2 = nend;
+                var found_c2 = false;
+                while c2 > loc_start {
+                    c2 = c2 - 1_usize;
+                    if rendered[c2] == b':' {
+                        found_c2 = true;
+                        break;
+                    }
+                }
+                if found_c2 {
+                    var c1 = c2;
+                    var found_c1 = false;
+                    while c1 > loc_start {
+                        c1 = c1 - 1_usize;
+                        if rendered[c1] == b':' {
+                            found_c1 = true;
+                            break;
+                        }
+                    }
+                    if found_c1 && c1 >= loc_start {
+                        let line_slice = rendered.sub(c1 +% 1_usize, c2) catch {
+                            rendered.sub(0_usize, 0_usize) catch { rendered }
+                        };
+                        let parsed_ln = str.parse_u64(line_slice) catch { 0_u64 };
+                        diag_line = parsed_ln.trunc.[u32]();
+                        file_off = loc_start.trunc.[u32]();
+                        file_len = (c1 -% loc_start).trunc.[u32]();
+                    }
+                }
+                pos = if nend < rendered.len { nend +% 1_usize } else { nend };
+            }
+        }
+
+        try out.items.push(
+            alloc,
+            ActualDiag.{
+                file_off: file_off,
+                file_len: file_len,
+                line: diag_line,
+                code_off: code_off,
+                code_len: code_len,
+                msg_off: msg_off,
+                msg_len: msg_len,
+            },
+        );
+    }
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// 1-to-1 Diagnostic Verification (matching `ui_test.rs::verify_diagnostics`)
+// ---------------------------------------------------------------------------
+
+fn verify_diagnostics(
+    alloc: *mut AllocCap,
+    sm: *span.SourceMap,
+    diags: *diag.DiagBag,
+    expected: *ExpectedList,
+    reason_out: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    reason_out.clear();
+    var rendered = try str.StrBuf.init(alloc, 256_usize);
+    errdefer rendered.destroy(alloc);
+    try diags.render_all(alloc, sm, &mut rendered);
+    let rbytes = rendered.as_bytes();
+
+    var actual = try ActualList.init(alloc);
+    errdefer actual.destroy(alloc);
+    try parse_rendered_diags(alloc, rbytes, &mut actual);
+
+    if expected.len() == 0_usize {
+        if actual.len() == 0_usize && !diags.has_errors() {
+            actual.destroy(alloc);
+            rendered.destroy(alloc);
+            return true;
+        }
+        try reason_out.push_str_grow(alloc, "expected 0 errors, got ");
+        try reason_out.push_u64_grow(alloc, diags.count().widen.[u64]());
+        try reason_out.push_str_grow(alloc, ":\n");
+        try reason_out.push_bytes_grow(alloc, rbytes);
+        actual.destroy(alloc);
+        rendered.destroy(alloc);
+        return false;
+    }
+
+    let n_act = actual.len();
+    var matched = try col.DynBuf.[u8].init(alloc, if n_act < 4_usize { 4_usize } else { n_act });
+    errdefer matched.destroy(alloc);
+    var mi: usize = 0_usize;
+    while mi < n_act {
+        try matched.push(alloc, 0_u8);
+        mi = mi +% 1_usize;
+    }
+
+    var missing_cnt: usize = 0_usize;
+    let exps = expected.items.as_slice();
+    let acts = actual.items.as_slice();
+    let m_mut = matched.as_mut_slice();
+
+    var ei: usize = 0_usize;
+    while ei < exps.len {
+        let exp = exps[ei];
+        let efname = sm.file_name(exp.fid);
+        let ecode = expected.code_at(ei);
+        let esub = expected.sub_at(ei);
+
+        var found = false;
+        var ai: usize = 0_usize;
+        while ai < acts.len && ai < m_mut.len {
+            if m_mut[ai] == 0_u8 {
+                let act = acts[ai];
+                let afname = slice_off_len(rbytes, act.file_off, act.file_len);
+                let acode = slice_off_len(rbytes, act.code_off, act.code_len);
+                let amsg = slice_off_len(rbytes, act.msg_off, act.msg_len);
+                let sub_ok = if esub.len == 0_usize {
+                    true
+                } else {
+                    find_bytes(amsg, esub) != null
+                };
+                if act.line == exp.line
+                    && str.bytes_eq(afname, efname)
+                    && str.bytes_eq(acode, ecode)
+                    && sub_ok
+                {
+                    m_mut[ai] = 1_u8;
+                    found = true;
+                    break;
+                }
+            }
+            ai = ai +% 1_usize;
+        }
+        if !found {
+            missing_cnt = missing_cnt +% 1_usize;
+            try reason_out.push_str_grow(alloc, "  - missing: ");
+            try reason_out.push_bytes_grow(alloc, efname);
+            try reason_out.push_str_grow(alloc, " line ");
+            try reason_out.push_u64_grow(alloc, exp.line.widen.[u64]());
+            try reason_out.push_str_grow(alloc, ": expected ");
+            try reason_out.push_bytes_grow(alloc, ecode);
+            if esub.len > 0_usize {
+                try reason_out.push_str_grow(alloc, " `");
+                try reason_out.push_bytes_grow(alloc, esub);
+                try reason_out.push_byte_grow(alloc, b'`');
+            }
+            try reason_out.push_byte_grow(alloc, b'\n');
+        }
+        ei = ei +% 1_usize;
+    }
+
+    var unexp_cnt: usize = 0_usize;
+    var ui: usize = 0_usize;
+    while ui < acts.len && ui < m_mut.len {
+        if m_mut[ui] == 0_u8 {
+            unexp_cnt = unexp_cnt +% 1_usize;
+            let act = acts[ui];
+            let afname = if act.file_len == 0_u32 {
+                "<dummy>".as_bytes()
+            } else {
+                slice_off_len(rbytes, act.file_off, act.file_len)
+            };
+            let acode = slice_off_len(rbytes, act.code_off, act.code_len);
+            let amsg = slice_off_len(rbytes, act.msg_off, act.msg_len);
+            try reason_out.push_str_grow(alloc, "  - unexpected: ");
+            try reason_out.push_bytes_grow(alloc, afname);
+            try reason_out.push_str_grow(alloc, " line ");
+            try reason_out.push_u64_grow(alloc, act.line.widen.[u64]());
+            try reason_out.push_str_grow(alloc, ": unexpected ");
+            try reason_out.push_bytes_grow(alloc, acode);
+            try reason_out.push_str_grow(alloc, " `");
+            try reason_out.push_bytes_grow(alloc, amsg);
+            try reason_out.push_str_grow(alloc, "`\n");
+        }
+        ui = ui +% 1_usize;
+    }
+
+    let ok = missing_cnt == 0_usize && unexp_cnt == 0_usize;
+    if !ok {
+        try reason_out.push_bytes_grow(alloc, rbytes);
+    }
+
+    matched.destroy(alloc);
+    actual.destroy(alloc);
+    rendered.destroy(alloc);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test Case Runners (parse_*, check_* single file, check_* pkg_*)
+// ---------------------------------------------------------------------------
+
+fn run_single_parse_case(
+    alloc: *mut AllocCap,
+    fs: *FsCap,
+    path_bytes: *[u8],
+    reason_out: *mut str.StrBuf,
+) -> bool ! OutOfMemory | Utf8Error {
+    let p_str = try path_bytes.as_str();
+    let fbuf = fs.read_file(alloc, p_str) catch {
+        reason_out.clear();
+        try reason_out.push_str_grow(alloc, "failed to read file `");
+        try reason_out.push_bytes_grow(alloc, path_bytes);
+        try reason_out.push_str_grow(alloc, "`\n");
+        return false;
+    };
+    errdefer fbuf.destroy(alloc);
+
+    var expected = try ExpectedList.init(alloc);
+    errdefer expected.destroy(alloc);
+    try parse_expected_errors_for_file(alloc, 0_u32, fbuf.as_slice(), &mut expected);
+
+    var sm = try span.SourceMap.init(alloc);
+    errdefer sm.destroy(alloc);
+    var interner = try span.SymInterner.init(alloc);
+    errdefer interner.destroy(alloc);
+    var diags = try diag.DiagBag.init(alloc);
+    errdefer diags.destroy(alloc);
+    var arena = try ast.AstArena.init(alloc);
+    errdefer arena.destroy(alloc);
+
+    let fid = try sm.add_file_bytes(alloc, path_bytes, fbuf.as_slice());
+    fbuf.destroy(alloc);
+    _ = try parser.parse_file(alloc, &sm, fid, &mut interner, &mut diags, &mut arena);
+
+    let passed = try verify_diagnostics(alloc, &sm, &diags, &expected, reason_out);
+
+    arena.destroy(alloc);
+    diags.destroy(alloc);
+    interner.destroy(alloc);
+    sm.destroy(alloc);
+    expected.destroy(alloc);
+    return passed;
+}
+
+fn run_semantic_pipeline(
+    alloc: *mut AllocCap,
+    arena: *ast.AstArena,
+    unit_ids: *[u32],
+    interner: *mut span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    var resolved = try resolve.resolve_program(alloc, arena, unit_ids, interner, diags);
+    errdefer resolved.destroy(alloc);
+    var tenv = try types.build_type_env(alloc, arena, &mut resolved, interner, diags);
+    errdefer tenv.destroy(alloc);
+    var ct = try ctvm.CtArena.init(alloc);
+    errdefer ct.destroy(alloc);
+
+    let ttable = try check.check_program(
+        alloc, arena, unit_ids, &mut resolved, &mut tenv, &mut ct, interner, diags,
+    );
+    errdefer ttable.destroy(alloc);
+
+    let pre_err_count = diags.count();
+    let cfg_prog = try cfg.lower_program(
+        alloc, arena, unit_ids, &resolved, &mut tenv, &ct, &ttable, interner,
+    );
+    errdefer cfg_prog.destroy(alloc);
+
+    try borrow.analyze_program(alloc, &resolved, &tenv, &cfg_prog, interner, diags);
+    if pre_err_count == 0_usize {
+        let eff_rep = try effects.check_effects_and_concurrency(
+            alloc, arena, unit_ids, &resolved, &tenv, &cfg_prog, interner, diags,
+        );
+        eff_rep.destroy(alloc);
+    }
+
+    var eir_prog = try eir.lower_cfg_to_eir_with_diags(
+        alloc, &cfg_prog, &resolved, &tenv, interner, diags, false,
+    );
+    errdefer eir_prog.destroy(alloc);
+
+    if pre_err_count == 0_usize {
+        let ver_rep = try verify.verify_program(
+            alloc, arena, &resolved, &tenv, &mut eir_prog, interner, diags,
+        );
+        ver_rep.destroy(alloc);
+        try eir.apply_layout_sharing(alloc, &mut eir_prog, &tenv);
+    }
+
+    eir_prog.destroy(alloc);
+    cfg_prog.destroy(alloc);
+    ttable.destroy(alloc);
+    ct.destroy(alloc);
+    tenv.destroy(alloc);
+    resolved.destroy(alloc);
+    return;
+}
+
+fn run_check_files_case(
+    alloc: *mut AllocCap,
+    fs: *FsCap,
+    files: *UiPathList,
+    reason_out: *mut str.StrBuf,
+) -> bool ! OutOfMemory | Utf8Error {
+    var expected = try ExpectedList.init(alloc);
+    errdefer expected.destroy(alloc);
+    var sm = try span.SourceMap.init(alloc);
+    errdefer sm.destroy(alloc);
+    var interner = try span.SymInterner.init(alloc);
+    errdefer interner.destroy(alloc);
+    var diags = try diag.DiagBag.init(alloc);
+    errdefer diags.destroy(alloc);
+    var arena = try ast.AstArena.init(alloc);
+    errdefer arena.destroy(alloc);
+    var unit_ids = try col.DynBuf.[u32].init(alloc, 8_usize);
+    errdefer unit_ids.destroy(alloc);
+
+    var fi: usize = 0_usize;
+    while fi < files.len() {
+        let p_bytes = files.get(fi);
+        let p_str = try p_bytes.as_str();
+        let fbuf = fs.read_file(alloc, p_str) catch {
+            reason_out.clear();
+            try reason_out.push_str_grow(alloc, "failed to read `");
+            try reason_out.push_bytes_grow(alloc, p_bytes);
+            try reason_out.push_str_grow(alloc, "`\n");
+            unit_ids.destroy(alloc);
+            arena.destroy(alloc);
+            diags.destroy(alloc);
+            interner.destroy(alloc);
+            sm.destroy(alloc);
+            expected.destroy(alloc);
+            return false;
+        };
+        errdefer fbuf.destroy(alloc);
+
+        let fid = try sm.add_file_bytes(alloc, p_bytes, fbuf.as_slice());
+        try parse_expected_errors_for_file(alloc, fid, fbuf.as_slice(), &mut expected);
+        fbuf.destroy(alloc);
+
+        let uid = try parser.parse_file(alloc, &sm, fid, &mut interner, &mut diags, &mut arena);
+        try unit_ids.push(alloc, uid);
+        fi = fi +% 1_usize;
+    }
+
+    try run_semantic_pipeline(alloc, &arena, unit_ids.as_slice(), &mut interner, &mut diags);
+
+    let passed = try verify_diagnostics(alloc, &sm, &diags, &expected, reason_out);
+
+    unit_ids.destroy(alloc);
+    arena.destroy(alloc);
+    diags.destroy(alloc);
+    interner.destroy(alloc);
+    sm.destroy(alloc);
+    expected.destroy(alloc);
+    return passed;
+}
+
+// ---------------------------------------------------------------------------
+// Public Entrypoint (`run_ui_tests`)
+// ---------------------------------------------------------------------------
+
+fn push_ms_2dec(alloc: *mut AllocCap, elapsed_ns: u64, out: *mut str.StrBuf) -> !OutOfMemory {
+    let whole_ms = elapsed_ns / 1000000_u64;
+    let frac = (elapsed_ns / 10000_u64) % 100_u64;
+    try out.push_u64_grow(alloc, whole_ms);
+    try out.push_byte_grow(alloc, b'.');
+    if frac < 10_u64 {
+        try out.push_byte_grow(alloc, b'0');
+    }
+    try out.push_u64_grow(alloc, frac);
+    return;
+}
+
+pub fn run_ui_tests(
+    env: *mut Env,
+    root_dir: *str,
+) -> i32 ! OutOfMemory | Utf8Error {
+    var err_buf = try str.StrBuf.init(&mut env.alloc, 256_usize);
+    errdefer err_buf.destroy(&mut env.alloc);
+
+    if !env.fs.is_dir(root_dir) {
+        let probe = env.fs.read_file(&mut env.alloc, root_dir) catch {
+            try err_buf.push_str_grow(&mut env.alloc, "test directory `");
+            try err_buf.push_str_grow(&mut env.alloc, root_dir);
+            try err_buf.push_str_grow(&mut env.alloc, "` does not exist\n");
+            rt.eprint_bytes(err_buf.as_bytes());
+            err_buf.destroy(&mut env.alloc);
+            return 1_i32;
+        };
+        probe.destroy(&mut env.alloc);
+    }
+
+    let start_ns = rt.now_ns(&env.clock);
+    var cases = try UiCaseList.init(&mut env.alloc);
+    errdefer cases.destroy(&mut env.alloc);
+
+    let col_ok = try collect_ui_cases(&mut env.alloc, &env.fs, root_dir, &mut cases);
+    if !col_ok {
+        try err_buf.push_str_grow(&mut env.alloc, "error scanning `");
+        try err_buf.push_str_grow(&mut env.alloc, root_dir);
+        try err_buf.push_str_grow(&mut env.alloc, "`\n");
+        rt.eprint_bytes(err_buf.as_bytes());
+        cases.destroy(&mut env.alloc);
+        err_buf.destroy(&mut env.alloc);
+        return 1_i32;
+    }
+
+    var reason_buf = try str.StrBuf.init(&mut env.alloc, 512_usize);
+    errdefer reason_buf.destroy(&mut env.alloc);
+
+    let total = cases.len();
+    var passed: usize = 0_usize;
+    var ci: usize = 0_usize;
+    while ci < total {
+        let kind = cases.case_kind(ci);
+        let cpath = cases.case_path(ci);
+        var ok = false;
+        if kind == CASE_PARSE_FILE {
+            ok = try run_single_parse_case(&mut env.alloc, &env.fs, cpath, &mut reason_buf);
+        } else if kind == CASE_CHECK_FILE {
+            var single = try UiPathList.init(&mut env.alloc);
+            errdefer single.destroy(&mut env.alloc);
+            try single.push(&mut env.alloc, cpath);
+            ok = try run_check_files_case(&mut env.alloc, &env.fs, &single, &mut reason_buf);
+            single.destroy(&mut env.alloc);
+        } else {
+            var pkg_files = try UiPathList.init(&mut env.alloc);
+            errdefer pkg_files.destroy(&mut env.alloc);
+            let p_str = try cpath.as_str();
+            let p_ok = try collect_eon_files_sorted(&mut env.alloc, &env.fs, p_str, &mut pkg_files);
+            if p_ok {
+                ok = try run_check_files_case(&mut env.alloc, &env.fs, &pkg_files, &mut reason_buf);
+            } else {
+                reason_buf.clear();
+                try reason_buf.push_str_grow(&mut env.alloc, "failed to collect package files\n");
+            }
+            pkg_files.destroy(&mut env.alloc);
+        }
+
+        if ok {
+            passed = passed +% 1_usize;
+        } else {
+            err_buf.clear();
+            try err_buf.push_str_grow(&mut env.alloc, "FAIL ");
+            try err_buf.push_bytes_grow(&mut env.alloc, cpath);
+            try err_buf.push_byte_grow(&mut env.alloc, b'\n');
+            let rbs = reason_buf.as_bytes();
+            try err_buf.push_bytes_grow(&mut env.alloc, rbs);
+            if rbs.len == 0_usize || rbs[rbs.len - 1_usize] != b'\n' {
+                try err_buf.push_byte_grow(&mut env.alloc, b'\n');
+            }
+            rt.eprint_bytes(err_buf.as_bytes());
+        }
+        ci = ci +% 1_usize;
+    }
+
+    let elapsed_ns = rt.elapsed_since(&env.clock, start_ns);
+    var out_buf = try str.StrBuf.init(&mut env.alloc, 128_usize);
+    errdefer out_buf.destroy(&mut env.alloc);
+    try out_buf.push_str_grow(&mut env.alloc, "ui-test: ");
+    try out_buf.push_u64_grow(&mut env.alloc, passed.widen.[u64]());
+    try out_buf.push_byte_grow(&mut env.alloc, b'/');
+    try out_buf.push_u64_grow(&mut env.alloc, total.widen.[u64]());
+    try out_buf.push_str_grow(&mut env.alloc, " passed in ");
+    try push_ms_2dec(&mut env.alloc, elapsed_ns, &mut out_buf);
+    try out_buf.push_str_grow(&mut env.alloc, " ms\n");
+    rt.print_bytes(out_buf.as_bytes());
+
+    out_buf.destroy(&mut env.alloc);
+    reason_buf.destroy(&mut env.alloc);
+    cases.destroy(&mut env.alloc);
+    err_buf.destroy(&mut env.alloc);
+
+    if passed == total && total > 0_usize {
+        return 0_i32;
+    }
+    return 1_i32;
+}

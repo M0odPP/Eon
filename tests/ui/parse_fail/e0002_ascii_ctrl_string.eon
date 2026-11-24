@@ -1,0 +1,2 @@
+module fail.ctrl_str;
+pub const S: *str = "hithere"; //~ ERROR E0002

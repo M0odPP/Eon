@@ -1,0 +1,4 @@
+module fail.fn_tail;
+pub fn f() -> u32 {
+    1_u32 //~ ERROR E0124
+}

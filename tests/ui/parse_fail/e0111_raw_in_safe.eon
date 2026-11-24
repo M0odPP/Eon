@@ -1,0 +1,7 @@
+module app.bad_hal;
+pub fn try_hack() {
+    raw { //~ ERROR E0111
+        let x = 1_u32;
+        _ = x;
+    }
+}

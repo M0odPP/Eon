@@ -1,0 +1,79 @@
+module core.mem;
+
+/// Swap two values in-place (Layout-Shared across all types with identical `(size, align)`).
+pub fn swap[T](a: *mut T, b: *mut T) {
+    let tmp = a.*;
+    a.* = b.*;
+    b.* = tmp;
+}
+
+/// Copy `n` elements from `src` to `dst` with zero hidden bounds checks (Layout-Shared).
+pub fn copy_slice[T](dst: *mut [T], src: *[T], n: usize)
+    where n <= dst.len && n <= src.len
+{
+    for i in 0_usize..n {
+        dst[i] = src[i];
+    }
+}
+
+/// Linear frame-allocator wrapper around the runtime `Arena` capability.
+pub linear struct FrameArena {
+    inner: Arena;
+}
+
+impl FrameArena {
+    pub fn init(alloc: *mut AllocCap, bytes: usize) -> FrameArena ! MemError {
+        let inner = try Arena.init(alloc, bytes);
+        return FrameArena.{ inner: inner };
+    }
+
+    pub view fn alloc_bytes(self: *mut Self, bytes: usize) -> *mut [u8] ! MemError {
+        return try self.inner.alloc(bytes);
+    }
+
+    pub fn used_bytes(self: *Self) -> usize {
+        return self.inner.used_bytes();
+    }
+
+    pub fn capacity(self: *Self) -> usize {
+        return self.inner.capacity();
+    }
+
+    pub fn reset(self: *mut Self) {
+        self.inner.reset();
+    }
+
+    pub fn destroy(self: FrameArena, alloc: *mut AllocCap) {
+        let FrameArena.{ inner } = self;
+        inner.destroy(alloc);
+    }
+}
+
+/// Library constructor for a frame-scoped SoA `ArenaPool[T]`.
+pub view fn init_frame_pool[T](arena: *mut FrameArena, cap: usize) -> ArenaPool[T] ! MemError {
+    return try ArenaPool.[T].init(&mut arena.inner, cap);
+}
+
+/// Library constructor for a persistent generational SoA `SlotPool[T]`.
+pub fn init_slot_pool[T](alloc: *mut AllocCap, cap: usize) -> SlotPool[T] ! OutOfMemory {
+    return try SlotPool.[T].init(alloc, cap);
+}
+
+/// Library constructor for a growable typed `Buf[T]`.
+pub fn init_buf[T](alloc: *mut AllocCap, cap: usize) -> Buf[T] ! OutOfMemory {
+    return try Buf.[T].init(alloc, cap);
+}
+
+/// Library constructor for a linear-element `LinearBuf[T]`.
+pub fn init_linear_buf[T](alloc: *mut AllocCap, cap: usize) -> LinearBuf[T] ! OutOfMemory {
+    return try LinearBuf.[T].init(alloc, cap);
+}
+
+/// Fixed-capacity bump-allocated byte slice helper inside a `FrameArena`.
+pub view fn arena_zero_buf(arena: *mut FrameArena, len: usize) -> *mut [u8] ! MemError {
+    let mem = try arena.alloc_bytes(len);
+    for i in 0_usize..mem.len {
+        mem[i] = 0_u8;
+    }
+    return mem;
+}

@@ -1,0 +1,26 @@
+module fail.exclusivity;
+
+pub pool Node {
+    pub val: u32;
+}
+
+fn swap_two(a: *mut u32, b: *mut u32) {
+    let tmp = a.*;
+    a.* = b.*;
+    b.* = tmp;
+}
+
+fn mix_mut_shared(a: *mut u32, b: *u32) {
+    a.* = a.* +% b.*;
+}
+
+pub fn alias_errors(arena: *mut Arena) -> !MemError {
+    var x: u32 = 10_u32;
+    swap_two(&mut x, &mut x); //~ ERROR E0118
+    mix_mut_shared(&mut x, &x); //~ ERROR E0118
+
+    let nodes = try ArenaPool.[Node].init(arena, 64_usize);
+    arena.reset(); //~ ERROR E0118
+    let _ = nodes.len();
+    return;
+}

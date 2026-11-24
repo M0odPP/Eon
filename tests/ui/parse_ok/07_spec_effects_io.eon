@@ -1,0 +1,61 @@
+module example.effects_ok;
+
+@align(64)
+pub struct IoSqe {
+    pub op:        IoOp;
+    pub flags:     u8;
+    pub _pad:      u16;
+    pub fd:        u32;
+    pub offset:    u64;
+    pub buf_addr:  u64;
+    pub buf_len:   u32;
+    pub op_flags:  u32;
+    pub user_data: u64;
+    pub _ext:      [24]u8;
+}
+
+@align(16)
+pub struct IoCqe {
+    pub user_data: u64;
+    pub result:    i32;
+    pub flags:     u32;
+}
+
+pub fn drain[T](buf: LinearBuf[T], alloc: *mut AllocCap, f: fn(T))
+    @effects_of(f) @stack(96 + @stack_of(f))
+{
+    _ = buf;
+    _ = alloc;
+    _ = f;
+}
+
+pub fn pure_math(a: f32, b: f32) -> f32 @pure @noalloc @noblock @stack(32) {
+    return (a * a) + (b * b);
+}
+
+pub fn kernel_helper(x: f32) -> f32 @noalloc @noblock @stack(128) {
+    return pure_math(x, 2.0_f32);
+}
+
+pub fn handle_client(conn: TcpStream, io: IoCap) -> !NetError @stack(4096) {
+    errdefer conn.close(io);
+    var buf: [2048]u8 = [0_u8; 2048];
+    loop {
+        let n = try conn.read(io, &mut buf[0_usize..2048_usize]);
+        if n == 0_usize { break; }
+        try conn.write_all(io, &buf[0_usize..n]);
+    }
+    conn.close(io);
+    return;
+}
+
+pub fn main(env: *mut Env) -> !AppError {
+    var frame_arena = try Arena.init(&mut env.alloc, 65536_usize);
+    defer frame_arena.destroy(&mut env.alloc);
+    let doc = try json.parse("{}", &mut frame_arena);
+    _ = doc;
+
+    let api_cap = env.net.restrict_host("api.example.com", 443_u16);
+    try client.fetch(api_cap, env.io);
+    return;
+}

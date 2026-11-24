@@ -1,0 +1,423 @@
+module app.json_parser;
+
+import core.mem;
+import core.str;
+import rt.hal;
+
+pub error JsonError {
+    UnexpectedEof,
+    UnexpectedToken,
+    InvalidEscape,
+    InvalidNumber,
+    TrailingData,
+    DepthLimit,
+}
+
+pub enum JsonKind : u8 {
+    Null = 0,
+    Bool = 1,
+    Int = 2,
+    Str = 3,
+    Array = 4,
+    Object = 5,
+}
+
+pub pool JsonNode {
+    pub kind: JsonKind;
+    pub int_val: i64;
+    pub bool_val: bool;
+    pub str_start: usize;
+    pub str_len: usize;
+    pub child_count: usize;
+    pub first_child: ?Link[Self];
+    pub next_sibling: ?Link[Self];
+}
+
+pub struct StrSpan {
+    pub start: usize;
+    pub len: usize;
+}
+
+pub struct ParserState {
+    pub pos: usize;
+    pub depth: u32;
+}
+
+fn is_ws(b: u8) -> bool {
+    return b == b' ' || b == b'\t' || b == b'\n' || b == b'\r';
+}
+
+fn skip_ws(src: *[u8], st: *mut ParserState) {
+    var p = st.pos;
+    while p < src.len {
+        if !is_ws(src[p]) {
+            break;
+        }
+        p = p + 1_usize;
+    }
+    st.pos = p;
+}
+
+fn expect_lit(src: *[u8], st: *mut ParserState, lit: *[u8]) -> !JsonError {
+    var i: usize = 0_usize;
+    while i < lit.len {
+        let p = st.pos;
+        if p >= src.len {
+            return .UnexpectedEof;
+        }
+        if src[p] != lit[i] {
+            return .UnexpectedToken;
+        }
+        st.pos = p + 1_usize;
+        i = i + 1_usize;
+    }
+    return;
+}
+
+fn parse_string_span(src: *[u8], st: *mut ParserState) -> StrSpan ! JsonError {
+    let p0 = st.pos;
+    if p0 >= src.len || src[p0] != b'"' {
+        return .UnexpectedToken;
+    }
+    st.pos = p0 + 1_usize;
+    var p = st.pos;
+    let start = p;
+    var count: usize = 0_usize;
+    while p < src.len {
+        let ch = src[p];
+        if ch == b'"' {
+            st.pos = p + 1_usize;
+            return StrSpan.{ start: start, len: count };
+        }
+        if ch == b'\\' {
+            let next_p = p + 1_usize;
+            if next_p >= src.len {
+                return .UnexpectedEof;
+            }
+            let esc = src[next_p];
+            if esc != b'"' && esc != b'\\' && esc != b'/' && esc != b'n' && esc != b'r' && esc != b't' {
+                return .InvalidEscape;
+            }
+            p = next_p + 1_usize;
+            count = count +% 2_usize;
+            continue;
+        }
+        if ch < 0x20_u8 {
+            return .UnexpectedToken;
+        }
+        p = p + 1_usize;
+        count = count +% 1_usize;
+    }
+    st.pos = p;
+    return .UnexpectedEof;
+}
+
+fn parse_int(src: *[u8], st: *mut ParserState) -> i64 ! JsonError {
+    var neg = false;
+    let p0 = st.pos;
+    if p0 >= src.len {
+        return .UnexpectedEof;
+    }
+    if src[p0] == b'-' {
+        neg = true;
+        st.pos = p0 + 1_usize;
+    }
+    var p = st.pos;
+    let start = p;
+    var acc: i64 = 0_i64;
+    while p < src.len {
+        let ch = src[p];
+        if ch < b'0' || ch > b'9' {
+            break;
+        }
+        let d = (ch - b'0').widen.[i64]();
+        acc = (acc *% 10_i64) +% d;
+        p = p + 1_usize;
+    }
+    st.pos = p;
+    if p == start {
+        return .InvalidNumber;
+    }
+    if neg {
+        return 0_i64 -% acc;
+    }
+    return acc;
+}
+
+@recursive
+fn parse_value(
+    src: *[u8],
+    st: *mut ParserState,
+    nodes: *mut ArenaPool[JsonNode],
+) -> Id[nodes] ! JsonError | MemError {
+    skip_ws(src, st);
+    let p = st.pos;
+    if p >= src.len {
+        return .UnexpectedEof;
+    }
+    if st.depth >= 32_u32 {
+        return .DepthLimit;
+    }
+    let ch = src[p];
+
+    if ch == b'n' {
+        try expect_lit(src, st, "null".as_bytes());
+        return try nodes.push(.{
+            kind: .Null,
+            int_val: 0_i64,
+            bool_val: false,
+            str_start: 0_usize,
+            str_len: 0_usize,
+            child_count: 0_usize,
+            first_child: null,
+            next_sibling: null,
+        });
+    }
+    if ch == b't' {
+        try expect_lit(src, st, "true".as_bytes());
+        return try nodes.push(.{
+            kind: .Bool,
+            int_val: 0_i64,
+            bool_val: true,
+            str_start: 0_usize,
+            str_len: 0_usize,
+            child_count: 0_usize,
+            first_child: null,
+            next_sibling: null,
+        });
+    }
+    if ch == b'f' {
+        try expect_lit(src, st, "false".as_bytes());
+        return try nodes.push(.{
+            kind: .Bool,
+            int_val: 0_i64,
+            bool_val: false,
+            str_start: 0_usize,
+            str_len: 0_usize,
+            child_count: 0_usize,
+            first_child: null,
+            next_sibling: null,
+        });
+    }
+    if ch == b'"' {
+        let sp = try parse_string_span(src, st);
+        return try nodes.push(.{
+            kind: .Str,
+            int_val: 0_i64,
+            bool_val: false,
+            str_start: sp.start,
+            str_len: sp.len,
+            child_count: 0_usize,
+            first_child: null,
+            next_sibling: null,
+        });
+    }
+    if ch == b'-' || (ch >= b'0' && ch <= b'9') {
+        let n = try parse_int(src, st);
+        return try nodes.push(.{
+            kind: .Int,
+            int_val: n,
+            bool_val: false,
+            str_start: 0_usize,
+            str_len: 0_usize,
+            child_count: 0_usize,
+            first_child: null,
+            next_sibling: null,
+        });
+    }
+    if ch == b'[' {
+        st.pos = p + 1_usize;
+        st.depth = st.depth +% 1_u32;
+        let arr_id = try nodes.push(.{
+            kind: .Array,
+            int_val: 0_i64,
+            bool_val: false,
+            str_start: 0_usize,
+            str_len: 0_usize,
+            child_count: 0_usize,
+            first_child: null,
+            next_sibling: null,
+        });
+        skip_ws(src, st);
+        let p_close = st.pos;
+        if p_close < src.len && src[p_close] == b']' {
+            st.pos = p_close + 1_usize;
+            st.depth = st.depth -% 1_u32;
+            return arr_id;
+        }
+        var count: usize = 0_usize;
+        var prev_child: ?Id[nodes] = null;
+        loop {
+            let elem_id = try parse_value(src, st, nodes);
+            if let prev = prev_child {
+                nodes.next_sibling[prev] = elem_id;
+            } else {
+                nodes.first_child[arr_id] = elem_id;
+            }
+            prev_child = elem_id;
+            count = count +% 1_usize;
+            skip_ws(src, st);
+            let pc = st.pos;
+            if pc >= src.len {
+                return .UnexpectedEof;
+            }
+            if src[pc] == b']' {
+                st.pos = pc + 1_usize;
+                break;
+            }
+            if src[pc] != b',' {
+                return .UnexpectedToken;
+            }
+            st.pos = pc + 1_usize;
+        }
+        nodes.child_count[arr_id] = count;
+        st.depth = st.depth -% 1_u32;
+        return arr_id;
+    }
+    if ch == b'{' {
+        st.pos = p + 1_usize;
+        st.depth = st.depth +% 1_u32;
+        let obj_id = try nodes.push(.{
+            kind: .Object,
+            int_val: 0_i64,
+            bool_val: false,
+            str_start: 0_usize,
+            str_len: 0_usize,
+            child_count: 0_usize,
+            first_child: null,
+            next_sibling: null,
+        });
+        skip_ws(src, st);
+        let p_close = st.pos;
+        if p_close < src.len && src[p_close] == b'}' {
+            st.pos = p_close + 1_usize;
+            st.depth = st.depth -% 1_u32;
+            return obj_id;
+        }
+        var count: usize = 0_usize;
+        var prev_child: ?Id[nodes] = null;
+        loop {
+            skip_ws(src, st);
+            let _key = try parse_string_span(src, st);
+            skip_ws(src, st);
+            let p_colon = st.pos;
+            if p_colon >= src.len || src[p_colon] != b':' {
+                return .UnexpectedToken;
+            }
+            st.pos = p_colon + 1_usize;
+            let val_id = try parse_value(src, st, nodes);
+            if let prev = prev_child {
+                nodes.next_sibling[prev] = val_id;
+            } else {
+                nodes.first_child[obj_id] = val_id;
+            }
+            prev_child = val_id;
+            count = count +% 1_usize;
+            skip_ws(src, st);
+            let pc = st.pos;
+            if pc >= src.len {
+                return .UnexpectedEof;
+            }
+            if src[pc] == b'}' {
+                st.pos = pc + 1_usize;
+                break;
+            }
+            if src[pc] != b',' {
+                return .UnexpectedToken;
+            }
+            st.pos = pc + 1_usize;
+        }
+        nodes.child_count[obj_id] = count;
+        st.depth = st.depth -% 1_u32;
+        return obj_id;
+    }
+    return .UnexpectedToken;
+}
+
+pub fn parse_json_doc(
+    input: *[u8],
+    nodes: *mut ArenaPool[JsonNode],
+) -> Id[nodes] ! Utf8Error | JsonError | MemError {
+    try str.validate_utf8(input);
+    var st = ParserState.{ pos: 0_usize, depth: 0_u32 };
+    let root = try parse_value(input, &mut st, nodes);
+    skip_ws(input, &mut st);
+    if st.pos != input.len {
+        return .TrailingData;
+    }
+    return root;
+}
+
+fn is_invalid_json(input: *[u8], nodes: *mut ArenaPool[JsonNode]) -> bool {
+    let _root = parse_json_doc(input, nodes) catch {
+        return true;
+    };
+    return false;
+}
+
+pub fn main(alloc: *mut AllocCap) -> i32 ! MemError | Utf8Error | JsonError {
+    var arena = try mem.FrameArena.init(alloc, 16384_usize);
+    errdefer arena.destroy(alloc);
+    var nodes = try mem.init_frame_pool.[JsonNode](&mut arena, 64_usize);
+
+    let doc = "{\"name\":\"Eon\",\"ver\":2,\"ok\":true,\"items\":[10,-20,null,\"hi\\n\"]}";
+    let root = try parse_json_doc(doc.as_bytes(), &mut nodes);
+    let obj_fields = nodes.child_count[root];
+    let total_nodes = nodes.len();
+
+    // Walk first 4 values of the root object: "Eon" (len 3), 2, true, [10, -20, null, "hi\n"] (len 4)
+    var int_sum: i64 = 0_i64;
+    var str_len_first: usize = 0_usize;
+    var arr_len: usize = 0_usize;
+    var cur = nodes.first_child[root];
+    loop {
+        let cid = cur orelse break;
+        match nodes.kind[cid] {
+            .Str => {
+                if str_len_first == 0_usize {
+                    str_len_first = nodes.str_len[cid];
+                }
+            }
+            .Int => {
+                int_sum = int_sum +% nodes.int_val[cid];
+            }
+            .Array => {
+                arr_len = nodes.child_count[cid];
+                var acur = nodes.first_child[cid];
+                loop {
+                    let aid = acur orelse break;
+                    if nodes.kind[aid] == .Int {
+                        int_sum = int_sum +% nodes.int_val[aid];
+                    }
+                    acur = nodes.next_sibling[aid];
+                }
+            }
+            _ => {}
+        }
+        cur = nodes.next_sibling[cid];
+    }
+
+    // Verify malformed JSON returns error cleanly!
+    nodes = nodes.reset();
+    let bad_doc = "{\"broken\": [1, 2, }";
+    let bad_rejected: u64 = if is_invalid_json(bad_doc.as_bytes(), &mut nodes) { 1_u64 } else { 0_u64 };
+
+    arena.destroy(alloc);
+
+    hal.print_str("fields=");
+    hal.print_u64(obj_fields.widen.[u64]());
+    hal.print_str(" nodes=");
+    hal.print_u64(total_nodes.widen.[u64]());
+    hal.print_str(" str0_len=");
+    hal.print_u64(str_len_first.widen.[u64]());
+    hal.print_str(" arr_len=");
+    hal.print_u64(arr_len.widen.[u64]());
+    hal.print_str(" int_sum=");
+    hal.print_i64(int_sum);
+    hal.print_str(" bad_rejected=");
+    hal.print_u64(bad_rejected);
+    hal.print_str(" live=");
+    hal.print_u64(alloc.live_allocs().widen.[u64]());
+    hal.print_nl();
+    return 0_i32;
+}

@@ -1,0 +1,59 @@
+module example.types_ok;
+
+pub struct Rect {
+    pub x: f32;
+    pub y: f32;
+    pub w: f32;
+    pub h: f32;
+}
+
+pub bitfield PageEntry : u64 {
+    present:    u1  @bits(0..1);
+    writable:   u1  @bits(1..2);
+    user:       u1  @bits(2..3);
+    pwt:        u1  @bits(3..4);
+    pcd:        u1  @bits(4..5);
+    accessed:   u1  @bits(5..6);
+    dirty:      u1  @bits(6..7);
+    huge_page:  u1  @bits(7..8);
+    phys_frame: u40 @bits(12..52);
+    no_exec:    u1  @bits(63..64);
+}
+
+pub union UiEvent {
+    MouseMove: f32x2,
+    KeyDown:   u32,
+    Resize:    struct { w: u32; h: u32; },
+    Quit,
+}
+
+pub pool Widget {
+    pos:    f32x2;
+    size:   f32x2;
+    color:  u8x4;
+    flags:  u32;
+    parent: ?Link[Self];
+}
+
+pub struct Box2D { pos: f32x2; size: f32x2; }
+
+pub pool GroupedWidget {
+    bounds: Box2D;
+    color:  u8x4;
+}
+
+pub struct Small { a: u64; b: u64; }
+pub struct Big   { data: [64]u8; }
+
+pub fn use_types(s: Small, big: Big) -> (Small, Big) {
+    let s2 = s;
+    let _s3 = s;
+    let b2 = copy big;
+    let _b3 = move big;
+    return (s2, b2);
+}
+
+pub fn utf8_check(bytes: *[u8]) -> *str ! Utf8Error {
+    let s = try str.from_utf8(bytes);
+    return s;
+}

@@ -1,0 +1,3 @@
+module fail.imp;
+pub fn f() {}
+import core.mem; //~ ERROR E0005

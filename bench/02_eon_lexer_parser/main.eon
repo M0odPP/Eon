@@ -1,0 +1,1044 @@
+module bench.eon_lexer_parser;
+
+import core.mem;
+import core.str;
+import std.rt;
+
+pub error ParseError {
+    UnexpectedChar,
+    UnexpectedToken,
+    UnexpectedEof,
+    TooDeep,
+}
+
+pub enum TokKind : u8 {
+    Eof = 0,
+    Ident = 1,
+    Int = 2,
+    KwPub = 3,
+    KwStruct = 4,
+    KwFn = 5,
+    KwLet = 6,
+    KwVar = 7,
+    KwIf = 8,
+    KwElse = 9,
+    KwWhile = 10,
+    KwReturn = 11,
+    LParen = 12,
+    RParen = 13,
+    LBrace = 14,
+    RBrace = 15,
+    Comma = 16,
+    Colon = 17,
+    Semi = 18,
+    Arrow = 19,
+    Eq = 20,
+    EqEq = 21,
+    Bang = 22,
+    BangEq = 23,
+    Lt = 24,
+    Le = 25,
+    Shl = 26,
+    Gt = 27,
+    Ge = 28,
+    Shr = 29,
+    Amp = 30,
+    AmpAmp = 31,
+    Pipe = 32,
+    PipePipe = 33,
+    Caret = 34,
+    Plus = 35,
+    Minus = 36,
+    Star = 37,
+    Slash = 38,
+    Percent = 39,
+}
+
+pub struct Token {
+    pub kind: TokKind;
+    pub start: u32;
+    pub len: u32;
+}
+
+pub enum AstKind : u8 {
+    StructDecl = 0,
+    FieldDecl = 1,
+    FnDecl = 2,
+    Param = 3,
+    Block = 4,
+    LetStmt = 5,
+    VarStmt = 6,
+    AssignStmt = 7,
+    IfStmt = 8,
+    WhileStmt = 9,
+    ReturnStmt = 10,
+    IntExpr = 11,
+    IdentExpr = 12,
+    UnaryExpr = 13,
+    BinaryExpr = 14,
+}
+
+pub pool AstNode {
+    pub meta: u64;
+    pub val: i64;
+    pub a: ?Link[Self];
+    pub b: ?Link[Self];
+    pub c: ?Link[Self];
+    pub next: ?Link[Self];
+}
+
+pub struct LexRes {
+    pub count: usize;
+    pub tok_hash: u64;
+}
+
+@inline
+fn pack_ast_meta(ast_k: u8, tok_op: u8, tok_idx: u32) -> u64 {
+    return ast_k.widen.[u64]()
+        | (tok_op.widen.[u64]() <<% 8_u64)
+        | (tok_idx.widen.[u64]() <<% 32_u64);
+}
+
+pub struct Parser {
+    pub pos: usize;
+    pub depth: u32;
+}
+
+fn next_u64(state: *mut u64) -> u64 {
+    var x = state.*;
+    x = x ^ (x <<% 13_u64);
+    x = x ^ (x >> 7_u64);
+    x = x ^ (x <<% 17_u64);
+    state.* = x;
+    return x;
+}
+
+fn hex_nib_upper(nib: u8) -> u8 {
+    let n = nib & 0x0F_u8;
+    if n < 10_u8 {
+        return b'0' +% n;
+    }
+    return b'A' +% (n -% 10_u8);
+}
+
+fn push_hex_u16(alloc: *mut AllocCap, out: *mut str.StrBuf, val: u16) -> !OutOfMemory {
+    try out.push_str_grow(alloc, "0x");
+    try out.push_byte_grow(alloc, hex_nib_upper((val >> 12_u16).trunc.[u8]()));
+    try out.push_byte_grow(alloc, hex_nib_upper((val >> 8_u16).trunc.[u8]()));
+    try out.push_byte_grow(alloc, hex_nib_upper((val >> 4_u16).trunc.[u8]()));
+    try out.push_byte_grow(alloc, hex_nib_upper(val.trunc.[u8]()));
+    return;
+}
+
+fn generate_eon_source(alloc: *mut AllocCap, num_blocks: usize) -> str.StrBuf ! OutOfMemory {
+    var out = try str.StrBuf.init(alloc, num_blocks *% 1150_usize);
+    errdefer out.destroy(alloc);
+    var rng: u64 = 0x5EEDCAFEBEEF1234_u64;
+
+    var b: usize = 0_usize;
+    while b < num_blocks {
+        let c1 = 2_u64 +% (next_u64(&mut rng) % 13_u64);
+        let c2 = 2_u64 +% (next_u64(&mut rng) % 7_u64);
+        let c3 = 3_u64 +% (next_u64(&mut rng) % 19_u64);
+        let c4 = 1_u64 +% (next_u64(&mut rng) % 97_u64);
+        let hex1 = (next_u64(&mut rng) & 0xFFFF_u64).trunc.[u16]();
+        let c5 = 1_u64 +% (next_u64(&mut rng) % 15_u64);
+        let c6 = 2_u64 +% (next_u64(&mut rng) % 11_u64);
+        let c7 = 3_u64 +% (next_u64(&mut rng) % 13_u64);
+        let c8 = 1_u64 +% (next_u64(&mut rng) % 53_u64);
+        let op_sel = next_u64(&mut rng) % 4_u64;
+        let cmp_sel = next_u64(&mut rng) % 4_u64;
+
+        try out.push_str_grow(alloc, "// Generated module block ");
+        try out.push_u64_grow(alloc, b.widen.[u64]());
+        try out.push_str_grow(alloc, " deterministic lexer and Pratt parser workload\n");
+
+        try out.push_str_grow(alloc, "pub struct RecordState_");
+        try out.push_u64_grow(alloc, b.widen.[u64]());
+        try out.push_str_grow(alloc, " {\n");
+        try out.push_str_grow(alloc, "    pub accumulator_val: i64;\n");
+        try out.push_str_grow(alloc, "    pub threshold_limit: u64;\n");
+        try out.push_str_grow(alloc, "    pub stride_offset: usize;\n");
+        try out.push_str_grow(alloc, "    pub flags_bitmask: u32;\n");
+        try out.push_str_grow(alloc, "}\n");
+
+        try out.push_str_grow(alloc, "// Kernel computation block ");
+        try out.push_u64_grow(alloc, b.widen.[u64]());
+        try out.push_str_grow(alloc, " with nested expressions and control flow\n");
+
+        try out.push_str_grow(alloc, "pub fn compute_kernel_block_");
+        try out.push_u64_grow(alloc, b.widen.[u64]());
+        try out.push_str_grow(alloc, "(alpha_input: i64, beta_scale: i64, max_limit: i64) -> i64 {\n");
+
+        try out.push_str_grow(alloc, "    var accumulator_state: i64 = (alpha_input + beta_scale * ");
+        try out.push_u64_grow(alloc, c1);
+        try out.push_str_grow(alloc, ") - (max_limit / ");
+        try out.push_u64_grow(alloc, c2);
+        try out.push_str_grow(alloc, ");\n");
+
+        try out.push_str_grow(alloc, "    let stride_factor: i64 = (alpha_input * ");
+        try out.push_u64_grow(alloc, c3);
+        try out.push_str_grow(alloc, " + beta_scale - ");
+        try out.push_u64_grow(alloc, c4);
+        try out.push_str_grow(alloc, ") ^ ");
+        try push_hex_u16(alloc, &mut out, hex1);
+        try out.push_str_grow(alloc, ";\n");
+
+        try out.push_str_grow(alloc, "    var loop_index: i64 = 0;\n");
+        try out.push_str_grow(alloc, "    while loop_index < max_limit && accumulator_state != 0 {\n");
+
+        try out.push_str_grow(alloc, "        if (loop_index & ");
+        try out.push_u64_grow(alloc, c5);
+        try out.push_str_grow(alloc, ") == 0 || accumulator_state ");
+        if cmp_sel == 0_u64 {
+            try out.push_str_grow(alloc, "<");
+        } else if cmp_sel == 1_u64 {
+            try out.push_str_grow(alloc, "<=");
+        } else if cmp_sel == 2_u64 {
+            try out.push_str_grow(alloc, ">");
+        } else {
+            try out.push_str_grow(alloc, ">=");
+        }
+        try out.push_str_grow(alloc, " stride_factor {\n");
+
+        try out.push_str_grow(alloc, "            accumulator_state = accumulator_state ");
+        if op_sel == 0_u64 {
+            try out.push_str_grow(alloc, "+");
+        } else if op_sel == 1_u64 {
+            try out.push_str_grow(alloc, "-");
+        } else if op_sel == 2_u64 {
+            try out.push_str_grow(alloc, "^");
+        } else {
+            try out.push_str_grow(alloc, "|");
+        }
+        try out.push_str_grow(alloc, " (loop_index * stride_factor - beta_scale) ^ (alpha_input >> 1);\n");
+
+        try out.push_str_grow(alloc, "        } else {\n");
+        try out.push_str_grow(alloc, "            accumulator_state = accumulator_state - (loop_index + 1) * ");
+        try out.push_u64_grow(alloc, c6);
+        try out.push_str_grow(alloc, " + (max_limit % ");
+        try out.push_u64_grow(alloc, c7);
+        try out.push_str_grow(alloc, ");\n");
+        try out.push_str_grow(alloc, "        }\n");
+
+        try out.push_str_grow(alloc, "        if !(accumulator_state <= 0) {\n");
+        try out.push_str_grow(alloc, "            accumulator_state = (accumulator_state << 1) | (loop_index & 7);\n");
+        try out.push_str_grow(alloc, "        }\n");
+        try out.push_str_grow(alloc, "        loop_index = loop_index + 1;\n");
+        try out.push_str_grow(alloc, "    }\n");
+
+        try out.push_str_grow(alloc, "    return accumulator_state + stride_factor * (alpha_input - beta_scale) + (-");
+        try out.push_u64_grow(alloc, c8);
+        try out.push_str_grow(alloc, ");\n");
+        try out.push_str_grow(alloc, "}\n");
+
+        b = b +% 1_usize;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// u8x16 SIMD helpers (whitespace, line comments, and identifier continuation)
+// ---------------------------------------------------------------------------
+
+@inline
+fn load_u8x16(bytes: *[u8], base: usize) -> u8x16
+    where base + 16_usize <= bytes.len
+{
+    return .{
+        bytes[base],
+        bytes[base + 1_usize],
+        bytes[base + 2_usize],
+        bytes[base + 3_usize],
+        bytes[base + 4_usize],
+        bytes[base + 5_usize],
+        bytes[base + 6_usize],
+        bytes[base + 7_usize],
+        bytes[base + 8_usize],
+        bytes[base + 9_usize],
+        bytes[base + 10_usize],
+        bytes[base + 11_usize],
+        bytes[base + 12_usize],
+        bytes[base + 13_usize],
+        bytes[base + 14_usize],
+        bytes[base + 15_usize],
+    };
+}
+
+@inline
+fn is_hex_digit(b: u8) -> bool {
+    let lo = b | 0x20_u8;
+    return (b -% b'0') <= 9_u8 || (lo -% b'a') <= 5_u8;
+}
+
+@inline
+fn skip_comment_simd(bytes: *[u8], p0: usize, nl_vec: u8x16) -> usize {
+    var p = p0;
+    while bytes.len >= 16_usize && p <= bytes.len - 16_usize {
+        let v = load_u8x16(bytes, p);
+        let m = v.cmpeq(nl_vec).bitmask();
+        if m == 0_u64 {
+            p = p +% 16_usize;
+        } else {
+            return p +% (@tzcnt(m) & 15_u64).trunc.[usize]();
+        }
+    }
+    while p < bytes.len && bytes[p] != b'\n' {
+        p = p + 1_usize;
+    }
+    return p;
+}
+
+/// Builds a 256-byte LUT for O(1) branchless byte classification & direct single-char TokKind dispatch:
+/// 0 = invalid, 1 = ws, 2 = digit ('0'..'9'), 3 = ident_start ('a'..'z','A'..'Z','_'),
+/// 4 = multi-char op ('/','-','=','!','<','>','&','|'), >=12 = direct single-char TokKind!
+/// Note: `(cls & 2) != 0` iff byte is an identifier continuation char (`a-zA-Z0-9_`)!
+fn init_lex_lut(lut: *mut [u8])
+    where lut.len >= 256_usize
+{
+    lut[32_usize] = 1_u8;  // ' '
+    lut[9_usize] = 1_u8;   // '\t'
+    lut[10_usize] = 1_u8;  // '\n'
+    lut[13_usize] = 1_u8;  // '\r'
+    var c: usize = 48_usize;
+    while c <= 57_usize {
+        lut[c] = 0x80_u8; // '0'..'9' (bit 7 set -> ident-continue)
+        c = c + 1_usize;
+    }
+    c = 65_usize;
+    while c <= 90_usize {
+        lut[c] = 0x81_u8; // 'A'..'Z' (bit 7 set -> ident-start & continue)
+        c = c + 1_usize;
+    }
+    c = 97_usize;
+    while c <= 122_usize {
+        lut[c] = 0x81_u8; // 'a'..'z'
+        c = c + 1_usize;
+    }
+    lut[95_usize] = 0x81_u8;  // '_'
+    // Single-char direct TokKind dispatch:
+    lut[40_usize] = 12_u8;  // '(' LParen
+    lut[41_usize] = 13_u8;  // ')' RParen
+    lut[123_usize] = 14_u8; // '{' LBrace
+    lut[125_usize] = 15_u8; // '}' RBrace
+    lut[44_usize] = 16_u8;  // ',' Comma
+    lut[58_usize] = 17_u8;  // ':' Colon
+    lut[59_usize] = 18_u8;  // ';' Semi
+    lut[43_usize] = 35_u8;  // '+' Plus
+    lut[42_usize] = 37_u8;  // '*' Star
+    lut[37_usize] = 39_u8;  // '%' Percent
+    lut[94_usize] = 34_u8;  // '^' Caret
+    // Multi-char operators & comment lead:
+    lut[47_usize] = 4_u8;   // '/'
+    lut[45_usize] = 4_u8;   // '-'
+    lut[61_usize] = 4_u8;   // '='
+    lut[33_usize] = 4_u8;   // '!'
+    lut[60_usize] = 4_u8;   // '<'
+    lut[62_usize] = 4_u8;   // '>'
+    lut[38_usize] = 4_u8;   // '&'
+    lut[124_usize] = 4_u8;  // '|'
+}
+
+@inline
+fn classify_ident_u8(src: *[u8], start: usize, end: usize) -> u8 {
+    if start >= src.len || end > src.len || end <= start {
+        return 1_u8; // Ident
+    }
+    let n = end - start;
+    if n == 2_usize {
+        let b0 = src[start];
+        let b1 = src[start + 1_usize];
+        if b0 == b'f' && b1 == b'n' { return 5_u8; } // KwFn
+        if b0 == b'i' && b1 == b'f' { return 8_u8; } // KwIf
+        return 1_u8;
+    }
+    if n == 3_usize {
+        let b0 = src[start];
+        let b1 = src[start + 1_usize];
+        let b2 = src[start + 2_usize];
+        if b0 == b'p' && b1 == b'u' && b2 == b'b' { return 3_u8; } // KwPub
+        if b0 == b'l' && b1 == b'e' && b2 == b't' { return 6_u8; } // KwLet
+        if b0 == b'v' && b1 == b'a' && b2 == b'r' { return 7_u8; } // KwVar
+        return 1_u8;
+    }
+    if n == 4_usize {
+        if src[start] == b'e'
+            && src[start + 1_usize] == b'l'
+            && src[start + 2_usize] == b's'
+            && src[start + 3_usize] == b'e'
+        {
+            return 9_u8; // KwElse
+        }
+        return 1_u8;
+    }
+    if n == 5_usize {
+        if src[start] == b'w'
+            && src[start + 1_usize] == b'h'
+            && src[start + 2_usize] == b'i'
+            && src[start + 3_usize] == b'l'
+            && src[start + 4_usize] == b'e'
+        {
+            return 10_u8; // KwWhile
+        }
+        return 1_u8;
+    }
+    if n == 6_usize {
+        let b0 = src[start];
+        if b0 == b's'
+            && src[start + 1_usize] == b't'
+            && src[start + 2_usize] == b'r'
+            && src[start + 3_usize] == b'u'
+            && src[start + 4_usize] == b'c'
+            && src[start + 5_usize] == b't'
+        {
+            return 4_u8; // KwStruct
+        }
+        if b0 == b'r'
+            && src[start + 1_usize] == b'e'
+            && src[start + 2_usize] == b't'
+            && src[start + 3_usize] == b'u'
+            && src[start + 4_usize] == b'r'
+            && src[start + 5_usize] == b'n'
+        {
+            return 11_u8; // KwReturn
+        }
+    }
+    return 1_u8;
+}
+
+/// Zero-call single-pass lexer: writes 1-byte `tok_kinds` (700 KB, fits L2!) + `tok_vals` (Ident FNV-1a / Int value)
+/// and computes the token stream hash inline while every byte is hot in registers!
+fn lex_source(
+    src: *[u8],
+    tok_kinds: *mut [u8],
+    tok_vals: *mut [i64],
+) -> LexRes ! ParseError {
+    var lut: [256]u8 = [0_u8; 256];
+    init_lex_lut(&mut lut);
+    let v_nl = u8x16.splat(b'\n');
+    let prime: u64 = 0x00000100000001B3_u64;
+    var th: u64 = 0xCBF29CE484222325_u64;
+    var n: usize = 0_usize;
+    var p: usize = 0_usize;
+    while p < src.len {
+        let b = src[p];
+        let cls = lut[b.widen.[usize]()];
+        if cls == 1_u8 {
+            p = p + 1_usize;
+            while p < src.len && lut[src[p].widen.[usize]()] == 1_u8 {
+                p = p + 1_usize;
+            }
+            continue;
+        }
+        let start = p;
+        var kind: u8 = cls;
+        var tval: i64 = 0_i64;
+        var has_val = false;
+        if cls == 0x81_u8 {
+            var ih: u64 = (0xCBF29CE484222325_u64 ^ b.widen.[u64]()) *% prime;
+            p = p + 1_usize;
+            while p < src.len {
+                let nb = src[p];
+                if lut[nb.widen.[usize]()] < 0x80_u8 {
+                    break;
+                }
+                ih = (ih ^ nb.widen.[u64]()) *% prime;
+                p = p + 1_usize;
+            }
+            kind = classify_ident_u8(src, start, p);
+            if kind == 1_u8 {
+                tval = ih.bitcast.[i64]();
+                has_val = true;
+            }
+        } else if cls >= 12_u8 && cls < 0x80_u8 {
+            p = p + 1_usize;
+        } else if cls == 0x80_u8 {
+            var acc: i64 = 0_i64;
+            if b == b'0' && p + 1_usize < src.len && (src[p + 1_usize] == b'x' || src[p + 1_usize] == b'X') {
+                p = p + 2_usize;
+                while p < src.len && is_hex_digit(src[p]) {
+                    let hb = src[p];
+                    var d: i64 = 0_i64;
+                    if hb <= b'9' {
+                        d = (hb -% b'0').widen.[i64]();
+                    } else if hb >= b'a' {
+                        d = (hb -% b'a').widen.[i64]() +% 10_i64;
+                    } else {
+                        d = (hb -% b'A').widen.[i64]() +% 10_i64;
+                    }
+                    acc = (acc <<% 4_i64) | d;
+                    p = p + 1_usize;
+                }
+            } else {
+                acc = (b -% b'0').widen.[i64]();
+                p = p + 1_usize;
+                while p < src.len {
+                    let db = src[p];
+                    if lut[db.widen.[usize]()] != 0x80_u8 {
+                        break;
+                    }
+                    acc = (acc *% 10_i64) +% (db -% b'0').widen.[i64]();
+                    p = p + 1_usize;
+                }
+            }
+            kind = 2_u8;
+            tval = acc;
+            has_val = true;
+        } else if cls == 4_u8 {
+            var next_b: u8 = 0_u8;
+            if p + 1_usize < src.len {
+                next_b = src[p + 1_usize];
+            }
+            if b == b'/' {
+                if next_b == b'/' {
+                    p = skip_comment_simd(src, p + 2_usize, v_nl);
+                    continue;
+                }
+                kind = 38_u8;
+                p = p + 1_usize;
+            } else if b == b'-' {
+                if next_b == b'>' { kind = 19_u8; p = p + 2_usize; } else { kind = 36_u8; p = p + 1_usize; }
+            } else if b == b'=' {
+                if next_b == b'=' { kind = 21_u8; p = p + 2_usize; } else { kind = 20_u8; p = p + 1_usize; }
+            } else if b == b'!' {
+                if next_b == b'=' { kind = 23_u8; p = p + 2_usize; } else { kind = 22_u8; p = p + 1_usize; }
+            } else if b == b'<' {
+                if next_b == b'=' { kind = 25_u8; p = p + 2_usize; }
+                else if next_b == b'<' { kind = 26_u8; p = p + 2_usize; }
+                else { kind = 24_u8; p = p + 1_usize; }
+            } else if b == b'>' {
+                if next_b == b'=' { kind = 28_u8; p = p + 2_usize; }
+                else if next_b == b'>' { kind = 29_u8; p = p + 2_usize; }
+                else { kind = 27_u8; p = p + 1_usize; }
+            } else if b == b'&' {
+                if next_b == b'&' { kind = 31_u8; p = p + 2_usize; } else { kind = 30_u8; p = p + 1_usize; }
+            } else {
+                if next_b == b'|' { kind = 33_u8; p = p + 2_usize; } else { kind = 32_u8; p = p + 1_usize; }
+            }
+        } else {
+            return .UnexpectedChar;
+        }
+
+        let tlen = (p -% start).widen.[u64]() & 0xFFFFFF_u64;
+        th = (th ^ ((kind.widen.[u64]() <<% 16_u64) | tlen)) *% prime;
+        if n < tok_kinds.len && n < tok_vals.len {
+            tok_kinds[n] = kind;
+            if has_val {
+                tok_vals[n] = tval;
+            }
+            n = n + 1_usize;
+        } else {
+            return .UnexpectedToken;
+        }
+    }
+
+    th = (th ^ 0_u64) *% prime;
+    if n < tok_kinds.len {
+        tok_kinds[n] = 0_u8;
+        n = n + 1_usize;
+    } else {
+        return .UnexpectedToken;
+    }
+    th = (th ^ n.widen.[u64]()) *% prime;
+    return LexRes.{ count: n, tok_hash: th };
+}
+
+// ---------------------------------------------------------------------------
+// Pratt expression parser + declaration parser -> compact 6-column ArenaPool[AstNode]
+// ---------------------------------------------------------------------------
+
+@inline
+fn peek_kind(tok_kinds: *[u8], pos: usize) -> u8 {
+    if pos < tok_kinds.len {
+        return tok_kinds[pos];
+    }
+    return 0_u8;
+}
+
+@inline
+fn expect_tok(tok_kinds: *[u8], st: *mut Parser, expected: u8) -> u32 ! ParseError {
+    let p = st.pos;
+    if p >= tok_kinds.len {
+        return .UnexpectedEof;
+    }
+    if tok_kinds[p] != expected {
+        return .UnexpectedToken;
+    }
+    st.pos = p + 1_usize;
+    return p.trunc.[u32]();
+}
+
+@inline
+fn infix_prec(k: u8) -> u8 {
+    if k < 21_u8 || k > 39_u8 {
+        return 0_u8;
+    }
+    if k >= 37_u8 {
+        return 10_u8;
+    }
+    let sh = (((k -% 21_u8) <<% 2_u8) & 63_u8).widen.[u64]();
+    return ((0x9941325877877606_u64 >> sh) & 15_u64).trunc.[u8]();
+}
+
+@recursive
+fn parse_expr(
+    tok_kinds: *[u8],
+    tok_vals: *[i64],
+    st: *mut Parser,
+    nodes: *mut ArenaPool[AstNode],
+    min_prec: u8,
+) -> Id[nodes] ! ParseError | MemError {
+    if st.depth >= 64_u32 {
+        return .TooDeep;
+    }
+    st.depth = st.depth +% 1_u32;
+
+    let p0 = st.pos;
+    if p0 >= tok_kinds.len || p0 >= tok_vals.len {
+        return .UnexpectedEof;
+    }
+    let k0 = tok_kinds[p0];
+    var lhs: ?Id[nodes] = null;
+
+    if k0 == 1_u8 || k0 == 2_u8 {
+        let ak0: u8 = if k0 == 1_u8 { 12_u8 } else { 11_u8 };
+        let v0 = tok_vals[p0];
+        st.pos = p0 + 1_usize;
+        lhs = try nodes.push(.{
+            meta: pack_ast_meta(ak0, k0, p0.trunc.[u32]()),
+            val: v0,
+            a: null,
+            b: null,
+            c: null,
+            next: null,
+        });
+    } else if k0 == 12_u8 {
+        // LParen
+        st.pos = p0 + 1_usize;
+        let inner = try parse_expr(tok_kinds, tok_vals, st, nodes, 1_u8);
+        _ = try expect_tok(tok_kinds, st, 13_u8);
+        lhs = inner;
+    } else if k0 == 36_u8 || k0 == 22_u8 {
+        // Unary Minus or Bang
+        st.pos = p0 + 1_usize;
+        let sub = try parse_expr(tok_kinds, tok_vals, st, nodes, 11_u8);
+        lhs = try nodes.push(.{
+            meta: pack_ast_meta(13_u8, k0, p0.trunc.[u32]()),
+            val: 0_i64,
+            a: sub,
+            b: null,
+            c: null,
+            next: null,
+        });
+    } else {
+        return .UnexpectedToken;
+    }
+
+    var cur_lhs = lhs orelse {
+        return .UnexpectedToken;
+    };
+
+    loop {
+        let op_pos = st.pos;
+        if op_pos >= tok_kinds.len {
+            break;
+        }
+        let op = tok_kinds[op_pos];
+        let prec = infix_prec(op);
+        if prec == 0_u8 || prec < min_prec {
+            break;
+        }
+        let op_tidx = op_pos.trunc.[u32]();
+        let rhs_pos = op_pos + 1_usize;
+        st.pos = rhs_pos;
+        let next_min = prec +% 1_u8;
+
+        // Fast-path: leaf Ident/Int RHS followed by lower-precedence token avoids recursive call!
+        var rhs_opt: ?Id[nodes] = null;
+        if rhs_pos < tok_kinds.len && rhs_pos < tok_vals.len {
+            let rk = tok_kinds[rhs_pos];
+            if (rk == 1_u8 || rk == 2_u8) && infix_prec(peek_kind(tok_kinds, rhs_pos + 1_usize)) < next_min {
+                let rak: u8 = if rk == 1_u8 { 12_u8 } else { 11_u8 };
+                let rv = tok_vals[rhs_pos];
+                st.pos = rhs_pos + 1_usize;
+                rhs_opt = try nodes.push(.{
+                    meta: pack_ast_meta(rak, rk, rhs_pos.trunc.[u32]()),
+                    val: rv,
+                    a: null,
+                    b: null,
+                    c: null,
+                    next: null,
+                });
+            }
+        }
+        var rhs_node: ?Id[nodes] = rhs_opt;
+        if rhs_node == null {
+            rhs_node = try parse_expr(tok_kinds, tok_vals, st, nodes, next_min);
+        }
+        let rhs = rhs_node orelse return .UnexpectedToken;
+        cur_lhs = try nodes.push(.{
+            meta: pack_ast_meta(14_u8, op, op_tidx),
+            val: prec.widen.[i64](),
+            a: cur_lhs,
+            b: rhs,
+            c: null,
+            next: null,
+        });
+    }
+
+    st.depth = st.depth -% 1_u32;
+    return cur_lhs;
+}
+
+@recursive
+fn parse_block(
+    tok_kinds: *[u8],
+    tok_vals: *[i64],
+    st: *mut Parser,
+    nodes: *mut ArenaPool[AstNode],
+) -> Id[nodes] ! ParseError | MemError {
+    if st.depth >= 64_u32 {
+        return .TooDeep;
+    }
+    st.depth = st.depth +% 1_u32;
+    let lb_idx = try expect_tok(tok_kinds, st, 14_u8);
+    let blk_id = try nodes.push(.{
+        meta: pack_ast_meta(4_u8, 14_u8, lb_idx),
+        val: 0_i64,
+        a: null,
+        b: null,
+        c: null,
+        next: null,
+    });
+
+    var prev_stmt: ?Id[nodes] = null;
+    var stmt_count: i64 = 0_i64;
+
+    loop {
+        let sk = peek_kind(tok_kinds, st.pos);
+        if sk == 15_u8 || sk == 0_u8 {
+            break;
+        }
+        var stmt_opt: ?Id[nodes] = null;
+        if sk == 6_u8 || sk == 7_u8 {
+            st.pos = st.pos +% 1_usize;
+            let name_idx = try expect_tok(tok_kinds, st, 1_u8);
+            _ = try expect_tok(tok_kinds, st, 17_u8);
+            let ty_idx = try expect_tok(tok_kinds, st, 1_u8);
+            _ = try expect_tok(tok_kinds, st, 20_u8);
+            let init_expr = try parse_expr(tok_kinds, tok_vals, st, nodes, 1_u8);
+            _ = try expect_tok(tok_kinds, st, 18_u8);
+            let ast_k: u8 = if sk == 6_u8 { 5_u8 } else { 6_u8 };
+            stmt_opt = try nodes.push(.{
+                meta: pack_ast_meta(ast_k, sk, name_idx),
+                val: ty_idx.widen.[i64](),
+                a: init_expr,
+                b: null,
+                c: null,
+                next: null,
+            });
+        } else if sk == 1_u8 {
+            let lhs_idx = st.pos.trunc.[u32]();
+            st.pos = st.pos +% 1_usize;
+            _ = try expect_tok(tok_kinds, st, 20_u8);
+            let rhs = try parse_expr(tok_kinds, tok_vals, st, nodes, 1_u8);
+            _ = try expect_tok(tok_kinds, st, 18_u8);
+            stmt_opt = try nodes.push(.{
+                meta: pack_ast_meta(7_u8, 20_u8, lhs_idx),
+                val: 0_i64,
+                a: rhs,
+                b: null,
+                c: null,
+                next: null,
+            });
+        } else if sk == 8_u8 {
+            let if_idx = st.pos.trunc.[u32]();
+            st.pos = st.pos +% 1_usize;
+            let cond = try parse_expr(tok_kinds, tok_vals, st, nodes, 1_u8);
+            let then_blk = try parse_block(tok_kinds, tok_vals, st, nodes);
+            var else_blk: ?Id[nodes] = null;
+            if peek_kind(tok_kinds, st.pos) == 9_u8 {
+                st.pos = st.pos +% 1_usize;
+                else_blk = try parse_block(tok_kinds, tok_vals, st, nodes);
+            }
+            stmt_opt = try nodes.push(.{
+                meta: pack_ast_meta(8_u8, 8_u8, if_idx),
+                val: 0_i64,
+                a: cond,
+                b: then_blk,
+                c: else_blk,
+                next: null,
+            });
+        } else if sk == 10_u8 {
+            let w_idx = st.pos.trunc.[u32]();
+            st.pos = st.pos +% 1_usize;
+            let cond = try parse_expr(tok_kinds, tok_vals, st, nodes, 1_u8);
+            let body = try parse_block(tok_kinds, tok_vals, st, nodes);
+            stmt_opt = try nodes.push(.{
+                meta: pack_ast_meta(9_u8, 10_u8, w_idx),
+                val: 0_i64,
+                a: cond,
+                b: body,
+                c: null,
+                next: null,
+            });
+        } else if sk == 11_u8 {
+            let r_idx = st.pos.trunc.[u32]();
+            st.pos = st.pos +% 1_usize;
+            let val_expr = try parse_expr(tok_kinds, tok_vals, st, nodes, 1_u8);
+            _ = try expect_tok(tok_kinds, st, 18_u8);
+            stmt_opt = try nodes.push(.{
+                meta: pack_ast_meta(10_u8, 11_u8, r_idx),
+                val: 0_i64,
+                a: val_expr,
+                b: null,
+                c: null,
+                next: null,
+            });
+        } else {
+            return .UnexpectedToken;
+        }
+
+        let stmt_id = stmt_opt orelse {
+            return .UnexpectedToken;
+        };
+        if let prev = prev_stmt {
+            nodes.next[prev] = stmt_id;
+        } else {
+            nodes.a[blk_id] = stmt_id;
+        }
+        prev_stmt = stmt_id;
+        stmt_count = stmt_count +% 1_i64;
+    }
+
+    _ = try expect_tok(tok_kinds, st, 15_u8);
+    nodes.val[blk_id] = stmt_count;
+    st.depth = st.depth -% 1_u32;
+    return blk_id;
+}
+
+fn parse_program(
+    tok_kinds: *[u8],
+    tok_vals: *[i64],
+    nodes: *mut ArenaPool[AstNode],
+) -> ?Id[nodes] ! ParseError | MemError {
+    var st = Parser.{ pos: 0_usize, depth: 0_u32 };
+    var first_decl: ?Id[nodes] = null;
+    var prev_decl: ?Id[nodes] = null;
+
+    while peek_kind(tok_kinds, st.pos) != 0_u8 {
+        var is_pub: i64 = 0_i64;
+        if peek_kind(tok_kinds, st.pos) == 3_u8 {
+            is_pub = 1_i64;
+            st.pos = st.pos +% 1_usize;
+        }
+        let dk = peek_kind(tok_kinds, st.pos);
+        var decl_opt: ?Id[nodes] = null;
+        if dk == 4_u8 {
+            st.pos = st.pos +% 1_usize;
+            let name_idx = try expect_tok(tok_kinds, &mut st, 1_u8);
+            _ = try expect_tok(tok_kinds, &mut st, 14_u8);
+            let s_id = try nodes.push(.{
+                meta: pack_ast_meta(0_u8, 4_u8, name_idx),
+                val: is_pub,
+                a: null,
+                b: null,
+                c: null,
+                next: null,
+            });
+            var prev_f: ?Id[nodes] = null;
+            while peek_kind(tok_kinds, st.pos) != 15_u8 && peek_kind(tok_kinds, st.pos) != 0_u8 {
+                if peek_kind(tok_kinds, st.pos) == 3_u8 {
+                    st.pos = st.pos +% 1_usize;
+                }
+                let fname = try expect_tok(tok_kinds, &mut st, 1_u8);
+                _ = try expect_tok(tok_kinds, &mut st, 17_u8);
+                let fty = try expect_tok(tok_kinds, &mut st, 1_u8);
+                _ = try expect_tok(tok_kinds, &mut st, 18_u8);
+                let f_id = try nodes.push(.{
+                    meta: pack_ast_meta(1_u8, 17_u8, fname),
+                    val: fty.widen.[i64](),
+                    a: null,
+                    b: null,
+                    c: null,
+                    next: null,
+                });
+                if let pf = prev_f {
+                    nodes.next[pf] = f_id;
+                } else {
+                    nodes.a[s_id] = f_id;
+                }
+                prev_f = f_id;
+            }
+            _ = try expect_tok(tok_kinds, &mut st, 15_u8);
+            decl_opt = s_id;
+        } else if dk == 5_u8 {
+            st.pos = st.pos +% 1_usize;
+            let name_idx = try expect_tok(tok_kinds, &mut st, 1_u8);
+            _ = try expect_tok(tok_kinds, &mut st, 12_u8);
+            let fn_id = try nodes.push(.{
+                meta: pack_ast_meta(2_u8, 5_u8, name_idx),
+                val: is_pub,
+                a: null,
+                b: null,
+                c: null,
+                next: null,
+            });
+            var prev_p: ?Id[nodes] = null;
+            while peek_kind(tok_kinds, st.pos) != 13_u8 && peek_kind(tok_kinds, st.pos) != 0_u8 {
+                let pname = try expect_tok(tok_kinds, &mut st, 1_u8);
+                _ = try expect_tok(tok_kinds, &mut st, 17_u8);
+                let pty = try expect_tok(tok_kinds, &mut st, 1_u8);
+                let p_id = try nodes.push(.{
+                    meta: pack_ast_meta(3_u8, 17_u8, pname),
+                    val: pty.widen.[i64](),
+                    a: null,
+                    b: null,
+                    c: null,
+                    next: null,
+                });
+                if let pp = prev_p {
+                    nodes.next[pp] = p_id;
+                } else {
+                    nodes.a[fn_id] = p_id;
+                }
+                prev_p = p_id;
+                if peek_kind(tok_kinds, st.pos) == 16_u8 {
+                    st.pos = st.pos +% 1_usize;
+                } else {
+                    break;
+                }
+            }
+            _ = try expect_tok(tok_kinds, &mut st, 13_u8);
+            _ = try expect_tok(tok_kinds, &mut st, 19_u8);
+            _ = try expect_tok(tok_kinds, &mut st, 1_u8);
+            let body = try parse_block(tok_kinds, tok_vals, &mut st, nodes);
+            nodes.b[fn_id] = body;
+            decl_opt = fn_id;
+        } else {
+            return .UnexpectedToken;
+        }
+
+        let decl_id = decl_opt orelse {
+            return .UnexpectedToken;
+        };
+        if let pd = prev_decl {
+            nodes.next[pd] = decl_id;
+        } else {
+            first_decl = decl_id;
+        }
+        prev_decl = decl_id;
+    }
+
+    return first_decl;
+}
+
+/// Sibling-iterative AST hash walk with 2-level leaf & BinExpr inlining (avoids ~90% of recursive calls!).
+@recursive
+fn walk_ast(
+    nodes: *ArenaPool[AstNode],
+    start_id: ?Id[nodes],
+    h_in: u64,
+) -> u64 {
+    let prime: u64 = 0x00000100000001B3_u64;
+    var h = h_in;
+    var cur = start_id;
+    loop {
+        let id = cur orelse break;
+        let m = nodes.meta[id];
+        let ak = m & 0xFF_u64;
+        let tag = (ak <<% 8_u64) | ((m >> 8_u64) & 0xFF_u64);
+        h = (h ^ tag) *% prime;
+        h = (h ^ nodes.val[id].bitcast.[u64]()) *% prime;
+        h = (h ^ (m >> 32_u64)) *% prime;
+        if ak != 11_u64 && ak != 12_u64 && ak != 1_u64 && ak != 3_u64 {
+            if let aid = nodes.a[id] {
+                h = (h ^ 0x1A_u64) *% prime;
+                let am = nodes.meta[aid];
+                let aak = am & 0xFF_u64;
+                if aak == 11_u64 || aak == 12_u64 {
+                    let atag = (aak <<% 8_u64) | ((am >> 8_u64) & 0xFF_u64);
+                    h = (h ^ atag) *% prime;
+                    h = (h ^ nodes.val[aid].bitcast.[u64]()) *% prime;
+                    h = (h ^ (am >> 32_u64)) *% prime;
+                } else {
+                    h = walk_ast(nodes, aid, h);
+                }
+            }
+            if let bid = nodes.b[id] {
+                h = (h ^ 0x2B_u64) *% prime;
+                let bm = nodes.meta[bid];
+                let bak = bm & 0xFF_u64;
+                if bak == 11_u64 || bak == 12_u64 {
+                    let btag = (bak <<% 8_u64) | ((bm >> 8_u64) & 0xFF_u64);
+                    h = (h ^ btag) *% prime;
+                    h = (h ^ nodes.val[bid].bitcast.[u64]()) *% prime;
+                    h = (h ^ (bm >> 32_u64)) *% prime;
+                } else {
+                    h = walk_ast(nodes, bid, h);
+                }
+            }
+            if ak == 8_u64 {
+                if let cid = nodes.c[id] {
+                    h = walk_ast(nodes, cid, (h ^ 0x3C_u64) *% prime);
+                }
+            }
+        }
+        cur = nodes.next[id];
+    }
+    return h;
+}
+
+pub fn main(env: *mut Env) -> i32 ! OutOfMemory | MemError | ParseError {
+    let alloc = &mut env.alloc;
+    let clock = &env.clock;
+    let num_blocks: usize = 4000_usize;
+    let iters: usize = 5_usize;
+    let max_toks: usize = 1048576_usize;
+    let max_nodes: usize = 524288_usize;
+    let prime: u64 = 0x00000100000001B3_u64;
+
+    let source = try generate_eon_source(alloc, num_blocks);
+    errdefer source.destroy(alloc);
+    let src = source.as_bytes();
+
+    var tok_kinds = try Buf.[u8].init(alloc, max_toks);
+    errdefer tok_kinds.destroy(alloc);
+    for _ in 0_usize..max_toks { try tok_kinds.push(0_u8); }
+
+    var tok_vals = try Buf.[i64].init(alloc, max_toks);
+    errdefer tok_vals.destroy(alloc);
+    for _ in 0_usize..max_toks { try tok_vals.push(0_i64); }
+
+    var arena = try mem.FrameArena.init(alloc, 36_usize *% 1024_usize *% 1024_usize);
+    errdefer arena.destroy(alloc);
+
+    let t0 = rt.now_ns(clock);
+    var checksum: u64 = 0xCBF29CE484222325_u64;
+    var iter: usize = 0_usize;
+    while iter < iters {
+        arena.reset();
+        var nodes = try mem.init_frame_pool.[AstNode](&mut arena, max_nodes);
+
+        let lr = try lex_source(src, tok_kinds.as_mut_slice(), tok_vals.as_mut_slice());
+        let first_decl = try parse_program(tok_kinds.as_slice(), tok_vals.as_slice(), &mut nodes);
+
+        var h = (lr.tok_hash ^ nodes.len().widen.[u64]()) *% prime;
+        h = walk_ast(&nodes, first_decl, h);
+        checksum = ((checksum ^ h) *% prime) +% iter.widen.[u64]();
+        iter = iter +% 1_usize;
+    }
+    let elapsed_ns = rt.elapsed_since(clock, t0);
+
+    arena.destroy(alloc);
+    tok_vals.destroy(alloc);
+    tok_kinds.destroy(alloc);
+    source.destroy(alloc);
+
+    rt.print_str("RESULT eon_lexer_parser checksum=");
+    rt.print_u64(checksum);
+    rt.print_str(" elapsed_ns=");
+    rt.print_u64(elapsed_ns);
+    rt.print_nl();
+    return 0_i32;
+}

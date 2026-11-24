@@ -1,0 +1,6 @@
+module fail.ret_where;
+pub fn f(x: u32) -> u32
+    where return <= x //~ ERROR E0126
+{
+    return x;
+}

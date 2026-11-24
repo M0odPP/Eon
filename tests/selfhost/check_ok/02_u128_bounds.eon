@@ -1,0 +1,22 @@
+module ok.u128_bounds;
+
+pub fn ok_u128_above_i128_max(x: u128) -> u32 {
+    if x > 170141183460469231731687303715884105727_u128 {
+        return 1_u32;
+    }
+    return 0_u32;
+}
+
+pub fn ok_u128_sub(x: u128) -> u128 {
+    if x >= 1_u128 {
+        return x - 1_u128;
+    }
+    return 0_u128;
+}
+
+pub fn ok_u128_bounded_add(x: u128) -> u128 {
+    if x <= 1000_u128 {
+        return x + 1_u128;
+    }
+    return x;
+}

@@ -1,0 +1,181 @@
+module utils.ewc;
+
+import std.rt;
+import utils.linux;
+
+/// Zero-libc static Linux `wc` utility using `mmap` + `vec[u8, 32]` (AVX2) SIMD bitmask counting.
+
+pub struct Counts {
+    pub lines: u64;
+    pub words: u64;
+    pub bytes: u64;
+}
+
+fn is_ws_byte(b: u8) -> bool {
+    return b == b' ' || b == 10_u8 || b == 9_u8 || b == 13_u8 || b == 11_u8 || b == 12_u8;
+}
+
+/// Branchless AVX2 `vec[u8, 32]` line & word counter:
+///   ws_mask    = eq(' ') | eq('\n') | eq('\t') | eq('\r') | eq(0x0B) | eq(0x0C)
+///   word_start = (~ws_mask) & ((ws_mask << 1) | prev_ws)
+///   words     += @popcnt(word_start), lines += @popcnt(nl_mask)
+fn count_simd(data: *[u8]) -> Counts {
+    let v_sp: vec[u8, 32] = u8x32.splat(b' ');
+    let v_nl: vec[u8, 32] = u8x32.splat(10_u8);
+    let v_tb: vec[u8, 32] = u8x32.splat(9_u8);
+    let v_cr: vec[u8, 32] = u8x32.splat(13_u8);
+    let v_vt: vec[u8, 32] = u8x32.splat(11_u8);
+    let v_ff: vec[u8, 32] = u8x32.splat(12_u8);
+
+    var lines: u64 = 0_u64;
+    var words: u64 = 0_u64;
+    var prev_ws: u64 = 1_u64; // Virtual leading whitespace so byte 0 starts a word if non-ws
+    var i: usize = 0_usize;
+
+    while i < data.len {
+        let end32 = i + 31_usize;
+        if end32 >= data.len {
+            break;
+        }
+        let v: vec[u8, 32] = .{
+            data[i], data[i + 1_usize], data[i + 2_usize], data[i + 3_usize],
+            data[i + 4_usize], data[i + 5_usize], data[i + 6_usize], data[i + 7_usize],
+            data[i + 8_usize], data[i + 9_usize], data[i + 10_usize], data[i + 11_usize],
+            data[i + 12_usize], data[i + 13_usize], data[i + 14_usize], data[i + 15_usize],
+            data[i + 16_usize], data[i + 17_usize], data[i + 18_usize], data[i + 19_usize],
+            data[i + 20_usize], data[i + 21_usize], data[i + 22_usize], data[i + 23_usize],
+            data[i + 24_usize], data[i + 25_usize], data[i + 26_usize], data[i + 27_usize],
+            data[i + 28_usize], data[i + 29_usize], data[i + 30_usize], data[end32],
+        };
+        let nl_m = v.cmpeq(v_nl).bitmask();
+        let ws_m = nl_m
+            | v.cmpeq(v_sp).bitmask()
+            | v.cmpeq(v_tb).bitmask()
+            | v.cmpeq(v_cr).bitmask()
+            | v.cmpeq(v_vt).bitmask()
+            | v.cmpeq(v_ff).bitmask();
+        let non_ws = (~ws_m) & 0xFFFFFFFF_u64;
+        let prev_shifted = ((ws_m <<% 1_u64) | prev_ws) & 0xFFFFFFFF_u64;
+        let starts = non_ws & prev_shifted;
+
+        lines = lines +% @popcnt(nl_m);
+        words = words +% @popcnt(starts);
+        prev_ws = (ws_m >> 31_u64) & 1_u64;
+        i = i +% 32_usize;
+    }
+
+    while i < data.len {
+        let b = data[i];
+        if b == 10_u8 {
+            lines = lines +% 1_u64;
+        }
+        let ws = if is_ws_byte(b) { 1_u64 } else { 0_u64 };
+        if ws == 0_u64 && prev_ws == 1_u64 {
+            words = words +% 1_u64;
+        }
+        prev_ws = ws;
+        i = i +% 1_usize;
+    }
+
+    return Counts.{
+        lines: lines,
+        words: words,
+        bytes: data.len.widen.[u64](),
+    };
+}
+
+pub fn main(env: *mut Env) -> i32 {
+    let args = &env.args;
+    let clock = &env.clock;
+    let argc = rt.arg_count(args);
+    if argc < 2_usize {
+        rt.eprint_str("usage: ewc [--bench N] <file...>\n");
+        return 1_i32;
+    }
+
+    var arg_idx: usize = 1_usize;
+    var repeat: u64 = 1_u64;
+    if let a1 = rt.arg_at(args, 1_usize) {
+        if rt.str_eq(a1, "--bench") && argc >= 4_usize {
+            if let a2 = rt.arg_at(args, 2_usize) {
+                let bs = a2.as_bytes();
+                var n: u64 = 0_u64;
+                var bi: usize = 0_usize;
+                while bi < bs.len {
+                    if bs[bi] >= b'0' && bs[bi] <= b'9' {
+                        n = (n *% 10_u64) +% (bs[bi] -% b'0').widen.[u64]();
+                    }
+                    bi = bi +% 1_usize;
+                }
+                if n > 0_u64 {
+                    repeat = n;
+                }
+            }
+            arg_idx = 3_usize;
+        }
+    }
+
+    var total_l: u64 = 0_u64;
+    var total_w: u64 = 0_u64;
+    var total_b: u64 = 0_u64;
+    var file_count: usize = 0_usize;
+    let t0 = rt.now_ns(clock);
+
+    while arg_idx < argc {
+        if let path = rt.arg_at(args, arg_idx) {
+            let mf = linux.MmapFile.open_readonly(path) catch {
+                rt.eprint_str("ewc: failed to open ");
+                rt.eprint_str(path);
+                rt.eprint_nl();
+                return 2_i32;
+            };
+            var c = Counts.{ lines: 0_u64, words: 0_u64, bytes: 0_u64 };
+            var rep: u64 = 0_u64;
+            while rep < repeat {
+                c = count_simd(mf.as_bytes());
+                rep = rep +% 1_u64;
+            }
+            mf.close();
+
+            total_l = total_l +% c.lines;
+            total_w = total_w +% c.words;
+            total_b = total_b +% c.bytes;
+            file_count = file_count +% 1_usize;
+
+            if repeat == 1_u64 {
+                rt.print_u64(c.lines);
+                rt.print_str(" ");
+                rt.print_u64(c.words);
+                rt.print_str(" ");
+                rt.print_u64(c.bytes);
+                rt.print_str(" ");
+                rt.print_str(path);
+                rt.print_nl();
+            }
+        }
+        arg_idx = arg_idx +% 1_usize;
+    }
+
+    let elapsed_ns = rt.elapsed_since(clock, t0);
+    if repeat > 1_u64 {
+        rt.print_str("ewc bench: lines=");
+        rt.print_u64(total_l);
+        rt.print_str(" words=");
+        rt.print_u64(total_w);
+        rt.print_str(" bytes=");
+        rt.print_u64(total_b);
+        rt.print_str(" reps=");
+        rt.print_u64(repeat);
+        rt.print_str(" ns=");
+        rt.print_u64(elapsed_ns);
+        rt.print_nl();
+    } else if file_count > 1_usize {
+        rt.print_u64(total_l);
+        rt.print_str(" ");
+        rt.print_u64(total_w);
+        rt.print_str(" ");
+        rt.print_u64(total_b);
+        rt.print_str(" total\n");
+    }
+    return 0_i32;
+}

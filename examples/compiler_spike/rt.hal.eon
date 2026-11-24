@@ -1,0 +1,11 @@
+module rt.hal @hal;
+
+extern "C" fn eon_rt_print_str(s: *str);
+extern "C" fn eon_rt_print_u64(v: u64);
+extern "C" fn eon_rt_print_i64(v: i64);
+extern "C" fn eon_rt_print_nl();
+
+pub fn print_str(s: *str) { eon_rt_print_str(s); }
+pub fn print_u64(v: u64) { eon_rt_print_u64(v); }
+pub fn print_i64(v: i64) { eon_rt_print_i64(v); }
+pub fn print_nl() { eon_rt_print_nl(); }

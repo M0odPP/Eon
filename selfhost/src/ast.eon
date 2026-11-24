@@ -1,0 +1,5012 @@
+module eonc.ast;
+
+import core.col;
+import core.str;
+import eonc.span;
+
+// ---------------------------------------------------------------------------
+// Constants and Core Value Types
+// ---------------------------------------------------------------------------
+
+pub const NONE_ID: u32 = 4294967295_u32;
+
+pub struct IdRange {
+    pub start: u32;
+    pub len: u32;
+}
+
+pub fn range_empty() -> IdRange {
+    return IdRange.{ start: 0_u32, len: 0_u32 };
+}
+
+pub fn range_new(start: u32, len: u32) -> IdRange {
+    return IdRange.{ start: start, len: len };
+}
+
+pub struct IdentSpan {
+    pub sym: u32;
+    pub span: span.Span;
+}
+
+pub fn ident_new(sym: u32, sp: span.Span) -> IdentSpan {
+    return IdentSpan.{ sym: sym, span: sp };
+}
+
+pub fn ident_none() -> IdentSpan {
+    return IdentSpan.{ sym: NONE_ID, span: span.span_dummy() };
+}
+
+pub fn ident_is_some(id: IdentSpan) -> bool {
+    return id.sym != NONE_ID;
+}
+
+pub struct TypePath {
+    pub segments: IdRange;
+    pub generics: IdRange;
+}
+
+pub fn type_path_empty() -> TypePath {
+    return TypePath.{ segments: range_empty(), generics: range_empty() };
+}
+
+pub fn type_path_new(segments: IdRange, generics: IdRange) -> TypePath {
+    return TypePath.{ segments: segments, generics: generics };
+}
+
+// ---------------------------------------------------------------------------
+// AST Enums
+// ---------------------------------------------------------------------------
+
+pub enum ImportTailKind : u8 {
+    None = 0,
+    Alias = 1,
+    Items = 2,
+}
+
+pub enum ParamModifier : u8 {
+    None = 0,
+    Mut = 1,
+    From = 2,
+}
+
+pub enum AccessMode : u8 {
+    None = 0,
+    Read = 1,
+    Write = 2,
+}
+
+pub enum DeclKind : u8 {
+    Fn = 0,
+    Sys = 1,
+    Struct = 2,
+    Pool = 3,
+    Enum = 4,
+    Union = 5,
+    Bitfield = 6,
+    Iface = 7,
+    Impl = 8,
+    Error = 9,
+    TypeAlias = 10,
+    Const = 11,
+    ExternFn = 12,
+    ExternStruct = 13,
+    ExternUnion = 14,
+}
+
+pub enum GenericArgKind : u8 {
+    Type = 0,
+    Expr = 1,
+    TypeOrConst = 2,
+}
+
+pub enum BorrowTargetKind : u8 {
+    Single = 0,
+    Slice = 1,
+    Str = 2,
+}
+
+pub enum TypeKind : u8 {
+    ErrorUnion = 0,
+    Optional = 1,
+    Borrow = 2,
+    Array = 3,
+    Dyn = 4,
+    FnPtr = 5,
+    InlineStruct = 6,
+    Tuple = 7,
+    Void = 8,
+    Never = 9,
+    TypeType = 10,
+    SelfType = 11,
+    Inferred = 12,
+    Path = 13,
+    Error = 14,
+}
+
+pub enum RangeKind : u8 {
+    Exclusive = 0,
+    Inclusive = 1,
+}
+
+pub enum BodyKind : u8 {
+    Block = 0,
+    Expr = 1,
+    Jump = 2,
+}
+
+pub enum JumpKind : u8 {
+    Return = 0,
+    Break = 1,
+    Continue = 2,
+    Unreachable = 3,
+}
+
+pub enum IfCondKind : u8 {
+    Expr = 0,
+    Let = 1,
+}
+
+pub enum ElseKind : u8 {
+    None = 0,
+    Block = 1,
+    If = 2,
+}
+
+pub enum AssignOp : u8 {
+    Assign = 0,
+    AddAssign = 1,
+    SubAssign = 2,
+    MulAssign = 3,
+    AddWrapAssign = 4,
+    SubWrapAssign = 5,
+    MulWrapAssign = 6,
+    AddSatAssign = 7,
+    SubSatAssign = 8,
+    MulSatAssign = 9,
+    BitAndAssign = 10,
+    BitOrAssign = 11,
+    BitXorAssign = 12,
+    ShlAssign = 13,
+    ShrAssign = 14,
+}
+
+pub enum UnaryOp : u8 {
+    Neg = 0,
+    Not = 1,
+    BitNot = 2,
+    Borrow = 3,
+    BorrowMut = 4,
+    Move = 5,
+    Copy = 6,
+    Try = 7,
+}
+
+pub enum BinaryOp : u8 {
+    Or = 0,
+    And = 1,
+    Eq = 2,
+    NotEq = 3,
+    Lt = 4,
+    LtEq = 5,
+    Gt = 6,
+    GtEq = 7,
+    BitOr = 8,
+    BitXor = 9,
+    BitAnd = 10,
+    Shl = 11,
+    Shr = 12,
+    ShlWrap = 13,
+    Add = 14,
+    Sub = 15,
+    AddWrap = 16,
+    SubWrap = 17,
+    AddSat = 18,
+    SubSat = 19,
+    AddCheck = 20,
+    SubCheck = 21,
+    Mul = 22,
+    Div = 23,
+    Mod = 24,
+    MulWrap = 25,
+    MulSat = 26,
+    MulCheck = 27,
+    DivCheck = 28,
+    ModCheck = 29,
+}
+
+pub enum StmtKind : u8 {
+    Let = 0,
+    Var = 1,
+    Const = 2,
+    Defer = 3,
+    Errdefer = 4,
+    Jump = 5,
+    If = 6,
+    Match = 7,
+    While = 8,
+    For = 9,
+    ParFor = 10,
+    Loop = 11,
+    ComptimeBlock = 12,
+    RawBlock = 13,
+    Assign = 14,
+    Discard = 15,
+    Expr = 16,
+}
+
+pub enum ExprKind : u8 {
+    IntLit = 0,
+    FloatLit = 1,
+    StringLit = 2,
+    RawStringLit = 3,
+    ByteStringLit = 4,
+    CharLit = 5,
+    ByteCharLit = 6,
+    BoolLit = 7,
+    Null = 8,
+    SelfVal = 9,
+    ReturnVal = 10,
+    Ident = 11,
+    EnumLit = 12,
+    AnonStructLit = 13,
+    NamedStructLit = 14,
+    ArrayLit = 15,
+    ArrayRepeat = 16,
+    Tuple = 17,
+    Paren = 18,
+    Closure = 19,
+    If = 20,
+    Match = 21,
+    Loop = 22,
+    ComptimeBlock = 23,
+    ComptimeExpr = 24,
+    Builtin = 25,
+    Asm = 26,
+    Unary = 27,
+    Binary = 28,
+    Is = 29,
+    Orelse = 30,
+    Catch = 31,
+    Field = 32,
+    Deref = 33,
+    GenericApply = 34,
+    Call = 35,
+    Index = 36,
+    Slice = 37,
+    Error = 38,
+}
+
+pub enum AsmOperandKind : u8 {
+    Named = 0,
+    Expr = 1,
+}
+
+pub enum PatKind : u8 {
+    Wildcard = 0,
+    Ident = 1,
+    IntLit = 2,
+    CharLit = 3,
+    BoolLit = 4,
+    Null = 5,
+    Variant = 6,
+    Struct = 7,
+    Tuple = 8,
+    Error = 9,
+}
+
+// ---------------------------------------------------------------------------
+// AST Node Structs
+// ---------------------------------------------------------------------------
+
+pub struct UnitNode {
+    pub file: u32;
+    pub profile: span.FileProfile;
+    pub module_path: IdRange;
+    pub is_hal: bool;
+    pub has_hal_span: bool;
+    pub hal_span: span.Span;
+    pub imports: IdRange;
+    pub decls: IdRange;
+    pub is_emi_stub: bool;
+}
+
+pub struct ImportItemNode {
+    pub span: span.Span;
+    pub name: IdentSpan;
+    pub alias: IdentSpan;
+}
+
+pub struct ImportNode {
+    pub span: span.Span;
+    pub path: IdRange;
+    pub tail_kind: ImportTailKind;
+    pub alias: IdentSpan;
+    pub items: IdRange;
+}
+
+pub struct AttrArgNode {
+    pub span: span.Span;
+    pub name: IdentSpan;
+    pub value: u32;
+}
+
+pub struct AttrNode {
+    pub span: span.Span;
+    pub name: IdentSpan;
+    pub args: IdRange;
+    pub has_parens: bool;
+}
+
+pub struct GenericParamNode {
+    pub span: span.Span;
+    pub is_comptime: bool;
+    pub name: IdentSpan;
+    pub comptime_ty: u32;
+    pub bounds: IdRange;
+}
+
+pub struct GenericArgNode {
+    pub span: span.Span;
+    pub kind: GenericArgKind;
+    pub node_id: u32;
+    pub segs: IdRange;
+}
+
+pub struct ParamNode {
+    pub span: span.Span;
+    pub attrs: IdRange;
+    pub is_comptime: bool;
+    pub modifier: ParamModifier;
+    pub name: IdentSpan;
+    pub is_self: bool;
+    pub access: AccessMode;
+    pub ty: u32;
+}
+
+pub struct SysParamNode {
+    pub span: span.Span;
+    pub attrs: IdRange;
+    pub is_comptime: bool;
+    pub modifier: ParamModifier;
+    pub name: IdentSpan;
+    pub is_self: bool;
+    pub access: AccessMode;
+    pub ty: u32;
+    pub columns: IdRange;
+}
+
+pub struct FieldNode {
+    pub span: span.Span;
+    pub attrs: IdRange;
+    pub is_pub: bool;
+    pub name: IdentSpan;
+    pub ty: u32;
+    pub default: u32;
+}
+
+pub struct DeclNode {
+    pub span: span.Span;
+    pub attrs: IdRange;
+    pub is_pub: bool;
+    pub kind: DeclKind;
+    pub payload: u32;
+}
+
+pub struct FnDeclNode {
+    pub is_comptime: bool;
+    pub is_view: bool;
+    pub name: IdentSpan;
+    pub generics: IdRange;
+    pub params: IdRange;
+    pub ret_type: u32;
+    pub effects: IdRange;
+    pub where_clauses: IdRange;
+    pub ensures_clauses: IdRange;
+    pub body: u32;
+    pub is_emi_stub_body: bool;
+}
+
+pub struct SysDeclNode {
+    pub name: IdentSpan;
+    pub generics: IdRange;
+    pub params: IdRange;
+    pub ret_type: u32;
+    pub effects: IdRange;
+    pub where_clauses: IdRange;
+    pub ensures_clauses: IdRange;
+    pub body: u32;
+    pub is_emi_stub_body: bool;
+}
+
+pub struct StructDeclNode {
+    pub is_linear: bool;
+    pub is_view: bool;
+    pub name: IdentSpan;
+    pub generics: IdRange;
+    pub where_clauses: IdRange;
+    pub fields: IdRange;
+}
+
+pub struct EnumVariantNode {
+    pub span: span.Span;
+    pub name: IdentSpan;
+    pub value: u32;
+}
+
+pub struct EnumDeclNode {
+    pub name: IdentSpan;
+    pub repr_int: IdentSpan;
+    pub variants: IdRange;
+}
+
+pub struct UnionVariantNode {
+    pub span: span.Span;
+    pub name: IdentSpan;
+    pub ty: u32;
+}
+
+pub struct UnionDeclNode {
+    pub is_linear: bool;
+    pub name: IdentSpan;
+    pub generics: IdRange;
+    pub where_clauses: IdRange;
+    pub variants: IdRange;
+}
+
+pub struct BitfieldMemberNode {
+    pub span: span.Span;
+    pub name: IdentSpan;
+    pub ty: IdentSpan;
+    pub has_bits: bool;
+    pub bits_lo: u32;
+    pub bits_hi: u32;
+}
+
+pub struct BitfieldDeclNode {
+    pub name: IdentSpan;
+    pub base_int: IdentSpan;
+    pub members: IdRange;
+}
+
+pub struct IfaceMethodNode {
+    pub span: span.Span;
+    pub attrs: IdRange;
+    pub is_view: bool;
+    pub name: IdentSpan;
+    pub generics: IdRange;
+    pub params: IdRange;
+    pub ret_type: u32;
+    pub effects: IdRange;
+    pub where_clauses: IdRange;
+    pub ensures_clauses: IdRange;
+}
+
+pub struct IfaceDeclNode {
+    pub name: IdentSpan;
+    pub generics: IdRange;
+    pub methods: IdRange;
+}
+
+pub struct ImplDeclNode {
+    pub generics: IdRange;
+    pub iface_type: u32;
+    pub target_type: u32;
+    pub where_clauses: IdRange;
+    pub decls: IdRange;
+}
+
+pub struct ErrorDeclNode {
+    pub name: IdentSpan;
+    pub variants: IdRange;
+}
+
+pub struct TypeAliasDeclNode {
+    pub name: IdentSpan;
+    pub generics: IdRange;
+    pub where_clauses: IdRange;
+    pub ty: u32;
+}
+
+pub struct ConstDeclNode {
+    pub name: IdentSpan;
+    pub ty: u32;
+    pub value: u32;
+}
+
+pub struct ExternDeclNode {
+    pub abi: u32;
+    pub name: IdentSpan;
+    pub params: IdRange;
+    pub fields: IdRange;
+    pub ret_type: u32;
+}
+
+pub struct TypeNode {
+    pub span: span.Span;
+    pub kind: TypeKind;
+    pub is_mut: bool;
+    pub borrow_target: BorrowTargetKind;
+    pub primary: u32;
+    pub aux: u32;
+    pub list: IdRange;
+    pub list2: IdRange;
+}
+
+pub fn type_zero(sp: span.Span, kind: TypeKind) -> TypeNode {
+    return TypeNode.{
+        span: sp,
+        kind: kind,
+        is_mut: false,
+        borrow_target: .Single,
+        primary: NONE_ID,
+        aux: NONE_ID,
+        list: range_empty(),
+        list2: range_empty(),
+    };
+}
+
+pub struct PatFieldNode {
+    pub span: span.Span;
+    pub name: IdentSpan;
+    pub pat: u32;
+}
+
+pub struct PatNode {
+    pub span: span.Span;
+    pub kind: PatKind;
+    pub flag: bool;
+    pub has_range: bool;
+    pub range_kind: RangeKind;
+    pub range_neg: bool;
+    pub data0: u32;
+    pub data1: u32;
+    pub ident: IdentSpan;
+    pub list: IdRange;
+    pub path_segs: IdRange;
+    pub path_gens: IdRange;
+}
+
+pub fn pat_zero(sp: span.Span, kind: PatKind) -> PatNode {
+    return PatNode.{
+        span: sp,
+        kind: kind,
+        flag: false,
+        has_range: false,
+        range_kind: .Exclusive,
+        range_neg: false,
+        data0: 0_u32,
+        data1: 0_u32,
+        ident: ident_none(),
+        list: range_empty(),
+        path_segs: range_empty(),
+        path_gens: range_empty(),
+    };
+}
+
+pub struct BlockNode {
+    pub span: span.Span;
+    pub stmts: IdRange;
+    pub tail_expr: u32;
+}
+
+pub struct JumpNode {
+    pub kind: JumpKind;
+    pub label: IdentSpan;
+    pub value: u32;
+}
+
+pub struct IfNode {
+    pub span: span.Span;
+    pub is_comptime: bool;
+    pub cond_kind: IfCondKind;
+    pub cond_pat: u32;
+    pub cond_expr: u32;
+    pub then_block: u32;
+    pub else_kind: ElseKind;
+    pub else_id: u32;
+}
+
+pub struct MatchArmNode {
+    pub span: span.Span;
+    pub pat: u32;
+    pub guard: u32;
+    pub body_kind: BodyKind;
+    pub body_id: u32;
+}
+
+pub struct StmtNode {
+    pub span: span.Span;
+    pub kind: StmtKind;
+    pub assign_op: AssignOp;
+    pub body_kind: BodyKind;
+    pub range_kind: RangeKind;
+    pub has_range: bool;
+    pub ident: IdentSpan;
+    pub a: u32;
+    pub b: u32;
+    pub c: u32;
+    pub d: u32;
+    pub list: IdRange;
+}
+
+pub fn stmt_zero(sp: span.Span, kind: StmtKind) -> StmtNode {
+    return StmtNode.{
+        span: sp,
+        kind: kind,
+        assign_op: .Assign,
+        body_kind: .Block,
+        range_kind: .Exclusive,
+        has_range: false,
+        ident: ident_none(),
+        a: NONE_ID,
+        b: NONE_ID,
+        c: NONE_ID,
+        d: NONE_ID,
+        list: range_empty(),
+    };
+}
+
+pub struct FieldInitNode {
+    pub span: span.Span;
+    pub name: IdentSpan;
+    pub value: u32;
+}
+
+pub struct AsmOperandNode {
+    pub span: span.Span;
+    pub kind: AsmOperandKind;
+    pub dir: IdentSpan;
+    pub expr: u32;
+    pub arg: u32;
+}
+
+pub struct ExprNode {
+    pub span: span.Span;
+    pub kind: ExprKind;
+    pub flag: bool;
+    pub unary_op: UnaryOp;
+    pub bin_op: BinaryOp;
+    pub body_kind: BodyKind;
+    pub a: u32;
+    pub b: u32;
+    pub c: u32;
+    pub ident: IdentSpan;
+    pub list: IdRange;
+    pub list2: IdRange;
+}
+
+pub fn expr_zero(sp: span.Span, kind: ExprKind) -> ExprNode {
+    return ExprNode.{
+        span: sp,
+        kind: kind,
+        flag: false,
+        unary_op: .Neg,
+        bin_op: .Add,
+        body_kind: .Expr,
+        a: NONE_ID,
+        b: NONE_ID,
+        c: NONE_ID,
+        ident: ident_none(),
+        list: range_empty(),
+        list2: range_empty(),
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Linear Sub-Pools (kept compact to stay well inside stack/DBM bounds)
+// ---------------------------------------------------------------------------
+
+pub linear struct AstMetaPools {
+    pub units: col.DynBuf[UnitNode];
+    pub imports: col.DynBuf[ImportNode];
+    pub import_items: col.DynBuf[ImportItemNode];
+    pub attrs: col.DynBuf[AttrNode];
+    pub attr_args: col.DynBuf[AttrArgNode];
+    pub idents: col.DynBuf[IdentSpan];
+    pub generic_params: col.DynBuf[GenericParamNode];
+    pub generic_args: col.DynBuf[GenericArgNode];
+    pub params: col.DynBuf[ParamNode];
+    pub sys_params: col.DynBuf[SysParamNode];
+    pub fields: col.DynBuf[FieldNode];
+}
+
+impl AstMetaPools {
+    pub fn init(alloc: *mut AllocCap) -> AstMetaPools ! OutOfMemory {
+        let units = try col.DynBuf.[UnitNode].init(alloc, 4_usize);
+        errdefer units.destroy(alloc);
+        let imports = try col.DynBuf.[ImportNode].init(alloc, 16_usize);
+        errdefer imports.destroy(alloc);
+        let import_items = try col.DynBuf.[ImportItemNode].init(alloc, 16_usize);
+        errdefer import_items.destroy(alloc);
+        let attrs = try col.DynBuf.[AttrNode].init(alloc, 16_usize);
+        errdefer attrs.destroy(alloc);
+        let attr_args = try col.DynBuf.[AttrArgNode].init(alloc, 16_usize);
+        errdefer attr_args.destroy(alloc);
+        let idents = try col.DynBuf.[IdentSpan].init(alloc, 64_usize);
+        errdefer idents.destroy(alloc);
+        let generic_params = try col.DynBuf.[GenericParamNode].init(alloc, 16_usize);
+        errdefer generic_params.destroy(alloc);
+        let generic_args = try col.DynBuf.[GenericArgNode].init(alloc, 32_usize);
+        errdefer generic_args.destroy(alloc);
+        let params = try col.DynBuf.[ParamNode].init(alloc, 64_usize);
+        errdefer params.destroy(alloc);
+        let sys_params = try col.DynBuf.[SysParamNode].init(alloc, 8_usize);
+        errdefer sys_params.destroy(alloc);
+        let fields = try col.DynBuf.[FieldNode].init(alloc, 64_usize);
+        errdefer fields.destroy(alloc);
+        return AstMetaPools.{
+            units: units,
+            imports: imports,
+            import_items: import_items,
+            attrs: attrs,
+            attr_args: attr_args,
+            idents: idents,
+            generic_params: generic_params,
+            generic_args: generic_args,
+            params: params,
+            sys_params: sys_params,
+            fields: fields,
+        };
+    }
+
+    pub fn destroy(self: AstMetaPools, alloc: *mut AllocCap) {
+        let AstMetaPools.{
+            units,
+            imports,
+            import_items,
+            attrs,
+            attr_args,
+            idents,
+            generic_params,
+            generic_args,
+            params,
+            sys_params,
+            fields,
+        } = self;
+        units.destroy(alloc);
+        imports.destroy(alloc);
+        import_items.destroy(alloc);
+        attrs.destroy(alloc);
+        attr_args.destroy(alloc);
+        idents.destroy(alloc);
+        generic_params.destroy(alloc);
+        generic_args.destroy(alloc);
+        params.destroy(alloc);
+        sys_params.destroy(alloc);
+        fields.destroy(alloc);
+    }
+}
+
+pub linear struct AstDeclCorePools {
+    pub decls: col.DynBuf[DeclNode];
+    pub decl_lists: col.DynBuf[u32];
+    pub fn_decls: col.DynBuf[FnDeclNode];
+    pub sys_decls: col.DynBuf[SysDeclNode];
+    pub struct_decls: col.DynBuf[StructDeclNode];
+    pub impl_decls: col.DynBuf[ImplDeclNode];
+    pub type_decls: col.DynBuf[TypeAliasDeclNode];
+    pub const_decls: col.DynBuf[ConstDeclNode];
+    pub extern_decls: col.DynBuf[ExternDeclNode];
+}
+
+impl AstDeclCorePools {
+    pub fn init(alloc: *mut AllocCap) -> AstDeclCorePools ! OutOfMemory {
+        let decls = try col.DynBuf.[DeclNode].init(alloc, 64_usize);
+        errdefer decls.destroy(alloc);
+        let decl_lists = try col.DynBuf.[u32].init(alloc, 64_usize);
+        errdefer decl_lists.destroy(alloc);
+        let fn_decls = try col.DynBuf.[FnDeclNode].init(alloc, 32_usize);
+        errdefer fn_decls.destroy(alloc);
+        let sys_decls = try col.DynBuf.[SysDeclNode].init(alloc, 4_usize);
+        errdefer sys_decls.destroy(alloc);
+        let struct_decls = try col.DynBuf.[StructDeclNode].init(alloc, 16_usize);
+        errdefer struct_decls.destroy(alloc);
+        let impl_decls = try col.DynBuf.[ImplDeclNode].init(alloc, 16_usize);
+        errdefer impl_decls.destroy(alloc);
+        let type_decls = try col.DynBuf.[TypeAliasDeclNode].init(alloc, 8_usize);
+        errdefer type_decls.destroy(alloc);
+        let const_decls = try col.DynBuf.[ConstDeclNode].init(alloc, 16_usize);
+        errdefer const_decls.destroy(alloc);
+        let extern_decls = try col.DynBuf.[ExternDeclNode].init(alloc, 8_usize);
+        errdefer extern_decls.destroy(alloc);
+        return AstDeclCorePools.{
+            decls: decls,
+            decl_lists: decl_lists,
+            fn_decls: fn_decls,
+            sys_decls: sys_decls,
+            struct_decls: struct_decls,
+            impl_decls: impl_decls,
+            type_decls: type_decls,
+            const_decls: const_decls,
+            extern_decls: extern_decls,
+        };
+    }
+
+    pub fn destroy(self: AstDeclCorePools, alloc: *mut AllocCap) {
+        let AstDeclCorePools.{
+            decls,
+            decl_lists,
+            fn_decls,
+            sys_decls,
+            struct_decls,
+            impl_decls,
+            type_decls,
+            const_decls,
+            extern_decls,
+        } = self;
+        decls.destroy(alloc);
+        decl_lists.destroy(alloc);
+        fn_decls.destroy(alloc);
+        sys_decls.destroy(alloc);
+        struct_decls.destroy(alloc);
+        impl_decls.destroy(alloc);
+        type_decls.destroy(alloc);
+        const_decls.destroy(alloc);
+        extern_decls.destroy(alloc);
+    }
+}
+
+pub linear struct AstDeclTypePools {
+    pub enum_decls: col.DynBuf[EnumDeclNode];
+    pub enum_variants: col.DynBuf[EnumVariantNode];
+    pub union_decls: col.DynBuf[UnionDeclNode];
+    pub union_variants: col.DynBuf[UnionVariantNode];
+    pub bitfield_decls: col.DynBuf[BitfieldDeclNode];
+    pub bitfield_members: col.DynBuf[BitfieldMemberNode];
+    pub iface_decls: col.DynBuf[IfaceDeclNode];
+    pub iface_methods: col.DynBuf[IfaceMethodNode];
+    pub error_decls: col.DynBuf[ErrorDeclNode];
+}
+
+impl AstDeclTypePools {
+    pub fn init(alloc: *mut AllocCap) -> AstDeclTypePools ! OutOfMemory {
+        let enum_decls = try col.DynBuf.[EnumDeclNode].init(alloc, 8_usize);
+        errdefer enum_decls.destroy(alloc);
+        let enum_variants = try col.DynBuf.[EnumVariantNode].init(alloc, 32_usize);
+        errdefer enum_variants.destroy(alloc);
+        let union_decls = try col.DynBuf.[UnionDeclNode].init(alloc, 8_usize);
+        errdefer union_decls.destroy(alloc);
+        let union_variants = try col.DynBuf.[UnionVariantNode].init(alloc, 16_usize);
+        errdefer union_variants.destroy(alloc);
+        let bitfield_decls = try col.DynBuf.[BitfieldDeclNode].init(alloc, 4_usize);
+        errdefer bitfield_decls.destroy(alloc);
+        let bitfield_members = try col.DynBuf.[BitfieldMemberNode].init(alloc, 8_usize);
+        errdefer bitfield_members.destroy(alloc);
+        let iface_decls = try col.DynBuf.[IfaceDeclNode].init(alloc, 8_usize);
+        errdefer iface_decls.destroy(alloc);
+        let iface_methods = try col.DynBuf.[IfaceMethodNode].init(alloc, 16_usize);
+        errdefer iface_methods.destroy(alloc);
+        let error_decls = try col.DynBuf.[ErrorDeclNode].init(alloc, 8_usize);
+        errdefer error_decls.destroy(alloc);
+        return AstDeclTypePools.{
+            enum_decls: enum_decls,
+            enum_variants: enum_variants,
+            union_decls: union_decls,
+            union_variants: union_variants,
+            bitfield_decls: bitfield_decls,
+            bitfield_members: bitfield_members,
+            iface_decls: iface_decls,
+            iface_methods: iface_methods,
+            error_decls: error_decls,
+        };
+    }
+
+    pub fn destroy(self: AstDeclTypePools, alloc: *mut AllocCap) {
+        let AstDeclTypePools.{
+            enum_decls,
+            enum_variants,
+            union_decls,
+            union_variants,
+            bitfield_decls,
+            bitfield_members,
+            iface_decls,
+            iface_methods,
+            error_decls,
+        } = self;
+        enum_decls.destroy(alloc);
+        enum_variants.destroy(alloc);
+        union_decls.destroy(alloc);
+        union_variants.destroy(alloc);
+        bitfield_decls.destroy(alloc);
+        bitfield_members.destroy(alloc);
+        iface_decls.destroy(alloc);
+        iface_methods.destroy(alloc);
+        error_decls.destroy(alloc);
+    }
+}
+
+pub linear struct AstStmtPatPools {
+    pub types: col.DynBuf[TypeNode];
+    pub type_lists: col.DynBuf[u32];
+    pub pats: col.DynBuf[PatNode];
+    pub pat_lists: col.DynBuf[u32];
+    pub pat_fields: col.DynBuf[PatFieldNode];
+    pub stmts: col.DynBuf[StmtNode];
+    pub stmt_lists: col.DynBuf[u32];
+    pub blocks: col.DynBuf[BlockNode];
+    pub jumps: col.DynBuf[JumpNode];
+    pub if_nodes: col.DynBuf[IfNode];
+    pub match_arms: col.DynBuf[MatchArmNode];
+}
+
+impl AstStmtPatPools {
+    pub fn init(alloc: *mut AllocCap) -> AstStmtPatPools ! OutOfMemory {
+        let types = try col.DynBuf.[TypeNode].init(alloc, 128_usize);
+        errdefer types.destroy(alloc);
+        let type_lists = try col.DynBuf.[u32].init(alloc, 64_usize);
+        errdefer type_lists.destroy(alloc);
+        let pats = try col.DynBuf.[PatNode].init(alloc, 64_usize);
+        errdefer pats.destroy(alloc);
+        let pat_lists = try col.DynBuf.[u32].init(alloc, 32_usize);
+        errdefer pat_lists.destroy(alloc);
+        let pat_fields = try col.DynBuf.[PatFieldNode].init(alloc, 16_usize);
+        errdefer pat_fields.destroy(alloc);
+        let stmts = try col.DynBuf.[StmtNode].init(alloc, 256_usize);
+        errdefer stmts.destroy(alloc);
+        let stmt_lists = try col.DynBuf.[u32].init(alloc, 256_usize);
+        errdefer stmt_lists.destroy(alloc);
+        let blocks = try col.DynBuf.[BlockNode].init(alloc, 64_usize);
+        errdefer blocks.destroy(alloc);
+        let jumps = try col.DynBuf.[JumpNode].init(alloc, 32_usize);
+        errdefer jumps.destroy(alloc);
+        let if_nodes = try col.DynBuf.[IfNode].init(alloc, 32_usize);
+        errdefer if_nodes.destroy(alloc);
+        let match_arms = try col.DynBuf.[MatchArmNode].init(alloc, 32_usize);
+        errdefer match_arms.destroy(alloc);
+        return AstStmtPatPools.{
+            types: types,
+            type_lists: type_lists,
+            pats: pats,
+            pat_lists: pat_lists,
+            pat_fields: pat_fields,
+            stmts: stmts,
+            stmt_lists: stmt_lists,
+            blocks: blocks,
+            jumps: jumps,
+            if_nodes: if_nodes,
+            match_arms: match_arms,
+        };
+    }
+
+    pub fn destroy(self: AstStmtPatPools, alloc: *mut AllocCap) {
+        let AstStmtPatPools.{
+            types,
+            type_lists,
+            pats,
+            pat_lists,
+            pat_fields,
+            stmts,
+            stmt_lists,
+            blocks,
+            jumps,
+            if_nodes,
+            match_arms,
+        } = self;
+        types.destroy(alloc);
+        type_lists.destroy(alloc);
+        pats.destroy(alloc);
+        pat_lists.destroy(alloc);
+        pat_fields.destroy(alloc);
+        stmts.destroy(alloc);
+        stmt_lists.destroy(alloc);
+        blocks.destroy(alloc);
+        jumps.destroy(alloc);
+        if_nodes.destroy(alloc);
+        match_arms.destroy(alloc);
+    }
+}
+
+pub linear struct AstExprPools {
+    pub exprs: col.DynBuf[ExprNode];
+    pub expr_lists: col.DynBuf[u32];
+    pub field_inits: col.DynBuf[FieldInitNode];
+    pub asm_ops: col.DynBuf[AsmOperandNode];
+    pub str_bytes: col.DynBuf[u8];
+    pub byte_bytes: col.DynBuf[u8];
+}
+
+impl AstExprPools {
+    pub fn init(alloc: *mut AllocCap) -> AstExprPools ! OutOfMemory {
+        let exprs = try col.DynBuf.[ExprNode].init(alloc, 512_usize);
+        errdefer exprs.destroy(alloc);
+        let expr_lists = try col.DynBuf.[u32].init(alloc, 256_usize);
+        errdefer expr_lists.destroy(alloc);
+        let field_inits = try col.DynBuf.[FieldInitNode].init(alloc, 64_usize);
+        errdefer field_inits.destroy(alloc);
+        let asm_ops = try col.DynBuf.[AsmOperandNode].init(alloc, 8_usize);
+        errdefer asm_ops.destroy(alloc);
+        let str_bytes = try col.DynBuf.[u8].init(alloc, 256_usize);
+        errdefer str_bytes.destroy(alloc);
+        let byte_bytes = try col.DynBuf.[u8].init(alloc, 64_usize);
+        errdefer byte_bytes.destroy(alloc);
+        return AstExprPools.{
+            exprs: exprs,
+            expr_lists: expr_lists,
+            field_inits: field_inits,
+            asm_ops: asm_ops,
+            str_bytes: str_bytes,
+            byte_bytes: byte_bytes,
+        };
+    }
+
+    pub fn destroy(self: AstExprPools, alloc: *mut AllocCap) {
+        let AstExprPools.{
+            exprs,
+            expr_lists,
+            field_inits,
+            asm_ops,
+            str_bytes,
+            byte_bytes,
+        } = self;
+        exprs.destroy(alloc);
+        expr_lists.destroy(alloc);
+        field_inits.destroy(alloc);
+        asm_ops.destroy(alloc);
+        str_bytes.destroy(alloc);
+        byte_bytes.destroy(alloc);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generic Slice Helper & Top-Level AstArena
+// ---------------------------------------------------------------------------
+
+view fn slice_range[T](all: *[T], r: IdRange) -> *[T] {
+    let start = r.start.widen.[usize]();
+    let end = start +% r.len.widen.[usize]();
+    let s = all.sub(start, end) catch {
+        return all.sub(0_usize, 0_usize) catch {
+            return all;
+        };
+    };
+    return s;
+}
+
+pub linear struct AstArena {
+    pub meta: AstMetaPools;
+    pub decl_core: AstDeclCorePools;
+    pub decl_types: AstDeclTypePools;
+    pub stmt_pat: AstStmtPatPools;
+    pub expr_pools: AstExprPools;
+}
+
+impl AstArena {
+    pub fn init(alloc: *mut AllocCap) -> AstArena ! OutOfMemory {
+        let meta = try AstMetaPools.init(alloc);
+        errdefer meta.destroy(alloc);
+        let decl_core = try AstDeclCorePools.init(alloc);
+        errdefer decl_core.destroy(alloc);
+        let decl_types = try AstDeclTypePools.init(alloc);
+        errdefer decl_types.destroy(alloc);
+        let stmt_pat = try AstStmtPatPools.init(alloc);
+        errdefer stmt_pat.destroy(alloc);
+        let expr_pools = try AstExprPools.init(alloc);
+        errdefer expr_pools.destroy(alloc);
+        return AstArena.{
+            meta: meta,
+            decl_core: decl_core,
+            decl_types: decl_types,
+            stmt_pat: stmt_pat,
+            expr_pools: expr_pools,
+        };
+    }
+
+    pub fn destroy(self: AstArena, alloc: *mut AllocCap) {
+        let AstArena.{ meta, decl_core, decl_types, stmt_pat, expr_pools } = self;
+        meta.destroy(alloc);
+        decl_core.destroy(alloc);
+        decl_types.destroy(alloc);
+        stmt_pat.destroy(alloc);
+        expr_pools.destroy(alloc);
+    }
+
+    // --- Single-node builders ---
+
+    pub fn add_unit(self: *mut Self, alloc: *mut AllocCap, node: UnitNode) -> u32 ! OutOfMemory {
+        let id = self.meta.units.len().trunc.[u32]();
+        try self.meta.units.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_decl(self: *mut Self, alloc: *mut AllocCap, node: DeclNode) -> u32 ! OutOfMemory {
+        let id = self.decl_core.decls.len().trunc.[u32]();
+        try self.decl_core.decls.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_fn_decl(self: *mut Self, alloc: *mut AllocCap, node: FnDeclNode) -> u32 ! OutOfMemory {
+        let id = self.decl_core.fn_decls.len().trunc.[u32]();
+        try self.decl_core.fn_decls.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_sys_decl(self: *mut Self, alloc: *mut AllocCap, node: SysDeclNode) -> u32 ! OutOfMemory {
+        let id = self.decl_core.sys_decls.len().trunc.[u32]();
+        try self.decl_core.sys_decls.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_struct_decl(self: *mut Self, alloc: *mut AllocCap, node: StructDeclNode) -> u32 ! OutOfMemory {
+        let id = self.decl_core.struct_decls.len().trunc.[u32]();
+        try self.decl_core.struct_decls.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_enum_decl(self: *mut Self, alloc: *mut AllocCap, node: EnumDeclNode) -> u32 ! OutOfMemory {
+        let id = self.decl_types.enum_decls.len().trunc.[u32]();
+        try self.decl_types.enum_decls.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_union_decl(self: *mut Self, alloc: *mut AllocCap, node: UnionDeclNode) -> u32 ! OutOfMemory {
+        let id = self.decl_types.union_decls.len().trunc.[u32]();
+        try self.decl_types.union_decls.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_bitfield_decl(self: *mut Self, alloc: *mut AllocCap, node: BitfieldDeclNode) -> u32 ! OutOfMemory {
+        let id = self.decl_types.bitfield_decls.len().trunc.[u32]();
+        try self.decl_types.bitfield_decls.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_iface_decl(self: *mut Self, alloc: *mut AllocCap, node: IfaceDeclNode) -> u32 ! OutOfMemory {
+        let id = self.decl_types.iface_decls.len().trunc.[u32]();
+        try self.decl_types.iface_decls.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_impl_decl(self: *mut Self, alloc: *mut AllocCap, node: ImplDeclNode) -> u32 ! OutOfMemory {
+        let id = self.decl_core.impl_decls.len().trunc.[u32]();
+        try self.decl_core.impl_decls.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_error_decl(self: *mut Self, alloc: *mut AllocCap, node: ErrorDeclNode) -> u32 ! OutOfMemory {
+        let id = self.decl_types.error_decls.len().trunc.[u32]();
+        try self.decl_types.error_decls.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_type_decl(self: *mut Self, alloc: *mut AllocCap, node: TypeAliasDeclNode) -> u32 ! OutOfMemory {
+        let id = self.decl_core.type_decls.len().trunc.[u32]();
+        try self.decl_core.type_decls.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_const_decl(self: *mut Self, alloc: *mut AllocCap, node: ConstDeclNode) -> u32 ! OutOfMemory {
+        let id = self.decl_core.const_decls.len().trunc.[u32]();
+        try self.decl_core.const_decls.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_extern_decl(self: *mut Self, alloc: *mut AllocCap, node: ExternDeclNode) -> u32 ! OutOfMemory {
+        let id = self.decl_core.extern_decls.len().trunc.[u32]();
+        try self.decl_core.extern_decls.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_type(self: *mut Self, alloc: *mut AllocCap, node: TypeNode) -> u32 ! OutOfMemory {
+        let id = self.stmt_pat.types.len().trunc.[u32]();
+        try self.stmt_pat.types.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_pat(self: *mut Self, alloc: *mut AllocCap, node: PatNode) -> u32 ! OutOfMemory {
+        let id = self.stmt_pat.pats.len().trunc.[u32]();
+        try self.stmt_pat.pats.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_stmt(self: *mut Self, alloc: *mut AllocCap, node: StmtNode) -> u32 ! OutOfMemory {
+        let id = self.stmt_pat.stmts.len().trunc.[u32]();
+        try self.stmt_pat.stmts.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_block(self: *mut Self, alloc: *mut AllocCap, node: BlockNode) -> u32 ! OutOfMemory {
+        let id = self.stmt_pat.blocks.len().trunc.[u32]();
+        try self.stmt_pat.blocks.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_jump(self: *mut Self, alloc: *mut AllocCap, node: JumpNode) -> u32 ! OutOfMemory {
+        let id = self.stmt_pat.jumps.len().trunc.[u32]();
+        try self.stmt_pat.jumps.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_if(self: *mut Self, alloc: *mut AllocCap, node: IfNode) -> u32 ! OutOfMemory {
+        let id = self.stmt_pat.if_nodes.len().trunc.[u32]();
+        try self.stmt_pat.if_nodes.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_expr(self: *mut Self, alloc: *mut AllocCap, node: ExprNode) -> u32 ! OutOfMemory {
+        let id = self.expr_pools.exprs.len().trunc.[u32]();
+        try self.expr_pools.exprs.push(alloc, node);
+        return id;
+    }
+
+    // --- Slice / range committers ---
+
+    pub fn push_imports(self: *mut Self, alloc: *mut AllocCap, src: *[ImportNode]) -> IdRange ! OutOfMemory {
+        let start = self.meta.imports.len().trunc.[u32]();
+        try self.meta.imports.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_import_items(self: *mut Self, alloc: *mut AllocCap, src: *[ImportItemNode]) -> IdRange ! OutOfMemory {
+        let start = self.meta.import_items.len().trunc.[u32]();
+        try self.meta.import_items.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_attrs(self: *mut Self, alloc: *mut AllocCap, src: *[AttrNode]) -> IdRange ! OutOfMemory {
+        let start = self.meta.attrs.len().trunc.[u32]();
+        try self.meta.attrs.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_attr_args(self: *mut Self, alloc: *mut AllocCap, src: *[AttrArgNode]) -> IdRange ! OutOfMemory {
+        let start = self.meta.attr_args.len().trunc.[u32]();
+        try self.meta.attr_args.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_idents(self: *mut Self, alloc: *mut AllocCap, src: *[IdentSpan]) -> IdRange ! OutOfMemory {
+        let start = self.meta.idents.len().trunc.[u32]();
+        try self.meta.idents.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_generic_params(self: *mut Self, alloc: *mut AllocCap, src: *[GenericParamNode]) -> IdRange ! OutOfMemory {
+        let start = self.meta.generic_params.len().trunc.[u32]();
+        try self.meta.generic_params.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_generic_args(self: *mut Self, alloc: *mut AllocCap, src: *[GenericArgNode]) -> IdRange ! OutOfMemory {
+        let start = self.meta.generic_args.len().trunc.[u32]();
+        try self.meta.generic_args.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_params(self: *mut Self, alloc: *mut AllocCap, src: *[ParamNode]) -> IdRange ! OutOfMemory {
+        let start = self.meta.params.len().trunc.[u32]();
+        try self.meta.params.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_sys_params(self: *mut Self, alloc: *mut AllocCap, src: *[SysParamNode]) -> IdRange ! OutOfMemory {
+        let start = self.meta.sys_params.len().trunc.[u32]();
+        try self.meta.sys_params.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_fields(self: *mut Self, alloc: *mut AllocCap, src: *[FieldNode]) -> IdRange ! OutOfMemory {
+        let start = self.meta.fields.len().trunc.[u32]();
+        try self.meta.fields.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_decl_list(self: *mut Self, alloc: *mut AllocCap, src: *[u32]) -> IdRange ! OutOfMemory {
+        let start = self.decl_core.decl_lists.len().trunc.[u32]();
+        try self.decl_core.decl_lists.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_enum_variants(self: *mut Self, alloc: *mut AllocCap, src: *[EnumVariantNode]) -> IdRange ! OutOfMemory {
+        let start = self.decl_types.enum_variants.len().trunc.[u32]();
+        try self.decl_types.enum_variants.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_union_variants(self: *mut Self, alloc: *mut AllocCap, src: *[UnionVariantNode]) -> IdRange ! OutOfMemory {
+        let start = self.decl_types.union_variants.len().trunc.[u32]();
+        try self.decl_types.union_variants.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_bitfield_members(self: *mut Self, alloc: *mut AllocCap, src: *[BitfieldMemberNode]) -> IdRange ! OutOfMemory {
+        let start = self.decl_types.bitfield_members.len().trunc.[u32]();
+        try self.decl_types.bitfield_members.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_iface_methods(self: *mut Self, alloc: *mut AllocCap, src: *[IfaceMethodNode]) -> IdRange ! OutOfMemory {
+        let start = self.decl_types.iface_methods.len().trunc.[u32]();
+        try self.decl_types.iface_methods.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_type_list(self: *mut Self, alloc: *mut AllocCap, src: *[u32]) -> IdRange ! OutOfMemory {
+        let start = self.stmt_pat.type_lists.len().trunc.[u32]();
+        try self.stmt_pat.type_lists.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_pat_list(self: *mut Self, alloc: *mut AllocCap, src: *[u32]) -> IdRange ! OutOfMemory {
+        let start = self.stmt_pat.pat_lists.len().trunc.[u32]();
+        try self.stmt_pat.pat_lists.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_pat_fields(self: *mut Self, alloc: *mut AllocCap, src: *[PatFieldNode]) -> IdRange ! OutOfMemory {
+        let start = self.stmt_pat.pat_fields.len().trunc.[u32]();
+        try self.stmt_pat.pat_fields.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_stmt_list(self: *mut Self, alloc: *mut AllocCap, src: *[u32]) -> IdRange ! OutOfMemory {
+        let start = self.stmt_pat.stmt_lists.len().trunc.[u32]();
+        try self.stmt_pat.stmt_lists.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_match_arms(self: *mut Self, alloc: *mut AllocCap, src: *[MatchArmNode]) -> IdRange ! OutOfMemory {
+        let start = self.stmt_pat.match_arms.len().trunc.[u32]();
+        try self.stmt_pat.match_arms.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_expr_list(self: *mut Self, alloc: *mut AllocCap, src: *[u32]) -> IdRange ! OutOfMemory {
+        let start = self.expr_pools.expr_lists.len().trunc.[u32]();
+        try self.expr_pools.expr_lists.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_field_inits(self: *mut Self, alloc: *mut AllocCap, src: *[FieldInitNode]) -> IdRange ! OutOfMemory {
+        let start = self.expr_pools.field_inits.len().trunc.[u32]();
+        try self.expr_pools.field_inits.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_asm_ops(self: *mut Self, alloc: *mut AllocCap, src: *[AsmOperandNode]) -> IdRange ! OutOfMemory {
+        let start = self.expr_pools.asm_ops.len().trunc.[u32]();
+        try self.expr_pools.asm_ops.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_str_bytes(self: *mut Self, alloc: *mut AllocCap, src: *[u8]) -> IdRange ! OutOfMemory {
+        let start = self.expr_pools.str_bytes.len().trunc.[u32]();
+        try self.expr_pools.str_bytes.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    pub fn push_byte_bytes(self: *mut Self, alloc: *mut AllocCap, src: *[u8]) -> IdRange ! OutOfMemory {
+        let start = self.expr_pools.byte_bytes.len().trunc.[u32]();
+        try self.expr_pools.byte_bytes.push_slice(alloc, src);
+        return range_new(start, src.len.trunc.[u32]());
+    }
+
+    // --- Single-node view getters ---
+
+    pub view fn get_unit(self: *Self, id: u32) -> ?*UnitNode {
+        return self.meta.units.get(id.widen.[usize]());
+    }
+
+    pub fn mark_unit_emi_stub(self: *mut Self, id: u32) {
+        let us = self.meta.units.as_mut_slice();
+        let idx = id.widen.[usize]();
+        if idx < us.len {
+            us[idx].is_emi_stub = true;
+        }
+    }
+
+    pub fn mark_fn_emi_stub_body(self: *mut Self, id: u32) {
+        let fs = self.decl_core.fn_decls.as_mut_slice();
+        let idx = id.widen.[usize]();
+        if idx < fs.len {
+            fs[idx].is_emi_stub_body = true;
+        }
+    }
+
+    pub view fn get_decl(self: *Self, id: u32) -> ?*DeclNode {
+        return self.decl_core.decls.get(id.widen.[usize]());
+    }
+
+    pub view fn get_fn_decl(self: *Self, id: u32) -> ?*FnDeclNode {
+        return self.decl_core.fn_decls.get(id.widen.[usize]());
+    }
+
+    pub view fn get_sys_decl(self: *Self, id: u32) -> ?*SysDeclNode {
+        return self.decl_core.sys_decls.get(id.widen.[usize]());
+    }
+
+    pub view fn get_struct_decl(self: *Self, id: u32) -> ?*StructDeclNode {
+        return self.decl_core.struct_decls.get(id.widen.[usize]());
+    }
+
+    pub view fn get_enum_decl(self: *Self, id: u32) -> ?*EnumDeclNode {
+        return self.decl_types.enum_decls.get(id.widen.[usize]());
+    }
+
+    pub view fn get_union_decl(self: *Self, id: u32) -> ?*UnionDeclNode {
+        return self.decl_types.union_decls.get(id.widen.[usize]());
+    }
+
+    pub view fn get_bitfield_decl(self: *Self, id: u32) -> ?*BitfieldDeclNode {
+        return self.decl_types.bitfield_decls.get(id.widen.[usize]());
+    }
+
+    pub view fn get_iface_decl(self: *Self, id: u32) -> ?*IfaceDeclNode {
+        return self.decl_types.iface_decls.get(id.widen.[usize]());
+    }
+
+    pub view fn get_impl_decl(self: *Self, id: u32) -> ?*ImplDeclNode {
+        return self.decl_core.impl_decls.get(id.widen.[usize]());
+    }
+
+    pub view fn get_error_decl(self: *Self, id: u32) -> ?*ErrorDeclNode {
+        return self.decl_types.error_decls.get(id.widen.[usize]());
+    }
+
+    pub view fn get_type_decl(self: *Self, id: u32) -> ?*TypeAliasDeclNode {
+        return self.decl_core.type_decls.get(id.widen.[usize]());
+    }
+
+    pub view fn get_const_decl(self: *Self, id: u32) -> ?*ConstDeclNode {
+        return self.decl_core.const_decls.get(id.widen.[usize]());
+    }
+
+    pub view fn get_extern_decl(self: *Self, id: u32) -> ?*ExternDeclNode {
+        return self.decl_core.extern_decls.get(id.widen.[usize]());
+    }
+
+    pub view fn get_type(self: *Self, id: u32) -> ?*TypeNode {
+        return self.stmt_pat.types.get(id.widen.[usize]());
+    }
+
+    pub view fn get_pat(self: *Self, id: u32) -> ?*PatNode {
+        return self.stmt_pat.pats.get(id.widen.[usize]());
+    }
+
+    pub view fn get_stmt(self: *Self, id: u32) -> ?*StmtNode {
+        return self.stmt_pat.stmts.get(id.widen.[usize]());
+    }
+
+    pub view fn get_block(self: *Self, id: u32) -> ?*BlockNode {
+        return self.stmt_pat.blocks.get(id.widen.[usize]());
+    }
+
+    pub view fn get_jump(self: *Self, id: u32) -> ?*JumpNode {
+        return self.stmt_pat.jumps.get(id.widen.[usize]());
+    }
+
+    pub view fn get_if(self: *Self, id: u32) -> ?*IfNode {
+        return self.stmt_pat.if_nodes.get(id.widen.[usize]());
+    }
+
+    pub view fn get_expr(self: *Self, id: u32) -> ?*ExprNode {
+        return self.expr_pools.exprs.get(id.widen.[usize]());
+    }
+
+    // --- Range slice getters ---
+
+    pub view fn imports_range(self: *Self, r: IdRange) -> *[ImportNode] {
+        return slice_range.[ImportNode](self.meta.imports.as_slice(), r);
+    }
+
+    pub view fn import_items_range(self: *Self, r: IdRange) -> *[ImportItemNode] {
+        return slice_range.[ImportItemNode](self.meta.import_items.as_slice(), r);
+    }
+
+    pub view fn attrs_range(self: *Self, r: IdRange) -> *[AttrNode] {
+        return slice_range.[AttrNode](self.meta.attrs.as_slice(), r);
+    }
+
+    pub view fn attr_args_range(self: *Self, r: IdRange) -> *[AttrArgNode] {
+        return slice_range.[AttrArgNode](self.meta.attr_args.as_slice(), r);
+    }
+
+    pub view fn idents_range(self: *Self, r: IdRange) -> *[IdentSpan] {
+        return slice_range.[IdentSpan](self.meta.idents.as_slice(), r);
+    }
+
+    pub view fn generic_params_range(self: *Self, r: IdRange) -> *[GenericParamNode] {
+        return slice_range.[GenericParamNode](self.meta.generic_params.as_slice(), r);
+    }
+
+    pub view fn generic_args_range(self: *Self, r: IdRange) -> *[GenericArgNode] {
+        return slice_range.[GenericArgNode](self.meta.generic_args.as_slice(), r);
+    }
+
+    pub view fn params_range(self: *Self, r: IdRange) -> *[ParamNode] {
+        return slice_range.[ParamNode](self.meta.params.as_slice(), r);
+    }
+
+    pub view fn sys_params_range(self: *Self, r: IdRange) -> *[SysParamNode] {
+        return slice_range.[SysParamNode](self.meta.sys_params.as_slice(), r);
+    }
+
+    pub view fn fields_range(self: *Self, r: IdRange) -> *[FieldNode] {
+        return slice_range.[FieldNode](self.meta.fields.as_slice(), r);
+    }
+
+    pub view fn decl_list_range(self: *Self, r: IdRange) -> *[u32] {
+        return slice_range.[u32](self.decl_core.decl_lists.as_slice(), r);
+    }
+
+    pub view fn enum_variants_range(self: *Self, r: IdRange) -> *[EnumVariantNode] {
+        return slice_range.[EnumVariantNode](self.decl_types.enum_variants.as_slice(), r);
+    }
+
+    pub view fn union_variants_range(self: *Self, r: IdRange) -> *[UnionVariantNode] {
+        return slice_range.[UnionVariantNode](self.decl_types.union_variants.as_slice(), r);
+    }
+
+    pub view fn bitfield_members_range(self: *Self, r: IdRange) -> *[BitfieldMemberNode] {
+        return slice_range.[BitfieldMemberNode](self.decl_types.bitfield_members.as_slice(), r);
+    }
+
+    pub view fn iface_methods_range(self: *Self, r: IdRange) -> *[IfaceMethodNode] {
+        return slice_range.[IfaceMethodNode](self.decl_types.iface_methods.as_slice(), r);
+    }
+
+    pub view fn type_list_range(self: *Self, r: IdRange) -> *[u32] {
+        return slice_range.[u32](self.stmt_pat.type_lists.as_slice(), r);
+    }
+
+    pub view fn pat_list_range(self: *Self, r: IdRange) -> *[u32] {
+        return slice_range.[u32](self.stmt_pat.pat_lists.as_slice(), r);
+    }
+
+    pub view fn pat_fields_range(self: *Self, r: IdRange) -> *[PatFieldNode] {
+        return slice_range.[PatFieldNode](self.stmt_pat.pat_fields.as_slice(), r);
+    }
+
+    pub view fn stmt_list_range(self: *Self, r: IdRange) -> *[u32] {
+        return slice_range.[u32](self.stmt_pat.stmt_lists.as_slice(), r);
+    }
+
+    pub view fn match_arms_range(self: *Self, r: IdRange) -> *[MatchArmNode] {
+        return slice_range.[MatchArmNode](self.stmt_pat.match_arms.as_slice(), r);
+    }
+
+    pub view fn expr_list_range(self: *Self, r: IdRange) -> *[u32] {
+        return slice_range.[u32](self.expr_pools.expr_lists.as_slice(), r);
+    }
+
+    pub view fn field_inits_range(self: *Self, r: IdRange) -> *[FieldInitNode] {
+        return slice_range.[FieldInitNode](self.expr_pools.field_inits.as_slice(), r);
+    }
+
+    pub view fn asm_ops_range(self: *Self, r: IdRange) -> *[AsmOperandNode] {
+        return slice_range.[AsmOperandNode](self.expr_pools.asm_ops.as_slice(), r);
+    }
+
+    pub view fn str_bytes_range(self: *Self, r: IdRange) -> *[u8] {
+        return slice_range.[u8](self.expr_pools.str_bytes.as_slice(), r);
+    }
+
+    pub view fn byte_bytes_range(self: *Self, r: IdRange) -> *[u8] {
+        return slice_range.[u8](self.expr_pools.byte_bytes.as_slice(), r);
+    }
+
+    // --- Counts ---
+
+    pub fn unit_count(self: *Self) -> u32 {
+        return self.meta.units.len().trunc.[u32]();
+    }
+
+    pub fn decl_count(self: *Self) -> u32 {
+        return self.decl_core.decls.len().trunc.[u32]();
+    }
+
+    pub fn type_count(self: *Self) -> u32 {
+        return self.stmt_pat.types.len().trunc.[u32]();
+    }
+
+    pub fn pat_count(self: *Self) -> u32 {
+        return self.stmt_pat.pats.len().trunc.[u32]();
+    }
+
+    pub fn stmt_count(self: *Self) -> u32 {
+        return self.stmt_pat.stmts.len().trunc.[u32]();
+    }
+
+    pub fn expr_count(self: *Self) -> u32 {
+        return self.expr_pools.exprs.len().trunc.[u32]();
+    }
+
+    // --- Canonical Renderers (byte-for-byte compatible with eonc0) ---
+
+    pub fn dump_summary(
+        self: *Self,
+        alloc: *mut AllocCap,
+        unit_id: u32,
+        interner: *span.SymInterner,
+        out: *mut str.StrBuf,
+    ) -> !OutOfMemory {
+        let u = self.get_unit(unit_id) orelse {
+            return;
+        };
+        try write_unit_header(self, alloc, u, interner, true, out);
+        let decls = self.decl_list_range(u.decls);
+        var i: usize = 0_usize;
+        while i < decls.len {
+            try dump_decl_summary(self, alloc, decls[i], interner, 0_usize, out);
+            i = i +% 1_usize;
+        }
+        return;
+    }
+
+    pub fn dump_full(
+        self: *Self,
+        alloc: *mut AllocCap,
+        unit_id: u32,
+        interner: *span.SymInterner,
+        out: *mut str.StrBuf,
+    ) -> !OutOfMemory {
+        let u = self.get_unit(unit_id) orelse {
+            return;
+        };
+        try write_unit_header(self, alloc, u, interner, false, out);
+        let decls = self.decl_list_range(u.decls);
+        var i: usize = 0_usize;
+        while i < decls.len {
+            try dump_decl_full(self, alloc, decls[i], interner, 0_usize, out);
+            i = i +% 1_usize;
+        }
+        return;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared Low-Level Dump Helpers
+// ---------------------------------------------------------------------------
+
+fn push_indent(alloc: *mut AllocCap, depth: usize, out: *mut str.StrBuf) -> !OutOfMemory {
+    var i: usize = 0_usize;
+    while i < depth {
+        try out.push_str_grow(alloc, "  ");
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+fn push_sym(alloc: *mut AllocCap, interner: *span.SymInterner, sym: u32, out: *mut str.StrBuf) -> !OutOfMemory {
+    try out.push_bytes_grow(alloc, interner.get(sym));
+    return;
+}
+
+fn write_ident_path(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    segs_range: IdRange,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let segs = arena.idents_range(segs_range);
+    var i: usize = 0_usize;
+    while i < segs.len {
+        if i > 0_usize {
+            try out.push_byte_grow(alloc, b'.');
+        }
+        try push_sym(alloc, interner, segs[i].sym, out);
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+fn write_unit_header(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    u: *UnitNode,
+    interner: *span.SymInterner,
+    with_semi: bool,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    try out.push_str_grow(alloc, "module ");
+    try write_ident_path(arena, alloc, u.module_path, interner, out);
+    if u.is_hal {
+        try out.push_str_grow(alloc, " @hal");
+    }
+    if with_semi {
+        try out.push_str_grow(alloc, ";\n");
+    } else {
+        try out.push_byte_grow(alloc, 10_u8);
+    }
+
+    let imps = arena.imports_range(u.imports);
+    var i: usize = 0_usize;
+    while i < imps.len {
+        let imp = imps[i];
+        try out.push_str_grow(alloc, "import ");
+        try write_ident_path(arena, alloc, imp.path, interner, out);
+        match imp.tail_kind {
+            .None => {}
+            .Alias => {
+                try out.push_str_grow(alloc, " as ");
+                try push_sym(alloc, interner, imp.alias.sym, out);
+            }
+            .Items => {
+                try out.push_str_grow(alloc, ".{");
+                let items = arena.import_items_range(imp.items);
+                var j: usize = 0_usize;
+                while j < items.len {
+                    if j > 0_usize {
+                        try out.push_str_grow(alloc, ", ");
+                    }
+                    let it = items[j];
+                    try push_sym(alloc, interner, it.name.sym, out);
+                    if ident_is_some(it.alias) {
+                        try out.push_str_grow(alloc, " as ");
+                        try push_sym(alloc, interner, it.alias.sym, out);
+                    }
+                    j = j +% 1_usize;
+                }
+                try out.push_byte_grow(alloc, b'}');
+            }
+        }
+        if with_semi {
+            try out.push_str_grow(alloc, ";\n");
+        } else {
+            try out.push_byte_grow(alloc, 10_u8);
+        }
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+fn hex_nibble(n: u8) -> u8 {
+    let v = n & 15_u8;
+    if v < 10_u8 {
+        return b'0' +% v;
+    }
+    return b'a' +% (v -% 10_u8);
+}
+
+fn push_hex_byte(alloc: *mut AllocCap, b: u8, out: *mut str.StrBuf) -> !OutOfMemory {
+    try out.push_byte_grow(alloc, hex_nibble(b >> 4_u8));
+    try out.push_byte_grow(alloc, hex_nibble(b));
+    return;
+}
+
+fn write_escaped_str(alloc: *mut AllocCap, bytes: *[u8], out: *mut str.StrBuf) -> !OutOfMemory {
+    try out.push_byte_grow(alloc, b'"');
+    var i: usize = 0_usize;
+    while i < bytes.len {
+        let b = bytes[i];
+        if b == 0x5C_u8 {
+            try out.push_str_grow(alloc, "\\\\");
+        } else if b == 0x22_u8 {
+            try out.push_str_grow(alloc, "\\\"");
+        } else if b == 0x0A_u8 {
+            try out.push_str_grow(alloc, "\\n");
+        } else if b == 0x0D_u8 {
+            try out.push_str_grow(alloc, "\\r");
+        } else if b == 0x09_u8 {
+            try out.push_str_grow(alloc, "\\t");
+        } else if b == 0x00_u8 {
+            try out.push_str_grow(alloc, "\\0");
+        } else if b < 0x20_u8 || b == 0x7F_u8 {
+            try out.push_str_grow(alloc, "\\x");
+            try push_hex_byte(alloc, b, out);
+        } else {
+            try out.push_byte_grow(alloc, b);
+        }
+        i = i +% 1_usize;
+    }
+    try out.push_byte_grow(alloc, b'"');
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// Operator Debug Name Renderers (exact Rust `{:?}` match)
+// ---------------------------------------------------------------------------
+
+fn write_assign_op_name(alloc: *mut AllocCap, op: AssignOp, out: *mut str.StrBuf) -> !OutOfMemory {
+    match op {
+        .Assign => { try out.push_str_grow(alloc, "Assign"); }
+        .AddAssign => { try out.push_str_grow(alloc, "AddAssign"); }
+        .SubAssign => { try out.push_str_grow(alloc, "SubAssign"); }
+        .MulAssign => { try out.push_str_grow(alloc, "MulAssign"); }
+        .AddWrapAssign => { try out.push_str_grow(alloc, "AddWrapAssign"); }
+        .SubWrapAssign => { try out.push_str_grow(alloc, "SubWrapAssign"); }
+        .MulWrapAssign => { try out.push_str_grow(alloc, "MulWrapAssign"); }
+        .AddSatAssign => { try out.push_str_grow(alloc, "AddSatAssign"); }
+        .SubSatAssign => { try out.push_str_grow(alloc, "SubSatAssign"); }
+        .MulSatAssign => { try out.push_str_grow(alloc, "MulSatAssign"); }
+        .BitAndAssign => { try out.push_str_grow(alloc, "BitAndAssign"); }
+        .BitOrAssign => { try out.push_str_grow(alloc, "BitOrAssign"); }
+        .BitXorAssign => { try out.push_str_grow(alloc, "BitXorAssign"); }
+        .ShlAssign => { try out.push_str_grow(alloc, "ShlAssign"); }
+        .ShrAssign => { try out.push_str_grow(alloc, "ShrAssign"); }
+    }
+    return;
+}
+
+fn write_unary_op_name(alloc: *mut AllocCap, op: UnaryOp, out: *mut str.StrBuf) -> !OutOfMemory {
+    match op {
+        .Neg => { try out.push_str_grow(alloc, "Neg"); }
+        .Not => { try out.push_str_grow(alloc, "Not"); }
+        .BitNot => { try out.push_str_grow(alloc, "BitNot"); }
+        .Borrow => { try out.push_str_grow(alloc, "Borrow"); }
+        .BorrowMut => { try out.push_str_grow(alloc, "BorrowMut"); }
+        .Move => { try out.push_str_grow(alloc, "Move"); }
+        .Copy => { try out.push_str_grow(alloc, "Copy"); }
+        .Try => { try out.push_str_grow(alloc, "Try"); }
+    }
+    return;
+}
+
+fn write_binary_op_name(alloc: *mut AllocCap, op: BinaryOp, out: *mut str.StrBuf) -> !OutOfMemory {
+    match op {
+        .Or => { try out.push_str_grow(alloc, "Or"); }
+        .And => { try out.push_str_grow(alloc, "And"); }
+        .Eq => { try out.push_str_grow(alloc, "Eq"); }
+        .NotEq => { try out.push_str_grow(alloc, "NotEq"); }
+        .Lt => { try out.push_str_grow(alloc, "Lt"); }
+        .LtEq => { try out.push_str_grow(alloc, "LtEq"); }
+        .Gt => { try out.push_str_grow(alloc, "Gt"); }
+        .GtEq => { try out.push_str_grow(alloc, "GtEq"); }
+        .BitOr => { try out.push_str_grow(alloc, "BitOr"); }
+        .BitXor => { try out.push_str_grow(alloc, "BitXor"); }
+        .BitAnd => { try out.push_str_grow(alloc, "BitAnd"); }
+        .Shl => { try out.push_str_grow(alloc, "Shl"); }
+        .Shr => { try out.push_str_grow(alloc, "Shr"); }
+        .ShlWrap => { try out.push_str_grow(alloc, "ShlWrap"); }
+        .Add => { try out.push_str_grow(alloc, "Add"); }
+        .Sub => { try out.push_str_grow(alloc, "Sub"); }
+        .AddWrap => { try out.push_str_grow(alloc, "AddWrap"); }
+        .SubWrap => { try out.push_str_grow(alloc, "SubWrap"); }
+        .AddSat => { try out.push_str_grow(alloc, "AddSat"); }
+        .SubSat => { try out.push_str_grow(alloc, "SubSat"); }
+        .AddCheck => { try out.push_str_grow(alloc, "AddCheck"); }
+        .SubCheck => { try out.push_str_grow(alloc, "SubCheck"); }
+        .Mul => { try out.push_str_grow(alloc, "Mul"); }
+        .Div => { try out.push_str_grow(alloc, "Div"); }
+        .Mod => { try out.push_str_grow(alloc, "Mod"); }
+        .MulWrap => { try out.push_str_grow(alloc, "MulWrap"); }
+        .MulSat => { try out.push_str_grow(alloc, "MulSat"); }
+        .MulCheck => { try out.push_str_grow(alloc, "MulCheck"); }
+        .DivCheck => { try out.push_str_grow(alloc, "DivCheck"); }
+        .ModCheck => { try out.push_str_grow(alloc, "ModCheck"); }
+    }
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// Summary Dumper (`--dump-ast`, matching `CompilationUnit::dump`)
+// ---------------------------------------------------------------------------
+
+fn dump_decl_summary_tail(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    d: *DeclNode,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    match d.kind {
+        .Bitfield => {
+            let b = arena.get_bitfield_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "bitfield ");
+            try push_sym(alloc, interner, b.name.sym, out);
+            try out.push_str_grow(alloc, " : ");
+            try push_sym(alloc, interner, b.base_int.sym, out);
+            try out.push_str_grow(alloc, " (");
+            try out.push_u64_grow(alloc, b.members.len.widen.[u64]());
+            try out.push_str_grow(alloc, " members)\n");
+        }
+        .Iface => {
+            let ic = arena.get_iface_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "iface ");
+            try push_sym(alloc, interner, ic.name.sym, out);
+            try out.push_str_grow(alloc, " (");
+            try out.push_u64_grow(alloc, ic.methods.len.widen.[u64]());
+            try out.push_str_grow(alloc, " methods)\n");
+        }
+        .Error => {
+            let er = arena.get_error_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "error ");
+            try push_sym(alloc, interner, er.name.sym, out);
+            try out.push_str_grow(alloc, " (");
+            try out.push_u64_grow(alloc, er.variants.len.widen.[u64]());
+            try out.push_str_grow(alloc, " variants)\n");
+        }
+        .TypeAlias => {
+            let t = arena.get_type_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "type ");
+            try push_sym(alloc, interner, t.name.sym, out);
+            try out.push_byte_grow(alloc, 10_u8);
+        }
+        .Const => {
+            let c = arena.get_const_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "const ");
+            try push_sym(alloc, interner, c.name.sym, out);
+            try out.push_byte_grow(alloc, 10_u8);
+        }
+        .ExternFn => {
+            let ex = arena.get_extern_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "extern \"");
+            try push_sym(alloc, interner, ex.abi, out);
+            try out.push_str_grow(alloc, "\" fn ");
+            try push_sym(alloc, interner, ex.name.sym, out);
+            try out.push_byte_grow(alloc, 10_u8);
+        }
+        .ExternStruct => {
+            let ex = arena.get_extern_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "extern \"");
+            try push_sym(alloc, interner, ex.abi, out);
+            try out.push_str_grow(alloc, "\" struct ");
+            try push_sym(alloc, interner, ex.name.sym, out);
+            try out.push_byte_grow(alloc, 10_u8);
+        }
+        .ExternUnion => {
+            let ex = arena.get_extern_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "extern \"");
+            try push_sym(alloc, interner, ex.abi, out);
+            try out.push_str_grow(alloc, "\" union ");
+            try push_sym(alloc, interner, ex.name.sym, out);
+            try out.push_byte_grow(alloc, 10_u8);
+        }
+        _ => {}
+    }
+    return;
+}
+
+@recursive
+fn dump_decl_summary(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    decl_id: u32,
+    interner: *span.SymInterner,
+    depth: usize,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let d = arena.get_decl(decl_id) orelse { return; };
+    try push_indent(alloc, depth, out);
+    let attrs = arena.attrs_range(d.attrs);
+    var ai: usize = 0_usize;
+    while ai < attrs.len {
+        try out.push_byte_grow(alloc, b'@');
+        try push_sym(alloc, interner, attrs[ai].name.sym, out);
+        try out.push_byte_grow(alloc, b' ');
+        ai = ai +% 1_usize;
+    }
+    if d.is_pub {
+        try out.push_str_grow(alloc, "pub ");
+    }
+    match d.kind {
+        .Fn => {
+            let f = arena.get_fn_decl(d.payload) orelse { return; };
+            if f.is_comptime { try out.push_str_grow(alloc, "comptime "); }
+            if f.is_view { try out.push_str_grow(alloc, "view "); }
+            try out.push_str_grow(alloc, "fn ");
+            try push_sym(alloc, interner, f.name.sym, out);
+            try out.push_str_grow(alloc, " { ... }\n");
+        }
+        .Sys => {
+            let s = arena.get_sys_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "sys ");
+            try push_sym(alloc, interner, s.name.sym, out);
+            try out.push_str_grow(alloc, " { ... }\n");
+        }
+        .Struct => {
+            let s = arena.get_struct_decl(d.payload) orelse { return; };
+            if s.is_linear { try out.push_str_grow(alloc, "linear "); }
+            if s.is_view { try out.push_str_grow(alloc, "view "); }
+            try out.push_str_grow(alloc, "struct ");
+            try push_sym(alloc, interner, s.name.sym, out);
+            try out.push_str_grow(alloc, " (");
+            try out.push_u64_grow(alloc, s.fields.len.widen.[u64]());
+            try out.push_str_grow(alloc, " fields)\n");
+        }
+        .Pool => {
+            let p = arena.get_struct_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "pool ");
+            try push_sym(alloc, interner, p.name.sym, out);
+            try out.push_str_grow(alloc, " (");
+            try out.push_u64_grow(alloc, p.fields.len.widen.[u64]());
+            try out.push_str_grow(alloc, " fields)\n");
+        }
+        .Enum => {
+            let e = arena.get_enum_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "enum ");
+            try push_sym(alloc, interner, e.name.sym, out);
+            try out.push_str_grow(alloc, " (");
+            try out.push_u64_grow(alloc, e.variants.len.widen.[u64]());
+            try out.push_str_grow(alloc, " variants)\n");
+        }
+        .Union => {
+            let u = arena.get_union_decl(d.payload) orelse { return; };
+            if u.is_linear { try out.push_str_grow(alloc, "linear "); }
+            try out.push_str_grow(alloc, "union ");
+            try push_sym(alloc, interner, u.name.sym, out);
+            try out.push_str_grow(alloc, " (");
+            try out.push_u64_grow(alloc, u.variants.len.widen.[u64]());
+            try out.push_str_grow(alloc, " variants)\n");
+        }
+        .Impl => {
+            let im = arena.get_impl_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "impl (");
+            try out.push_u64_grow(alloc, im.decls.len.widen.[u64]());
+            try out.push_str_grow(alloc, " decls)\n");
+            let subs = arena.decl_list_range(im.decls);
+            var si: usize = 0_usize;
+            while si < subs.len {
+                try dump_decl_summary(arena, alloc, subs[si], interner, depth +% 1_usize, out);
+                si = si +% 1_usize;
+            }
+        }
+        _ => {
+            try dump_decl_summary_tail(arena, alloc, d, interner, out);
+        }
+    }
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// Full Dumper Inline Helpers (`--dump-ast-full`, matching `dump_full`)
+// ---------------------------------------------------------------------------
+
+@recursive
+fn write_attr(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    attr: AttrNode,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    try out.push_byte_grow(alloc, b'@');
+    try push_sym(alloc, interner, attr.name.sym, out);
+    if attr.has_parens || attr.args.len > 0_u32 {
+        try out.push_byte_grow(alloc, b'(');
+        let args = arena.attr_args_range(attr.args);
+        var i: usize = 0_usize;
+        while i < args.len {
+            if i > 0_usize {
+                try out.push_str_grow(alloc, ", ");
+            }
+            let arg = args[i];
+            if ident_is_some(arg.name) {
+                try push_sym(alloc, interner, arg.name.sym, out);
+                try out.push_byte_grow(alloc, b'=');
+            }
+            try write_expr_inline(arena, alloc, arg.value, interner, out);
+            i = i +% 1_usize;
+        }
+        try out.push_byte_grow(alloc, b')');
+    }
+    return;
+}
+
+@recursive
+fn write_attrs_inline(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    attrs_range: IdRange,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let attrs = arena.attrs_range(attrs_range);
+    var i: usize = 0_usize;
+    while i < attrs.len {
+        try write_attr(arena, alloc, attrs[i], interner, out);
+        try out.push_byte_grow(alloc, b' ');
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+@recursive
+fn write_generic_params(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    params_range: IdRange,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let params = arena.generic_params_range(params_range);
+    if params.len == 0_usize {
+        return;
+    }
+    try out.push_byte_grow(alloc, b'[');
+    var i: usize = 0_usize;
+    while i < params.len {
+        if i > 0_usize {
+            try out.push_str_grow(alloc, ", ");
+        }
+        let gp = params[i];
+        if gp.is_comptime {
+            try out.push_str_grow(alloc, "comptime ");
+        }
+        try push_sym(alloc, interner, gp.name.sym, out);
+        if gp.comptime_ty != NONE_ID {
+            try out.push_str_grow(alloc, ": ");
+            try write_type_inline(arena, alloc, gp.comptime_ty, interner, out);
+        }
+        let bounds = arena.type_list_range(gp.bounds);
+        if bounds.len > 0_usize {
+            try out.push_str_grow(alloc, ": ");
+            var j: usize = 0_usize;
+            while j < bounds.len {
+                if j > 0_usize {
+                    try out.push_str_grow(alloc, " + ");
+                }
+                try write_type_inline(arena, alloc, bounds[j], interner, out);
+                j = j +% 1_usize;
+            }
+        }
+        i = i +% 1_usize;
+    }
+    try out.push_byte_grow(alloc, b']');
+    return;
+}
+
+@recursive
+fn write_generic_args(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    args_range: IdRange,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let args = arena.generic_args_range(args_range);
+    if args.len == 0_usize {
+        return;
+    }
+    try out.push_byte_grow(alloc, b'[');
+    var i: usize = 0_usize;
+    while i < args.len {
+        if i > 0_usize {
+            try out.push_str_grow(alloc, ", ");
+        }
+        let arg = args[i];
+        match arg.kind {
+            .Type => {
+                try out.push_str_grow(alloc, "ty:");
+                try write_type_inline(arena, alloc, arg.node_id, interner, out);
+            }
+            .Expr => {
+                try out.push_str_grow(alloc, "expr:");
+                try write_expr_inline(arena, alloc, arg.node_id, interner, out);
+            }
+            .TypeOrConst => {
+                try out.push_str_grow(alloc, "sym:");
+                try write_ident_path(arena, alloc, arg.segs, interner, out);
+            }
+        }
+        i = i +% 1_usize;
+    }
+    try out.push_byte_grow(alloc, b']');
+    return;
+}
+
+@recursive
+fn write_param_prefix(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    attrs_range: IdRange,
+    is_comptime: bool,
+    modifier: ParamModifier,
+    access: AccessMode,
+    is_self: bool,
+    name: IdentSpan,
+    ty: u32,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    try out.push_byte_grow(alloc, b'(');
+    try write_attrs_inline(arena, alloc, attrs_range, interner, out);
+    if is_comptime {
+        try out.push_str_grow(alloc, "comptime ");
+    }
+    match modifier {
+        .None => {}
+        .Mut => { try out.push_str_grow(alloc, "mut "); }
+        .From => { try out.push_str_grow(alloc, "from "); }
+    }
+    match access {
+        .None => {}
+        .Read => { try out.push_str_grow(alloc, "read "); }
+        .Write => { try out.push_str_grow(alloc, "write "); }
+    }
+    if is_self {
+        try out.push_str_grow(alloc, "self");
+    } else {
+        try push_sym(alloc, interner, name.sym, out);
+    }
+    try out.push_str_grow(alloc, ": ");
+    try write_type_inline(arena, alloc, ty, interner, out);
+    return;
+}
+
+@recursive
+fn write_param_inline(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    p: ParamNode,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    try write_param_prefix(
+        arena, alloc, p.attrs, p.is_comptime, p.modifier, p.access, p.is_self, p.name, p.ty, interner, out,
+    );
+    try out.push_byte_grow(alloc, b')');
+    return;
+}
+
+@recursive
+fn write_sys_param_inline(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    p: SysParamNode,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    try write_param_prefix(
+        arena, alloc, p.attrs, p.is_comptime, p.modifier, p.access, p.is_self, p.name, p.ty, interner, out,
+    );
+    let cols = arena.idents_range(p.columns);
+    if cols.len > 0_usize {
+        try out.push_str_grow(alloc, " cols[");
+        var i: usize = 0_usize;
+        while i < cols.len {
+            if i > 0_usize {
+                try out.push_str_grow(alloc, ", ");
+            }
+            try push_sym(alloc, interner, cols[i].sym, out);
+            i = i +% 1_usize;
+        }
+        try out.push_byte_grow(alloc, b']');
+    }
+    try out.push_byte_grow(alloc, b')');
+    return;
+}
+
+@recursive
+fn write_field_inline(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    f: FieldNode,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    try out.push_str_grow(alloc, "(field ");
+    try write_attrs_inline(arena, alloc, f.attrs, interner, out);
+    if f.is_pub {
+        try out.push_str_grow(alloc, "pub ");
+    }
+    try push_sym(alloc, interner, f.name.sym, out);
+    try out.push_str_grow(alloc, ": ");
+    try write_type_inline(arena, alloc, f.ty, interner, out);
+    if f.default != NONE_ID {
+        try out.push_str_grow(alloc, " = ");
+        try write_expr_inline(arena, alloc, f.default, interner, out);
+    }
+    try out.push_byte_grow(alloc, b')');
+    return;
+}
+
+@recursive
+fn write_type_path_inline(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    segs: IdRange,
+    gens: IdRange,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    try write_ident_path(arena, alloc, segs, interner, out);
+    try write_generic_args(arena, alloc, gens, interner, out);
+    return;
+}
+
+@recursive
+fn write_type_inline(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    type_id: u32,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let ty = arena.get_type(type_id) orelse {
+        try out.push_str_grow(alloc, "<ty-err>");
+        return;
+    };
+    match ty.kind {
+        .ErrorUnion => {
+            try out.push_str_grow(alloc, "(err-union ");
+            if ty.primary != NONE_ID {
+                try write_type_inline(arena, alloc, ty.primary, interner, out);
+            } else {
+                try out.push_byte_grow(alloc, b'_');
+            }
+            let errs = arena.type_list_range(ty.list);
+            var i: usize = 0_usize;
+            while i < errs.len {
+                try out.push_byte_grow(alloc, b' ');
+                try write_type_inline(arena, alloc, errs[i], interner, out);
+                i = i +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Optional => {
+            try out.push_str_grow(alloc, "(opt ");
+            try write_type_inline(arena, alloc, ty.primary, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Borrow => {
+            if ty.is_mut {
+                try out.push_str_grow(alloc, "(borrow-mut ");
+            } else {
+                try out.push_str_grow(alloc, "(borrow ");
+            }
+            match ty.borrow_target {
+                .Single => {
+                    try out.push_str_grow(alloc, "single ");
+                    try write_type_inline(arena, alloc, ty.primary, interner, out);
+                }
+                .Slice => {
+                    try out.push_str_grow(alloc, "slice ");
+                    try write_type_inline(arena, alloc, ty.primary, interner, out);
+                }
+                .Str => {
+                    try out.push_str_grow(alloc, "str");
+                }
+            }
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Array => {
+            try out.push_str_grow(alloc, "(array ");
+            try write_expr_inline(arena, alloc, ty.aux, interner, out);
+            try out.push_byte_grow(alloc, b' ');
+            try write_type_inline(arena, alloc, ty.primary, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Dyn => {
+            try out.push_str_grow(alloc, "(dyn ");
+            try write_type_path_inline(arena, alloc, ty.list, ty.list2, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .FnPtr => {
+            try out.push_str_grow(alloc, "(fn-ptr (");
+            let params = arena.type_list_range(ty.list);
+            var i: usize = 0_usize;
+            while i < params.len {
+                if i > 0_usize { try out.push_byte_grow(alloc, b' '); }
+                try write_type_inline(arena, alloc, params[i], interner, out);
+                i = i +% 1_usize;
+            }
+            try out.push_str_grow(alloc, ") ");
+            if ty.primary != NONE_ID {
+                try write_type_inline(arena, alloc, ty.primary, interner, out);
+            } else {
+                try out.push_byte_grow(alloc, b'_');
+            }
+            let efs = arena.attrs_range(ty.list2);
+            if efs.len > 0_usize {
+                try out.push_str_grow(alloc, " (");
+                var j: usize = 0_usize;
+                while j < efs.len {
+                    if j > 0_usize { try out.push_byte_grow(alloc, b' '); }
+                    try write_attr(arena, alloc, efs[j], interner, out);
+                    j = j +% 1_usize;
+                }
+                try out.push_byte_grow(alloc, b')');
+            }
+            try out.push_byte_grow(alloc, b')');
+        }
+        .InlineStruct => {
+            try out.push_str_grow(alloc, "(inline-struct");
+            let fs = arena.fields_range(ty.list);
+            var i: usize = 0_usize;
+            while i < fs.len {
+                try out.push_byte_grow(alloc, b' ');
+                try write_field_inline(arena, alloc, fs[i], interner, out);
+                i = i +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Tuple => {
+            try out.push_str_grow(alloc, "(tuple");
+            let elems = arena.type_list_range(ty.list);
+            var i: usize = 0_usize;
+            while i < elems.len {
+                try out.push_byte_grow(alloc, b' ');
+                try write_type_inline(arena, alloc, elems[i], interner, out);
+                i = i +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Void => { try out.push_str_grow(alloc, "void"); }
+        .Never => { try out.push_str_grow(alloc, "never"); }
+        .TypeType => { try out.push_str_grow(alloc, "type"); }
+        .SelfType => { try out.push_str_grow(alloc, "Self"); }
+        .Inferred => { try out.push_byte_grow(alloc, b'_'); }
+        .Path => { try write_type_path_inline(arena, alloc, ty.list, ty.list2, interner, out); }
+        .Error => { try out.push_str_grow(alloc, "<ty-err>"); }
+    }
+    return;
+}
+
+@recursive
+fn write_pat_inline(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    pat_id: u32,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let pat = arena.get_pat(pat_id) orelse {
+        try out.push_str_grow(alloc, "(pat-err)");
+        return;
+    };
+    match pat.kind {
+        .Wildcard => { try out.push_byte_grow(alloc, b'_'); }
+        .Ident => {
+            try out.push_str_grow(alloc, "(pat-ident ");
+            try push_sym(alloc, interner, pat.data0, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .IntLit => {
+            try out.push_str_grow(alloc, "(pat-int ");
+            if pat.flag { try out.push_byte_grow(alloc, b'-'); }
+            try push_sym(alloc, interner, pat.data0, out);
+            if pat.has_range {
+                match pat.range_kind {
+                    .Exclusive => { try out.push_str_grow(alloc, ".."); }
+                    .Inclusive => { try out.push_str_grow(alloc, "..="); }
+                }
+                if pat.range_neg { try out.push_byte_grow(alloc, b'-'); }
+                try push_sym(alloc, interner, pat.data1, out);
+            }
+            try out.push_byte_grow(alloc, b')');
+        }
+        .CharLit => {
+            try out.push_str_grow(alloc, "(pat-char ");
+            try out.push_u64_grow(alloc, pat.data0.widen.[u64]());
+            if pat.has_range {
+                match pat.range_kind {
+                    .Exclusive => { try out.push_str_grow(alloc, ".."); }
+                    .Inclusive => { try out.push_str_grow(alloc, "..="); }
+                }
+                try out.push_u64_grow(alloc, pat.data1.widen.[u64]());
+            }
+            try out.push_byte_grow(alloc, b')');
+        }
+        .BoolLit => {
+            if pat.flag {
+                try out.push_str_grow(alloc, "(pat-bool true)");
+            } else {
+                try out.push_str_grow(alloc, "(pat-bool false)");
+            }
+        }
+        .Null => { try out.push_str_grow(alloc, "(pat-null)"); }
+        .Variant => {
+            try out.push_str_grow(alloc, "(pat-variant .");
+            try push_sym(alloc, interner, pat.ident.sym, out);
+            let args = arena.pat_list_range(pat.list);
+            var i: usize = 0_usize;
+            while i < args.len {
+                try out.push_byte_grow(alloc, b' ');
+                try write_pat_inline(arena, alloc, args[i], interner, out);
+                i = i +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Struct => {
+            try out.push_str_grow(alloc, "(pat-struct ");
+            if pat.flag {
+                try write_type_path_inline(arena, alloc, pat.path_segs, pat.path_gens, interner, out);
+            } else {
+                try out.push_byte_grow(alloc, b'_');
+            }
+            let fps = arena.pat_fields_range(pat.list);
+            var i: usize = 0_usize;
+            while i < fps.len {
+                let fp = fps[i];
+                try out.push_str_grow(alloc, " (");
+                try push_sym(alloc, interner, fp.name.sym, out);
+                if fp.pat != NONE_ID {
+                    try out.push_byte_grow(alloc, b' ');
+                    try write_pat_inline(arena, alloc, fp.pat, interner, out);
+                }
+                try out.push_byte_grow(alloc, b')');
+                i = i +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Tuple => {
+            try out.push_str_grow(alloc, "(pat-tuple");
+            let ps = arena.pat_list_range(pat.list);
+            var i: usize = 0_usize;
+            while i < ps.len {
+                try out.push_byte_grow(alloc, b' ');
+                try write_pat_inline(arena, alloc, ps[i], interner, out);
+                i = i +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Error => { try out.push_str_grow(alloc, "(pat-err)"); }
+    }
+    return;
+}
+
+@recursive
+fn write_jump_inline(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    jump_id: u32,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let j = arena.get_jump(jump_id) orelse { return; };
+    match j.kind {
+        .Return => {
+            try out.push_str_grow(alloc, "(return");
+            if j.value != NONE_ID {
+                try out.push_byte_grow(alloc, b' ');
+                try write_expr_inline(arena, alloc, j.value, interner, out);
+            }
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Break => {
+            try out.push_str_grow(alloc, "(break");
+            if ident_is_some(j.label) {
+                try out.push_str_grow(alloc, " '");
+                try push_sym(alloc, interner, j.label.sym, out);
+            }
+            if j.value != NONE_ID {
+                try out.push_byte_grow(alloc, b' ');
+                try write_expr_inline(arena, alloc, j.value, interner, out);
+            }
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Continue => {
+            try out.push_str_grow(alloc, "(continue");
+            if ident_is_some(j.label) {
+                try out.push_str_grow(alloc, " '");
+                try push_sym(alloc, interner, j.label.sym, out);
+            }
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Unreachable => {
+            try out.push_str_grow(alloc, "(unreachable)");
+        }
+    }
+    return;
+}
+
+@recursive
+fn write_if_cond_inline(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    node: *IfNode,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    match node.cond_kind {
+        .Expr => {
+            try write_expr_inline(arena, alloc, node.cond_expr, interner, out);
+        }
+        .Let => {
+            try out.push_str_grow(alloc, "(if-let ");
+            try write_pat_inline(arena, alloc, node.cond_pat, interner, out);
+            try out.push_byte_grow(alloc, b' ');
+            try write_expr_inline(arena, alloc, node.cond_expr, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+    }
+    return;
+}
+
+@recursive
+fn write_body_inline(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    kind: BodyKind,
+    id: u32,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    match kind {
+        .Block => { try write_block_inline(arena, alloc, id, interner, out); }
+        .Expr => { try write_expr_inline(arena, alloc, id, interner, out); }
+        .Jump => { try write_jump_inline(arena, alloc, id, interner, out); }
+    }
+    return;
+}
+
+@recursive
+fn write_match_arm_inline(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    arm: MatchArmNode,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    try out.push_str_grow(alloc, "(arm ");
+    try write_pat_inline(arena, alloc, arm.pat, interner, out);
+    if arm.guard != NONE_ID {
+        try out.push_str_grow(alloc, " (guard ");
+        try write_expr_inline(arena, alloc, arm.guard, interner, out);
+        try out.push_byte_grow(alloc, b')');
+    }
+    try out.push_byte_grow(alloc, b' ');
+    try write_body_inline(arena, alloc, arm.body_kind, arm.body_id, interner, out);
+    try out.push_byte_grow(alloc, b')');
+    return;
+}
+
+@recursive
+fn write_field_init_inline(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    fi: FieldInitNode,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    try out.push_byte_grow(alloc, b'(');
+    if ident_is_some(fi.name) {
+        try push_sym(alloc, interner, fi.name.sym, out);
+        try out.push_str_grow(alloc, ": ");
+    }
+    try write_expr_inline(arena, alloc, fi.value, interner, out);
+    try out.push_byte_grow(alloc, b')');
+    return;
+}
+
+@recursive
+fn write_block_inline(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    block_id: u32,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let b = arena.get_block(block_id) orelse {
+        try out.push_str_grow(alloc, "(block)");
+        return;
+    };
+    try out.push_str_grow(alloc, "(block");
+    let stmts = arena.stmt_list_range(b.stmts);
+    var i: usize = 0_usize;
+    while i < stmts.len {
+        try out.push_byte_grow(alloc, b' ');
+        try write_stmt_inline(arena, alloc, stmts[i], interner, out);
+        i = i +% 1_usize;
+    }
+    if b.tail_expr != NONE_ID {
+        try out.push_str_grow(alloc, " (tail ");
+        try write_expr_inline(arena, alloc, b.tail_expr, interner, out);
+        try out.push_byte_grow(alloc, b')');
+    }
+    try out.push_byte_grow(alloc, b')');
+    return;
+}
+
+@recursive
+fn write_if_expr_inline(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    if_id: u32,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let node = arena.get_if(if_id) orelse { return; };
+    if node.is_comptime {
+        try out.push_str_grow(alloc, "(comptime-if ");
+    } else {
+        try out.push_str_grow(alloc, "(if ");
+    }
+    try write_if_cond_inline(arena, alloc, node, interner, out);
+    try out.push_byte_grow(alloc, b' ');
+    try write_block_inline(arena, alloc, node.then_block, interner, out);
+    match node.else_kind {
+        .None => {}
+        .Block => {
+            try out.push_str_grow(alloc, " (else ");
+            try write_block_inline(arena, alloc, node.else_id, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .If => {
+            try out.push_str_grow(alloc, " (else ");
+            try write_if_expr_inline(arena, alloc, node.else_id, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+    }
+    try out.push_byte_grow(alloc, b')');
+    return;
+}
+
+@recursive
+fn write_stmt_inline_part2(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    s: *StmtNode,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    match s.kind {
+        .While => {
+            try out.push_str_grow(alloc, "(while");
+            if ident_is_some(s.ident) {
+                try out.push_str_grow(alloc, " '");
+                try push_sym(alloc, interner, s.ident.sym, out);
+            }
+            try out.push_byte_grow(alloc, b' ');
+            try write_expr_inline(arena, alloc, s.a, interner, out);
+            let ws = arena.expr_list_range(s.list);
+            if ws.len > 0_usize {
+                try out.push_str_grow(alloc, " (where");
+                var i: usize = 0_usize;
+                while i < ws.len {
+                    try out.push_byte_grow(alloc, b' ');
+                    try write_expr_inline(arena, alloc, ws[i], interner, out);
+                    i = i +% 1_usize;
+                }
+                try out.push_byte_grow(alloc, b')');
+            }
+            try out.push_byte_grow(alloc, b' ');
+            try write_block_inline(arena, alloc, s.b, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .For => {
+            try out.push_str_grow(alloc, "(for");
+            if ident_is_some(s.ident) {
+                try out.push_str_grow(alloc, " '");
+                try push_sym(alloc, interner, s.ident.sym, out);
+            }
+            try out.push_byte_grow(alloc, b' ');
+            try write_pat_inline(arena, alloc, s.a, interner, out);
+            try out.push_byte_grow(alloc, b' ');
+            try write_expr_inline(arena, alloc, s.c, interner, out);
+            if s.has_range {
+                match s.range_kind {
+                    .Exclusive => { try out.push_str_grow(alloc, " .. "); }
+                    .Inclusive => { try out.push_str_grow(alloc, " ..= "); }
+                }
+                try write_expr_inline(arena, alloc, s.d, interner, out);
+            }
+            try out.push_byte_grow(alloc, b' ');
+            try write_block_inline(arena, alloc, s.b, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .ParFor => {
+            try out.push_str_grow(alloc, "(par-for ");
+            try write_pat_inline(arena, alloc, s.a, interner, out);
+            try out.push_byte_grow(alloc, b' ');
+            try write_expr_inline(arena, alloc, s.c, interner, out);
+            if s.has_range {
+                match s.range_kind {
+                    .Exclusive => { try out.push_str_grow(alloc, " .. "); }
+                    .Inclusive => { try out.push_str_grow(alloc, " ..= "); }
+                }
+                try write_expr_inline(arena, alloc, s.d, interner, out);
+            }
+            try out.push_byte_grow(alloc, b' ');
+            try write_block_inline(arena, alloc, s.b, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Loop => {
+            try out.push_str_grow(alloc, "(loop");
+            if ident_is_some(s.ident) {
+                try out.push_str_grow(alloc, " '");
+                try push_sym(alloc, interner, s.ident.sym, out);
+            }
+            try out.push_byte_grow(alloc, b' ');
+            try write_block_inline(arena, alloc, s.a, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .ComptimeBlock => {
+            try out.push_str_grow(alloc, "(comptime-block ");
+            try write_block_inline(arena, alloc, s.a, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .RawBlock => {
+            try out.push_str_grow(alloc, "(raw-block ");
+            try write_block_inline(arena, alloc, s.a, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Assign => {
+            try out.push_str_grow(alloc, "(assign ");
+            try write_assign_op_name(alloc, s.assign_op, out);
+            try out.push_byte_grow(alloc, b' ');
+            try write_expr_inline(arena, alloc, s.a, interner, out);
+            try out.push_byte_grow(alloc, b' ');
+            try write_expr_inline(arena, alloc, s.b, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Discard => {
+            try out.push_str_grow(alloc, "(discard ");
+            try write_expr_inline(arena, alloc, s.a, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Expr => {
+            try out.push_str_grow(alloc, "(expr ");
+            try write_expr_inline(arena, alloc, s.a, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        _ => {}
+    }
+    return;
+}
+
+@recursive
+fn write_stmt_inline(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    stmt_id: u32,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let s = arena.get_stmt(stmt_id) orelse { return; };
+    match s.kind {
+        .Let => {
+            try out.push_str_grow(alloc, "(let ");
+            try write_attrs_inline(arena, alloc, s.list, interner, out);
+            try write_pat_inline(arena, alloc, s.a, interner, out);
+            if s.b != NONE_ID {
+                try out.push_str_grow(alloc, " : ");
+                try write_type_inline(arena, alloc, s.b, interner, out);
+            }
+            try out.push_str_grow(alloc, " = ");
+            try write_expr_inline(arena, alloc, s.c, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Var => {
+            try out.push_str_grow(alloc, "(var ");
+            try write_attrs_inline(arena, alloc, s.list, interner, out);
+            try push_sym(alloc, interner, s.ident.sym, out);
+            if s.b != NONE_ID {
+                try out.push_str_grow(alloc, " : ");
+                try write_type_inline(arena, alloc, s.b, interner, out);
+            }
+            try out.push_str_grow(alloc, " = ");
+            try write_expr_inline(arena, alloc, s.c, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Const => {
+            let c = arena.get_const_decl(s.a) orelse { return; };
+            try out.push_str_grow(alloc, "(const ");
+            try push_sym(alloc, interner, c.name.sym, out);
+            try out.push_str_grow(alloc, " : ");
+            try write_type_inline(arena, alloc, c.ty, interner, out);
+            try out.push_str_grow(alloc, " = ");
+            try write_expr_inline(arena, alloc, c.value, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Defer => {
+            try out.push_str_grow(alloc, "(defer ");
+            try write_body_inline(arena, alloc, s.body_kind, s.a, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Errdefer => {
+            try out.push_str_grow(alloc, "(errdefer");
+            if ident_is_some(s.ident) {
+                try out.push_byte_grow(alloc, b' ');
+                try push_sym(alloc, interner, s.ident.sym, out);
+            }
+            try out.push_byte_grow(alloc, b' ');
+            try write_body_inline(arena, alloc, s.body_kind, s.a, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Jump => {
+            try write_jump_inline(arena, alloc, s.a, interner, out);
+        }
+        .If => {
+            try write_if_expr_inline(arena, alloc, s.a, interner, out);
+        }
+        .Match => {
+            try out.push_str_grow(alloc, "(match ");
+            try write_expr_inline(arena, alloc, s.a, interner, out);
+            let arms = arena.match_arms_range(s.list);
+            var i: usize = 0_usize;
+            while i < arms.len {
+                try out.push_byte_grow(alloc, b' ');
+                try write_match_arm_inline(arena, alloc, arms[i], interner, out);
+                i = i +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, b')');
+        }
+        _ => {
+            try write_stmt_inline_part2(arena, alloc, s, interner, out);
+        }
+    }
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// Expression Inline Dumpers (split across 4 compact helpers)
+// ---------------------------------------------------------------------------
+
+fn write_expr_atoms(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    e: *ExprNode,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    match e.kind {
+        .IntLit => {
+            try out.push_str_grow(alloc, "(int ");
+            try push_sym(alloc, interner, e.a, out);
+            if e.b != NONE_ID {
+                try out.push_byte_grow(alloc, b'_');
+                try push_sym(alloc, interner, e.b, out);
+            }
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .FloatLit => {
+            try out.push_str_grow(alloc, "(float ");
+            try push_sym(alloc, interner, e.a, out);
+            if e.b != NONE_ID {
+                try out.push_byte_grow(alloc, b'_');
+                try push_sym(alloc, interner, e.b, out);
+            }
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .StringLit => {
+            try out.push_str_grow(alloc, "(str ");
+            try write_escaped_str(alloc, arena.str_bytes_range(e.list), out);
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .RawStringLit => {
+            try out.push_str_grow(alloc, "(rawstr ");
+            try write_escaped_str(alloc, arena.str_bytes_range(e.list), out);
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .ByteStringLit => {
+            try out.push_str_grow(alloc, "(bstr ");
+            let bs = arena.byte_bytes_range(e.list);
+            var i: usize = 0_usize;
+            while i < bs.len {
+                try push_hex_byte(alloc, bs[i], out);
+                i = i +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .CharLit => {
+            try out.push_str_grow(alloc, "(char ");
+            try out.push_u64_grow(alloc, e.a.widen.[u64]());
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .ByteCharLit => {
+            try out.push_str_grow(alloc, "(bchar ");
+            try out.push_u64_grow(alloc, (e.a & 0xFF_u32).widen.[u64]());
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .BoolLit => {
+            if e.flag {
+                try out.push_str_grow(alloc, "(bool true)");
+            } else {
+                try out.push_str_grow(alloc, "(bool false)");
+            }
+            return true;
+        }
+        .Null => { try out.push_str_grow(alloc, "(null)"); return true; }
+        .SelfVal => { try out.push_str_grow(alloc, "(self)"); return true; }
+        .ReturnVal => { try out.push_str_grow(alloc, "(return-val)"); return true; }
+        .Ident => {
+            try out.push_str_grow(alloc, "(ident ");
+            try push_sym(alloc, interner, e.a, out);
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .EnumLit => {
+            try out.push_str_grow(alloc, "(enum-lit .");
+            try push_sym(alloc, interner, e.ident.sym, out);
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .Error => { try out.push_str_grow(alloc, "(expr-err)"); return true; }
+        _ => { return false; }
+    }
+}
+
+@recursive
+fn write_expr_compound(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    e: *ExprNode,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    match e.kind {
+        .AnonStructLit => {
+            try out.push_str_grow(alloc, "(anon-struct");
+            let fis = arena.field_inits_range(e.list);
+            var i: usize = 0_usize;
+            while i < fis.len {
+                try out.push_byte_grow(alloc, b' ');
+                try write_field_init_inline(arena, alloc, fis[i], interner, out);
+                i = i +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .NamedStructLit => {
+            try out.push_str_grow(alloc, "(struct-lit ");
+            try write_expr_inline(arena, alloc, e.a, interner, out);
+            let fis = arena.field_inits_range(e.list);
+            var i: usize = 0_usize;
+            while i < fis.len {
+                try out.push_byte_grow(alloc, b' ');
+                try write_field_init_inline(arena, alloc, fis[i], interner, out);
+                i = i +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .ArrayLit => {
+            try out.push_str_grow(alloc, "(array");
+            let elems = arena.expr_list_range(e.list);
+            var i: usize = 0_usize;
+            while i < elems.len {
+                try out.push_byte_grow(alloc, b' ');
+                try write_expr_inline(arena, alloc, elems[i], interner, out);
+                i = i +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .ArrayRepeat => {
+            try out.push_str_grow(alloc, "(array-repeat ");
+            try write_expr_inline(arena, alloc, e.a, interner, out);
+            try out.push_byte_grow(alloc, b' ');
+            try write_expr_inline(arena, alloc, e.b, interner, out);
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .Tuple => {
+            try out.push_str_grow(alloc, "(tuple");
+            let elems = arena.expr_list_range(e.list);
+            var i: usize = 0_usize;
+            while i < elems.len {
+                try out.push_byte_grow(alloc, b' ');
+                try write_expr_inline(arena, alloc, elems[i], interner, out);
+                i = i +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .Paren => {
+            try out.push_str_grow(alloc, "(paren ");
+            try write_expr_inline(arena, alloc, e.a, interner, out);
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .Closure => {
+            try out.push_str_grow(alloc, "(closure (");
+            let ps = arena.params_range(e.list);
+            var i: usize = 0_usize;
+            while i < ps.len {
+                if i > 0_usize { try out.push_byte_grow(alloc, b' '); }
+                try write_param_inline(arena, alloc, ps[i], interner, out);
+                i = i +% 1_usize;
+            }
+            try out.push_str_grow(alloc, ") ");
+            try write_block_inline(arena, alloc, e.a, interner, out);
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        _ => { return false; }
+    }
+}
+
+@recursive
+fn write_expr_control(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    e: *ExprNode,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    match e.kind {
+        .If => {
+            try write_if_expr_inline(arena, alloc, e.a, interner, out);
+            return true;
+        }
+        .Match => {
+            try out.push_str_grow(alloc, "(match ");
+            try write_expr_inline(arena, alloc, e.a, interner, out);
+            let arms = arena.match_arms_range(e.list);
+            var i: usize = 0_usize;
+            while i < arms.len {
+                try out.push_byte_grow(alloc, b' ');
+                try write_match_arm_inline(arena, alloc, arms[i], interner, out);
+                i = i +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .Loop => {
+            try out.push_str_grow(alloc, "(loop");
+            if ident_is_some(e.ident) {
+                try out.push_str_grow(alloc, " '");
+                try push_sym(alloc, interner, e.ident.sym, out);
+            }
+            try out.push_byte_grow(alloc, b' ');
+            try write_block_inline(arena, alloc, e.a, interner, out);
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .ComptimeBlock => {
+            try out.push_str_grow(alloc, "(comptime-block ");
+            try write_block_inline(arena, alloc, e.a, interner, out);
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .ComptimeExpr => {
+            try out.push_str_grow(alloc, "(comptime ");
+            try write_expr_inline(arena, alloc, e.a, interner, out);
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .Builtin => {
+            try out.push_str_grow(alloc, "(builtin @");
+            try push_sym(alloc, interner, e.ident.sym, out);
+            if e.list.len > 0_u32 {
+                try out.push_byte_grow(alloc, b' ');
+                try write_generic_args(arena, alloc, e.list, interner, out);
+            }
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        .Asm => {
+            try out.push_str_grow(alloc, "(asm ");
+            try write_escaped_str(alloc, arena.str_bytes_range(e.list), out);
+            let ops = arena.asm_ops_range(e.list2);
+            var i: usize = 0_usize;
+            while i < ops.len {
+                let op = ops[i];
+                try out.push_byte_grow(alloc, b' ');
+                match op.kind {
+                    .Named => {
+                        try out.push_byte_grow(alloc, b'(');
+                        try push_sym(alloc, interner, op.dir.sym, out);
+                        try out.push_byte_grow(alloc, b' ');
+                        try write_expr_inline(arena, alloc, op.expr, interner, out);
+                        if op.arg != NONE_ID {
+                            try out.push_byte_grow(alloc, b' ');
+                            try write_expr_inline(arena, alloc, op.arg, interner, out);
+                        }
+                        try out.push_byte_grow(alloc, b')');
+                    }
+                    .Expr => {
+                        try write_expr_inline(arena, alloc, op.expr, interner, out);
+                    }
+                }
+                i = i +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, b')');
+            return true;
+        }
+        _ => { return false; }
+    }
+}
+
+@recursive
+fn write_expr_ops(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    e: *ExprNode,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    match e.kind {
+        .Unary => {
+            try out.push_str_grow(alloc, "(unary ");
+            try write_unary_op_name(alloc, e.unary_op, out);
+            try out.push_byte_grow(alloc, b' ');
+            try write_expr_inline(arena, alloc, e.a, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Binary => {
+            try out.push_str_grow(alloc, "(bin ");
+            try write_binary_op_name(alloc, e.bin_op, out);
+            try out.push_byte_grow(alloc, b' ');
+            try write_expr_inline(arena, alloc, e.a, interner, out);
+            try out.push_byte_grow(alloc, b' ');
+            try write_expr_inline(arena, alloc, e.b, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Is => {
+            try out.push_str_grow(alloc, "(is ");
+            try write_expr_inline(arena, alloc, e.a, interner, out);
+            try out.push_byte_grow(alloc, b' ');
+            try write_pat_inline(arena, alloc, e.b, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Orelse => {
+            try out.push_str_grow(alloc, "(orelse ");
+            try write_expr_inline(arena, alloc, e.a, interner, out);
+            try out.push_byte_grow(alloc, b' ');
+            try write_body_inline(arena, alloc, e.body_kind, e.b, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Catch => {
+            try out.push_str_grow(alloc, "(catch ");
+            try write_expr_inline(arena, alloc, e.a, interner, out);
+            if ident_is_some(e.ident) {
+                try out.push_str_grow(alloc, " |");
+                try push_sym(alloc, interner, e.ident.sym, out);
+                try out.push_byte_grow(alloc, b'|');
+            }
+            try out.push_byte_grow(alloc, b' ');
+            try write_body_inline(arena, alloc, e.body_kind, e.b, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Field => {
+            try out.push_str_grow(alloc, "(field ");
+            try write_expr_inline(arena, alloc, e.a, interner, out);
+            try out.push_str_grow(alloc, " .");
+            try push_sym(alloc, interner, e.ident.sym, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Deref => {
+            try out.push_str_grow(alloc, "(deref ");
+            try write_expr_inline(arena, alloc, e.a, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .GenericApply => {
+            try out.push_str_grow(alloc, "(generic-apply ");
+            try write_expr_inline(arena, alloc, e.a, interner, out);
+            try out.push_byte_grow(alloc, b' ');
+            try write_generic_args(arena, alloc, e.list, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Call => {
+            try out.push_str_grow(alloc, "(call ");
+            try write_expr_inline(arena, alloc, e.a, interner, out);
+            let args = arena.expr_list_range(e.list);
+            var i: usize = 0_usize;
+            while i < args.len {
+                try out.push_byte_grow(alloc, b' ');
+                try write_expr_inline(arena, alloc, args[i], interner, out);
+                i = i +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Index => {
+            try out.push_str_grow(alloc, "(index ");
+            try write_expr_inline(arena, alloc, e.a, interner, out);
+            try out.push_byte_grow(alloc, b' ');
+            try write_expr_inline(arena, alloc, e.b, interner, out);
+            try out.push_byte_grow(alloc, b')');
+        }
+        .Slice => {
+            try out.push_str_grow(alloc, "(slice ");
+            try write_expr_inline(arena, alloc, e.a, interner, out);
+            try out.push_byte_grow(alloc, b' ');
+            if e.b != NONE_ID {
+                try write_expr_inline(arena, alloc, e.b, interner, out);
+            } else {
+                try out.push_byte_grow(alloc, b'_');
+            }
+            try out.push_byte_grow(alloc, b' ');
+            if e.c != NONE_ID {
+                try write_expr_inline(arena, alloc, e.c, interner, out);
+            } else {
+                try out.push_byte_grow(alloc, b'_');
+            }
+            try out.push_byte_grow(alloc, b')');
+        }
+        _ => {}
+    }
+    return;
+}
+
+@recursive
+fn write_expr_inline(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    expr_id: u32,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let e = arena.get_expr(expr_id) orelse {
+        try out.push_str_grow(alloc, "(expr-err)");
+        return;
+    };
+    if try write_expr_atoms(arena, alloc, e, interner, out) { return; }
+    if try write_expr_compound(arena, alloc, e, interner, out) { return; }
+    if try write_expr_control(arena, alloc, e, interner, out) { return; }
+    try write_expr_ops(arena, alloc, e, interner, out);
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Line Block / Statement / Declaration Dumpers (`--dump-ast-full`)
+// ---------------------------------------------------------------------------
+
+@recursive
+fn dump_block_lines(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    block_id: u32,
+    interner: *span.SymInterner,
+    depth: usize,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let b = arena.get_block(block_id) orelse { return; };
+    try push_indent(alloc, depth, out);
+    try out.push_str_grow(alloc, "(block\n");
+    let stmts = arena.stmt_list_range(b.stmts);
+    var i: usize = 0_usize;
+    while i < stmts.len {
+        try dump_stmt_lines(arena, alloc, stmts[i], interner, depth +% 1_usize, out);
+        i = i +% 1_usize;
+    }
+    if b.tail_expr != NONE_ID {
+        try push_indent(alloc, depth +% 1_usize, out);
+        try out.push_str_grow(alloc, "(tail ");
+        try write_expr_inline(arena, alloc, b.tail_expr, interner, out);
+        try out.push_str_grow(alloc, ")\n");
+    }
+    try push_indent(alloc, depth, out);
+    try out.push_str_grow(alloc, ")\n");
+    return;
+}
+
+@recursive
+fn dump_if_lines(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    if_id: u32,
+    interner: *span.SymInterner,
+    depth: usize,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let node = arena.get_if(if_id) orelse { return; };
+    try push_indent(alloc, depth, out);
+    if node.is_comptime {
+        try out.push_str_grow(alloc, "(comptime-if ");
+    } else {
+        try out.push_str_grow(alloc, "(if ");
+    }
+    try write_if_cond_inline(arena, alloc, node, interner, out);
+    try out.push_byte_grow(alloc, 10_u8);
+    try dump_block_lines(arena, alloc, node.then_block, interner, depth +% 1_usize, out);
+    match node.else_kind {
+        .None => {}
+        .Block => {
+            try push_indent(alloc, depth +% 1_usize, out);
+            try out.push_str_grow(alloc, "(else\n");
+            try dump_block_lines(arena, alloc, node.else_id, interner, depth +% 2_usize, out);
+            try push_indent(alloc, depth +% 1_usize, out);
+            try out.push_str_grow(alloc, ")\n");
+        }
+        .If => {
+            try push_indent(alloc, depth +% 1_usize, out);
+            try out.push_str_grow(alloc, "(else\n");
+            try dump_if_lines(arena, alloc, node.else_id, interner, depth +% 2_usize, out);
+            try push_indent(alloc, depth +% 1_usize, out);
+            try out.push_str_grow(alloc, ")\n");
+        }
+    }
+    try push_indent(alloc, depth, out);
+    try out.push_str_grow(alloc, ")\n");
+    return;
+}
+
+@recursive
+fn dump_stmt_lines_loops(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    s: *StmtNode,
+    interner: *span.SymInterner,
+    depth: usize,
+    out: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    match s.kind {
+        .While => {
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, "(while");
+            if ident_is_some(s.ident) {
+                try out.push_str_grow(alloc, " '");
+                try push_sym(alloc, interner, s.ident.sym, out);
+            }
+            try out.push_byte_grow(alloc, b' ');
+            try write_expr_inline(arena, alloc, s.a, interner, out);
+            let ws = arena.expr_list_range(s.list);
+            if ws.len > 0_usize {
+                try out.push_str_grow(alloc, " (where");
+                var i: usize = 0_usize;
+                while i < ws.len {
+                    try out.push_byte_grow(alloc, b' ');
+                    try write_expr_inline(arena, alloc, ws[i], interner, out);
+                    i = i +% 1_usize;
+                }
+                try out.push_byte_grow(alloc, b')');
+            }
+            try out.push_byte_grow(alloc, 10_u8);
+            try dump_block_lines(arena, alloc, s.b, interner, depth +% 1_usize, out);
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, ")\n");
+            return true;
+        }
+        .For => {
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, "(for");
+            if ident_is_some(s.ident) {
+                try out.push_str_grow(alloc, " '");
+                try push_sym(alloc, interner, s.ident.sym, out);
+            }
+            try out.push_byte_grow(alloc, b' ');
+            try write_pat_inline(arena, alloc, s.a, interner, out);
+            try out.push_byte_grow(alloc, b' ');
+            try write_expr_inline(arena, alloc, s.c, interner, out);
+            if s.has_range {
+                match s.range_kind {
+                    .Exclusive => { try out.push_str_grow(alloc, " .. "); }
+                    .Inclusive => { try out.push_str_grow(alloc, " ..= "); }
+                }
+                try write_expr_inline(arena, alloc, s.d, interner, out);
+            }
+            try out.push_byte_grow(alloc, 10_u8);
+            try dump_block_lines(arena, alloc, s.b, interner, depth +% 1_usize, out);
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, ")\n");
+            return true;
+        }
+        .ParFor => {
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, "(par-for ");
+            try write_pat_inline(arena, alloc, s.a, interner, out);
+            try out.push_byte_grow(alloc, b' ');
+            try write_expr_inline(arena, alloc, s.c, interner, out);
+            if s.has_range {
+                match s.range_kind {
+                    .Exclusive => { try out.push_str_grow(alloc, " .. "); }
+                    .Inclusive => { try out.push_str_grow(alloc, " ..= "); }
+                }
+                try write_expr_inline(arena, alloc, s.d, interner, out);
+            }
+            try out.push_byte_grow(alloc, 10_u8);
+            try dump_block_lines(arena, alloc, s.b, interner, depth +% 1_usize, out);
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, ")\n");
+            return true;
+        }
+        .Loop => {
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, "(loop");
+            if ident_is_some(s.ident) {
+                try out.push_str_grow(alloc, " '");
+                try push_sym(alloc, interner, s.ident.sym, out);
+            }
+            try out.push_byte_grow(alloc, 10_u8);
+            try dump_block_lines(arena, alloc, s.a, interner, depth +% 1_usize, out);
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, ")\n");
+            return true;
+        }
+        _ => { return false; }
+    }
+}
+
+@recursive
+fn dump_stmt_lines(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    stmt_id: u32,
+    interner: *span.SymInterner,
+    depth: usize,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let s = arena.get_stmt(stmt_id) orelse { return; };
+    if try dump_stmt_lines_loops(arena, alloc, s, interner, depth, out) {
+        return;
+    }
+    match s.kind {
+        .If => {
+            try dump_if_lines(arena, alloc, s.a, interner, depth, out);
+        }
+        .Match => {
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, "(match ");
+            try write_expr_inline(arena, alloc, s.a, interner, out);
+            try out.push_byte_grow(alloc, 10_u8);
+            let arms = arena.match_arms_range(s.list);
+            var i: usize = 0_usize;
+            while i < arms.len {
+                let arm = arms[i];
+                try push_indent(alloc, depth +% 1_usize, out);
+                try out.push_str_grow(alloc, "(arm ");
+                try write_pat_inline(arena, alloc, arm.pat, interner, out);
+                if arm.guard != NONE_ID {
+                    try out.push_str_grow(alloc, " (guard ");
+                    try write_expr_inline(arena, alloc, arm.guard, interner, out);
+                    try out.push_byte_grow(alloc, b')');
+                }
+                match arm.body_kind {
+                    .Block => {
+                        try out.push_byte_grow(alloc, 10_u8);
+                        try dump_block_lines(arena, alloc, arm.body_id, interner, depth +% 2_usize, out);
+                        try push_indent(alloc, depth +% 1_usize, out);
+                        try out.push_str_grow(alloc, ")\n");
+                    }
+                    .Expr => {
+                        try out.push_byte_grow(alloc, b' ');
+                        try write_expr_inline(arena, alloc, arm.body_id, interner, out);
+                        try out.push_str_grow(alloc, ")\n");
+                    }
+                    .Jump => {
+                        try out.push_byte_grow(alloc, b' ');
+                        try write_jump_inline(arena, alloc, arm.body_id, interner, out);
+                        try out.push_str_grow(alloc, ")\n");
+                    }
+                }
+                i = i +% 1_usize;
+            }
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, ")\n");
+        }
+        .ComptimeBlock => {
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, "(comptime-block\n");
+            try dump_block_lines(arena, alloc, s.a, interner, depth +% 1_usize, out);
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, ")\n");
+        }
+        .RawBlock => {
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, "(raw-block\n");
+            try dump_block_lines(arena, alloc, s.a, interner, depth +% 1_usize, out);
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, ")\n");
+        }
+        .Defer => {
+            match s.body_kind {
+                .Block => {
+                    try push_indent(alloc, depth, out);
+                    try out.push_str_grow(alloc, "(defer\n");
+                    try dump_block_lines(arena, alloc, s.a, interner, depth +% 1_usize, out);
+                    try push_indent(alloc, depth, out);
+                    try out.push_str_grow(alloc, ")\n");
+                }
+                _ => {
+                    try push_indent(alloc, depth, out);
+                    try write_stmt_inline(arena, alloc, stmt_id, interner, out);
+                    try out.push_byte_grow(alloc, 10_u8);
+                }
+            }
+        }
+        .Errdefer => {
+            match s.body_kind {
+                .Block => {
+                    try push_indent(alloc, depth, out);
+                    try out.push_str_grow(alloc, "(errdefer");
+                    if ident_is_some(s.ident) {
+                        try out.push_byte_grow(alloc, b' ');
+                        try push_sym(alloc, interner, s.ident.sym, out);
+                    }
+                    try out.push_byte_grow(alloc, 10_u8);
+                    try dump_block_lines(arena, alloc, s.a, interner, depth +% 1_usize, out);
+                    try push_indent(alloc, depth, out);
+                    try out.push_str_grow(alloc, ")\n");
+                }
+                _ => {
+                    try push_indent(alloc, depth, out);
+                    try write_stmt_inline(arena, alloc, stmt_id, interner, out);
+                    try out.push_byte_grow(alloc, 10_u8);
+                }
+            }
+        }
+        _ => {
+            try push_indent(alloc, depth, out);
+            try write_stmt_inline(arena, alloc, stmt_id, interner, out);
+            try out.push_byte_grow(alloc, 10_u8);
+        }
+    }
+    return;
+}
+
+fn write_clauses_suffix(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    effects_range: IdRange,
+    where_range: IdRange,
+    ensures_range: IdRange,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let efs = arena.attrs_range(effects_range);
+    if efs.len > 0_usize {
+        try out.push_str_grow(alloc, " (effects");
+        var i: usize = 0_usize;
+        while i < efs.len {
+            try out.push_byte_grow(alloc, b' ');
+            try write_attr(arena, alloc, efs[i], interner, out);
+            i = i +% 1_usize;
+        }
+        try out.push_byte_grow(alloc, b')');
+    }
+    let ws = arena.expr_list_range(where_range);
+    if ws.len > 0_usize {
+        try out.push_str_grow(alloc, " (where");
+        var i: usize = 0_usize;
+        while i < ws.len {
+            try out.push_byte_grow(alloc, b' ');
+            try write_expr_inline(arena, alloc, ws[i], interner, out);
+            i = i +% 1_usize;
+        }
+        try out.push_byte_grow(alloc, b')');
+    }
+    let es = arena.expr_list_range(ensures_range);
+    if es.len > 0_usize {
+        try out.push_str_grow(alloc, " (ensures");
+        var i: usize = 0_usize;
+        while i < es.len {
+            try out.push_byte_grow(alloc, b' ');
+            try write_expr_inline(arena, alloc, es[i], interner, out);
+            i = i +% 1_usize;
+        }
+        try out.push_byte_grow(alloc, b')');
+    }
+    return;
+}
+
+fn dump_fields_block(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    fields_range: IdRange,
+    interner: *span.SymInterner,
+    depth: usize,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let fs = arena.fields_range(fields_range);
+    var i: usize = 0_usize;
+    while i < fs.len {
+        try push_indent(alloc, depth +% 1_usize, out);
+        try write_field_inline(arena, alloc, fs[i], interner, out);
+        try out.push_byte_grow(alloc, 10_u8);
+        i = i +% 1_usize;
+    }
+    try push_indent(alloc, depth, out);
+    try out.push_str_grow(alloc, ")\n");
+    return;
+}
+
+fn dump_decl_full_types(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    d: *DeclNode,
+    interner: *span.SymInterner,
+    depth: usize,
+    out: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    match d.kind {
+        .Enum => {
+            let e = arena.get_enum_decl(d.payload) orelse { return true; };
+            try out.push_str_grow(alloc, "enum ");
+            try push_sym(alloc, interner, e.name.sym, out);
+            if ident_is_some(e.repr_int) {
+                try out.push_str_grow(alloc, " : ");
+                try push_sym(alloc, interner, e.repr_int.sym, out);
+            }
+            try out.push_byte_grow(alloc, 10_u8);
+            let vs = arena.enum_variants_range(e.variants);
+            var i: usize = 0_usize;
+            while i < vs.len {
+                let v = vs[i];
+                try push_indent(alloc, depth +% 1_usize, out);
+                try out.push_str_grow(alloc, "(variant ");
+                try push_sym(alloc, interner, v.name.sym, out);
+                if v.value != NONE_ID {
+                    try out.push_str_grow(alloc, " = ");
+                    try write_expr_inline(arena, alloc, v.value, interner, out);
+                }
+                try out.push_str_grow(alloc, ")\n");
+                i = i +% 1_usize;
+            }
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, ")\n");
+            return true;
+        }
+        .Union => {
+            let u = arena.get_union_decl(d.payload) orelse { return true; };
+            if u.is_linear { try out.push_str_grow(alloc, "linear "); }
+            try out.push_str_grow(alloc, "union ");
+            try push_sym(alloc, interner, u.name.sym, out);
+            try write_generic_params(arena, alloc, u.generics, interner, out);
+            try write_clauses_suffix(arena, alloc, range_empty(), u.where_clauses, range_empty(), interner, out);
+            try out.push_byte_grow(alloc, 10_u8);
+            let vs = arena.union_variants_range(u.variants);
+            var i: usize = 0_usize;
+            while i < vs.len {
+                let v = vs[i];
+                try push_indent(alloc, depth +% 1_usize, out);
+                try out.push_str_grow(alloc, "(variant ");
+                try push_sym(alloc, interner, v.name.sym, out);
+                if v.ty != NONE_ID {
+                    try out.push_str_grow(alloc, ": ");
+                    try write_type_inline(arena, alloc, v.ty, interner, out);
+                }
+                try out.push_str_grow(alloc, ")\n");
+                i = i +% 1_usize;
+            }
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, ")\n");
+            return true;
+        }
+        .Bitfield => {
+            let b = arena.get_bitfield_decl(d.payload) orelse { return true; };
+            try out.push_str_grow(alloc, "bitfield ");
+            try push_sym(alloc, interner, b.name.sym, out);
+            try out.push_str_grow(alloc, " : ");
+            try push_sym(alloc, interner, b.base_int.sym, out);
+            try out.push_byte_grow(alloc, 10_u8);
+            let ms = arena.bitfield_members_range(b.members);
+            var i: usize = 0_usize;
+            while i < ms.len {
+                let m = ms[i];
+                try push_indent(alloc, depth +% 1_usize, out);
+                try out.push_str_grow(alloc, "(member ");
+                try push_sym(alloc, interner, m.name.sym, out);
+                try out.push_str_grow(alloc, ": ");
+                try push_sym(alloc, interner, m.ty.sym, out);
+                if m.has_bits {
+                    try out.push_str_grow(alloc, " bits ");
+                    try write_expr_inline(arena, alloc, m.bits_lo, interner, out);
+                    try out.push_str_grow(alloc, "..");
+                    try write_expr_inline(arena, alloc, m.bits_hi, interner, out);
+                }
+                try out.push_str_grow(alloc, ")\n");
+                i = i +% 1_usize;
+            }
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, ")\n");
+            return true;
+        }
+        .Iface => {
+            let ic = arena.get_iface_decl(d.payload) orelse { return true; };
+            try out.push_str_grow(alloc, "iface ");
+            try push_sym(alloc, interner, ic.name.sym, out);
+            try write_generic_params(arena, alloc, ic.generics, interner, out);
+            try out.push_byte_grow(alloc, 10_u8);
+            let ms = arena.iface_methods_range(ic.methods);
+            var i: usize = 0_usize;
+            while i < ms.len {
+                let m = ms[i];
+                try push_indent(alloc, depth +% 1_usize, out);
+                try out.push_byte_grow(alloc, b'(');
+                try write_attrs_inline(arena, alloc, m.attrs, interner, out);
+                if m.is_view { try out.push_str_grow(alloc, "view "); }
+                try out.push_str_grow(alloc, "fn ");
+                try push_sym(alloc, interner, m.name.sym, out);
+                try write_generic_params(arena, alloc, m.generics, interner, out);
+                try out.push_str_grow(alloc, " (params");
+                let ps = arena.params_range(m.params);
+                var j: usize = 0_usize;
+                while j < ps.len {
+                    try out.push_byte_grow(alloc, b' ');
+                    try write_param_inline(arena, alloc, ps[j], interner, out);
+                    j = j +% 1_usize;
+                }
+                try out.push_byte_grow(alloc, b')');
+                if m.ret_type != NONE_ID {
+                    try out.push_str_grow(alloc, " -> ");
+                    try write_type_inline(arena, alloc, m.ret_type, interner, out);
+                }
+                try write_clauses_suffix(arena, alloc, m.effects, m.where_clauses, m.ensures_clauses, interner, out);
+                try out.push_str_grow(alloc, ")\n");
+                i = i +% 1_usize;
+            }
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, ")\n");
+            return true;
+        }
+        _ => { return false; }
+    }
+}
+
+fn dump_decl_full_misc(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    d: *DeclNode,
+    interner: *span.SymInterner,
+    depth: usize,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    match d.kind {
+        .Error => {
+            let er = arena.get_error_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "error ");
+            try push_sym(alloc, interner, er.name.sym, out);
+            let vs = arena.idents_range(er.variants);
+            var i: usize = 0_usize;
+            while i < vs.len {
+                try out.push_byte_grow(alloc, b' ');
+                try push_sym(alloc, interner, vs[i].sym, out);
+                i = i +% 1_usize;
+            }
+            try out.push_str_grow(alloc, ")\n");
+        }
+        .TypeAlias => {
+            let t = arena.get_type_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "type ");
+            try push_sym(alloc, interner, t.name.sym, out);
+            try write_generic_params(arena, alloc, t.generics, interner, out);
+            try write_clauses_suffix(arena, alloc, range_empty(), t.where_clauses, range_empty(), interner, out);
+            try out.push_str_grow(alloc, " = ");
+            try write_type_inline(arena, alloc, t.ty, interner, out);
+            try out.push_str_grow(alloc, ")\n");
+        }
+        .Const => {
+            let c = arena.get_const_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "const ");
+            try push_sym(alloc, interner, c.name.sym, out);
+            try out.push_str_grow(alloc, ": ");
+            try write_type_inline(arena, alloc, c.ty, interner, out);
+            try out.push_str_grow(alloc, " = ");
+            try write_expr_inline(arena, alloc, c.value, interner, out);
+            try out.push_str_grow(alloc, ")\n");
+        }
+        .ExternFn => {
+            let ex = arena.get_extern_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "extern \"");
+            try push_sym(alloc, interner, ex.abi, out);
+            try out.push_str_grow(alloc, "\" fn ");
+            try push_sym(alloc, interner, ex.name.sym, out);
+            try out.push_str_grow(alloc, " (params");
+            let ps = arena.params_range(ex.params);
+            var i: usize = 0_usize;
+            while i < ps.len {
+                try out.push_byte_grow(alloc, b' ');
+                try write_param_inline(arena, alloc, ps[i], interner, out);
+                i = i +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, b')');
+            if ex.ret_type != NONE_ID {
+                try out.push_str_grow(alloc, " -> ");
+                try write_type_inline(arena, alloc, ex.ret_type, interner, out);
+            }
+            try out.push_str_grow(alloc, ")\n");
+        }
+        .ExternStruct => {
+            let ex = arena.get_extern_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "extern \"");
+            try push_sym(alloc, interner, ex.abi, out);
+            try out.push_str_grow(alloc, "\" struct ");
+            try push_sym(alloc, interner, ex.name.sym, out);
+            try out.push_byte_grow(alloc, 10_u8);
+            try dump_fields_block(arena, alloc, ex.fields, interner, depth, out);
+        }
+        .ExternUnion => {
+            let ex = arena.get_extern_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "extern \"");
+            try push_sym(alloc, interner, ex.abi, out);
+            try out.push_str_grow(alloc, "\" union ");
+            try push_sym(alloc, interner, ex.name.sym, out);
+            try out.push_byte_grow(alloc, 10_u8);
+            try dump_fields_block(arena, alloc, ex.fields, interner, depth, out);
+        }
+        _ => {}
+    }
+    return;
+}
+
+@recursive
+fn dump_decl_full(
+    arena: *AstArena,
+    alloc: *mut AllocCap,
+    decl_id: u32,
+    interner: *span.SymInterner,
+    depth: usize,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let d = arena.get_decl(decl_id) orelse { return; };
+    try push_indent(alloc, depth, out);
+    try out.push_byte_grow(alloc, b'(');
+    try write_attrs_inline(arena, alloc, d.attrs, interner, out);
+    if d.is_pub {
+        try out.push_str_grow(alloc, "pub ");
+    }
+    if try dump_decl_full_types(arena, alloc, d, interner, depth, out) {
+        return;
+    }
+    match d.kind {
+        .Fn => {
+            let f = arena.get_fn_decl(d.payload) orelse { return; };
+            if f.is_comptime { try out.push_str_grow(alloc, "comptime "); }
+            if f.is_view { try out.push_str_grow(alloc, "view "); }
+            try out.push_str_grow(alloc, "fn ");
+            try push_sym(alloc, interner, f.name.sym, out);
+            try write_generic_params(arena, alloc, f.generics, interner, out);
+            try out.push_str_grow(alloc, " (params");
+            let ps = arena.params_range(f.params);
+            var i: usize = 0_usize;
+            while i < ps.len {
+                try out.push_byte_grow(alloc, b' ');
+                try write_param_inline(arena, alloc, ps[i], interner, out);
+                i = i +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, b')');
+            if f.ret_type != NONE_ID {
+                try out.push_str_grow(alloc, " -> ");
+                try write_type_inline(arena, alloc, f.ret_type, interner, out);
+            }
+            try write_clauses_suffix(arena, alloc, f.effects, f.where_clauses, f.ensures_clauses, interner, out);
+            try out.push_byte_grow(alloc, 10_u8);
+            try dump_block_lines(arena, alloc, f.body, interner, depth +% 1_usize, out);
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, ")\n");
+        }
+        .Sys => {
+            let s = arena.get_sys_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "sys ");
+            try push_sym(alloc, interner, s.name.sym, out);
+            try write_generic_params(arena, alloc, s.generics, interner, out);
+            try out.push_str_grow(alloc, " (params");
+            let ps = arena.sys_params_range(s.params);
+            var i: usize = 0_usize;
+            while i < ps.len {
+                try out.push_byte_grow(alloc, b' ');
+                try write_sys_param_inline(arena, alloc, ps[i], interner, out);
+                i = i +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, b')');
+            if s.ret_type != NONE_ID {
+                try out.push_str_grow(alloc, " -> ");
+                try write_type_inline(arena, alloc, s.ret_type, interner, out);
+            }
+            try write_clauses_suffix(arena, alloc, s.effects, s.where_clauses, s.ensures_clauses, interner, out);
+            try out.push_byte_grow(alloc, 10_u8);
+            try dump_block_lines(arena, alloc, s.body, interner, depth +% 1_usize, out);
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, ")\n");
+        }
+        .Struct => {
+            let s = arena.get_struct_decl(d.payload) orelse { return; };
+            if s.is_linear { try out.push_str_grow(alloc, "linear "); }
+            if s.is_view { try out.push_str_grow(alloc, "view "); }
+            try out.push_str_grow(alloc, "struct ");
+            try push_sym(alloc, interner, s.name.sym, out);
+            try write_generic_params(arena, alloc, s.generics, interner, out);
+            try write_clauses_suffix(arena, alloc, range_empty(), s.where_clauses, range_empty(), interner, out);
+            try out.push_byte_grow(alloc, 10_u8);
+            try dump_fields_block(arena, alloc, s.fields, interner, depth, out);
+        }
+        .Pool => {
+            let p = arena.get_struct_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "pool ");
+            try push_sym(alloc, interner, p.name.sym, out);
+            try write_generic_params(arena, alloc, p.generics, interner, out);
+            try write_clauses_suffix(arena, alloc, range_empty(), p.where_clauses, range_empty(), interner, out);
+            try out.push_byte_grow(alloc, 10_u8);
+            try dump_fields_block(arena, alloc, p.fields, interner, depth, out);
+        }
+        .Impl => {
+            let im = arena.get_impl_decl(d.payload) orelse { return; };
+            try out.push_str_grow(alloc, "impl");
+            try write_generic_params(arena, alloc, im.generics, interner, out);
+            try out.push_byte_grow(alloc, b' ');
+            if im.iface_type != NONE_ID {
+                try write_type_inline(arena, alloc, im.iface_type, interner, out);
+                try out.push_str_grow(alloc, " for ");
+            }
+            try write_type_inline(arena, alloc, im.target_type, interner, out);
+            try write_clauses_suffix(arena, alloc, range_empty(), im.where_clauses, range_empty(), interner, out);
+            try out.push_byte_grow(alloc, 10_u8);
+            let subs = arena.decl_list_range(im.decls);
+            var si: usize = 0_usize;
+            while si < subs.len {
+                try dump_decl_full(arena, alloc, subs[si], interner, depth +% 1_usize, out);
+                si = si +% 1_usize;
+            }
+            try push_indent(alloc, depth, out);
+            try out.push_str_grow(alloc, ")\n");
+        }
+        _ => {
+            try dump_decl_full_misc(arena, alloc, d, interner, depth, out);
+        }
+    }
+    return;
+}
+
+// ===========================================================================
+// Parallel AST Merge Helpers (In-Place Offset + SymId Fixup & Bulk Append)
+// ===========================================================================
+
+pub struct AstPoolOffsets {
+    pub units: u32;
+    pub imports: u32;
+    pub import_items: u32;
+    pub attrs: u32;
+    pub attr_args: u32;
+    pub idents: u32;
+    pub generic_params: u32;
+    pub generic_args: u32;
+    pub params: u32;
+    pub sys_params: u32;
+    pub fields: u32;
+    pub decls: u32;
+    pub decl_lists: u32;
+    pub fn_decls: u32;
+    pub sys_decls: u32;
+    pub struct_decls: u32;
+    pub impl_decls: u32;
+    pub type_decls: u32;
+    pub const_decls: u32;
+    pub extern_decls: u32;
+    pub enum_decls: u32;
+    pub enum_variants: u32;
+    pub union_decls: u32;
+    pub union_variants: u32;
+    pub bitfield_decls: u32;
+    pub bitfield_members: u32;
+    pub iface_decls: u32;
+    pub iface_methods: u32;
+    pub error_decls: u32;
+    pub types: u32;
+    pub type_lists: u32;
+    pub pats: u32;
+    pub pat_lists: u32;
+    pub pat_fields: u32;
+    pub stmts: u32;
+    pub stmt_lists: u32;
+    pub blocks: u32;
+    pub jumps: u32;
+    pub if_nodes: u32;
+    pub match_arms: u32;
+    pub exprs: u32;
+    pub expr_lists: u32;
+    pub field_inits: u32;
+    pub asm_ops: u32;
+    pub str_bytes: u32;
+    pub byte_bytes: u32;
+}
+
+pub fn ast_pool_offsets_zero() -> AstPoolOffsets {
+    return AstPoolOffsets.{
+        units: 0_u32,
+        imports: 0_u32,
+        import_items: 0_u32,
+        attrs: 0_u32,
+        attr_args: 0_u32,
+        idents: 0_u32,
+        generic_params: 0_u32,
+        generic_args: 0_u32,
+        params: 0_u32,
+        sys_params: 0_u32,
+        fields: 0_u32,
+        decls: 0_u32,
+        decl_lists: 0_u32,
+        fn_decls: 0_u32,
+        sys_decls: 0_u32,
+        struct_decls: 0_u32,
+        impl_decls: 0_u32,
+        type_decls: 0_u32,
+        const_decls: 0_u32,
+        extern_decls: 0_u32,
+        enum_decls: 0_u32,
+        enum_variants: 0_u32,
+        union_decls: 0_u32,
+        union_variants: 0_u32,
+        bitfield_decls: 0_u32,
+        bitfield_members: 0_u32,
+        iface_decls: 0_u32,
+        iface_methods: 0_u32,
+        error_decls: 0_u32,
+        types: 0_u32,
+        type_lists: 0_u32,
+        pats: 0_u32,
+        pat_lists: 0_u32,
+        pat_fields: 0_u32,
+        stmts: 0_u32,
+        stmt_lists: 0_u32,
+        blocks: 0_u32,
+        jumps: 0_u32,
+        if_nodes: 0_u32,
+        match_arms: 0_u32,
+        exprs: 0_u32,
+        expr_lists: 0_u32,
+        field_inits: 0_u32,
+        asm_ops: 0_u32,
+        str_bytes: 0_u32,
+        byte_bytes: 0_u32,
+    };
+}
+
+pub fn ast_pool_offsets_copy(dst: *mut AstPoolOffsets, src: *AstPoolOffsets) {
+    dst.units = src.units;
+    dst.imports = src.imports;
+    dst.import_items = src.import_items;
+    dst.attrs = src.attrs;
+    dst.attr_args = src.attr_args;
+    dst.idents = src.idents;
+    dst.generic_params = src.generic_params;
+    dst.generic_args = src.generic_args;
+    dst.params = src.params;
+    dst.sys_params = src.sys_params;
+    dst.fields = src.fields;
+    dst.decls = src.decls;
+    dst.decl_lists = src.decl_lists;
+    dst.fn_decls = src.fn_decls;
+    dst.sys_decls = src.sys_decls;
+    dst.struct_decls = src.struct_decls;
+    dst.impl_decls = src.impl_decls;
+    dst.type_decls = src.type_decls;
+    dst.const_decls = src.const_decls;
+    dst.extern_decls = src.extern_decls;
+    dst.enum_decls = src.enum_decls;
+    dst.enum_variants = src.enum_variants;
+    dst.union_decls = src.union_decls;
+    dst.union_variants = src.union_variants;
+    dst.bitfield_decls = src.bitfield_decls;
+    dst.bitfield_members = src.bitfield_members;
+    dst.iface_decls = src.iface_decls;
+    dst.iface_methods = src.iface_methods;
+    dst.error_decls = src.error_decls;
+    dst.types = src.types;
+    dst.type_lists = src.type_lists;
+    dst.pats = src.pats;
+    dst.pat_lists = src.pat_lists;
+    dst.pat_fields = src.pat_fields;
+    dst.stmts = src.stmts;
+    dst.stmt_lists = src.stmt_lists;
+    dst.blocks = src.blocks;
+    dst.jumps = src.jumps;
+    dst.if_nodes = src.if_nodes;
+    dst.match_arms = src.match_arms;
+    dst.exprs = src.exprs;
+    dst.expr_lists = src.expr_lists;
+    dst.field_inits = src.field_inits;
+    dst.asm_ops = src.asm_ops;
+    dst.str_bytes = src.str_bytes;
+    dst.byte_bytes = src.byte_bytes;
+}
+
+pub fn ast_pool_offsets_from(a: *AstArena) -> AstPoolOffsets {
+    return AstPoolOffsets.{
+        units: a.meta.units.len().trunc.[u32](),
+        imports: a.meta.imports.len().trunc.[u32](),
+        import_items: a.meta.import_items.len().trunc.[u32](),
+        attrs: a.meta.attrs.len().trunc.[u32](),
+        attr_args: a.meta.attr_args.len().trunc.[u32](),
+        idents: a.meta.idents.len().trunc.[u32](),
+        generic_params: a.meta.generic_params.len().trunc.[u32](),
+        generic_args: a.meta.generic_args.len().trunc.[u32](),
+        params: a.meta.params.len().trunc.[u32](),
+        sys_params: a.meta.sys_params.len().trunc.[u32](),
+        fields: a.meta.fields.len().trunc.[u32](),
+        decls: a.decl_core.decls.len().trunc.[u32](),
+        decl_lists: a.decl_core.decl_lists.len().trunc.[u32](),
+        fn_decls: a.decl_core.fn_decls.len().trunc.[u32](),
+        sys_decls: a.decl_core.sys_decls.len().trunc.[u32](),
+        struct_decls: a.decl_core.struct_decls.len().trunc.[u32](),
+        impl_decls: a.decl_core.impl_decls.len().trunc.[u32](),
+        type_decls: a.decl_core.type_decls.len().trunc.[u32](),
+        const_decls: a.decl_core.const_decls.len().trunc.[u32](),
+        extern_decls: a.decl_core.extern_decls.len().trunc.[u32](),
+        enum_decls: a.decl_types.enum_decls.len().trunc.[u32](),
+        enum_variants: a.decl_types.enum_variants.len().trunc.[u32](),
+        union_decls: a.decl_types.union_decls.len().trunc.[u32](),
+        union_variants: a.decl_types.union_variants.len().trunc.[u32](),
+        bitfield_decls: a.decl_types.bitfield_decls.len().trunc.[u32](),
+        bitfield_members: a.decl_types.bitfield_members.len().trunc.[u32](),
+        iface_decls: a.decl_types.iface_decls.len().trunc.[u32](),
+        iface_methods: a.decl_types.iface_methods.len().trunc.[u32](),
+        error_decls: a.decl_types.error_decls.len().trunc.[u32](),
+        types: a.stmt_pat.types.len().trunc.[u32](),
+        type_lists: a.stmt_pat.type_lists.len().trunc.[u32](),
+        pats: a.stmt_pat.pats.len().trunc.[u32](),
+        pat_lists: a.stmt_pat.pat_lists.len().trunc.[u32](),
+        pat_fields: a.stmt_pat.pat_fields.len().trunc.[u32](),
+        stmts: a.stmt_pat.stmts.len().trunc.[u32](),
+        stmt_lists: a.stmt_pat.stmt_lists.len().trunc.[u32](),
+        blocks: a.stmt_pat.blocks.len().trunc.[u32](),
+        jumps: a.stmt_pat.jumps.len().trunc.[u32](),
+        if_nodes: a.stmt_pat.if_nodes.len().trunc.[u32](),
+        match_arms: a.stmt_pat.match_arms.len().trunc.[u32](),
+        exprs: a.expr_pools.exprs.len().trunc.[u32](),
+        expr_lists: a.expr_pools.expr_lists.len().trunc.[u32](),
+        field_inits: a.expr_pools.field_inits.len().trunc.[u32](),
+        asm_ops: a.expr_pools.asm_ops.len().trunc.[u32](),
+        str_bytes: a.expr_pools.str_bytes.len().trunc.[u32](),
+        byte_bytes: a.expr_pools.byte_bytes.len().trunc.[u32](),
+    };
+}
+
+pub fn ast_pool_offsets_advance(cur: *mut AstPoolOffsets, w: *AstArena) {
+    cur.units = cur.units +% w.meta.units.len().trunc.[u32]();
+    cur.imports = cur.imports +% w.meta.imports.len().trunc.[u32]();
+    cur.import_items = cur.import_items +% w.meta.import_items.len().trunc.[u32]();
+    cur.attrs = cur.attrs +% w.meta.attrs.len().trunc.[u32]();
+    cur.attr_args = cur.attr_args +% w.meta.attr_args.len().trunc.[u32]();
+    cur.idents = cur.idents +% w.meta.idents.len().trunc.[u32]();
+    cur.generic_params = cur.generic_params +% w.meta.generic_params.len().trunc.[u32]();
+    cur.generic_args = cur.generic_args +% w.meta.generic_args.len().trunc.[u32]();
+    cur.params = cur.params +% w.meta.params.len().trunc.[u32]();
+    cur.sys_params = cur.sys_params +% w.meta.sys_params.len().trunc.[u32]();
+    cur.fields = cur.fields +% w.meta.fields.len().trunc.[u32]();
+    cur.decls = cur.decls +% w.decl_core.decls.len().trunc.[u32]();
+    cur.decl_lists = cur.decl_lists +% w.decl_core.decl_lists.len().trunc.[u32]();
+    cur.fn_decls = cur.fn_decls +% w.decl_core.fn_decls.len().trunc.[u32]();
+    cur.sys_decls = cur.sys_decls +% w.decl_core.sys_decls.len().trunc.[u32]();
+    cur.struct_decls = cur.struct_decls +% w.decl_core.struct_decls.len().trunc.[u32]();
+    cur.impl_decls = cur.impl_decls +% w.decl_core.impl_decls.len().trunc.[u32]();
+    cur.type_decls = cur.type_decls +% w.decl_core.type_decls.len().trunc.[u32]();
+    cur.const_decls = cur.const_decls +% w.decl_core.const_decls.len().trunc.[u32]();
+    cur.extern_decls = cur.extern_decls +% w.decl_core.extern_decls.len().trunc.[u32]();
+    cur.enum_decls = cur.enum_decls +% w.decl_types.enum_decls.len().trunc.[u32]();
+    cur.enum_variants = cur.enum_variants +% w.decl_types.enum_variants.len().trunc.[u32]();
+    cur.union_decls = cur.union_decls +% w.decl_types.union_decls.len().trunc.[u32]();
+    cur.union_variants = cur.union_variants +% w.decl_types.union_variants.len().trunc.[u32]();
+    cur.bitfield_decls = cur.bitfield_decls +% w.decl_types.bitfield_decls.len().trunc.[u32]();
+    cur.bitfield_members = cur.bitfield_members +% w.decl_types.bitfield_members.len().trunc.[u32]();
+    cur.iface_decls = cur.iface_decls +% w.decl_types.iface_decls.len().trunc.[u32]();
+    cur.iface_methods = cur.iface_methods +% w.decl_types.iface_methods.len().trunc.[u32]();
+    cur.error_decls = cur.error_decls +% w.decl_types.error_decls.len().trunc.[u32]();
+    cur.types = cur.types +% w.stmt_pat.types.len().trunc.[u32]();
+    cur.type_lists = cur.type_lists +% w.stmt_pat.type_lists.len().trunc.[u32]();
+    cur.pats = cur.pats +% w.stmt_pat.pats.len().trunc.[u32]();
+    cur.pat_lists = cur.pat_lists +% w.stmt_pat.pat_lists.len().trunc.[u32]();
+    cur.pat_fields = cur.pat_fields +% w.stmt_pat.pat_fields.len().trunc.[u32]();
+    cur.stmts = cur.stmts +% w.stmt_pat.stmts.len().trunc.[u32]();
+    cur.stmt_lists = cur.stmt_lists +% w.stmt_pat.stmt_lists.len().trunc.[u32]();
+    cur.blocks = cur.blocks +% w.stmt_pat.blocks.len().trunc.[u32]();
+    cur.jumps = cur.jumps +% w.stmt_pat.jumps.len().trunc.[u32]();
+    cur.if_nodes = cur.if_nodes +% w.stmt_pat.if_nodes.len().trunc.[u32]();
+    cur.match_arms = cur.match_arms +% w.stmt_pat.match_arms.len().trunc.[u32]();
+    cur.exprs = cur.exprs +% w.expr_pools.exprs.len().trunc.[u32]();
+    cur.expr_lists = cur.expr_lists +% w.expr_pools.expr_lists.len().trunc.[u32]();
+    cur.field_inits = cur.field_inits +% w.expr_pools.field_inits.len().trunc.[u32]();
+    cur.asm_ops = cur.asm_ops +% w.expr_pools.asm_ops.len().trunc.[u32]();
+    cur.str_bytes = cur.str_bytes +% w.expr_pools.str_bytes.len().trunc.[u32]();
+    cur.byte_bytes = cur.byte_bytes +% w.expr_pools.byte_bytes.len().trunc.[u32]();
+}
+
+@inline
+fn remap_sym_id(sym_map: *[u32], s: u32) -> u32 {
+    if s == NONE_ID || s == span.SYM_EMPTY {
+        return s;
+    }
+    let idx = s.widen.[usize]();
+    if idx < sym_map.len {
+        return sym_map[idx];
+    }
+    return s;
+}
+
+@inline
+fn remap_ident_span(sym_map: *[u32], id: IdentSpan) -> IdentSpan {
+    return IdentSpan.{ sym: remap_sym_id(sym_map, id.sym), span: id.span };
+}
+
+@inline
+fn shift_ast_id(id: u32, off: u32) -> u32 {
+    if id == NONE_ID {
+        return NONE_ID;
+    }
+    return id +% off;
+}
+
+@inline
+fn shift_ast_range(r: IdRange, off: u32) -> IdRange {
+    if r.len == 0_u32 {
+        return r;
+    }
+    return range_new(r.start +% off, r.len);
+}
+
+@inline
+fn shift_body_id(kind: BodyKind, id: u32, off: *AstPoolOffsets) -> u32 {
+    match kind {
+        .Block => { return shift_ast_id(id, off.blocks); }
+        .Expr => { return shift_ast_id(id, off.exprs); }
+        .Jump => { return shift_ast_id(id, off.jumps); }
+    }
+}
+
+fn shift_u32_slice(xs: *mut [u32], off: u32) {
+    if off == 0_u32 {
+        return;
+    }
+    var i: usize = 0_usize;
+    while i < xs.len {
+        if xs[i] != NONE_ID {
+            xs[i] = xs[i] +% off;
+        }
+        i = i +% 1_usize;
+    }
+}
+
+fn fixup_ast_meta_and_decls(a: *mut AstArena, off: *AstPoolOffsets, sym_map: *[u32]) {
+    let units = a.meta.units.as_mut_slice();
+    var i: usize = 0_usize;
+    while i < units.len {
+        units[i].module_path = shift_ast_range(units[i].module_path, off.idents);
+        units[i].imports = shift_ast_range(units[i].imports, off.imports);
+        units[i].decls = shift_ast_range(units[i].decls, off.decl_lists);
+        i = i +% 1_usize;
+    }
+    let imps = a.meta.imports.as_mut_slice();
+    i = 0_usize;
+    while i < imps.len {
+        imps[i].path = shift_ast_range(imps[i].path, off.idents);
+        imps[i].alias = remap_ident_span(sym_map, imps[i].alias);
+        imps[i].items = shift_ast_range(imps[i].items, off.import_items);
+        i = i +% 1_usize;
+    }
+    let iis = a.meta.import_items.as_mut_slice();
+    i = 0_usize;
+    while i < iis.len {
+        iis[i].name = remap_ident_span(sym_map, iis[i].name);
+        iis[i].alias = remap_ident_span(sym_map, iis[i].alias);
+        i = i +% 1_usize;
+    }
+    let attrs = a.meta.attrs.as_mut_slice();
+    i = 0_usize;
+    while i < attrs.len {
+        attrs[i].name = remap_ident_span(sym_map, attrs[i].name);
+        attrs[i].args = shift_ast_range(attrs[i].args, off.attr_args);
+        i = i +% 1_usize;
+    }
+    let aargs = a.meta.attr_args.as_mut_slice();
+    i = 0_usize;
+    while i < aargs.len {
+        aargs[i].name = remap_ident_span(sym_map, aargs[i].name);
+        aargs[i].value = shift_ast_id(aargs[i].value, off.exprs);
+        i = i +% 1_usize;
+    }
+    let idents = a.meta.idents.as_mut_slice();
+    i = 0_usize;
+    while i < idents.len {
+        idents[i].sym = remap_sym_id(sym_map, idents[i].sym);
+        i = i +% 1_usize;
+    }
+    let gps = a.meta.generic_params.as_mut_slice();
+    i = 0_usize;
+    while i < gps.len {
+        gps[i].name = remap_ident_span(sym_map, gps[i].name);
+        gps[i].comptime_ty = shift_ast_id(gps[i].comptime_ty, off.types);
+        gps[i].bounds = shift_ast_range(gps[i].bounds, off.type_lists);
+        i = i +% 1_usize;
+    }
+    let gas = a.meta.generic_args.as_mut_slice();
+    i = 0_usize;
+    while i < gas.len {
+        match gas[i].kind {
+            .Type => { gas[i].node_id = shift_ast_id(gas[i].node_id, off.types); }
+            .Expr => { gas[i].node_id = shift_ast_id(gas[i].node_id, off.exprs); }
+            .TypeOrConst => { gas[i].segs = shift_ast_range(gas[i].segs, off.idents); }
+        }
+        i = i +% 1_usize;
+    }
+    let ps = a.meta.params.as_mut_slice();
+    i = 0_usize;
+    while i < ps.len {
+        ps[i].attrs = shift_ast_range(ps[i].attrs, off.attrs);
+        ps[i].name = remap_ident_span(sym_map, ps[i].name);
+        ps[i].ty = shift_ast_id(ps[i].ty, off.types);
+        i = i +% 1_usize;
+    }
+    let sps = a.meta.sys_params.as_mut_slice();
+    i = 0_usize;
+    while i < sps.len {
+        sps[i].attrs = shift_ast_range(sps[i].attrs, off.attrs);
+        sps[i].name = remap_ident_span(sym_map, sps[i].name);
+        sps[i].ty = shift_ast_id(sps[i].ty, off.types);
+        sps[i].columns = shift_ast_range(sps[i].columns, off.idents);
+        i = i +% 1_usize;
+    }
+    let fs = a.meta.fields.as_mut_slice();
+    i = 0_usize;
+    while i < fs.len {
+        fs[i].attrs = shift_ast_range(fs[i].attrs, off.attrs);
+        fs[i].name = remap_ident_span(sym_map, fs[i].name);
+        fs[i].ty = shift_ast_id(fs[i].ty, off.types);
+        fs[i].default = shift_ast_id(fs[i].default, off.exprs);
+        i = i +% 1_usize;
+    }
+}
+
+fn fixup_ast_decl_core(a: *mut AstArena, off: *AstPoolOffsets, sym_map: *[u32]) {
+    let decls = a.decl_core.decls.as_mut_slice();
+    var i: usize = 0_usize;
+    while i < decls.len {
+        decls[i].attrs = shift_ast_range(decls[i].attrs, off.attrs);
+        match decls[i].kind {
+            .Fn => { decls[i].payload = shift_ast_id(decls[i].payload, off.fn_decls); }
+            .Sys => { decls[i].payload = shift_ast_id(decls[i].payload, off.sys_decls); }
+            .Struct => { decls[i].payload = shift_ast_id(decls[i].payload, off.struct_decls); }
+            .Pool => { decls[i].payload = shift_ast_id(decls[i].payload, off.struct_decls); }
+            .Enum => { decls[i].payload = shift_ast_id(decls[i].payload, off.enum_decls); }
+            .Union => { decls[i].payload = shift_ast_id(decls[i].payload, off.union_decls); }
+            .Bitfield => { decls[i].payload = shift_ast_id(decls[i].payload, off.bitfield_decls); }
+            .Iface => { decls[i].payload = shift_ast_id(decls[i].payload, off.iface_decls); }
+            .Impl => { decls[i].payload = shift_ast_id(decls[i].payload, off.impl_decls); }
+            .Error => { decls[i].payload = shift_ast_id(decls[i].payload, off.error_decls); }
+            .TypeAlias => { decls[i].payload = shift_ast_id(decls[i].payload, off.type_decls); }
+            .Const => { decls[i].payload = shift_ast_id(decls[i].payload, off.const_decls); }
+            .ExternFn => { decls[i].payload = shift_ast_id(decls[i].payload, off.extern_decls); }
+            .ExternStruct => { decls[i].payload = shift_ast_id(decls[i].payload, off.extern_decls); }
+            .ExternUnion => { decls[i].payload = shift_ast_id(decls[i].payload, off.extern_decls); }
+        }
+        i = i +% 1_usize;
+    }
+    shift_u32_slice(a.decl_core.decl_lists.as_mut_slice(), off.decls);
+
+    let fns = a.decl_core.fn_decls.as_mut_slice();
+    i = 0_usize;
+    while i < fns.len {
+        fns[i].name = remap_ident_span(sym_map, fns[i].name);
+        fns[i].generics = shift_ast_range(fns[i].generics, off.generic_params);
+        fns[i].params = shift_ast_range(fns[i].params, off.params);
+        fns[i].ret_type = shift_ast_id(fns[i].ret_type, off.types);
+        fns[i].effects = shift_ast_range(fns[i].effects, off.attrs);
+        fns[i].where_clauses = shift_ast_range(fns[i].where_clauses, off.expr_lists);
+        fns[i].ensures_clauses = shift_ast_range(fns[i].ensures_clauses, off.expr_lists);
+        fns[i].body = shift_ast_id(fns[i].body, off.blocks);
+        i = i +% 1_usize;
+    }
+    let syss = a.decl_core.sys_decls.as_mut_slice();
+    i = 0_usize;
+    while i < syss.len {
+        syss[i].name = remap_ident_span(sym_map, syss[i].name);
+        syss[i].generics = shift_ast_range(syss[i].generics, off.generic_params);
+        syss[i].params = shift_ast_range(syss[i].params, off.sys_params);
+        syss[i].ret_type = shift_ast_id(syss[i].ret_type, off.types);
+        syss[i].effects = shift_ast_range(syss[i].effects, off.attrs);
+        syss[i].where_clauses = shift_ast_range(syss[i].where_clauses, off.expr_lists);
+        syss[i].ensures_clauses = shift_ast_range(syss[i].ensures_clauses, off.expr_lists);
+        syss[i].body = shift_ast_id(syss[i].body, off.blocks);
+        i = i +% 1_usize;
+    }
+    let sts = a.decl_core.struct_decls.as_mut_slice();
+    i = 0_usize;
+    while i < sts.len {
+        sts[i].name = remap_ident_span(sym_map, sts[i].name);
+        sts[i].generics = shift_ast_range(sts[i].generics, off.generic_params);
+        sts[i].where_clauses = shift_ast_range(sts[i].where_clauses, off.expr_lists);
+        sts[i].fields = shift_ast_range(sts[i].fields, off.fields);
+        i = i +% 1_usize;
+    }
+    let ims = a.decl_core.impl_decls.as_mut_slice();
+    i = 0_usize;
+    while i < ims.len {
+        ims[i].generics = shift_ast_range(ims[i].generics, off.generic_params);
+        ims[i].iface_type = shift_ast_id(ims[i].iface_type, off.types);
+        ims[i].target_type = shift_ast_id(ims[i].target_type, off.types);
+        ims[i].where_clauses = shift_ast_range(ims[i].where_clauses, off.expr_lists);
+        ims[i].decls = shift_ast_range(ims[i].decls, off.decl_lists);
+        i = i +% 1_usize;
+    }
+    let tds = a.decl_core.type_decls.as_mut_slice();
+    i = 0_usize;
+    while i < tds.len {
+        tds[i].name = remap_ident_span(sym_map, tds[i].name);
+        tds[i].generics = shift_ast_range(tds[i].generics, off.generic_params);
+        tds[i].where_clauses = shift_ast_range(tds[i].where_clauses, off.expr_lists);
+        tds[i].ty = shift_ast_id(tds[i].ty, off.types);
+        i = i +% 1_usize;
+    }
+    let cds = a.decl_core.const_decls.as_mut_slice();
+    i = 0_usize;
+    while i < cds.len {
+        cds[i].name = remap_ident_span(sym_map, cds[i].name);
+        cds[i].ty = shift_ast_id(cds[i].ty, off.types);
+        cds[i].value = shift_ast_id(cds[i].value, off.exprs);
+        i = i +% 1_usize;
+    }
+    let exs = a.decl_core.extern_decls.as_mut_slice();
+    i = 0_usize;
+    while i < exs.len {
+        exs[i].abi = remap_sym_id(sym_map, exs[i].abi);
+        exs[i].name = remap_ident_span(sym_map, exs[i].name);
+        exs[i].params = shift_ast_range(exs[i].params, off.params);
+        exs[i].fields = shift_ast_range(exs[i].fields, off.fields);
+        exs[i].ret_type = shift_ast_id(exs[i].ret_type, off.types);
+        i = i +% 1_usize;
+    }
+}
+
+fn fixup_ast_decl_types(a: *mut AstArena, off: *AstPoolOffsets, sym_map: *[u32]) {
+    let eds = a.decl_types.enum_decls.as_mut_slice();
+    var i: usize = 0_usize;
+    while i < eds.len {
+        eds[i].name = remap_ident_span(sym_map, eds[i].name);
+        eds[i].repr_int = remap_ident_span(sym_map, eds[i].repr_int);
+        eds[i].variants = shift_ast_range(eds[i].variants, off.enum_variants);
+        i = i +% 1_usize;
+    }
+    let evs = a.decl_types.enum_variants.as_mut_slice();
+    i = 0_usize;
+    while i < evs.len {
+        evs[i].name = remap_ident_span(sym_map, evs[i].name);
+        evs[i].value = shift_ast_id(evs[i].value, off.exprs);
+        i = i +% 1_usize;
+    }
+    let uds = a.decl_types.union_decls.as_mut_slice();
+    i = 0_usize;
+    while i < uds.len {
+        uds[i].name = remap_ident_span(sym_map, uds[i].name);
+        uds[i].generics = shift_ast_range(uds[i].generics, off.generic_params);
+        uds[i].where_clauses = shift_ast_range(uds[i].where_clauses, off.expr_lists);
+        uds[i].variants = shift_ast_range(uds[i].variants, off.union_variants);
+        i = i +% 1_usize;
+    }
+    let uvs = a.decl_types.union_variants.as_mut_slice();
+    i = 0_usize;
+    while i < uvs.len {
+        uvs[i].name = remap_ident_span(sym_map, uvs[i].name);
+        uvs[i].ty = shift_ast_id(uvs[i].ty, off.types);
+        i = i +% 1_usize;
+    }
+    let bds = a.decl_types.bitfield_decls.as_mut_slice();
+    i = 0_usize;
+    while i < bds.len {
+        bds[i].name = remap_ident_span(sym_map, bds[i].name);
+        bds[i].base_int = remap_ident_span(sym_map, bds[i].base_int);
+        bds[i].members = shift_ast_range(bds[i].members, off.bitfield_members);
+        i = i +% 1_usize;
+    }
+    let bms = a.decl_types.bitfield_members.as_mut_slice();
+    i = 0_usize;
+    while i < bms.len {
+        bms[i].name = remap_ident_span(sym_map, bms[i].name);
+        bms[i].ty = remap_ident_span(sym_map, bms[i].ty);
+        if bms[i].has_bits {
+            bms[i].bits_lo = shift_ast_id(bms[i].bits_lo, off.exprs);
+            bms[i].bits_hi = shift_ast_id(bms[i].bits_hi, off.exprs);
+        }
+        i = i +% 1_usize;
+    }
+    let ifs = a.decl_types.iface_decls.as_mut_slice();
+    i = 0_usize;
+    while i < ifs.len {
+        ifs[i].name = remap_ident_span(sym_map, ifs[i].name);
+        ifs[i].generics = shift_ast_range(ifs[i].generics, off.generic_params);
+        ifs[i].methods = shift_ast_range(ifs[i].methods, off.iface_methods);
+        i = i +% 1_usize;
+    }
+    let ims2 = a.decl_types.iface_methods.as_mut_slice();
+    i = 0_usize;
+    while i < ims2.len {
+        ims2[i].attrs = shift_ast_range(ims2[i].attrs, off.attrs);
+        ims2[i].name = remap_ident_span(sym_map, ims2[i].name);
+        ims2[i].generics = shift_ast_range(ims2[i].generics, off.generic_params);
+        ims2[i].params = shift_ast_range(ims2[i].params, off.params);
+        ims2[i].ret_type = shift_ast_id(ims2[i].ret_type, off.types);
+        ims2[i].effects = shift_ast_range(ims2[i].effects, off.attrs);
+        ims2[i].where_clauses = shift_ast_range(ims2[i].where_clauses, off.expr_lists);
+        ims2[i].ensures_clauses = shift_ast_range(ims2[i].ensures_clauses, off.expr_lists);
+        i = i +% 1_usize;
+    }
+    let ers = a.decl_types.error_decls.as_mut_slice();
+    i = 0_usize;
+    while i < ers.len {
+        ers[i].name = remap_ident_span(sym_map, ers[i].name);
+        ers[i].variants = shift_ast_range(ers[i].variants, off.idents);
+        i = i +% 1_usize;
+    }
+}
+
+fn fixup_ast_stmt_pat_and_exprs(a: *mut AstArena, off: *AstPoolOffsets, sym_map: *[u32]) {
+    let tys = a.stmt_pat.types.as_mut_slice();
+    var i: usize = 0_usize;
+    while i < tys.len {
+        match tys[i].kind {
+            .ErrorUnion => {
+                tys[i].primary = shift_ast_id(tys[i].primary, off.types);
+                tys[i].list = shift_ast_range(tys[i].list, off.type_lists);
+            }
+            .Optional => { tys[i].primary = shift_ast_id(tys[i].primary, off.types); }
+            .Borrow => {
+                if tys[i].borrow_target != .Str {
+                    tys[i].primary = shift_ast_id(tys[i].primary, off.types);
+                }
+                _ = 0_u8;
+            }
+            .Array => {
+                tys[i].primary = shift_ast_id(tys[i].primary, off.types);
+                tys[i].aux = shift_ast_id(tys[i].aux, off.exprs);
+            }
+            .Dyn => {
+                tys[i].list = shift_ast_range(tys[i].list, off.idents);
+                tys[i].list2 = shift_ast_range(tys[i].list2, off.generic_args);
+            }
+            .Path => {
+                tys[i].list = shift_ast_range(tys[i].list, off.idents);
+                tys[i].list2 = shift_ast_range(tys[i].list2, off.generic_args);
+            }
+            .FnPtr => {
+                tys[i].primary = shift_ast_id(tys[i].primary, off.types);
+                tys[i].list = shift_ast_range(tys[i].list, off.type_lists);
+                tys[i].list2 = shift_ast_range(tys[i].list2, off.attrs);
+            }
+            .InlineStruct => { tys[i].list = shift_ast_range(tys[i].list, off.fields); }
+            .Tuple => { tys[i].list = shift_ast_range(tys[i].list, off.type_lists); }
+            _ => {}
+        }
+        i = i +% 1_usize;
+    }
+    shift_u32_slice(a.stmt_pat.type_lists.as_mut_slice(), off.types);
+
+    let pats = a.stmt_pat.pats.as_mut_slice();
+    i = 0_usize;
+    while i < pats.len {
+        match pats[i].kind {
+            .Ident => { pats[i].data0 = remap_sym_id(sym_map, pats[i].data0); }
+            .IntLit => {
+                pats[i].data0 = remap_sym_id(sym_map, pats[i].data0);
+                if pats[i].has_range {
+                    pats[i].data1 = remap_sym_id(sym_map, pats[i].data1);
+                }
+                _ = 0_u8;
+            }
+            .Variant => {
+                pats[i].ident = remap_ident_span(sym_map, pats[i].ident);
+                pats[i].list = shift_ast_range(pats[i].list, off.pat_lists);
+            }
+            .Struct => {
+                if pats[i].flag {
+                    pats[i].path_segs = shift_ast_range(pats[i].path_segs, off.idents);
+                    pats[i].path_gens = shift_ast_range(pats[i].path_gens, off.generic_args);
+                }
+                pats[i].list = shift_ast_range(pats[i].list, off.pat_fields);
+            }
+            .Tuple => { pats[i].list = shift_ast_range(pats[i].list, off.pat_lists); }
+            _ => {}
+        }
+        i = i +% 1_usize;
+    }
+    shift_u32_slice(a.stmt_pat.pat_lists.as_mut_slice(), off.pats);
+
+    let pfs = a.stmt_pat.pat_fields.as_mut_slice();
+    i = 0_usize;
+    while i < pfs.len {
+        pfs[i].name = remap_ident_span(sym_map, pfs[i].name);
+        pfs[i].pat = shift_ast_id(pfs[i].pat, off.pats);
+        i = i +% 1_usize;
+    }
+
+    let stmts = a.stmt_pat.stmts.as_mut_slice();
+    i = 0_usize;
+    while i < stmts.len {
+        match stmts[i].kind {
+            .Let => {
+                stmts[i].list = shift_ast_range(stmts[i].list, off.attrs);
+                stmts[i].a = shift_ast_id(stmts[i].a, off.pats);
+                stmts[i].b = shift_ast_id(stmts[i].b, off.types);
+                stmts[i].c = shift_ast_id(stmts[i].c, off.exprs);
+            }
+            .Var => {
+                stmts[i].list = shift_ast_range(stmts[i].list, off.attrs);
+                stmts[i].ident = remap_ident_span(sym_map, stmts[i].ident);
+                stmts[i].b = shift_ast_id(stmts[i].b, off.types);
+                stmts[i].c = shift_ast_id(stmts[i].c, off.exprs);
+            }
+            .Const => { stmts[i].a = shift_ast_id(stmts[i].a, off.const_decls); }
+            .Defer => { stmts[i].a = shift_body_id(stmts[i].body_kind, stmts[i].a, off); }
+            .Errdefer => {
+                stmts[i].ident = remap_ident_span(sym_map, stmts[i].ident);
+                stmts[i].a = shift_body_id(stmts[i].body_kind, stmts[i].a, off);
+            }
+            .Jump => { stmts[i].a = shift_ast_id(stmts[i].a, off.jumps); }
+            .If => { stmts[i].a = shift_ast_id(stmts[i].a, off.if_nodes); }
+            .Match => {
+                stmts[i].a = shift_ast_id(stmts[i].a, off.exprs);
+                stmts[i].list = shift_ast_range(stmts[i].list, off.match_arms);
+            }
+            .While => {
+                stmts[i].ident = remap_ident_span(sym_map, stmts[i].ident);
+                stmts[i].a = shift_ast_id(stmts[i].a, off.exprs);
+                stmts[i].b = shift_ast_id(stmts[i].b, off.blocks);
+                stmts[i].list = shift_ast_range(stmts[i].list, off.expr_lists);
+            }
+            .For => {
+                stmts[i].ident = remap_ident_span(sym_map, stmts[i].ident);
+                stmts[i].a = shift_ast_id(stmts[i].a, off.pats);
+                stmts[i].b = shift_ast_id(stmts[i].b, off.blocks);
+                stmts[i].c = shift_ast_id(stmts[i].c, off.exprs);
+                if stmts[i].has_range {
+                    stmts[i].d = shift_ast_id(stmts[i].d, off.exprs);
+                }
+                _ = 0_u8;
+            }
+            .ParFor => {
+                stmts[i].a = shift_ast_id(stmts[i].a, off.pats);
+                stmts[i].b = shift_ast_id(stmts[i].b, off.blocks);
+                stmts[i].c = shift_ast_id(stmts[i].c, off.exprs);
+                if stmts[i].has_range {
+                    stmts[i].d = shift_ast_id(stmts[i].d, off.exprs);
+                }
+                _ = 0_u8;
+            }
+            .Loop => {
+                stmts[i].ident = remap_ident_span(sym_map, stmts[i].ident);
+                stmts[i].a = shift_ast_id(stmts[i].a, off.blocks);
+            }
+            .ComptimeBlock => { stmts[i].a = shift_ast_id(stmts[i].a, off.blocks); }
+            .RawBlock => { stmts[i].a = shift_ast_id(stmts[i].a, off.blocks); }
+            .Assign => {
+                stmts[i].a = shift_ast_id(stmts[i].a, off.exprs);
+                stmts[i].b = shift_ast_id(stmts[i].b, off.exprs);
+            }
+            .Discard => { stmts[i].a = shift_ast_id(stmts[i].a, off.exprs); }
+            .Expr => { stmts[i].a = shift_ast_id(stmts[i].a, off.exprs); }
+        }
+        i = i +% 1_usize;
+    }
+    shift_u32_slice(a.stmt_pat.stmt_lists.as_mut_slice(), off.stmts);
+
+    let blks = a.stmt_pat.blocks.as_mut_slice();
+    i = 0_usize;
+    while i < blks.len {
+        blks[i].stmts = shift_ast_range(blks[i].stmts, off.stmt_lists);
+        blks[i].tail_expr = shift_ast_id(blks[i].tail_expr, off.exprs);
+        i = i +% 1_usize;
+    }
+    let jmps = a.stmt_pat.jumps.as_mut_slice();
+    i = 0_usize;
+    while i < jmps.len {
+        jmps[i].label = remap_ident_span(sym_map, jmps[i].label);
+        jmps[i].value = shift_ast_id(jmps[i].value, off.exprs);
+        i = i +% 1_usize;
+    }
+    let ifns = a.stmt_pat.if_nodes.as_mut_slice();
+    i = 0_usize;
+    while i < ifns.len {
+        if ifns[i].cond_kind == .Let {
+            ifns[i].cond_pat = shift_ast_id(ifns[i].cond_pat, off.pats);
+        }
+        ifns[i].cond_expr = shift_ast_id(ifns[i].cond_expr, off.exprs);
+        ifns[i].then_block = shift_ast_id(ifns[i].then_block, off.blocks);
+        if ifns[i].else_kind == .Block {
+            ifns[i].else_id = shift_ast_id(ifns[i].else_id, off.blocks);
+        } else if ifns[i].else_kind == .If {
+            ifns[i].else_id = shift_ast_id(ifns[i].else_id, off.if_nodes);
+        }
+        i = i +% 1_usize;
+    }
+    let arms = a.stmt_pat.match_arms.as_mut_slice();
+    i = 0_usize;
+    while i < arms.len {
+        arms[i].pat = shift_ast_id(arms[i].pat, off.pats);
+        arms[i].guard = shift_ast_id(arms[i].guard, off.exprs);
+        arms[i].body_id = shift_body_id(arms[i].body_kind, arms[i].body_id, off);
+        i = i +% 1_usize;
+    }
+
+    let exprs = a.expr_pools.exprs.as_mut_slice();
+    i = 0_usize;
+    while i < exprs.len {
+        match exprs[i].kind {
+            .IntLit => {
+                exprs[i].a = remap_sym_id(sym_map, exprs[i].a);
+                exprs[i].b = remap_sym_id(sym_map, exprs[i].b);
+            }
+            .FloatLit => {
+                exprs[i].a = remap_sym_id(sym_map, exprs[i].a);
+                exprs[i].b = remap_sym_id(sym_map, exprs[i].b);
+            }
+            .StringLit => { exprs[i].list = shift_ast_range(exprs[i].list, off.str_bytes); }
+            .RawStringLit => { exprs[i].list = shift_ast_range(exprs[i].list, off.str_bytes); }
+            .ByteStringLit => { exprs[i].list = shift_ast_range(exprs[i].list, off.byte_bytes); }
+            .Ident => { exprs[i].a = remap_sym_id(sym_map, exprs[i].a); }
+            .EnumLit => { exprs[i].ident = remap_ident_span(sym_map, exprs[i].ident); }
+            .AnonStructLit => { exprs[i].list = shift_ast_range(exprs[i].list, off.field_inits); }
+            .NamedStructLit => {
+                exprs[i].a = shift_ast_id(exprs[i].a, off.exprs);
+                exprs[i].list = shift_ast_range(exprs[i].list, off.field_inits);
+            }
+            .ArrayLit => { exprs[i].list = shift_ast_range(exprs[i].list, off.expr_lists); }
+            .ArrayRepeat => {
+                exprs[i].a = shift_ast_id(exprs[i].a, off.exprs);
+                exprs[i].b = shift_ast_id(exprs[i].b, off.exprs);
+            }
+            .Tuple => { exprs[i].list = shift_ast_range(exprs[i].list, off.expr_lists); }
+            .Paren => { exprs[i].a = shift_ast_id(exprs[i].a, off.exprs); }
+            .Closure => {
+                exprs[i].list = shift_ast_range(exprs[i].list, off.params);
+                exprs[i].a = shift_ast_id(exprs[i].a, off.blocks);
+            }
+            .If => { exprs[i].a = shift_ast_id(exprs[i].a, off.if_nodes); }
+            .Match => {
+                exprs[i].a = shift_ast_id(exprs[i].a, off.exprs);
+                exprs[i].list = shift_ast_range(exprs[i].list, off.match_arms);
+            }
+            .Loop => {
+                exprs[i].ident = remap_ident_span(sym_map, exprs[i].ident);
+                exprs[i].a = shift_ast_id(exprs[i].a, off.blocks);
+            }
+            .ComptimeBlock => { exprs[i].a = shift_ast_id(exprs[i].a, off.blocks); }
+            .ComptimeExpr => { exprs[i].a = shift_ast_id(exprs[i].a, off.exprs); }
+            .Builtin => {
+                exprs[i].ident = remap_ident_span(sym_map, exprs[i].ident);
+                exprs[i].list = shift_ast_range(exprs[i].list, off.generic_args);
+            }
+            .Asm => {
+                exprs[i].list = shift_ast_range(exprs[i].list, off.str_bytes);
+                exprs[i].list2 = shift_ast_range(exprs[i].list2, off.asm_ops);
+            }
+            .Unary => { exprs[i].a = shift_ast_id(exprs[i].a, off.exprs); }
+            .Binary => {
+                exprs[i].a = shift_ast_id(exprs[i].a, off.exprs);
+                exprs[i].b = shift_ast_id(exprs[i].b, off.exprs);
+            }
+            .Is => {
+                exprs[i].a = shift_ast_id(exprs[i].a, off.exprs);
+                exprs[i].b = shift_ast_id(exprs[i].b, off.pats);
+            }
+            .Orelse => {
+                exprs[i].a = shift_ast_id(exprs[i].a, off.exprs);
+                exprs[i].b = shift_body_id(exprs[i].body_kind, exprs[i].b, off);
+            }
+            .Catch => {
+                exprs[i].a = shift_ast_id(exprs[i].a, off.exprs);
+                exprs[i].ident = remap_ident_span(sym_map, exprs[i].ident);
+                exprs[i].b = shift_body_id(exprs[i].body_kind, exprs[i].b, off);
+            }
+            .Field => {
+                exprs[i].a = shift_ast_id(exprs[i].a, off.exprs);
+                exprs[i].ident = remap_ident_span(sym_map, exprs[i].ident);
+            }
+            .Deref => { exprs[i].a = shift_ast_id(exprs[i].a, off.exprs); }
+            .GenericApply => {
+                exprs[i].a = shift_ast_id(exprs[i].a, off.exprs);
+                exprs[i].list = shift_ast_range(exprs[i].list, off.generic_args);
+            }
+            .Call => {
+                exprs[i].a = shift_ast_id(exprs[i].a, off.exprs);
+                exprs[i].list = shift_ast_range(exprs[i].list, off.expr_lists);
+            }
+            .Index => {
+                exprs[i].a = shift_ast_id(exprs[i].a, off.exprs);
+                exprs[i].b = shift_ast_id(exprs[i].b, off.exprs);
+            }
+            .Slice => {
+                exprs[i].a = shift_ast_id(exprs[i].a, off.exprs);
+                exprs[i].b = shift_ast_id(exprs[i].b, off.exprs);
+                exprs[i].c = shift_ast_id(exprs[i].c, off.exprs);
+            }
+            _ => {}
+        }
+        i = i +% 1_usize;
+    }
+    shift_u32_slice(a.expr_pools.expr_lists.as_mut_slice(), off.exprs);
+
+    let fis = a.expr_pools.field_inits.as_mut_slice();
+    i = 0_usize;
+    while i < fis.len {
+        fis[i].name = remap_ident_span(sym_map, fis[i].name);
+        fis[i].value = shift_ast_id(fis[i].value, off.exprs);
+        i = i +% 1_usize;
+    }
+    let aops = a.expr_pools.asm_ops.as_mut_slice();
+    i = 0_usize;
+    while i < aops.len {
+        aops[i].dir = remap_ident_span(sym_map, aops[i].dir);
+        aops[i].expr = shift_ast_id(aops[i].expr, off.exprs);
+        aops[i].arg = shift_ast_id(aops[i].arg, off.exprs);
+        i = i +% 1_usize;
+    }
+}
+
+pub fn fixup_worker_ast_inplace(a: *mut AstArena, off: *AstPoolOffsets, sym_map: *[u32]) {
+    fixup_ast_meta_and_decls(a, off, sym_map);
+    fixup_ast_decl_core(a, off, sym_map);
+    fixup_ast_decl_types(a, off, sym_map);
+    fixup_ast_stmt_pat_and_exprs(a, off, sym_map);
+}
+
+pub fn reserve_for_bulk_append(
+    alloc: *mut AllocCap,
+    dst: *mut AstArena,
+    totals: *AstPoolOffsets,
+) -> !OutOfMemory {
+    try dst.meta.units.reserve_exact(alloc, totals.units.widen.[usize]());
+    try dst.meta.imports.reserve_exact(alloc, totals.imports.widen.[usize]());
+    try dst.meta.import_items.reserve_exact(alloc, totals.import_items.widen.[usize]());
+    try dst.meta.attrs.reserve_exact(alloc, totals.attrs.widen.[usize]());
+    try dst.meta.attr_args.reserve_exact(alloc, totals.attr_args.widen.[usize]());
+    try dst.meta.idents.reserve_exact(alloc, totals.idents.widen.[usize]());
+    try dst.meta.generic_params.reserve_exact(alloc, totals.generic_params.widen.[usize]());
+    try dst.meta.generic_args.reserve_exact(alloc, totals.generic_args.widen.[usize]());
+    try dst.meta.params.reserve_exact(alloc, totals.params.widen.[usize]());
+    try dst.meta.sys_params.reserve_exact(alloc, totals.sys_params.widen.[usize]());
+    try dst.meta.fields.reserve_exact(alloc, totals.fields.widen.[usize]());
+
+    try dst.decl_core.decls.reserve_exact(alloc, totals.decls.widen.[usize]());
+    try dst.decl_core.decl_lists.reserve_exact(alloc, totals.decl_lists.widen.[usize]());
+    try dst.decl_core.fn_decls.reserve_exact(alloc, totals.fn_decls.widen.[usize]());
+    try dst.decl_core.sys_decls.reserve_exact(alloc, totals.sys_decls.widen.[usize]());
+    try dst.decl_core.struct_decls.reserve_exact(alloc, totals.struct_decls.widen.[usize]());
+    try dst.decl_core.impl_decls.reserve_exact(alloc, totals.impl_decls.widen.[usize]());
+    try dst.decl_core.type_decls.reserve_exact(alloc, totals.type_decls.widen.[usize]());
+    try dst.decl_core.const_decls.reserve_exact(alloc, totals.const_decls.widen.[usize]());
+    try dst.decl_core.extern_decls.reserve_exact(alloc, totals.extern_decls.widen.[usize]());
+
+    try dst.decl_types.enum_decls.reserve_exact(alloc, totals.enum_decls.widen.[usize]());
+    try dst.decl_types.enum_variants.reserve_exact(alloc, totals.enum_variants.widen.[usize]());
+    try dst.decl_types.union_decls.reserve_exact(alloc, totals.union_decls.widen.[usize]());
+    try dst.decl_types.union_variants.reserve_exact(alloc, totals.union_variants.widen.[usize]());
+    try dst.decl_types.bitfield_decls.reserve_exact(alloc, totals.bitfield_decls.widen.[usize]());
+    try dst.decl_types.bitfield_members.reserve_exact(alloc, totals.bitfield_members.widen.[usize]());
+    try dst.decl_types.iface_decls.reserve_exact(alloc, totals.iface_decls.widen.[usize]());
+    try dst.decl_types.iface_methods.reserve_exact(alloc, totals.iface_methods.widen.[usize]());
+    try dst.decl_types.error_decls.reserve_exact(alloc, totals.error_decls.widen.[usize]());
+
+    try dst.stmt_pat.types.reserve_exact(alloc, totals.types.widen.[usize]());
+    try dst.stmt_pat.type_lists.reserve_exact(alloc, totals.type_lists.widen.[usize]());
+    try dst.stmt_pat.pats.reserve_exact(alloc, totals.pats.widen.[usize]());
+    try dst.stmt_pat.pat_lists.reserve_exact(alloc, totals.pat_lists.widen.[usize]());
+    try dst.stmt_pat.pat_fields.reserve_exact(alloc, totals.pat_fields.widen.[usize]());
+    try dst.stmt_pat.stmts.reserve_exact(alloc, totals.stmts.widen.[usize]());
+    try dst.stmt_pat.stmt_lists.reserve_exact(alloc, totals.stmt_lists.widen.[usize]());
+    try dst.stmt_pat.blocks.reserve_exact(alloc, totals.blocks.widen.[usize]());
+    try dst.stmt_pat.jumps.reserve_exact(alloc, totals.jumps.widen.[usize]());
+    try dst.stmt_pat.if_nodes.reserve_exact(alloc, totals.if_nodes.widen.[usize]());
+    try dst.stmt_pat.match_arms.reserve_exact(alloc, totals.match_arms.widen.[usize]());
+
+    try dst.expr_pools.exprs.reserve_exact(alloc, totals.exprs.widen.[usize]());
+    try dst.expr_pools.expr_lists.reserve_exact(alloc, totals.expr_lists.widen.[usize]());
+    try dst.expr_pools.field_inits.reserve_exact(alloc, totals.field_inits.widen.[usize]());
+    try dst.expr_pools.asm_ops.reserve_exact(alloc, totals.asm_ops.widen.[usize]());
+    try dst.expr_pools.str_bytes.reserve_exact(alloc, totals.str_bytes.widen.[usize]());
+    try dst.expr_pools.byte_bytes.reserve_exact(alloc, totals.byte_bytes.widen.[usize]());
+    return;
+}
+
+pub fn bulk_append_worker_ast_pools(
+    alloc: *mut AllocCap,
+    src: *AstArena,
+    dst: *mut AstArena,
+) -> !OutOfMemory {
+    try dst.meta.units.push_slice(alloc, src.meta.units.as_slice());
+    try dst.meta.imports.push_slice(alloc, src.meta.imports.as_slice());
+    try dst.meta.import_items.push_slice(alloc, src.meta.import_items.as_slice());
+    try dst.meta.attrs.push_slice(alloc, src.meta.attrs.as_slice());
+    try dst.meta.attr_args.push_slice(alloc, src.meta.attr_args.as_slice());
+    try dst.meta.idents.push_slice(alloc, src.meta.idents.as_slice());
+    try dst.meta.generic_params.push_slice(alloc, src.meta.generic_params.as_slice());
+    try dst.meta.generic_args.push_slice(alloc, src.meta.generic_args.as_slice());
+    try dst.meta.params.push_slice(alloc, src.meta.params.as_slice());
+    try dst.meta.sys_params.push_slice(alloc, src.meta.sys_params.as_slice());
+    try dst.meta.fields.push_slice(alloc, src.meta.fields.as_slice());
+
+    try dst.decl_core.decls.push_slice(alloc, src.decl_core.decls.as_slice());
+    try dst.decl_core.decl_lists.push_slice(alloc, src.decl_core.decl_lists.as_slice());
+    try dst.decl_core.fn_decls.push_slice(alloc, src.decl_core.fn_decls.as_slice());
+    try dst.decl_core.sys_decls.push_slice(alloc, src.decl_core.sys_decls.as_slice());
+    try dst.decl_core.struct_decls.push_slice(alloc, src.decl_core.struct_decls.as_slice());
+    try dst.decl_core.impl_decls.push_slice(alloc, src.decl_core.impl_decls.as_slice());
+    try dst.decl_core.type_decls.push_slice(alloc, src.decl_core.type_decls.as_slice());
+    try dst.decl_core.const_decls.push_slice(alloc, src.decl_core.const_decls.as_slice());
+    try dst.decl_core.extern_decls.push_slice(alloc, src.decl_core.extern_decls.as_slice());
+
+    try dst.decl_types.enum_decls.push_slice(alloc, src.decl_types.enum_decls.as_slice());
+    try dst.decl_types.enum_variants.push_slice(alloc, src.decl_types.enum_variants.as_slice());
+    try dst.decl_types.union_decls.push_slice(alloc, src.decl_types.union_decls.as_slice());
+    try dst.decl_types.union_variants.push_slice(alloc, src.decl_types.union_variants.as_slice());
+    try dst.decl_types.bitfield_decls.push_slice(alloc, src.decl_types.bitfield_decls.as_slice());
+    try dst.decl_types.bitfield_members.push_slice(alloc, src.decl_types.bitfield_members.as_slice());
+    try dst.decl_types.iface_decls.push_slice(alloc, src.decl_types.iface_decls.as_slice());
+    try dst.decl_types.iface_methods.push_slice(alloc, src.decl_types.iface_methods.as_slice());
+    try dst.decl_types.error_decls.push_slice(alloc, src.decl_types.error_decls.as_slice());
+
+    try dst.stmt_pat.types.push_slice(alloc, src.stmt_pat.types.as_slice());
+    try dst.stmt_pat.type_lists.push_slice(alloc, src.stmt_pat.type_lists.as_slice());
+    try dst.stmt_pat.pats.push_slice(alloc, src.stmt_pat.pats.as_slice());
+    try dst.stmt_pat.pat_lists.push_slice(alloc, src.stmt_pat.pat_lists.as_slice());
+    try dst.stmt_pat.pat_fields.push_slice(alloc, src.stmt_pat.pat_fields.as_slice());
+    try dst.stmt_pat.stmts.push_slice(alloc, src.stmt_pat.stmts.as_slice());
+    try dst.stmt_pat.stmt_lists.push_slice(alloc, src.stmt_pat.stmt_lists.as_slice());
+    try dst.stmt_pat.blocks.push_slice(alloc, src.stmt_pat.blocks.as_slice());
+    try dst.stmt_pat.jumps.push_slice(alloc, src.stmt_pat.jumps.as_slice());
+    try dst.stmt_pat.if_nodes.push_slice(alloc, src.stmt_pat.if_nodes.as_slice());
+    try dst.stmt_pat.match_arms.push_slice(alloc, src.stmt_pat.match_arms.as_slice());
+
+    try dst.expr_pools.exprs.push_slice(alloc, src.expr_pools.exprs.as_slice());
+    try dst.expr_pools.expr_lists.push_slice(alloc, src.expr_pools.expr_lists.as_slice());
+    try dst.expr_pools.field_inits.push_slice(alloc, src.expr_pools.field_inits.as_slice());
+    try dst.expr_pools.asm_ops.push_slice(alloc, src.expr_pools.asm_ops.as_slice());
+    try dst.expr_pools.str_bytes.push_slice(alloc, src.expr_pools.str_bytes.as_slice());
+    try dst.expr_pools.byte_bytes.push_slice(alloc, src.expr_pools.byte_bytes.as_slice());
+    return;
+}

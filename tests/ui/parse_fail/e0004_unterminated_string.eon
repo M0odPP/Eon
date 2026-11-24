@@ -1,0 +1,3 @@
+module fail.unterm_str;
+pub const S: *str = "hello
+; //~^ ERROR E0004

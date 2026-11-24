@@ -1,0 +1,2 @@
+module fail.multichar;
+pub const C: char = 'ab'; //~ ERROR E0004

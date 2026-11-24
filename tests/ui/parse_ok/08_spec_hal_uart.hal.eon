@@ -1,0 +1,13 @@
+module kernel.driver.uart @hal;
+
+pub struct Uart16550 {
+    tx: MmioReg[u8, .WriteOnly] @offset(0x00);
+    lsr: MmioReg[u8, .ReadOnly] @offset(0x05);
+}
+
+pub fn write_byte(uart: *mut Uart16550, byte: u8) @noalloc @noblock @stack(32) {
+    raw {
+        while (uart.lsr.read() & 0x20_u8) == 0_u8 {}
+        uart.tx.write(byte);
+    }
+}

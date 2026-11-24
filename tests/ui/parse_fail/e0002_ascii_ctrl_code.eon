@@ -1,0 +1,4 @@
+module fail.ctrl;
+pub fn f() {
+    let x = 1_u32; //~ ERROR E0002
+}

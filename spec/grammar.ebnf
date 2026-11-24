@@ -1,0 +1,375 @@
+(* ============================================================================
+ * Eon v0.2 Formal Grammar (ISO EBNF)
+ * Deterministic LL(1) declarations + Pratt expression parsing.
+ * Zero backtracking, zero turbofish ambiguity.
+ *
+ * Honest lookahead budget (everything else is LL(1)):
+ *   1. Patterns: `IDENT` (binding) vs `IDENT . ...` (path / struct pattern)
+ *      needs 1 extra token of lookahead after the identifier.
+ *   2. Lexer: `'x'` (char literal) vs `'x:` / `'x ` (loop label) is decided
+ *      by looking at the character right after the first scalar after `'`.
+ *   3. Lexer: `||` is always the logical-or token; the empty closure is
+ *      written `|| block` and is handled by `closure_expr` below.
+ *
+ * Changes v0.1 -> v0.2 (see spec/CHANGES-v0.2.md):
+ *   - borrow expressions are `&x` / `&mut x`, dereference is postfix `p.*`
+ *     (the `*` token is now ONLY the pointer-type former and binary `*`);
+ *   - enum literals `.Variant`, struct patterns, trailing field attributes,
+ *     `ensures`, `from`, `dyn`, access modes on any parameter;
+ *   - `par reduce` is a library method, not syntax.
+ * ============================================================================ *)
+
+(* --- 1. Compilation Unit & Modules ---------------------------------------- *)
+
+compilation_unit = module_header , { import_decl } , { top_level_decl } , EOF ;
+
+module_header    = "module" , module_path , [ "@hal" ] , ";" ;
+module_path      = IDENT , { "." , IDENT } ;
+
+import_decl      = "import" , module_path , [ import_tail ] , ";" ;
+import_tail      = "as" , IDENT
+                 | "." , "{" , import_item , { "," , import_item } , [ "," ] , "}" ;
+import_item      = IDENT , [ "as" , IDENT ] ;
+
+(* --- 2. Top-Level Declarations -------------------------------------------- *)
+
+top_level_decl   = { attribute } , [ "pub" ] , decl_body ;
+
+decl_body        = fn_decl
+                 | sys_decl
+                 | struct_decl
+                 | pool_decl
+                 | enum_decl
+                 | union_decl
+                 | bitfield_decl
+                 | iface_decl
+                 | impl_decl
+                 | error_decl
+                 | type_alias_decl
+                 | const_decl
+                 | extern_decl ;
+
+attribute        = "@" , ( IDENT | "extern" ) , [ "(" , attr_args , ")" ] ;
+attr_args        = attr_arg , { "," , attr_arg } , [ "," ] ;
+attr_arg         = expr | ( IDENT , "=" , expr ) ;
+                   (* attribute arguments are ordinary expressions: enum
+                      literals `.Compute`, tuples `(8, 8, 1)`, calls
+                      `@stack(64 + @stack_of(f))`, `@effects_of(f)` *)
+
+(* --- 3. Functions & Systems ----------------------------------------------- *)
+
+fn_decl          = [ "comptime" | "view" ] , "fn" , IDENT , [ generic_params ] ,
+                   "(" , [ param_list ] , ")" ,
+                   [ ( "->" , type_expr ) | ( "!" , error_set_expr ) ] ,
+                   [ effect_list ] ,
+                   [ where_clause ] ,
+                   [ ensures_clause ] ,
+                   block ;
+
+sys_decl         = "sys" , IDENT , [ generic_params ] ,
+                   "(" , [ sys_param_list ] , ")" ,
+                   [ ( "->" , type_expr ) | ( "!" , error_set_expr ) ] ,
+                   [ effect_list ] ,
+                   [ where_clause ] ,
+                   [ ensures_clause ] ,
+                   block ;
+
+param_list       = param , { "," , param } , [ "," ] ;
+param            = { attribute } , [ "comptime" ] , [ "mut" | "from" ] ,
+                   param_name , ":" , [ "read" | "write" ] , type_expr ;
+                   (* `mut`  : by-value parameter that is a mutable local copy.
+                      `from` : marks the single borrow source of a `view fn`.
+                      `read`/`write` are contextual keywords (valid as normal
+                      method/field/variable names like `uart.lsr.read()`);
+                      access modes allowed only on `sys` and `@gpu` (E0823). *)
+param_name       = IDENT | "self" ;
+
+sys_param_list   = sys_param , { "," , sys_param } , [ "," ] ;
+sys_param        = { attribute } , ( ( IDENT , ":" , ( "read" | "write" ) , pool_access_type )
+                                   | param ) ;
+
+pool_access_type = type_expr , [ "." , ( IDENT | "{" , ident_list , "}" ) ] ;
+
+effect_list      = { attribute } ;
+where_clause     = "where" , constraint_expr , { "&&" , constraint_expr } ;
+ensures_clause   = "ensures" , constraint_expr , { "&&" , constraint_expr } ;
+constraint_expr  = expr ; (* restricted semantically to relational predicates;
+                             inside `ensures` the keyword `return` denotes the
+                             returned value (E0126 elsewhere) *)
+
+extern_decl      = "extern" , STRING_LIT ,
+                   ( extern_fn_sig | extern_struct_decl | extern_union_decl ) ;
+                   (* HAL-ONLY: parser rejects outside `@hal` modules.
+                      `extern "C" fn` IMPORTS a C symbol;
+                      `@extern("C") fn` (attribute) EXPORTS an Eon function
+                      with the C ABI (callbacks). *)
+extern_fn_sig    = "fn" , IDENT , "(" , [ param_list ] , ")" ,
+                   [ "->" , type_expr ] , ";" ;
+extern_struct_decl = "struct" , IDENT , "{" , { field_decl } , "}" ;
+extern_union_decl  = "union" , IDENT , "{" , { field_decl } , "}" ;
+
+(* --- 4. Data Type Declarations -------------------------------------------- *)
+
+struct_decl      = [ "linear" ] , [ "view" ] , "struct" , IDENT , [ generic_params ] ,
+                   [ where_clause ] , "{" , { field_decl } , "}" ;
+
+field_decl       = { attribute } , [ "pub" ] , IDENT , ":" , type_expr ,
+                   { attribute } , [ "=" , expr ] , ";" ;
+                   (* trailing attributes: `reg: MmioReg[u32, .ReadOnly] @offset(0x20);` *)
+
+pool_decl        = "pool" , IDENT , [ generic_params ] ,
+                   [ where_clause ] , "{" , { field_decl } , "}" ;
+
+enum_decl        = "enum" , IDENT , [ ":" , int_type ] ,
+                   "{" , [ enum_variant , { "," , enum_variant } , [ "," ] ] , "}" ;
+enum_variant     = IDENT , [ "=" , expr ] ;
+
+union_decl       = [ "linear" ] , "union" , IDENT , [ generic_params ] ,
+                   [ where_clause ] , "{" , [ union_variant , { "," , union_variant } , [ "," ] ] , "}" ;
+union_variant    = IDENT , [ ":" , type_expr ] ;
+
+bitfield_decl    = "bitfield" , IDENT , ":" , uint_type ,
+                   "{" , { bitfield_member } , "}" ;
+bitfield_member  = IDENT , ":" , uint_type , [ "@bits" , "(" , expr , ".." , expr , ")" ] , ";" ;
+
+iface_decl       = "iface" , IDENT , [ generic_params ] ,
+                   "{" , { iface_method } , "}" ;
+iface_method     = { attribute } , [ "view" ] , "fn" , IDENT , [ generic_params ] ,
+                   "(" , [ param_list ] , ")" ,
+                   [ ( "->" , type_expr ) | ( "!" , error_set_expr ) ] ,
+                   [ effect_list ] ,
+                   [ where_clause ] ,
+                   [ ensures_clause ] , ";" ;
+
+impl_decl        = "impl" , [ generic_params ] , [ type_expr , "for" ] , type_expr ,
+                   [ where_clause ] , "{" , { top_level_decl } , "}" ;
+
+error_decl       = "error" , IDENT , "{" , [ ident_list ] , "}" ;
+
+type_alias_decl  = "type" , IDENT , [ generic_params ] , [ where_clause ] , "=" , type_expr , ";" ;
+
+const_decl       = "const" , IDENT , ":" , type_expr , "=" , expr , ";" ;
+
+(* --- 5. Generics ---------------------------------------------------------- *)
+
+generic_params   = "[" , generic_param , { "," , generic_param } , [ "," ] , "]" ;
+generic_param    = ( "comptime" , IDENT , ":" , type_expr )
+                 | ( IDENT , [ ":" , type_bound_list ] ) ;
+type_bound_list  = type_expr , { "+" , type_expr } ;
+
+generic_args     = "[" , generic_arg , { "," , generic_arg } , [ "," ] , "]" ;
+generic_arg      = type_expr | expr ; (* disambiguated in semantic analysis *)
+
+(* --- 6. Type Expressions -------------------------------------------------- *)
+
+type_expr        = error_union_type ;
+error_union_type = base_type , [ "!" , error_set_expr ]
+                 | "!" , error_set_expr ; (* shorthand for void ! ErrorSet *)
+
+error_set_expr   = type_path , { "|" , type_path } ;
+
+base_type        = "?" , base_type                        (* Optional *)
+                 | "*" , [ "mut" ] , borrow_target        (* Second-class borrow type *)
+                 | "[" , expr , "]" , base_type           (* Fixed-size array *)
+                 | "dyn" , type_path                      (* Dynamic interface; only behind `*` / `*mut` *)
+                 | "fn" , "(" , [ type_list ] , ")" ,
+                   [ "->" , type_expr ] , [ effect_list ] (* Function pointer *)
+                 | "struct" , "{" , { field_decl } , "}"  (* Inline anonymous struct *)
+                 | "(" , [ type_list ] , ")"              (* Tuple / unit *)
+                 | "void" | "never" | "type" | "Self"
+                 | type_path ;
+
+borrow_target    = "[" , type_expr , "]"                  (* Slice borrow *[T] / *mut [T];
+                                                             disambiguated from *[N]T by checking
+                                                             whether `]` is followed by `base_type` *)
+                 | "str"                                  (* Context-sensitive `IDENT("str")`: *str *)
+                 | base_type ;                            (* Single borrow *T / *mut T, incl. *[N]T *)
+
+type_path        = IDENT , { "." , IDENT } , [ generic_args ] ;
+type_list        = type_expr , { "," , type_expr } , [ "," ] ;
+ident_list       = IDENT , { "," , IDENT } , [ "," ] ;
+
+(* --- 7. Statements & Blocks ----------------------------------------------- *)
+
+block            = "{" , { stmt } , [ expr ] , "}" ;
+                   (* A trailing expression WITHOUT `;` is the value of an
+                      expression-block (`if`-expr, `match` arm block, closure
+                      body, `comptime` block). In the body of a `fn` a trailing
+                      expression is an error (E0124): functions return ONLY via
+                      `return expr;`. *)
+
+stmt             = let_stmt
+                 | var_stmt
+                 | const_decl
+                 | discard_stmt
+                 | defer_stmt
+                 | errdefer_stmt
+                 | return_stmt
+                 | break_stmt
+                 | continue_stmt
+                 | unreachable_stmt
+                 | if_stmt
+                 | match_stmt
+                 | while_stmt
+                 | for_stmt
+                 | par_for_stmt
+                 | loop_stmt
+                 | comptime_stmt
+                 | raw_block                              (* HAL-ONLY *)
+                 | assign_or_expr_stmt ;
+                   (* Statement-position rule: a statement that STARTS with
+                      `if`, `match`, `while`, `for`, `par`, `loop` or `raw` is
+                      always the corresponding statement. To use such a form as
+                      an expression it must be in expression position
+                      (right side of `let`/`=`, argument, `return`) or
+                      parenthesised. *)
+
+let_stmt         = { attribute } , "let" , pattern , [ ":" , type_expr ] , "=" , expr , ";" ;
+var_stmt         = { attribute } , "var" , IDENT , [ ":" , type_expr ] , "=" , expr , ";" ;
+                   (* attributes e.g. `@gpu_shared var tile: [64]f32 = ...;` *)
+
+defer_stmt       = "defer" , ( block | expr , ";" ) ;
+errdefer_stmt    = "errdefer" , [ "|" , IDENT , "|" ] , ( block | expr , ";" ) ;
+
+return_stmt      = "return" , [ expr ] , ";" ;
+break_stmt       = "break" , [ LABEL ] , [ expr ] , ";" ;
+                   (* `break 'l value;` is valid only for `loop` (value of the loop) *)
+continue_stmt    = "continue" , [ LABEL ] , ";" ;
+unreachable_stmt = "unreachable" , ";" ;
+discard_stmt     = "_" , "=" , expr , ";" ;
+
+if_stmt          = "if" , ( if_let_cond | expr ) , block ,
+                   [ "else" , ( [ "comptime" ] , if_stmt | block ) ] ;
+if_let_cond      = "let" , pattern , "=" , expr ;
+
+match_stmt       = "match" , expr , "{" , { match_arm } , "}" ;
+match_expr       = match_stmt ;  (* identical syntax; value form when in expression position *)
+match_arm        = pattern , [ "if" , expr ] , "=>" ,
+                   ( block , [ "," ] | ( jump_expr | expr ) , ( "," | & "}" ) ) ;
+jump_expr        = ( "return" , [ expr ] )
+                 | ( "break" , [ LABEL ] , [ expr ] )
+                 | ( "continue" , [ LABEL ] )
+                 | "unreachable" ;
+
+while_stmt       = [ LABEL , ":" ] , "while" , expr ,
+                   [ "where" , constraint_expr ] , block ;
+
+for_stmt         = [ LABEL , ":" ] , "for" , pattern , "in" , iter_expr , block ;
+par_for_stmt     = "par" , "for" , pattern , "in" , iter_expr , block ;
+iter_expr        = expr , [ ".." , [ "=" ] , expr ] ;
+
+loop_stmt        = [ LABEL , ":" ] , "loop" , block ;
+comptime_stmt    = "comptime" , ( if_stmt | block ) ;
+
+raw_block        = "raw" , block ; (* HAL-ONLY: rejected in `.eon` with E0111 *)
+
+assign_or_expr_stmt = expr , [ assign_op , expr ] , ";" ;
+assign_op        = "=" | "+=" | "-=" | "*=" | "+%=" | "-%=" | "*%="
+                 | "+|=" | "-|=" | "*|=" | "&=" | "|=" | "^=" | "<<=" | ">>=" ;
+
+(* --- 8. Expressions (Parsed via Pratt Algorithm) -------------------------- *)
+
+expr             = catch_orelse_expr ;
+catch_orelse_expr = [ "try" ] , binary_expr , { ( "orelse" , ( block | jump_expr | binary_expr ) )
+                                  | ( "catch" , [ "|" , IDENT , "|" ] , ( block | jump_expr | binary_expr ) ) } ;
+
+                   (* `try` is a prefix of a WHOLE expression: its operand is the entire
+                      binary expression to its right, so `try acc +? x` == `try (acc +? x)`.
+                      `try` may appear only at the start of an expression
+                      (argument, `let` initializer, `return`, statement); write
+                      `let t = try f(); a + t;` instead of `a + try f()`. *)
+
+binary_expr      = unary_expr , { ( binary_op , unary_expr ) | ( "is" , pattern ) } ;
+                   (* `is` takes a PATTERN on its right (`x is .Quit`).
+                      Precedence/associativity are defined by the Pratt table
+                      in 01-lexical-and-syntax.md, not by this production. *)
+binary_op        = "||" | "&&"
+                 | "==" | "!=" | "<" | "<=" | ">" | ">="
+                 | "|" | "^" | "&"
+                 | "<<" | ">>" | "<<%"
+                 | "+" | "-" | "+%" | "-%" | "+|" | "-|" | "+?" | "-?"
+                 | "*" | "/" | "%" | "*%" | "*|" | "*?" | "/?" | "%?" ;
+                   (* binary `&` (bit-and) is distinguished from prefix `&`
+                      (borrow) purely by position: prefix vs infix. *)
+
+unary_expr       = ( "-" | "!" | "~" | "&" | ( "&" , "mut" )
+                   | "move" | "copy" ) , unary_expr
+                 | postfix_expr ;
+
+postfix_expr     = primary_expr , { postfix_op } ;
+postfix_op       = "." , IDENT                            (* Field access / method *)
+                 | ".*"                                   (* Dereference of *T / *mut T *)
+                 | "." , generic_args                     (* Explicit generic args .[T] *)
+                 | ".{" , [ field_init_list ] , "}"       (* Named struct literal Type.{ ... } *)
+                 | "(" , [ arg_list ] , ")"               (* Function / method call *)
+                 | "[" , index_or_slice , "]" ;           (* Verified index or subslice *)
+
+index_or_slice   = expr , [ ".." , [ expr ] ]
+                 | ".." , [ expr ] ;
+
+arg_list         = expr , { "," , expr } , [ "," ] ;
+
+primary_expr     = INT_LIT
+                 | FLOAT_LIT
+                 | STRING_LIT
+                 | RAW_STRING_LIT
+                 | BYTE_STRING_LIT
+                 | CHAR_LIT
+                 | BYTE_CHAR_LIT
+                 | "true" | "false" | "null" | "self"
+                 | IDENT
+                 | enum_literal
+                 | anon_struct_literal
+                 | array_literal
+                 | closure_expr
+                 | "(" , expr , { "," , expr } , ")"
+                 | if_expr
+                 | match_expr
+                 | loop_expr
+                 | comptime_expr
+                 | builtin_expr
+                 | asm_expr ;                             (* HAL-ONLY *)
+
+enum_literal     = "." , IDENT ;   (* `.Less`, `.OutOfBounds`; payload via call postfix: `.KeyDown(code)` *)
+anon_struct_literal = ".{" , [ field_init_list ] , "}" ;
+field_init_list  = field_init , { "," , field_init } , [ "," ] ;
+field_init       = ( IDENT , ":" , expr ) | expr ;
+
+array_literal    = "[" , [ expr , ( ";" , expr | { "," , expr } , [ "," ] ) ] , "]" ;
+
+closure_expr     = ( "|" , [ closure_params ] , "|" | "||" ) , block ;
+                   (* Second-class non-escaping closure; zero heap allocation.
+                      The body block is an expression-block (trailing expr = value). *)
+closure_params   = closure_param , { "," , closure_param } , [ "," ] ;
+closure_param    = IDENT , [ ":" , type_expr ] ;
+
+if_expr          = "if" , ( if_let_cond | expr ) , block , "else" , ( if_expr | block ) ;
+
+loop_expr        = [ LABEL , ":" ] , "loop" , block ;
+comptime_expr    = "comptime" , ( if_expr | block | expr ) ;
+builtin_expr     = "@" , IDENT , [ "(" , [ generic_arg , { "," , generic_arg } , [ "," ] ] , ")" ] ;
+
+asm_expr         = "asm" , "(" , STRING_LIT , { "," , asm_operand } , [ "," ] , ")" ; (* HAL-ONLY *)
+asm_operand      = IDENT , "(" , expr , ")" , [ expr ]
+                 | expr ;
+
+(* --- 9. Patterns ---------------------------------------------------------- *)
+
+pattern          = "_"
+                 | IDENT                                    (* binding (one token) *)
+                 | [ "-" ] , INT_LIT , [ ( ".." | "..=" ) , [ "-" ] , INT_LIT ]
+                 | CHAR_LIT , [ ( ".." | "..=" ) , CHAR_LIT ]
+                 | "true" | "false" | "null"
+                 | "." , IDENT , [ "(" , pattern , { "," , pattern } , ")" ]   (* Enum / Union / Error variant *)
+                 | type_path , ".{" , [ field_pat_list ] , "}"                 (* struct pattern: PhysPage.{ base } *)
+                 | ".{" , [ field_pat_list ] , "}"                             (* anonymous struct pattern *)
+                 | "(" , pattern , { "," , pattern } , ")" ;                   (* tuple *)
+field_pat_list   = field_pat , { "," , field_pat } , [ "," ] ;
+field_pat        = IDENT , [ ":" , pattern ] ;              (* `base` == `base: base` *)
+
+(* --- 10. Lexical Tokens --------------------------------------------------- *)
+
+IDENT            = ( "A".."Z" | "a".."z" | "_" ) , { "A".."Z" | "a".."z" | "0".."9" | "_" } ;
+LABEL            = "'" , IDENT ;  (* a `'` followed by ONE scalar and a closing `'` is a CHAR_LIT, otherwise a LABEL *)
+int_type         = "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | uint_type ;
+uint_type        = "u1" | "u2" | (* ... through ... *) "u64" | "u128" | "usize" ;

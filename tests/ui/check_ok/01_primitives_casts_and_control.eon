@@ -1,0 +1,96 @@
+module check_ok.basics;
+
+error MathErr {
+    Overflow,
+    BadInput,
+}
+
+enum Color: u8 {
+    Red = 0,
+    Green = 1,
+    Blue = 2,
+}
+
+union Event {
+    Quit,
+    Click: struct { x: i32; y: i32; },
+}
+
+fn add_checked(a: u32, b: u32) -> u32 ! MathErr {
+    if a > 1000_u32 {
+        return .BadInput;
+    }
+    return a +% b;
+}
+
+fn maybe_val(flag: bool) -> ?u32 {
+    if flag {
+        return 42_u32;
+    }
+    return null;
+}
+
+fn color_code(c: Color) -> u32 {
+    let code: u32 = match c {
+        .Red => 1,
+        .Green => 2,
+        .Blue => 3,
+    };
+    return code;
+}
+
+fn event_score(ev: Event) -> i32 {
+    return match ev {
+        .Quit => 0_i32,
+        .Click(.{ x, y }) => x +% y,
+    };
+}
+
+fn small_int_match(v: u2) -> i32 {
+    return match v {
+        0 => 10_i32,
+        1 => 20_i32,
+        2..=3 => 30_i32,
+    };
+}
+
+pub fn run_all() -> u64 ! MathErr {
+    let min_i8: i8 = -128;
+    let max_u8: u8 = 255;
+    let wide_u64: u64 = max_u8.widen.[u64]();
+    let clamped: u8 = wide_u64.clamp.[u8]();
+    let flt: f64 = clamped.to_float.[f64]();
+    let back: i64 = flt.trunc_to_int.[i64]();
+    let raw_bits: u64 = back.bitcast.[u64]();
+
+    var sum: u32 = try add_checked(10_u32, 20_u32);
+    sum +%= 1_u32;
+    let fallback: u32 = maybe_val(true) orelse 0_u32;
+    let matched_opt: u32 = match maybe_val(false) {
+        null => 7_u32,
+        v => v,
+    };
+    let caught: u32 = add_checked(2000_u32, 1_u32) catch |err| match err {
+        .Overflow => 1_u32,
+        .BadInput => 2_u32,
+    };
+
+    var loop_acc: u32 = 0_u32;
+    for i in 0_u32..4_u32 {
+        loop_acc +%= i;
+    }
+    while loop_acc > 10_u32 {
+        loop_acc -= 1_u32;
+    }
+    for _ in 0_usize..2_usize {
+        sum +%= 1_u32;
+    }
+
+    let c = color_code(.Green);
+    let e = event_score(.Click(.{ x: 3_i32, y: 4_i32 }));
+    let s = small_int_match(2_u2);
+    let _ = e +% s +% min_i8.widen.[i32]();
+
+    let total_u32 = sum +% fallback +% matched_opt +% caught +% loop_acc +% c;
+    return raw_bits +% total_u32.widen.[u64]();
+}

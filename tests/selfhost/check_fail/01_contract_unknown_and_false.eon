@@ -1,0 +1,62 @@
+module fail.contract_soundness;
+
+// 1. Unrecognized operand (`x * 2`) in `where` MUST NOT silently pass as proven!
+fn req_mul(x: u32) -> u32
+    where x * 2_u32 > 10_u32
+{
+    return x;
+}
+
+// 2. Literal `false` in `where` MUST be disproven!
+fn req_false(x: u32) -> u32
+    where false
+{
+    return x;
+}
+
+// 3. Disjunction `||` when neither branch is proven MUST fail!
+fn req_or(a: u32, b: u32) -> u32
+    where (a > 10_u32 || b > 10_u32)
+{
+    return a +% b;
+}
+
+// 4. Unrecognized operand (`return * 2`) in `ensures` MUST NOT silently pass!
+pub fn bad_ensures_mul(x: u32) -> u32
+    ensures return * 2_u32 > 10_u32 //~ ERROR E0108
+{
+    return x;
+}
+
+// 5. Literal `false` in `ensures` MUST be disproven!
+pub fn bad_ensures_false(x: u32) -> u32
+    ensures false //~ ERROR E0108
+{
+    return x;
+}
+
+// 6. Unproven `ensures return == 5` MUST fail!
+pub fn bad_ensures_eq(x: u32) -> u32
+    ensures return == 5_u32 //~ ERROR E0108
+{
+    return x;
+}
+
+// 7. Call sites violating `where` MUST fail!
+pub fn bad_callers(a: u32, b: u32) -> u32 {
+    let r1 = req_mul(a); //~ ERROR E0107
+    let r2 = req_false(a); //~ ERROR E0107
+    let r3 = req_or(a, b); //~ ERROR E0107
+    return r1 +% r2 +% r3;
+}
+
+// 8. Bogus loop invariant `where` MUST fail instead of turning loop body to bottom!
+pub fn bad_loop_inv(n: usize) -> usize {
+    var i: usize = 0_usize;
+    while i < n
+        where i > 10_usize //~ ERROR E0107
+    {
+        i = i +% 1_usize;
+    }
+    return i;
+}

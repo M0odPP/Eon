@@ -1,0 +1,2 @@
+module fail.emptychar;
+pub const C: char = ''; //~ ERROR E0004

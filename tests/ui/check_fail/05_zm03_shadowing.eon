@@ -1,0 +1,10 @@
+module fail.zm03;
+
+pub fn shadow(param: i32) -> i32 {
+    let x: i32 = param;
+    if x > 0_i32 {
+        let x: i32 = 2_i32; //~ ERROR E0103
+        return x;
+    }
+    return x;
+}

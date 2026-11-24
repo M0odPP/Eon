@@ -1,0 +1,46 @@
+module mut_slot_invalidation_fail;
+
+fn bump(p: *mut usize) {
+    p.* = 100_usize;
+}
+
+fn shrink(s: *mut *[u8]) {
+    let empty: [0]u8 = [];
+    _ = empty;
+    let cur = s.*;
+    if cur.len > 0_usize {
+        s.* = cur[0_usize..0_usize];
+    }
+}
+
+fn bad_oob_after_mut_call() -> u8 {
+    let arr: [4]u8 = [1_u8, 2_u8, 3_u8, 4_u8];
+    var i: usize = 0_usize;
+    bump(&mut i);
+    return arr[i]; //~ ERROR E0107
+}
+
+fn bad_oob_after_ptr_store() -> u8 {
+    let arr: [4]u8 = [1_u8, 2_u8, 3_u8, 4_u8];
+    var i: usize = 0_usize;
+    let p: *mut usize = &mut i;
+    p.* = 100_usize;
+    return arr[i]; //~ ERROR E0107
+}
+
+fn bad_oob_after_mut_slice_call(data: *[u8]) -> u8 {
+    if data.len < 4_usize {
+        return 0_u8;
+    }
+    var s: *[u8] = data;
+    shrink(&mut s);
+    return s[3_usize]; //~ ERROR E0107
+}
+
+pub fn main() -> i32 {
+    let buf: [4]u8 = [1_u8, 2_u8, 3_u8, 4_u8];
+    let a = bad_oob_after_mut_call();
+    let b = bad_oob_after_ptr_store();
+    let c = bad_oob_after_mut_slice_call(buf[0_usize..4_usize]);
+    return (a +% b +% c).widen.[i32]();
+}

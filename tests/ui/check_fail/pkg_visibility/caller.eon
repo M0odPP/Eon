@@ -1,0 +1,10 @@
+module vis.caller;
+
+import vis.secret;
+import vis.secret.{priv_fn}; //~ ERROR E0133
+
+pub fn call_bad() -> i32 {
+    let b = secret.init_box();
+    let _ = secret.priv_fn(); //~ ERROR E0133
+    return b.hidden; //~ ERROR E0133
+}

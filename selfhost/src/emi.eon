@@ -1,0 +1,1234 @@
+module eonc.emi;
+
+import core.col;
+import core.str;
+import eonc.span;
+import eonc.tcb_audit;
+
+// ---------------------------------------------------------------------------
+// `.emi` Binary Module Interface Constants & Error Set
+// ---------------------------------------------------------------------------
+// 64-byte fixed little-endian header:
+//   [0..4]   magic = "EOMI"
+//   [4..8]   version: u32 (EMI_VERSION)
+//   [8..40]  interface_hash: [32]u8 (FIPS 180-4 SHA-256)
+//   [40..44] entries_offset: u32
+//   [44..48] entries_count: u32
+//   [48..52] code_offset: u32
+//   [52..56] relocs_offset: u32
+//   [56..60] flags: u32
+//   [60..64] reserved: u32 (0)
+
+pub const EMI_MAGIC_0: u8 = b'E';
+pub const EMI_MAGIC_1: u8 = b'O';
+pub const EMI_MAGIC_2: u8 = b'M';
+pub const EMI_MAGIC_3: u8 = b'I';
+pub const EMI_VERSION: u32 = 0x00030002_u32;
+pub const EMI_HEADER_SIZE: usize = 64_usize;
+
+pub error EmiError {
+    TruncatedHeader,
+    InvalidMagic,
+    IncompatibleVersion,
+    UnexpectedEof,
+    InvalidUtf8,
+    InvalidRange,
+}
+
+// ---------------------------------------------------------------------------
+// Data Model: Entries, Stats, and Module Cache
+// ---------------------------------------------------------------------------
+
+pub struct EmiEntry {
+    pub fn_sym: u32;
+    pub hash: [32]u8;
+    pub code_off: u32;
+    pub code_len: u32;
+    pub reloc_off: u32;
+    pub reloc_len: u32;
+}
+
+pub struct IncrementalStats {
+    pub modules_total: usize;
+    pub modules_early_cutoff: usize;
+    pub fns_total: usize;
+    pub fns_cached: usize;
+    pub fns_recompiled: usize;
+}
+
+pub fn incremental_stats_zero() -> IncrementalStats {
+    return IncrementalStats.{
+        modules_total: 0_usize,
+        modules_early_cutoff: 0_usize,
+        fns_total: 0_usize,
+        fns_cached: 0_usize,
+        fns_recompiled: 0_usize,
+    };
+}
+
+pub fn hash_eq(a: *[32]u8, b: *[32]u8) -> bool {
+    var i: usize = 0_usize;
+    while i < 32_usize {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i +% 1_usize;
+    }
+    return true;
+}
+
+view fn slice_u32_range(all: *[u8], off: u32, len: u32) -> *[u8] {
+    let empty: *str = "";
+    let start = off.widen.[usize]();
+    let end = start +% len.widen.[usize]();
+    let s = all.sub(start, end) catch {
+        return empty.as_bytes();
+    };
+    return s;
+}
+
+pub linear struct EmiModuleCache {
+    pub module_name: str.StrBuf;
+    pub stub_text: str.StrBuf;
+    pub interface_hash: [32]u8;
+    pub opts_hash: [32]u8;
+    pub flags: u32;
+    pub entries: col.DynBuf[EmiEntry];
+    pub code_bytes: col.DynBuf[u8];
+    pub reloc_bytes: col.DynBuf[u8];
+    pub by_sym: col.HashMap[u32];
+    pub dirty: bool;
+}
+
+impl EmiModuleCache {
+    pub fn init(alloc: *mut AllocCap, module_name: *[u8]) -> EmiModuleCache ! OutOfMemory {
+        var mod_buf = try str.StrBuf.init(alloc, 32_usize);
+        errdefer mod_buf.destroy(alloc);
+        try mod_buf.push_bytes_grow(alloc, module_name);
+
+        let stub_text = try str.StrBuf.init(alloc, 128_usize);
+        errdefer stub_text.destroy(alloc);
+
+        let entries = try col.DynBuf.[EmiEntry].init(alloc, 16_usize);
+        errdefer entries.destroy(alloc);
+        let code_bytes = try col.DynBuf.[u8].init(alloc, 256_usize);
+        errdefer code_bytes.destroy(alloc);
+        let reloc_bytes = try col.DynBuf.[u8].init(alloc, 64_usize);
+        errdefer reloc_bytes.destroy(alloc);
+        let by_sym = try col.HashMap.[u32].init(alloc, 16_usize);
+        errdefer by_sym.destroy(alloc);
+
+        return EmiModuleCache.{
+            module_name: mod_buf,
+            stub_text: stub_text,
+            interface_hash: [0_u8; 32],
+            opts_hash: [0_u8; 32],
+            flags: 0_u32,
+            entries: entries,
+            code_bytes: code_bytes,
+            reloc_bytes: reloc_bytes,
+            by_sym: by_sym,
+            dirty: false,
+        };
+    }
+
+    pub fn set_stub_text(self: *mut Self, alloc: *mut AllocCap, bytes: *[u8]) -> !OutOfMemory {
+        self.stub_text.clear();
+        try self.stub_text.push_bytes_grow(alloc, bytes);
+        self.dirty = true;
+        return;
+    }
+
+    pub fn set_interface_hash(self: *mut Self, hash: [32]u8) {
+        self.interface_hash = hash;
+        self.dirty = true;
+    }
+
+    pub fn set_opts_hash(self: *mut Self, hash: [32]u8) {
+        self.opts_hash = hash;
+        self.dirty = true;
+    }
+
+    pub fn set_flags(self: *mut Self, flags: u32) {
+        self.flags = flags;
+        self.dirty = true;
+    }
+
+    pub fn interface_matches(self: *Self, iface_hash: *[32]u8, opts_hash: *[32]u8) -> bool {
+        return hash_eq(&self.interface_hash, iface_hash)
+            && hash_eq(&self.opts_hash, opts_hash);
+    }
+
+    pub fn entry_count(self: *Self) -> usize {
+        return self.entries.len();
+    }
+
+    pub fn put_entry(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        fn_sym: u32,
+        hash: [32]u8,
+        code: *[u8],
+        relocs: *[u8],
+    ) -> !OutOfMemory {
+        let code_off = self.code_bytes.len().trunc.[u32]();
+        let code_len = code.len.trunc.[u32]();
+        try self.code_bytes.push_slice(alloc, code);
+
+        let reloc_off = self.reloc_bytes.len().trunc.[u32]();
+        let reloc_len = relocs.len.trunc.[u32]();
+        try self.reloc_bytes.push_slice(alloc, relocs);
+
+        let entry = EmiEntry.{
+            fn_sym: fn_sym,
+            hash: hash,
+            code_off: code_off,
+            code_len: code_len,
+            reloc_off: reloc_off,
+            reloc_len: reloc_len,
+        };
+
+        let key = fn_sym.widen.[u64]();
+        if let existing_idx = self.by_sym.get(key) {
+            let idx = existing_idx.widen.[usize]();
+            let es = self.entries.as_mut_slice();
+            if idx < es.len {
+                es[idx] = entry;
+                self.dirty = true;
+                return;
+            }
+        }
+
+        let new_idx = self.entries.len().trunc.[u32]();
+        try self.entries.push(alloc, entry);
+        try self.by_sym.insert(alloc, key, new_idx);
+        self.dirty = true;
+        return;
+    }
+
+    pub fn lookup_entry(self: *Self, fn_sym: u32) -> ?EmiEntry {
+        let idx_u32 = self.by_sym.get(fn_sym.widen.[u64]()) orelse {
+            return null;
+        };
+        let idx = idx_u32.widen.[usize]();
+        let es = self.entries.as_slice();
+        if idx < es.len {
+            return es[idx];
+        }
+        return null;
+    }
+
+    pub fn is_fn_fresh(self: *Self, fn_sym: u32, expected_hash: *[32]u8) -> bool {
+        let e = self.lookup_entry(fn_sym) orelse {
+            return false;
+        };
+        return hash_eq(&e.hash, expected_hash);
+    }
+
+    pub view fn entry_code(self: *Self, entry: *EmiEntry) -> *[u8] {
+        return slice_u32_range(self.code_bytes.as_slice(), entry.code_off, entry.code_len);
+    }
+
+    pub view fn entry_relocs(self: *Self, entry: *EmiEntry) -> *[u8] {
+        return slice_u32_range(self.reloc_bytes.as_slice(), entry.reloc_off, entry.reloc_len);
+    }
+
+    pub fn destroy(self: EmiModuleCache, alloc: *mut AllocCap) {
+        let EmiModuleCache.{
+            module_name,
+            stub_text,
+            interface_hash: _,
+            opts_hash: _,
+            flags: _,
+            entries,
+            code_bytes,
+            reloc_bytes,
+            by_sym,
+            dirty: _,
+        } = self;
+        module_name.destroy(alloc);
+        stub_text.destroy(alloc);
+        entries.destroy(alloc);
+        code_bytes.destroy(alloc);
+        reloc_bytes.destroy(alloc);
+        by_sym.destroy(alloc);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Content Hashing via `tcb_audit.sha256`
+// ---------------------------------------------------------------------------
+
+fn push_u32_le(alloc: *mut AllocCap, out: *mut col.DynBuf[u8], v: u32) -> !OutOfMemory {
+    try out.push(alloc, (v & 0xFF_u32).trunc.[u8]());
+    try out.push(alloc, ((v >> 8_u32) & 0xFF_u32).trunc.[u8]());
+    try out.push(alloc, ((v >> 16_u32) & 0xFF_u32).trunc.[u8]());
+    try out.push(alloc, ((v >> 24_u32) & 0xFF_u32).trunc.[u8]());
+    return;
+}
+
+fn push_len_bytes(alloc: *mut AllocCap, out: *mut col.DynBuf[u8], bs: *[u8]) -> !OutOfMemory {
+    try push_u32_le(alloc, out, bs.len.trunc.[u32]());
+    try out.push_slice(alloc, bs);
+    return;
+}
+
+fn push_bytes32(alloc: *mut AllocCap, out: *mut col.DynBuf[u8], bs: *[32]u8) -> !OutOfMemory {
+    try out.reserve(alloc, 32_usize);
+    var i: usize = 0_usize;
+    while i < 32_usize {
+        try out.push(alloc, bs[i]);
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+pub fn compute_fn_hash(
+    alloc: *mut AllocCap,
+    fn_name: *[u8],
+    sig_bytes: *[u8],
+    body_bytes: *[u8],
+    opts_hash: *[32]u8,
+) -> tcb_audit.Sha256Digest ! OutOfMemory {
+    var buf = try col.DynBuf.[u8].init(alloc, 128_usize);
+    errdefer buf.destroy(alloc);
+    try buf.push_slice(alloc, "EON_EMI_FN_V1".as_bytes());
+    try push_len_bytes(alloc, &mut buf, fn_name);
+    try push_len_bytes(alloc, &mut buf, sig_bytes);
+    try push_len_bytes(alloc, &mut buf, body_bytes);
+    try push_bytes32(alloc, &mut buf, opts_hash);
+    let digest = tcb_audit.sha256(buf.as_slice());
+    buf.destroy(alloc);
+    return digest;
+}
+
+pub fn compute_module_hash(
+    alloc: *mut AllocCap,
+    module_name: *[u8],
+    iface_bytes: *[u8],
+    opts_hash: *[32]u8,
+) -> tcb_audit.Sha256Digest ! OutOfMemory {
+    var buf = try col.DynBuf.[u8].init(alloc, 128_usize);
+    errdefer buf.destroy(alloc);
+    try buf.push_slice(alloc, "EON_EMI_MOD_V1".as_bytes());
+    try push_len_bytes(alloc, &mut buf, module_name);
+    try push_len_bytes(alloc, &mut buf, iface_bytes);
+    try push_bytes32(alloc, &mut buf, opts_hash);
+    let digest = tcb_audit.sha256(buf.as_slice());
+    buf.destroy(alloc);
+    return digest;
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic Binary `.emi` Serialization / Deserialization
+// ---------------------------------------------------------------------------
+
+fn cmp_bytes_lex(a: *[u8], b: *[u8]) -> i32 {
+    let min_len = if a.len < b.len { a.len } else { b.len };
+    var i: usize = 0_usize;
+    while i < min_len {
+        if a[i] < b[i] {
+            return -1_i32;
+        }
+        if a[i] > b[i] {
+            return 1_i32;
+        }
+        i = i +% 1_usize;
+    }
+    if a.len < b.len {
+        return -1_i32;
+    }
+    if a.len > b.len {
+        return 1_i32;
+    }
+    return 0_i32;
+}
+
+fn sort_entry_order(
+    order: *mut [usize],
+    entries: *[EmiEntry],
+    interner: *span.SymInterner,
+) {
+    if order.len <= 1_usize {
+        return;
+    }
+    var gap: usize = 1_usize;
+    let third = order.len / 3_usize;
+    while gap < third {
+        gap = (gap *% 3_usize) +% 1_usize;
+    }
+    while gap > 0_usize {
+        var i = gap;
+        while i < order.len {
+            let cur_idx = order[i];
+            let cur_sym = if cur_idx < entries.len { entries[cur_idx].fn_sym } else { 0_u32 };
+            let cur_name = interner.get(cur_sym);
+            var j = i;
+            while j >= gap && j < order.len {
+                let prev = j - gap;
+                let prev_idx = order[prev];
+                let prev_sym = if prev_idx < entries.len { entries[prev_idx].fn_sym } else { 0_u32 };
+                let prev_name = interner.get(prev_sym);
+                if cmp_bytes_lex(prev_name, cur_name) <= 0_i32 {
+                    break;
+                }
+                order[j] = order[prev];
+                j = prev;
+            }
+            order[j] = cur_idx;
+            i = i +% 1_usize;
+        }
+        gap = gap / 3_usize;
+    }
+}
+
+pub fn serialize_emi_cache(
+    alloc: *mut AllocCap,
+    cache: *EmiModuleCache,
+    interner: *span.SymInterner,
+    out: *mut col.DynBuf[u8],
+) -> !OutOfMemory {
+    let entries = cache.entries.as_slice();
+    var order = try col.DynBuf.[usize].init(alloc, entries.len);
+    errdefer order.destroy(alloc);
+    var oi: usize = 0_usize;
+    while oi < entries.len {
+        try order.push(alloc, oi);
+        oi = oi +% 1_usize;
+    }
+    sort_entry_order(order.as_mut_slice(), entries, interner);
+
+    var entry_sec = try col.DynBuf.[u8].init(alloc, 128_usize);
+    errdefer entry_sec.destroy(alloc);
+    var code_sec = try col.DynBuf.[u8].init(alloc, cache.code_bytes.len());
+    errdefer code_sec.destroy(alloc);
+    var reloc_sec = try col.DynBuf.[u8].init(alloc, cache.reloc_bytes.len());
+    errdefer reloc_sec.destroy(alloc);
+
+    let ord_slice = order.as_slice();
+    var i: usize = 0_usize;
+    while i < ord_slice.len {
+        let idx = ord_slice[i];
+        if idx < entries.len {
+            let e = entries[idx];
+            let c_off = code_sec.len().trunc.[u32]();
+            let c_slice = cache.entry_code(&e);
+            try code_sec.push_slice(alloc, c_slice);
+
+            let r_off = reloc_sec.len().trunc.[u32]();
+            let r_slice = cache.entry_relocs(&e);
+            try reloc_sec.push_slice(alloc, r_slice);
+
+            try push_len_bytes(alloc, &mut entry_sec, interner.get(e.fn_sym));
+            try push_bytes32(alloc, &mut entry_sec, &e.hash);
+            try push_u32_le(alloc, &mut entry_sec, c_off);
+            try push_u32_le(alloc, &mut entry_sec, c_slice.len.trunc.[u32]());
+            try push_u32_le(alloc, &mut entry_sec, r_off);
+            try push_u32_le(alloc, &mut entry_sec, r_slice.len.trunc.[u32]());
+        }
+        i = i +% 1_usize;
+    }
+
+    var meta_sec = try col.DynBuf.[u8].init(alloc, 64_usize);
+    errdefer meta_sec.destroy(alloc);
+    try push_len_bytes(alloc, &mut meta_sec, cache.module_name.as_bytes());
+    try push_bytes32(alloc, &mut meta_sec, &cache.opts_hash);
+    try push_u32_le(alloc, &mut meta_sec, code_sec.len().trunc.[u32]());
+    try push_u32_le(alloc, &mut meta_sec, reloc_sec.len().trunc.[u32]());
+    try push_len_bytes(alloc, &mut meta_sec, cache.stub_text.as_bytes());
+
+    let entries_off = (EMI_HEADER_SIZE +% meta_sec.len()).trunc.[u32]();
+    let code_off = (entries_off.widen.[usize]() +% entry_sec.len()).trunc.[u32]();
+    let relocs_off = (code_off.widen.[usize]() +% code_sec.len()).trunc.[u32]();
+
+    // Fixed 64-byte header
+    try out.push(alloc, EMI_MAGIC_0);
+    try out.push(alloc, EMI_MAGIC_1);
+    try out.push(alloc, EMI_MAGIC_2);
+    try out.push(alloc, EMI_MAGIC_3);
+    try push_u32_le(alloc, out, EMI_VERSION);
+    try push_bytes32(alloc, out, &cache.interface_hash);
+    try push_u32_le(alloc, out, entries_off);
+    try push_u32_le(alloc, out, entries.len.trunc.[u32]());
+    try push_u32_le(alloc, out, code_off);
+    try push_u32_le(alloc, out, relocs_off);
+    try push_u32_le(alloc, out, cache.flags);
+    try push_u32_le(alloc, out, 0_u32);
+
+    try out.push_slice(alloc, meta_sec.as_slice());
+    try out.push_slice(alloc, entry_sec.as_slice());
+    try out.push_slice(alloc, code_sec.as_slice());
+    try out.push_slice(alloc, reloc_sec.as_slice());
+    let digest = tcb_audit.sha256(out.as_slice());
+    try push_bytes32(alloc, out, &digest.bytes);
+
+    meta_sec.destroy(alloc);
+    reloc_sec.destroy(alloc);
+    code_sec.destroy(alloc);
+    entry_sec.destroy(alloc);
+    order.destroy(alloc);
+    return;
+}
+
+struct ByteSpan {
+    start: usize;
+    end: usize;
+}
+
+fn read_u32_le(data: *[u8], cur: *mut usize) -> u32 ! EmiError {
+    let p0 = cur.*;
+    let p4 = (p0 +? 4_usize) catch {
+        return .UnexpectedEof;
+    };
+    if p4 > data.len {
+        return .UnexpectedEof;
+    }
+    let p1 = p0 +% 1_usize;
+    let p2 = p0 +% 2_usize;
+    let p3 = p0 +% 3_usize;
+    if p0 >= data.len || p1 >= data.len || p2 >= data.len || p3 >= data.len {
+        return .UnexpectedEof;
+    }
+    let b0 = data[p0].widen.[u32]();
+    let b1 = data[p1].widen.[u32]() <<% 8_u32;
+    let b2 = data[p2].widen.[u32]() <<% 16_u32;
+    let b3 = data[p3].widen.[u32]() <<% 24_u32;
+    cur.* = p4;
+    return b0 | b1 | b2 | b3;
+}
+
+fn read_bytes32(data: *[u8], cur: *mut usize) -> [32]u8 ! EmiError {
+    let p0 = cur.*;
+    let p32 = (p0 +? 32_usize) catch {
+        return .UnexpectedEof;
+    };
+    if p32 > data.len {
+        return .UnexpectedEof;
+    }
+    var out: [32]u8 = [0_u8; 32];
+    var i: usize = 0_usize;
+    while i < 32_usize {
+        let idx = p0 +% i;
+        if idx < data.len {
+            out[i] = data[idx];
+        }
+        i = i +% 1_usize;
+    }
+    cur.* = p32;
+    return out;
+}
+
+fn read_len_span(data: *[u8], cur: *mut usize) -> ByteSpan ! EmiError {
+    let n = (try read_u32_le(data, cur)).widen.[usize]();
+    let start = cur.*;
+    let end = (start +? n) catch {
+        return .UnexpectedEof;
+    };
+    if end > data.len {
+        return .UnexpectedEof;
+    }
+    cur.* = end;
+    return ByteSpan.{ start: start, end: end };
+}
+
+struct EmiHeader {
+    interface_hash: [32]u8;
+    entries_off: usize;
+    entries_cnt: usize;
+    code_off: usize;
+    relocs_off: usize;
+    flags: u32;
+}
+
+fn parse_emi_header(data: *[u8]) -> EmiHeader ! EmiError {
+    if data.len < EMI_HEADER_SIZE {
+        return .TruncatedHeader;
+    }
+    if data[0] != EMI_MAGIC_0
+        || data[1] != EMI_MAGIC_1
+        || data[2] != EMI_MAGIC_2
+        || data[3] != EMI_MAGIC_3
+    {
+        return .InvalidMagic;
+    }
+    var cur: usize = 4_usize;
+    let ver = try read_u32_le(data, &mut cur);
+    if ver != EMI_VERSION {
+        return .IncompatibleVersion;
+    }
+    let iface_hash = try read_bytes32(data, &mut cur);
+    let entries_off = (try read_u32_le(data, &mut cur)).widen.[usize]();
+    let entries_cnt = (try read_u32_le(data, &mut cur)).widen.[usize]();
+    let code_off = (try read_u32_le(data, &mut cur)).widen.[usize]();
+    let relocs_off = (try read_u32_le(data, &mut cur)).widen.[usize]();
+    let flags = try read_u32_le(data, &mut cur);
+    _ = try read_u32_le(data, &mut cur);
+
+    if entries_off > data.len || code_off > data.len || relocs_off > data.len {
+        return .InvalidRange;
+    }
+    return EmiHeader.{
+        interface_hash: iface_hash,
+        entries_off: entries_off,
+        entries_cnt: entries_cnt,
+        code_off: code_off,
+        relocs_off: relocs_off,
+        flags: flags,
+    };
+}
+
+view fn verify_trailing_sha256(data: *[u8]) -> *[u8] ! EmiError {
+    if data.len < 32_usize {
+        return .TruncatedHeader;
+    }
+    let payload_len = data.len - 32_usize;
+    let payload = data.sub(0_usize, payload_len) catch {
+        return .InvalidRange;
+    };
+    let tail = data.sub(payload_len, data.len) catch {
+        return .InvalidRange;
+    };
+    let actual = tcb_audit.sha256(payload);
+    var i: usize = 0_usize;
+    while i < 32_usize {
+        if i >= tail.len || tail[i] != actual.bytes[i] {
+            return .InvalidMagic;
+        }
+        i = i +% 1_usize;
+    }
+    return payload;
+}
+
+pub fn deserialize_emi_cache(
+    alloc: *mut AllocCap,
+    raw_data: *[u8],
+    interner: *mut span.SymInterner,
+) -> EmiModuleCache ! OutOfMemory | EmiError {
+    let data = try verify_trailing_sha256(raw_data);
+    let hdr = try parse_emi_header(data);
+
+    var cur: usize = EMI_HEADER_SIZE;
+    let mod_span = try read_len_span(data, &mut cur);
+    let mod_bytes = data.sub(mod_span.start, mod_span.end) catch {
+        return .InvalidRange;
+    };
+    str.validate_utf8(mod_bytes) catch {
+        return .InvalidUtf8;
+    };
+    let opts_hash = try read_bytes32(data, &mut cur);
+    let code_total = (try read_u32_le(data, &mut cur)).widen.[usize]();
+    let reloc_total = (try read_u32_le(data, &mut cur)).widen.[usize]();
+    let stub_span = try read_len_span(data, &mut cur);
+    let stub_bytes = data.sub(stub_span.start, stub_span.end) catch {
+        return .InvalidRange;
+    };
+
+    let code_end = (hdr.code_off +? code_total) catch {
+        return .InvalidRange;
+    };
+    let reloc_end = (hdr.relocs_off +? reloc_total) catch {
+        return .InvalidRange;
+    };
+    if code_end > data.len || reloc_end > data.len {
+        return .InvalidRange;
+    }
+
+    var cache = try EmiModuleCache.init(alloc, mod_bytes);
+    errdefer cache.destroy(alloc);
+    try cache.stub_text.push_bytes_grow(alloc, stub_bytes);
+    cache.interface_hash = hdr.interface_hash;
+    cache.opts_hash = opts_hash;
+    cache.flags = hdr.flags;
+
+    let code_slice = data.sub(hdr.code_off, code_end) catch {
+        return .InvalidRange;
+    };
+    let reloc_slice = data.sub(hdr.relocs_off, reloc_end) catch {
+        return .InvalidRange;
+    };
+    try cache.code_bytes.push_slice(alloc, code_slice);
+    try cache.reloc_bytes.push_slice(alloc, reloc_slice);
+
+    var ecur = hdr.entries_off;
+    var ei: usize = 0_usize;
+    while ei < hdr.entries_cnt {
+        let name_span = try read_len_span(data, &mut ecur);
+        let name_bytes = data.sub(name_span.start, name_span.end) catch {
+            return .InvalidRange;
+        };
+        str.validate_utf8(name_bytes) catch {
+            return .InvalidUtf8;
+        };
+        let fn_sym = try interner.intern(alloc, name_bytes);
+        let fhash = try read_bytes32(data, &mut ecur);
+        let c_off = try read_u32_le(data, &mut ecur);
+        let c_len = try read_u32_le(data, &mut ecur);
+        let r_off = try read_u32_le(data, &mut ecur);
+        let r_len = try read_u32_le(data, &mut ecur);
+
+        let ce = (c_off.widen.[usize]() +? c_len.widen.[usize]()) catch {
+            return .InvalidRange;
+        };
+        let re = (r_off.widen.[usize]() +? r_len.widen.[usize]()) catch {
+            return .InvalidRange;
+        };
+        if ce > code_total || re > reloc_total {
+            return .InvalidRange;
+        }
+
+        let new_idx = cache.entries.len().trunc.[u32]();
+        try cache.entries.push(
+            alloc,
+            EmiEntry.{
+                fn_sym: fn_sym,
+                hash: fhash,
+                code_off: c_off,
+                code_len: c_len,
+                reloc_off: r_off,
+                reloc_len: r_len,
+            },
+        );
+        try cache.by_sym.insert(alloc, fn_sym.widen.[u64](), new_idx);
+        ei = ei +% 1_usize;
+    }
+
+    cache.dirty = false;
+    return cache;
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem Persistence via `FsCap.{read_file, write_file, mkdir_all}`
+// ---------------------------------------------------------------------------
+
+fn is_safe_filename_byte(b: u8) -> bool {
+    if b >= b'a' && b <= b'z' {
+        return true;
+    }
+    if b >= b'A' && b <= b'Z' {
+        return true;
+    }
+    if b >= b'0' && b <= b'9' {
+        return true;
+    }
+    return b == b'_' || b == b'.';
+}
+
+pub fn emi_cache_file_path(
+    alloc: *mut AllocCap,
+    cache_dir: *[u8],
+    module_name: *[u8],
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    out.clear();
+    try out.push_bytes_grow(alloc, cache_dir);
+    if cache_dir.len > 0_usize && cache_dir[cache_dir.len - 1_usize] != b'/' {
+        try out.push_byte_grow(alloc, b'/');
+    }
+    if module_name.len == 0_usize {
+        try out.push_str_grow(alloc, "_unnamed");
+    } else {
+        var i: usize = 0_usize;
+        while i < module_name.len {
+            let b = module_name[i];
+            if is_safe_filename_byte(b) {
+                try out.push_byte_grow(alloc, b);
+            } else {
+                try out.push_byte_grow(alloc, b'_');
+            }
+            i = i +% 1_usize;
+        }
+    }
+    try out.push_str_grow(alloc, ".emi");
+    return;
+}
+
+pub fn save_emi_cache(
+    alloc: *mut AllocCap,
+    fs: *FsCap,
+    cache_dir: *str,
+    cache: *EmiModuleCache,
+    interner: *span.SymInterner,
+) -> !OutOfMemory | IoError | Utf8Error {
+    if cache_dir.as_bytes().len > 0_usize {
+        try fs.mkdir_all(cache_dir);
+    }
+    var path_buf = try str.StrBuf.init(alloc, 128_usize);
+    errdefer path_buf.destroy(alloc);
+    try emi_cache_file_path(alloc, cache_dir.as_bytes(), cache.module_name.as_bytes(), &mut path_buf);
+
+    var raw_buf = try col.DynBuf.[u8].init(alloc, 256_usize);
+    errdefer raw_buf.destroy(alloc);
+    try serialize_emi_cache(alloc, cache, interner, &mut raw_buf);
+
+    let path_str = try path_buf.as_str();
+    try fs.write_file(path_str, raw_buf.as_slice());
+
+    raw_buf.destroy(alloc);
+    path_buf.destroy(alloc);
+    return;
+}
+
+pub fn load_emi_cache(
+    alloc: *mut AllocCap,
+    fs: *FsCap,
+    cache_dir: *str,
+    module_name: *[u8],
+    interner: *mut span.SymInterner,
+) -> EmiModuleCache ! OutOfMemory | IoError | Utf8Error | EmiError {
+    var path_buf = try str.StrBuf.init(alloc, 128_usize);
+    errdefer path_buf.destroy(alloc);
+    try emi_cache_file_path(alloc, cache_dir.as_bytes(), module_name, &mut path_buf);
+
+    let path_str = try path_buf.as_str();
+    let file_buf = try fs.read_file(alloc, path_str);
+    errdefer file_buf.destroy(alloc);
+
+    let loaded = try deserialize_emi_cache(alloc, file_buf.as_slice(), interner);
+    file_buf.destroy(alloc);
+    path_buf.destroy(alloc);
+    return loaded;
+}
+
+pub fn try_load_emi_cache(
+    alloc: *mut AllocCap,
+    fs: *FsCap,
+    cache_dir: *str,
+    module_name: *[u8],
+    interner: *mut span.SymInterner,
+) -> ?EmiModuleCache ! OutOfMemory {
+    var path_buf = try str.StrBuf.init(alloc, 128_usize);
+    errdefer path_buf.destroy(alloc);
+    try emi_cache_file_path(alloc, cache_dir.as_bytes(), module_name, &mut path_buf);
+
+    let path_str = path_buf.as_str() catch {
+        path_buf.destroy(alloc);
+        return null;
+    };
+    let file_buf = fs.read_file(alloc, path_str) catch {
+        path_buf.destroy(alloc);
+        return null;
+    };
+    let loaded = deserialize_emi_cache(alloc, file_buf.as_slice(), interner) catch {
+        file_buf.destroy(alloc);
+        path_buf.destroy(alloc);
+        return null;
+    };
+    file_buf.destroy(alloc);
+    path_buf.destroy(alloc);
+    return loaded;
+}
+
+// ---------------------------------------------------------------------------
+// Whole-Program Incremental Manifest (`_inc_prog.emi`)
+// ---------------------------------------------------------------------------
+
+pub const INC_MANIFEST_MAGIC_0: u8 = b'E';
+pub const INC_MANIFEST_MAGIC_1: u8 = b'O';
+pub const INC_MANIFEST_MAGIC_2: u8 = b'M';
+pub const INC_MANIFEST_MAGIC_3: u8 = b'P';
+pub const INC_MANIFEST_VERSION: u32 = 0x00010004_u32;
+
+pub const EMI_FLAG_IS_HAL: u32 = 1_u32;
+
+pub struct IncFileRec {
+    pub path_off: u32;
+    pub path_len: u32;
+    pub mod_off: u32;
+    pub mod_len: u32;
+    pub imp_off: u32;
+    pub imp_len: u32;
+    pub file_sha256: [32]u8;
+    pub iface_sha256: [32]u8;
+}
+
+pub struct IncModRec {
+    pub path_off: u32;
+    pub path_len: u32;
+    pub mod_off: u32;
+    pub mod_len: u32;
+    pub file_sha256: [32]u8;
+    pub iface_sha256: [32]u8;
+}
+
+pub linear struct IncProgramManifest {
+    pub opts_hash: [32]u8;
+    pub can_inc: bool;
+    pub has_out_elf: bool;
+    pub out_elf_len: u64;
+    pub out_elf_sha256: [32]u8;
+    pub start_code: col.DynBuf[u8];
+    pub start_meta: col.DynBuf[u8];
+    pub str_pool: col.DynBuf[u8];
+    pub files: col.DynBuf[IncFileRec];
+    pub stdlibs: col.DynBuf[IncModRec];
+}
+
+impl IncProgramManifest {
+    pub fn init(alloc: *mut AllocCap) -> IncProgramManifest ! OutOfMemory {
+        let start_code = try col.DynBuf.[u8].init(alloc, 256_usize);
+        errdefer start_code.destroy(alloc);
+        let start_meta = try col.DynBuf.[u8].init(alloc, 256_usize);
+        errdefer start_meta.destroy(alloc);
+        let str_pool = try col.DynBuf.[u8].init(alloc, 512_usize);
+        errdefer str_pool.destroy(alloc);
+        let files = try col.DynBuf.[IncFileRec].init(alloc, 32_usize);
+        errdefer files.destroy(alloc);
+        let stdlibs = try col.DynBuf.[IncModRec].init(alloc, 8_usize);
+        errdefer stdlibs.destroy(alloc);
+        return IncProgramManifest.{
+            opts_hash: [0_u8; 32],
+            can_inc: false,
+            has_out_elf: false,
+            out_elf_len: 0_u64,
+            out_elf_sha256: [0_u8; 32],
+            start_code: start_code,
+            start_meta: start_meta,
+            str_pool: str_pool,
+            files: files,
+            stdlibs: stdlibs,
+        };
+    }
+
+    pub fn add_file(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        path: *[u8],
+        mod_name: *[u8],
+        imports_nl: *[u8],
+        file_sha256: [32]u8,
+        iface_sha256: [32]u8,
+    ) -> !OutOfMemory {
+        let poff = self.str_pool.len().trunc.[u32]();
+        let plen = path.len.trunc.[u32]();
+        try self.str_pool.push_slice(alloc, path);
+        let moff = self.str_pool.len().trunc.[u32]();
+        let mlen = mod_name.len.trunc.[u32]();
+        try self.str_pool.push_slice(alloc, mod_name);
+        let ioff = self.str_pool.len().trunc.[u32]();
+        let ilen = imports_nl.len.trunc.[u32]();
+        try self.str_pool.push_slice(alloc, imports_nl);
+        try self.files.push(
+            alloc,
+            IncFileRec.{
+                path_off: poff,
+                path_len: plen,
+                mod_off: moff,
+                mod_len: mlen,
+                imp_off: ioff,
+                imp_len: ilen,
+                file_sha256: file_sha256,
+                iface_sha256: iface_sha256,
+            },
+        );
+        return;
+    }
+
+    pub fn add_stdlib(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        path: *[u8],
+        mod_name: *[u8],
+        file_sha256: [32]u8,
+        iface_sha256: [32]u8,
+    ) -> !OutOfMemory {
+        let poff = self.str_pool.len().trunc.[u32]();
+        let plen = path.len.trunc.[u32]();
+        try self.str_pool.push_slice(alloc, path);
+        let moff = self.str_pool.len().trunc.[u32]();
+        let mlen = mod_name.len.trunc.[u32]();
+        try self.str_pool.push_slice(alloc, mod_name);
+        try self.stdlibs.push(
+            alloc,
+            IncModRec.{
+                path_off: poff,
+                path_len: plen,
+                mod_off: moff,
+                mod_len: mlen,
+                file_sha256: file_sha256,
+                iface_sha256: iface_sha256,
+            },
+        );
+        return;
+    }
+
+    pub view fn stdlib_path(self: *Self, idx: usize) -> *[u8] {
+        let empty: *str = "";
+        let ss = self.stdlibs.as_slice();
+        if idx < ss.len {
+            let r = ss[idx];
+            return slice_u32_range(self.str_pool.as_slice(), r.path_off, r.path_len);
+        }
+        return empty.as_bytes();
+    }
+
+    pub view fn file_path(self: *Self, idx: usize) -> *[u8] {
+        let empty: *str = "";
+        let fs = self.files.as_slice();
+        if idx < fs.len {
+            let r = fs[idx];
+            return slice_u32_range(self.str_pool.as_slice(), r.path_off, r.path_len);
+        }
+        return empty.as_bytes();
+    }
+
+    pub view fn file_mod(self: *Self, idx: usize) -> *[u8] {
+        let empty: *str = "";
+        let fs = self.files.as_slice();
+        if idx < fs.len {
+            let r = fs[idx];
+            return slice_u32_range(self.str_pool.as_slice(), r.mod_off, r.mod_len);
+        }
+        return empty.as_bytes();
+    }
+
+    pub view fn file_imports(self: *Self, idx: usize) -> *[u8] {
+        let empty: *str = "";
+        let fs = self.files.as_slice();
+        if idx < fs.len {
+            let r = fs[idx];
+            return slice_u32_range(self.str_pool.as_slice(), r.imp_off, r.imp_len);
+        }
+        return empty.as_bytes();
+    }
+
+    pub view fn stdlib_mod(self: *Self, idx: usize) -> *[u8] {
+        let empty: *str = "";
+        let ss = self.stdlibs.as_slice();
+        if idx < ss.len {
+            let r = ss[idx];
+            return slice_u32_range(self.str_pool.as_slice(), r.mod_off, r.mod_len);
+        }
+        return empty.as_bytes();
+    }
+
+    pub fn set_file_hashes(
+        self: *mut Self,
+        idx: usize,
+        file_sha256: [32]u8,
+        iface_sha256: [32]u8,
+    ) {
+        let fs = self.files.as_mut_slice();
+        if idx < fs.len {
+            fs[idx].file_sha256 = file_sha256;
+            fs[idx].iface_sha256 = iface_sha256;
+        }
+    }
+
+    pub fn set_file_hashes_and_imports(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        idx: usize,
+        file_sha256: [32]u8,
+        iface_sha256: [32]u8,
+        imports_nl: *[u8],
+    ) -> !OutOfMemory {
+        let ioff = self.str_pool.len().trunc.[u32]();
+        let ilen = imports_nl.len.trunc.[u32]();
+        try self.str_pool.push_slice(alloc, imports_nl);
+        let fs = self.files.as_mut_slice();
+        if idx < fs.len {
+            fs[idx].file_sha256 = file_sha256;
+            fs[idx].iface_sha256 = iface_sha256;
+            fs[idx].imp_off = ioff;
+            fs[idx].imp_len = ilen;
+        }
+        return;
+    }
+
+    pub fn destroy(self: IncProgramManifest, alloc: *mut AllocCap) {
+        let IncProgramManifest.{
+            opts_hash: _,
+            can_inc: _,
+            has_out_elf: _,
+            out_elf_len: _,
+            out_elf_sha256: _,
+            start_code,
+            start_meta,
+            str_pool,
+            files,
+            stdlibs,
+        } = self;
+        start_code.destroy(alloc);
+        start_meta.destroy(alloc);
+        str_pool.destroy(alloc);
+        files.destroy(alloc);
+        stdlibs.destroy(alloc);
+    }
+}
+
+pub fn serialize_inc_manifest(
+    alloc: *mut AllocCap,
+    m: *IncProgramManifest,
+    out: *mut col.DynBuf[u8],
+) -> !OutOfMemory {
+    try out.push(alloc, INC_MANIFEST_MAGIC_0);
+    try out.push(alloc, INC_MANIFEST_MAGIC_1);
+    try out.push(alloc, INC_MANIFEST_MAGIC_2);
+    try out.push(alloc, INC_MANIFEST_MAGIC_3);
+    try push_u32_le(alloc, out, INC_MANIFEST_VERSION);
+    try push_bytes32(alloc, out, &m.opts_hash);
+    let mflags = (if m.can_inc { 1_u32 } else { 0_u32 })
+        | (if m.has_out_elf { 2_u32 } else { 0_u32 });
+    try push_u32_le(alloc, out, mflags);
+    try push_u32_le(alloc, out, (m.out_elf_len & 0xFFFFFFFF_u64).trunc.[u32]());
+    try push_u32_le(alloc, out, (m.out_elf_len >> 32_u64).trunc.[u32]());
+    try push_bytes32(alloc, out, &m.out_elf_sha256);
+    try push_len_bytes(alloc, out, m.start_code.as_slice());
+    try push_len_bytes(alloc, out, m.start_meta.as_slice());
+
+    let fs = m.files.as_slice();
+    try push_u32_le(alloc, out, fs.len.trunc.[u32]());
+    var i: usize = 0_usize;
+    while i < fs.len {
+        let r = fs[i];
+        try push_len_bytes(alloc, out, m.file_path(i));
+        try push_len_bytes(alloc, out, m.file_mod(i));
+        try push_len_bytes(alloc, out, m.file_imports(i));
+        try push_bytes32(alloc, out, &r.file_sha256);
+        try push_bytes32(alloc, out, &r.iface_sha256);
+        i = i +% 1_usize;
+    }
+
+    let ss = m.stdlibs.as_slice();
+    try push_u32_le(alloc, out, ss.len.trunc.[u32]());
+    i = 0_usize;
+    while i < ss.len {
+        let r = ss[i];
+        try push_len_bytes(alloc, out, m.stdlib_path(i));
+        try push_len_bytes(alloc, out, m.stdlib_mod(i));
+        try push_bytes32(alloc, out, &r.file_sha256);
+        try push_bytes32(alloc, out, &r.iface_sha256);
+        i = i +% 1_usize;
+    }
+    let digest = tcb_audit.sha256(out.as_slice());
+    try push_bytes32(alloc, out, &digest.bytes);
+    return;
+}
+
+fn cursor_at_end(cur: *usize, len: usize) -> bool {
+    return cur.* == len;
+}
+
+pub fn deserialize_inc_manifest(
+    alloc: *mut AllocCap,
+    raw_data: *[u8],
+) -> IncProgramManifest ! OutOfMemory | EmiError {
+    let data = try verify_trailing_sha256(raw_data);
+    if data.len < 44_usize {
+        return .TruncatedHeader;
+    }
+    if data[0_usize] != INC_MANIFEST_MAGIC_0
+        || data[1_usize] != INC_MANIFEST_MAGIC_1
+        || data[2_usize] != INC_MANIFEST_MAGIC_2
+        || data[3_usize] != INC_MANIFEST_MAGIC_3
+    {
+        return .InvalidMagic;
+    }
+    var cur: usize = 4_usize;
+    let ver = try read_u32_le(data, &mut cur);
+    if ver != INC_MANIFEST_VERSION {
+        return .IncompatibleVersion;
+    }
+    var m = try IncProgramManifest.init(alloc);
+    errdefer m.destroy(alloc);
+    m.opts_hash = try read_bytes32(data, &mut cur);
+    let flags = try read_u32_le(data, &mut cur);
+    m.can_inc = (flags & 1_u32) != 0_u32;
+    m.has_out_elf = (flags & 2_u32) != 0_u32;
+    let elf_lo = (try read_u32_le(data, &mut cur)).widen.[u64]();
+    let elf_hi = (try read_u32_le(data, &mut cur)).widen.[u64]();
+    m.out_elf_len = elf_lo | (elf_hi <<% 32_u64);
+    m.out_elf_sha256 = try read_bytes32(data, &mut cur);
+
+    let sc_sp = try read_len_span(data, &mut cur);
+    let sc_bs = data.sub(sc_sp.start, sc_sp.end) catch { return .InvalidRange; };
+    try m.start_code.push_slice(alloc, sc_bs);
+
+    let sm_sp = try read_len_span(data, &mut cur);
+    let sm_bs = data.sub(sm_sp.start, sm_sp.end) catch { return .InvalidRange; };
+    try m.start_meta.push_slice(alloc, sm_bs);
+
+    let nf = (try read_u32_le(data, &mut cur)).widen.[usize]();
+    var fi: usize = 0_usize;
+    while fi < nf {
+        let p_sp = try read_len_span(data, &mut cur);
+        let p_bs = data.sub(p_sp.start, p_sp.end) catch { return .InvalidRange; };
+        let m_sp = try read_len_span(data, &mut cur);
+        let m_bs = data.sub(m_sp.start, m_sp.end) catch { return .InvalidRange; };
+        let i_sp = try read_len_span(data, &mut cur);
+        let i_bs = data.sub(i_sp.start, i_sp.end) catch { return .InvalidRange; };
+        let fsha = try read_bytes32(data, &mut cur);
+        let isha = try read_bytes32(data, &mut cur);
+        try m.add_file(alloc, p_bs, m_bs, i_bs, fsha, isha);
+        fi = fi +% 1_usize;
+    }
+
+    let ns = (try read_u32_le(data, &mut cur)).widen.[usize]();
+    var si: usize = 0_usize;
+    while si < ns {
+        let p_sp = try read_len_span(data, &mut cur);
+        let p_bs = data.sub(p_sp.start, p_sp.end) catch { return .InvalidRange; };
+        let m_sp = try read_len_span(data, &mut cur);
+        let m_bs = data.sub(m_sp.start, m_sp.end) catch { return .InvalidRange; };
+        let fsha = try read_bytes32(data, &mut cur);
+        let isha = try read_bytes32(data, &mut cur);
+        try m.add_stdlib(alloc, p_bs, m_bs, fsha, isha);
+        si = si +% 1_usize;
+    }
+    if !cursor_at_end(&cur, data.len) {
+        return .InvalidRange;
+    }
+    return m;
+}
+
+pub fn save_inc_manifest(
+    alloc: *mut AllocCap,
+    fs: *FsCap,
+    cache_dir: *str,
+    m: *IncProgramManifest,
+) -> !OutOfMemory | IoError | Utf8Error {
+    if cache_dir.as_bytes().len > 0_usize {
+        try fs.mkdir_all(cache_dir);
+    }
+    var path_buf = try str.StrBuf.init(alloc, 128_usize);
+    errdefer path_buf.destroy(alloc);
+    try emi_cache_file_path(alloc, cache_dir.as_bytes(), "_inc_prog".as_bytes(), &mut path_buf);
+
+    var raw_buf = try col.DynBuf.[u8].init(alloc, 512_usize);
+    errdefer raw_buf.destroy(alloc);
+    try serialize_inc_manifest(alloc, m, &mut raw_buf);
+
+    let path_str = try path_buf.as_str();
+    try fs.write_file(path_str, raw_buf.as_slice());
+
+    raw_buf.destroy(alloc);
+    path_buf.destroy(alloc);
+    return;
+}
+
+pub fn try_load_inc_manifest(
+    alloc: *mut AllocCap,
+    fs: *FsCap,
+    cache_dir: *str,
+) -> ?IncProgramManifest ! OutOfMemory {
+    var path_buf = try str.StrBuf.init(alloc, 128_usize);
+    errdefer path_buf.destroy(alloc);
+    try emi_cache_file_path(alloc, cache_dir.as_bytes(), "_inc_prog".as_bytes(), &mut path_buf);
+
+    let path_str = path_buf.as_str() catch {
+        path_buf.destroy(alloc);
+        return null;
+    };
+    let file_buf = fs.read_file(alloc, path_str) catch {
+        path_buf.destroy(alloc);
+        return null;
+    };
+    let loaded = deserialize_inc_manifest(alloc, file_buf.as_slice()) catch {
+        file_buf.destroy(alloc);
+        path_buf.destroy(alloc);
+        return null;
+    };
+    file_buf.destroy(alloc);
+    path_buf.destroy(alloc);
+    return loaded;
+}

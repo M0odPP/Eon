@@ -1,0 +1,2 @@
+module fail.unterm_cmt;
+/* unterminated //~ ERROR E0004

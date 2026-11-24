@@ -1,0 +1,363 @@
+module utils.egrep;
+
+import std.rt;
+import utils.linux;
+
+/// Zero-libc static Linux `egrep` utility using `mmap` + `vec[u8, 32]` (AVX2)
+/// 2-byte anchored literal scanner and non-allocating regex (`^`, `$`, `.`, `*`, `+`, `?`).
+
+fn has_regex_meta(pat: *[u8]) -> bool {
+    var i: usize = 0_usize;
+    while i < pat.len {
+        let c = pat[i];
+        if c == b'^' || c == b'$' || c == b'.' || c == b'*' || c == b'+' || c == b'?' {
+            return true;
+        }
+        i = i +% 1_usize;
+    }
+    return false;
+}
+
+@inline
+fn eq_bytes_at(hay: *[u8], pos: usize, pat: *[u8]) -> bool {
+    let plen = pat.len;
+    if pos > hay.len || plen > hay.len - pos {
+        return false;
+    }
+    var k: usize = 0_usize;
+    while k < plen {
+        if hay[pos +% k] != pat[k] {
+            return false;
+        }
+        k = k +% 1_usize;
+    }
+    return true;
+}
+
+fn find_line_start(data: *[u8], pos: usize) -> usize {
+    var p = if pos < data.len { pos } else { data.len };
+    while p > 0_usize {
+        let prev = p - 1_usize;
+        if prev < data.len && data[prev] == 10_u8 {
+            return p;
+        }
+        p = prev;
+    }
+    return 0_usize;
+}
+
+fn find_line_end_simd(data: *[u8], start: usize) -> usize {
+    let v_nl: vec[u8, 32] = u8x32.splat(10_u8);
+    var i = start;
+    while i < data.len {
+        let end32 = i + 31_usize;
+        if end32 >= data.len {
+            break;
+        }
+        let v: vec[u8, 32] = .{
+            data[i], data[i + 1_usize], data[i + 2_usize], data[i + 3_usize],
+            data[i + 4_usize], data[i + 5_usize], data[i + 6_usize], data[i + 7_usize],
+            data[i + 8_usize], data[i + 9_usize], data[i + 10_usize], data[i + 11_usize],
+            data[i + 12_usize], data[i + 13_usize], data[i + 14_usize], data[i + 15_usize],
+            data[i + 16_usize], data[i + 17_usize], data[i + 18_usize], data[i + 19_usize],
+            data[i + 20_usize], data[i + 21_usize], data[i + 22_usize], data[i + 23_usize],
+            data[i + 24_usize], data[i + 25_usize], data[i + 26_usize], data[i + 27_usize],
+            data[i + 28_usize], data[i + 29_usize], data[i + 30_usize], data[end32],
+        };
+        let m = v.cmpeq(v_nl).bitmask();
+        if m != 0_u64 {
+            return i +% (@tzcnt(m) & 31_u64).trunc.[usize]();
+        }
+        i = i +% 32_usize;
+    }
+    while i < data.len {
+        if data[i] == 10_u8 {
+            return i;
+        }
+        i = i +% 1_usize;
+    }
+    return data.len;
+}
+
+/// Fast AVX2 `vec[u8, 32]` 2-byte anchored literal search across the entire `mmap`'d file.
+/// Jumps straight past the rest of each matching line after recording a match.
+fn count_literal_lines_simd(data: *[u8], pat: *[u8], print_lines: bool) -> u64 {
+    let plen = pat.len;
+    if plen == 0_usize || data.len < plen {
+        return 0_u64;
+    }
+    let first_b = pat[0_usize];
+    let last_b = pat[plen - 1_usize];
+    let v_first: vec[u8, 32] = u8x32.splat(first_b);
+    let v_last: vec[u8, 32] = u8x32.splat(last_b);
+    let last_off = plen - 1_usize;
+
+    var matches: u64 = 0_u64;
+    var i: usize = 0_usize;
+    let limit = data.len - plen;
+
+    while i <= limit {
+        let end_f = i + 31_usize;
+        if end_f >= data.len {
+            break;
+        }
+        let vf: vec[u8, 32] = .{
+            data[i], data[i + 1_usize], data[i + 2_usize], data[i + 3_usize],
+            data[i + 4_usize], data[i + 5_usize], data[i + 6_usize], data[i + 7_usize],
+            data[i + 8_usize], data[i + 9_usize], data[i + 10_usize], data[i + 11_usize],
+            data[i + 12_usize], data[i + 13_usize], data[i + 14_usize], data[i + 15_usize],
+            data[i + 16_usize], data[i + 17_usize], data[i + 18_usize], data[i + 19_usize],
+            data[i + 20_usize], data[i + 21_usize], data[i + 22_usize], data[i + 23_usize],
+            data[i + 24_usize], data[i + 25_usize], data[i + 26_usize], data[i + 27_usize],
+            data[i + 28_usize], data[i + 29_usize], data[i + 30_usize], data[end_f],
+        };
+        let l0 = i +% last_off;
+        if l0 >= data.len {
+            break;
+        }
+        let end_last = l0 + 31_usize;
+        if end_last >= data.len {
+            break;
+        }
+        let vl: vec[u8, 32] = .{
+            data[l0], data[l0 + 1_usize], data[l0 + 2_usize], data[l0 + 3_usize],
+            data[l0 + 4_usize], data[l0 + 5_usize], data[l0 + 6_usize], data[l0 + 7_usize],
+            data[l0 + 8_usize], data[l0 + 9_usize], data[l0 + 10_usize], data[l0 + 11_usize],
+            data[l0 + 12_usize], data[l0 + 13_usize], data[l0 + 14_usize], data[l0 + 15_usize],
+            data[l0 + 16_usize], data[l0 + 17_usize], data[l0 + 18_usize], data[l0 + 19_usize],
+            data[l0 + 20_usize], data[l0 + 21_usize], data[l0 + 22_usize], data[l0 + 23_usize],
+            data[l0 + 24_usize], data[l0 + 25_usize], data[l0 + 26_usize], data[l0 + 27_usize],
+            data[l0 + 28_usize], data[l0 + 29_usize], data[l0 + 30_usize], data[end_last],
+        };
+        var mask = vf.cmpeq(v_first).bitmask() & vl.cmpeq(v_last).bitmask();
+        var jumped = false;
+        while mask != 0_u64 {
+            let bit = (@tzcnt(mask) & 31_u64).trunc.[usize]();
+            let pos = i +% bit;
+            if eq_bytes_at(data, pos, pat) {
+                matches = matches +% 1_u64;
+                let le = find_line_end_simd(data, pos +% plen);
+                if print_lines {
+                    let ls = find_line_start(data, pos);
+                    let empty_s: *str = "";
+                    let line_s = data.sub(ls, le) catch { empty_s.as_bytes() };
+                    _ = linux.sys_write_all(1_i32, line_s);
+                    let nl: [1]u8 = [10_u8];
+                    _ = linux.sys_write_all(1_i32, &nl);
+                }
+                i = if le < data.len { le +% 1_usize } else { data.len };
+                jumped = true;
+                break;
+            }
+            mask = mask & (mask -% 1_u64);
+        }
+        if !jumped {
+            i = i +% 32_usize;
+        }
+    }
+
+    // Scalar tail
+    while i <= limit && i < data.len {
+        let li = i +% last_off;
+        if li < data.len && data[i] == first_b && data[li] == last_b && eq_bytes_at(data, i, pat) {
+            matches = matches +% 1_u64;
+            let le = find_line_end_simd(data, i +% plen);
+            if print_lines {
+                let ls = find_line_start(data, i);
+                let empty_s: *str = "";
+                let line_s = data.sub(ls, le) catch { empty_s.as_bytes() };
+                _ = linux.sys_write_all(1_i32, line_s);
+                let nl: [1]u8 = [10_u8];
+                _ = linux.sys_write_all(1_i32, &nl);
+            }
+            i = if le < data.len { le +% 1_usize } else { data.len };
+        } else {
+            i = i +% 1_usize;
+        }
+    }
+    return matches;
+}
+
+// ---------------------------------------------------------------------------
+// Non-Allocating Regex Matcher (`^`, `$`, `.`, `*`, `+`, `?`)
+// ---------------------------------------------------------------------------
+
+@inline
+fn char_matches(p: u8, c: u8) -> bool {
+    return p == b'.' || p == c;
+}
+
+@recursive
+fn regex_match_here(pat: *[u8], pi: usize, line: *[u8], li: usize) -> bool {
+    if pi >= pat.len {
+        return true;
+    }
+    if pat[pi] == b'$' && pi +% 1_usize == pat.len {
+        return li == line.len;
+    }
+    if pi +% 1_usize < pat.len {
+        let q = pat[pi +% 1_usize];
+        if q == b'*' {
+            var cur = li;
+            loop {
+                if regex_match_here(pat, pi +% 2_usize, line, cur) {
+                    return true;
+                }
+                if cur < line.len && char_matches(pat[pi], line[cur]) {
+                    cur = cur +% 1_usize;
+                } else {
+                    return false;
+                }
+            }
+        }
+        if q == b'+' {
+            if li >= line.len || !char_matches(pat[pi], line[li]) {
+                return false;
+            }
+            var cur = li +% 1_usize;
+            loop {
+                if regex_match_here(pat, pi +% 2_usize, line, cur) {
+                    return true;
+                }
+                if cur < line.len && char_matches(pat[pi], line[cur]) {
+                    cur = cur +% 1_usize;
+                } else {
+                    return false;
+                }
+            }
+        }
+        if q == b'?' {
+            if li < line.len && char_matches(pat[pi], line[li]) {
+                if regex_match_here(pat, pi +% 2_usize, line, li +% 1_usize) {
+                    return true;
+                }
+            }
+            return regex_match_here(pat, pi +% 2_usize, line, li);
+        }
+    }
+    if li < line.len && char_matches(pat[pi], line[li]) {
+        return regex_match_here(pat, pi +% 1_usize, line, li +% 1_usize);
+    }
+    return false;
+}
+
+fn regex_match_line(pat: *[u8], line: *[u8]) -> bool {
+    if pat.len == 0_usize {
+        return true;
+    }
+    if pat[0_usize] == b'^' {
+        return regex_match_here(pat, 1_usize, line, 0_usize);
+    }
+    var i: usize = 0_usize;
+    while i <= line.len {
+        if regex_match_here(pat, 0_usize, line, i) {
+            return true;
+        }
+        i = i +% 1_usize;
+    }
+    return false;
+}
+
+fn count_regex_lines(data: *[u8], pat: *[u8], print_lines: bool) -> u64 {
+    var matches: u64 = 0_u64;
+    var pos: usize = 0_usize;
+    let empty_s: *str = "";
+    while pos < data.len {
+        let le = find_line_end_simd(data, pos);
+        let line = data.sub(pos, le) catch { empty_s.as_bytes() };
+        if regex_match_line(pat, line) {
+            matches = matches +% 1_u64;
+            if print_lines {
+                _ = linux.sys_write_all(1_i32, line);
+                let nl: [1]u8 = [10_u8];
+                _ = linux.sys_write_all(1_i32, &nl);
+            }
+        }
+        pos = if le < data.len { le +% 1_usize } else { data.len };
+    }
+    return matches;
+}
+
+pub fn main(env: *mut Env) -> i32 {
+    let args = &env.args;
+    let clock = &env.clock;
+    let argc = rt.arg_count(args);
+    if argc < 3_usize {
+        rt.eprint_str("usage: egrep [-c] [--bench N] <pattern> <file>\n");
+        return 1_i32;
+    }
+
+    var count_only = false;
+    var repeat: u64 = 1_u64;
+    var idx: usize = 1_usize;
+    while idx < argc {
+        if let a = rt.arg_at(args, idx) {
+            if rt.str_eq(a, "-c") {
+                count_only = true;
+                idx = idx +% 1_usize;
+                continue;
+            }
+            if rt.str_eq(a, "--bench") && idx +% 1_usize < argc {
+                if let n_str = rt.arg_at(args, idx +% 1_usize) {
+                    let bs = n_str.as_bytes();
+                    var n: u64 = 0_u64;
+                    var bi: usize = 0_usize;
+                    while bi < bs.len {
+                        if bs[bi] >= b'0' && bs[bi] <= b'9' {
+                            n = (n *% 10_u64) +% (bs[bi] -% b'0').widen.[u64]();
+                        }
+                        bi = bi +% 1_usize;
+                    }
+                    if n > 0_u64 { repeat = n; }
+                }
+                count_only = true;
+                idx = idx +% 2_usize;
+                continue;
+            }
+        }
+        break;
+    }
+
+    if idx +% 1_usize >= argc {
+        rt.eprint_str("egrep: missing <pattern> <file>\n");
+        return 1_i32;
+    }
+    let pat_str = rt.arg_at(args, idx) orelse "";
+    let file_str = rt.arg_at(args, idx +% 1_usize) orelse "";
+    let pat = pat_str.as_bytes();
+    let use_regex = has_regex_meta(pat);
+
+    let mf = linux.MmapFile.open_readonly(file_str) catch {
+        rt.eprint_str("egrep: failed to open file\n");
+        return 2_i32;
+    };
+
+    let t0 = rt.now_ns(clock);
+    var total: u64 = 0_u64;
+    var r: u64 = 0_u64;
+    while r < repeat {
+        let data = mf.as_bytes();
+        total = if use_regex {
+            count_regex_lines(data, pat, !count_only)
+        } else {
+            count_literal_lines_simd(data, pat, !count_only)
+        };
+        r = r +% 1_u64;
+    }
+    let elapsed_ns = rt.elapsed_since(clock, t0);
+    mf.close();
+
+    if repeat > 1_u64 {
+        rt.print_str("egrep bench: matches=");
+        rt.print_u64(total);
+        rt.print_str(" reps=");
+        rt.print_u64(repeat);
+        rt.print_str(" ns=");
+        rt.print_u64(elapsed_ns);
+        rt.print_nl();
+    } else if count_only {
+        rt.print_u64(total);
+        rt.print_nl();
+    }
+    return 0_i32;
+}

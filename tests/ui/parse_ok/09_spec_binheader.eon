@@ -1,0 +1,15 @@
+module eon.abi.binheader;
+
+@layout(c) @align(8)
+pub struct EonBinHeader {
+    magic:        [4]u8;
+    abi_version:  u16;
+    arch:         u8;
+    flags:        u8;
+    entry_offset: u32;
+    text_size:    u32;
+    rodata_size:  u32;
+    meta_offset:  u32;
+    cap_mask:     u64;
+    sys_abi_hash: [32]u8;
+}

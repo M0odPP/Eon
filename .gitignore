@@ -1,0 +1,11 @@
+/compiler/target/
+/selfhost/out/
+/kernel/out/
+/utils/out/
+/utils/results/ci_*.json
+*.emi
+*.eobj
+*.pyc
+**/__pycache__/
+tests/fuzz/failures/
+.DS_Store

@@ -1,0 +1,2 @@
+module fail.global_var;
+var GLOBAL_COUNTER: u64 = 0_u64; //~ ERROR E0110

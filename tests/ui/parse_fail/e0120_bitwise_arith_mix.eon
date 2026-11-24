@@ -1,0 +1,4 @@
+module fail.bit_arith;
+pub fn f(a: u32, b: u32) -> u32 {
+    return a + b & 1_u32; //~ ERROR E0120
+}

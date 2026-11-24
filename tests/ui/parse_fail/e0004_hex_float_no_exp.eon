@@ -1,0 +1,2 @@
+module fail.hex_no_exp;
+pub const F: f64 = 0x1.f; //~ ERROR E0004

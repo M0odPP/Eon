@@ -1,0 +1,14 @@
+module fail.zm05;
+
+fn take_u64(v: u64) -> u64 {
+    return v;
+}
+
+pub fn bad_coerce(a: u32, b: u64, f: f32) -> u64 {
+    let x: u64 = a; //~ ERROR E0105
+    let y = take_u64(a); //~ ERROR E0105
+    let z = a +% b; //~ ERROR E0105
+    let df: f64 = f; //~ ERROR E0105
+    let _ = df;
+    return x +% y +% z;
+}

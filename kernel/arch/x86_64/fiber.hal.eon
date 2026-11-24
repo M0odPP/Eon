@@ -1,0 +1,148 @@
+module kernel.arch.x86_64.fiber @hal;
+
+import kernel.arch.x86_64.cpu;
+
+/// Callee-saved x86_64 context for a freestanding kernel fiber.
+pub struct FiberCtx {
+    pub rsp: u64;
+    pub rbx: u64;
+    pub rbp: u64;
+    pub r12: u64;
+    pub r13: u64;
+    pub r14: u64;
+    pub r15: u64;
+}
+
+impl FiberCtx {
+    pub fn empty() -> FiberCtx @noalloc @noblock {
+        return FiberCtx.{
+            rsp: 0_u64,
+            rbx: 0_u64,
+            rbp: 0_u64,
+            r12: 0_u64,
+            r13: 0_u64,
+            r14: 0_u64,
+            r15: 0_u64,
+        };
+    }
+}
+
+/// Cooperative x86_64 kernel fiber switch: saves callee-saved registers into `old_ctx`
+/// (`rdi`) and restores them from `new_ctx` (`rsi`), returning onto the target fiber's stack.
+@naked
+pub fn fiber_switch(_old_ctx: *mut FiberCtx, _new_ctx: *FiberCtx) @noalloc @noblock {
+    raw {
+        asm(
+            ".byte 0x48, 0x89, 0x27; .byte 0x48, 0x89, 0x5F, 0x08; .byte 0x48, 0x89, 0x6F, 0x10; .byte 0x4C, 0x89, 0x67, 0x18; .byte 0x4C, 0x89, 0x6F, 0x20; .byte 0x4C, 0x89, 0x77, 0x28; .byte 0x4C, 0x89, 0x7F, 0x30; .byte 0x48, 0x8B, 0x26; .byte 0x48, 0x8B, 0x5E, 0x08; .byte 0x48, 0x8B, 0x6E, 0x10; .byte 0x4C, 0x8B, 0x66, 0x18; .byte 0x4C, 0x8B, 0x6E, 0x20; .byte 0x4C, 0x8B, 0x76, 0x28; .byte 0x4C, 0x8B, 0x7E, 0x30; ret",
+            options(noreturn),
+        );
+    }
+}
+
+@naked
+fn fiber_trampoline() @noalloc @noblock {
+    raw {
+        asm("mov rdi, r13; call r12; cli; hlt", options(noreturn));
+    }
+}
+
+/// Prepare a `FiberCtx` with an isolated 16-byte-aligned kernel stack at `stack_top`,
+/// entering `entry(arg)` upon first `fiber_switch`.
+pub fn init_ctx(stack_top: u64, entry: fn(u64), arg: u64) -> FiberCtx @noalloc @noblock {
+    let aligned_top = stack_top & (~15_u64);
+    let ret_slot = aligned_top -% 8_u64;
+    let tramp_addr = cpu.direct_fn0_addr(fiber_trampoline);
+    let entry_addr = cpu.direct_fn1_addr(entry);
+    cpu.mem_write_u64(ret_slot.trunc.[usize](), tramp_addr);
+    return FiberCtx.{
+        rsp: ret_slot,
+        rbx: 0_u64,
+        rbp: 0_u64,
+        r12: entry_addr,
+        r13: arg,
+        r14: 0_u64,
+        r15: 0_u64,
+    };
+}
+
+/// Accessor for the fixed scheduler fiber table in kernel BSS/RAM (`0x00220000`)
+/// so cooperative fibers can yield cleanly back to the scheduler.
+const FIBER_TABLE_ADDR: usize = 0x00220000_usize;
+
+pub struct FiberTable {
+    pub main_ctx: FiberCtx;
+    pub ctxs: [3]FiberCtx;
+    pub current: usize;
+    pub switches: u64;
+    pub checksum: u64;
+    pub done_mask: u32;
+}
+
+pub fn reset_fiber_table() @noalloc @noblock {
+    cpu.mem_zero(FIBER_TABLE_ADDR, 512_usize);
+}
+
+pub fn register_fiber(idx: usize, stack_top: u64, entry: fn(u64), arg: u64) @noalloc @noblock {
+    if idx >= 3_usize {
+        return;
+    }
+    let ctx = init_ctx(stack_top, entry, arg);
+    raw {
+        let tbl = rawptr_mut.[FiberTable].from_usize(FIBER_TABLE_ADDR);
+        tbl.*.ctxs[idx] = ctx;
+    }
+}
+
+pub fn switch_main_to_fiber(idx: usize) @noalloc @noblock {
+    if idx >= 3_usize {
+        return;
+    }
+    raw {
+        let tbl = rawptr_mut.[FiberTable].from_usize(FIBER_TABLE_ADDR);
+        tbl.*.current = idx;
+        tbl.*.switches = tbl.*.switches +% 1_u64;
+        fiber_switch(&mut tbl.*.main_ctx, &tbl.*.ctxs[idx]);
+    }
+}
+
+pub fn yield_to_main(add_hash: u64, finished: bool) @noalloc @noblock {
+    raw {
+        let tbl = rawptr_mut.[FiberTable].from_usize(FIBER_TABLE_ADDR);
+        let cur = tbl.*.current;
+        if cur < 3_usize {
+            tbl.*.checksum = (tbl.*.checksum *% 31_u64) +% add_hash;
+            if finished {
+                tbl.*.done_mask = tbl.*.done_mask | (1_u32 <<% cur.trunc.[u32]());
+            }
+            tbl.*.switches = tbl.*.switches +% 1_u64;
+            fiber_switch(&mut tbl.*.ctxs[cur], &tbl.*.main_ctx);
+        }
+    }
+}
+
+pub fn fiber_done_mask() -> u32 @noalloc @noblock {
+    var m: u32 = 0_u32;
+    raw {
+        let tbl = rawptr_mut.[FiberTable].from_usize(FIBER_TABLE_ADDR);
+        m = tbl.*.done_mask;
+    }
+    return m;
+}
+
+pub fn fiber_switch_count() -> u64 @noalloc @noblock {
+    var c: u64 = 0_u64;
+    raw {
+        let tbl = rawptr_mut.[FiberTable].from_usize(FIBER_TABLE_ADDR);
+        c = tbl.*.switches;
+    }
+    return c;
+}
+
+pub fn fiber_checksum() -> u64 @noalloc @noblock {
+    var h: u64 = 0_u64;
+    raw {
+        let tbl = rawptr_mut.[FiberTable].from_usize(FIBER_TABLE_ADDR);
+        h = tbl.*.checksum;
+    }
+    return h;
+}

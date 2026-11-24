@@ -1,0 +1,34 @@
+name: Soundness Bug
+description: Report a bypass of Zero-Mercy, borrow checking, DBM verification, linear types, @stack(N), @hal isolation, or .emi caching
+title: "[Soundness]: "
+labels: ["soundness", "priority: high"]
+body:
+  - type: dropdown
+    id: subsystem
+    attributes:
+      label: Affected Subsystem
+      options:
+        - Relational DBM / Bounds / Overflow Verifier
+        - Borrow Checker / View / Pool Brands
+        - Linear Types / errdefer
+        - Effects / @stack(N)
+        - "@hal / raw / TCB Audit"
+        - ".emi Incremental Cache"
+        - Optimizer / Codegen Miscompilation
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal Reproducer
+      description: Self-contained `.eon` program that compiles when it should be rejected (or silently violates a guarantee).
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Diagnostic / Guarantee Violated
+      description: Specify the expected `E0xxx` / `ZM-xx` rule or invariant.
+    validations:
+      required: true

@@ -1,0 +1,4 @@
+module fail.braceless_par;
+pub fn f(xs: *mut [u32]) {
+    par for x in xs.each_mut() _ = x; //~ ERROR E0117
+}

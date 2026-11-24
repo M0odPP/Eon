@@ -1,0 +1,303 @@
+module bench.hashmap_intern;
+
+import core.col;
+import std.rt;
+
+fn rng_next(state: *mut u64) -> u64 {
+    var x = state.*;
+    x = x ^ (x <<% 13_u64);
+    x = x ^ (x >> 7_u64);
+    x = x ^ (x <<% 17_u64);
+    state.* = x;
+    return x;
+}
+
+fn splitmix64(x: u64) -> u64 {
+    var z = x +% 0x9E3779B97F4A7C15_u64;
+    z = (z ^ (z >> 30_u64)) *% 0xBF58476D1CE4E5B9_u64;
+    z = (z ^ (z >> 27_u64)) *% 0x94D049BB133111EB_u64;
+    return z ^ (z >> 31_u64);
+}
+
+fn hex_nibble(v: u64) -> u8 {
+    let n = (v & 15_u64).trunc.[u8]();
+    if n < 10_u8 {
+        return 48_u8 +% n;
+    }
+    return 87_u8 +% n;
+}
+
+fn alpha_char(v: u64) -> u8 {
+    let idx = (v & 31_u64).trunc.[u8]();
+    if idx < 26_u8 {
+        return 97_u8 +% idx;
+    }
+    if idx == 31_u8 {
+        return 95_u8;
+    }
+    return 48_u8 +% (idx -% 26_u8);
+}
+
+fn push_prefix(buf: *mut col.DynBuf[u8], alloc: *mut AllocCap, kind: usize) -> !OutOfMemory {
+    if kind == 0_usize {
+        try buf.push_slice(alloc, "sym_".as_bytes());
+    } else if kind == 1_usize {
+        try buf.push_slice(alloc, "mod_".as_bytes());
+    } else if kind == 2_usize {
+        try buf.push_slice(alloc, "fn_".as_bytes());
+    } else if kind == 3_usize {
+        try buf.push_slice(alloc, "type_".as_bytes());
+    } else if kind == 4_usize {
+        try buf.push_slice(alloc, "var_".as_bytes());
+    } else if kind == 5_usize {
+        try buf.push_slice(alloc, "cfg_".as_bytes());
+    } else if kind == 6_usize {
+        try buf.push_slice(alloc, "ast_".as_bytes());
+    } else {
+        try buf.push_slice(alloc, "pkg_".as_bytes());
+    }
+    return;
+}
+
+fn sample_zipf(rng: *mut u64) -> u32 {
+    let r = rng_next(rng);
+    let tier = r & 255_u64;
+    if tier < 96_u64 {
+        return ((r >> 8_u64) & 127_u64).trunc.[u32]();
+    }
+    if tier < 168_u64 {
+        return 128_u32 +% ((r >> 8_u64) & 1023_u64).trunc.[u32]();
+    }
+    if tier < 216_u64 {
+        return 1152_u32 +% ((r >> 8_u64) & 4095_u64).trunc.[u32]();
+    }
+    return ((r >> 8_u64) & 32767_u64).trunc.[u32]();
+}
+
+fn run_pass1_events(
+    alloc: *mut AllocCap,
+    kb_slice: *[u8],
+    offs_slice: *[u32],
+    lens_slice: *[u32],
+    ev_slice: *[u32],
+    interner: *mut col.Interner,
+    sym_stats: *mut col.FlatMapU64,
+    pair_stats: *mut col.FlatMapU64,
+    checksum_in: u64,
+) -> u64 ! OutOfMemory | BoundsError {
+    var checksum = checksum_in;
+    var i: usize = 0_usize;
+    while i < ev_slice.len {
+        let key_idx = ev_slice[i].widen.[usize]();
+        if key_idx < offs_slice.len && key_idx < lens_slice.len {
+            let off = offs_slice[key_idx].widen.[usize]();
+            let len = lens_slice[key_idx].widen.[usize]();
+            let s = try kb_slice.sub(off, off +% len);
+
+            let sym_id = try interner.intern(alloc, s);
+            let sym_u64 = sym_id.widen.[u64]();
+            let iu = i.widen.[u64]();
+
+            checksum = (checksum ^ sym_u64) *% 0x100000001B3_u64;
+
+            let delta = (iu *% 3_u64) ^ 0x517CC1B727220A95_u64;
+            try sym_stats.upsert_add(alloc, sym_u64, delta, delta | 1_u64);
+
+            let k2 = (sym_u64 <<% 2_u64) | (iu & 3_u64);
+            let pdelta = (sym_u64 *% 0x9E3779B97F4A7C15_u64) ^ iu;
+            try pair_stats.upsert_add(alloc, k2, pdelta, pdelta);
+        }
+        i = i + 1_usize;
+    }
+    return checksum;
+}
+
+struct Pass2Res {
+    checksum: u64;
+    miss_count: u64;
+}
+
+fn run_pass2_probes(
+    kb_slice: *[u8],
+    offs_slice: *[u32],
+    lens_slice: *[u32],
+    pr_slice: *[u32],
+    interner: *col.Interner,
+    sym_stats: *col.FlatMapU64,
+    pair_stats: *col.FlatMapU64,
+    checksum_in: u64,
+) -> Pass2Res ! BoundsError {
+    var checksum = checksum_in;
+    var miss_count: u64 = 0_u64;
+    var p: usize = 0_usize;
+    while p < pr_slice.len {
+        let key_idx = pr_slice[p].widen.[usize]();
+        if key_idx < offs_slice.len && key_idx < lens_slice.len {
+            let off = offs_slice[key_idx].widen.[usize]();
+            let len = lens_slice[key_idx].widen.[usize]();
+            let s = try kb_slice.sub(off, off +% len);
+            let pu = p.widen.[u64]();
+
+            if let id = interner.lookup(s) {
+                let id_u64 = id.widen.[u64]();
+                let v1 = sym_stats.get(id_u64) orelse 0_u64;
+                let k2 = (id_u64 <<% 2_u64) | (pu & 3_u64);
+                let v2 = pair_stats.get(k2) orelse 0_u64;
+                checksum = (checksum ^ (v1 +% v2 +% id_u64)) *% 0x100000001B3_u64;
+            } else {
+                miss_count = miss_count +% 1_u64;
+                checksum = (checksum ^ (pu +% 0xFF_u64)) *% 0x100000001B3_u64;
+            }
+        }
+        p = p + 1_usize;
+    }
+    return Pass2Res.{ checksum: checksum, miss_count: miss_count };
+}
+
+fn run_pass3_delete_and_scan(
+    interner: *col.Interner,
+    sym_stats: *mut col.FlatMapU64,
+    pair_stats: *col.FlatMapU64,
+    checksum_in: u64,
+    miss_count: u64,
+) -> u64 {
+    var checksum = checksum_in;
+    let uniq_len = interner.len();
+    for id in 0_usize..uniq_len {
+        if (id & 3_usize) == 0_usize {
+            let rem = sym_stats.remove(id.widen.[u64]()) orelse 0_u64;
+            checksum = (checksum ^ rem) *% 0x100000001B3_u64;
+        }
+    }
+
+    for id in 0_usize..uniq_len {
+        let id_u32 = id.trunc.[u32]();
+        let id_u64 = id.widen.[u64]();
+        if let sbytes = interner.get(id_u32) {
+            if sbytes.len > 0_usize {
+                let first = sbytes[0_usize].widen.[u64]();
+                let last = sbytes[sbytes.len - 1_usize].widen.[u64]();
+                let meta = (sbytes.len.widen.[u64]() <<% 16_u64) | (first <<% 8_u64) | last;
+                checksum = (checksum ^ meta) *% 0x100000001B3_u64;
+            }
+        }
+        let sv = sym_stats.get(id_u64) orelse 0xA5A5_u64;
+        let pv = pair_stats.get((id_u64 <<% 2_u64) | (id_u64 & 3_u64)) orelse 0x5A5A_u64;
+        checksum = (checksum ^ sv ^ pv) *% 0x100000001B3_u64;
+    }
+
+    return checksum ^ (uniq_len.widen.[u64]() <<% 32_u64) ^ (sym_stats.len().widen.[u64]() <<% 16_u64) ^ miss_count;
+}
+
+pub fn main(env: *mut Env) -> i32 ! OutOfMemory | BoundsError {
+    let alloc = &mut env.alloc;
+    let num_unique: usize = 32768_usize;
+    let num_miss_keys: usize = 2048_usize;
+    let total_strings: usize = num_unique +% num_miss_keys;
+    let num_events: usize = 400000_usize;
+    let num_probes: usize = 100000_usize;
+
+    // 1. Pre-generate deterministic string corpus and Zipf-skewed event/probe streams (excluded from timer).
+    var key_bytes = try col.DynBuf.[u8].init(alloc, total_strings *% 28_usize);
+    errdefer key_bytes.destroy(alloc);
+    var key_offs = try Buf.[u32].init(alloc, total_strings);
+    errdefer key_offs.destroy(alloc);
+    var key_lens = try Buf.[u32].init(alloc, total_strings);
+    errdefer key_lens.destroy(alloc);
+
+    for k in 0_usize..total_strings {
+        let start = key_bytes.len();
+        let ku = k.widen.[u64]();
+        let h0 = splitmix64(ku ^ 0x9E3779B97F4A7C15_u64);
+        let h1 = splitmix64(h0);
+        try push_prefix(&mut key_bytes, alloc, k & 7_usize);
+
+        let body_len = 8_usize +% ((h0 >> 4_u64) & 15_u64).trunc.[usize]();
+        var s = h1;
+        for _j in 0_usize..body_len {
+            try key_bytes.push(alloc, alpha_char(s));
+            s = splitmix64(s +% 1_u64);
+        }
+        try key_bytes.push(alloc, 95_u8);
+        try key_bytes.push(alloc, hex_nibble(ku >> 16_u64));
+        try key_bytes.push(alloc, hex_nibble(ku >> 12_u64));
+        try key_bytes.push(alloc, hex_nibble(ku >> 8_u64));
+        try key_bytes.push(alloc, hex_nibble(ku >> 4_u64));
+        try key_bytes.push(alloc, hex_nibble(ku));
+
+        let end = key_bytes.len();
+        try key_offs.push(start.trunc.[u32]());
+        try key_lens.push((end -% start).trunc.[u32]());
+    }
+
+    var rng: u64 = 0x517CC1B727220A95_u64;
+    var events = try Buf.[u32].init(alloc, num_events);
+    errdefer events.destroy(alloc);
+    for i in 0_usize..num_events {
+        if i < 262144_usize && (i & 7_usize) == 0_usize {
+            let seq = i >> 3_usize;
+            let idx = ((seq *% 19937_usize +% 13_usize) & 32767_usize).trunc.[u32]();
+            try events.push(idx);
+        } else {
+            try events.push(sample_zipf(&mut rng));
+        }
+    }
+
+    var probes = try Buf.[u32].init(alloc, num_probes);
+    errdefer probes.destroy(alloc);
+    for _p in 0_usize..num_probes {
+        let r = rng_next(&mut rng);
+        if (r & 4_u64) == 0_u64 && ((r >> 3_u64) & 3_u64) == 0_u64 {
+            // ~12.5% guaranteed negative lookups
+            let midx = num_unique.trunc.[u32]() +% ((r >> 8_u64) & 2047_u64).trunc.[u32]();
+            try probes.push(midx);
+        } else {
+            try probes.push(sample_zipf(&mut rng));
+        }
+    }
+
+    let kb_slice = key_bytes.as_slice();
+    let offs_slice = key_offs.as_slice();
+    let lens_slice = key_lens.as_slice();
+    let ev_slice = events.as_slice();
+    let pr_slice = probes.as_slice();
+
+    // 2. Timed interning + HashMap insert/update/lookup/delete workload.
+    let t0 = rt.now_ns(&env.clock);
+
+    var interner = try col.Interner.init(alloc, 16_usize);
+    errdefer interner.destroy(alloc);
+    var sym_stats = try col.FlatMapU64.init(alloc, 16_usize);
+    errdefer sym_stats.destroy(alloc);
+    var pair_stats = try col.FlatMapU64.init(alloc, 16_usize);
+    errdefer pair_stats.destroy(alloc);
+
+    var checksum: u64 = 0xCBF29CE484222325_u64;
+    checksum = try run_pass1_events(alloc, kb_slice, offs_slice, lens_slice, ev_slice, &mut interner, &mut sym_stats, &mut pair_stats, checksum);
+    let p2 = try run_pass2_probes(kb_slice, offs_slice, lens_slice, pr_slice, &interner, &sym_stats, &pair_stats, checksum);
+    checksum = run_pass3_delete_and_scan(&interner, &mut sym_stats, &pair_stats, p2.checksum, p2.miss_count);
+
+    pair_stats.destroy(alloc);
+    sym_stats.destroy(alloc);
+    interner.destroy(alloc);
+
+    let elapsed_ns = rt.elapsed_since(&env.clock, t0);
+
+    probes.destroy(alloc);
+    events.destroy(alloc);
+    key_lens.destroy(alloc);
+    key_offs.destroy(alloc);
+    key_bytes.destroy(alloc);
+
+    if alloc.live_allocs() != 0_usize {
+        return 1_i32;
+    }
+
+    rt.print_str("RESULT hashmap_intern checksum=");
+    rt.print_u64(checksum);
+    rt.print_str(" elapsed_ns=");
+    rt.print_u64(elapsed_ns);
+    rt.print_nl();
+
+    return 0_i32;
+}

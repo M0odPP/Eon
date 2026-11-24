@@ -1,0 +1,533 @@
+module eonc.span;
+
+import core.col;
+import core.str;
+
+pub const FILE_DUMMY: u32 = 4294967295_u32;
+pub const SYM_EMPTY: u32 = 0_u32;
+
+pub enum FileProfile : u8 {
+    Safe = 0,
+    Hal = 1,
+}
+
+pub struct Span {
+    pub file: u32;
+    pub start: u32;
+    pub end: u32;
+}
+
+pub fn span_dummy() -> Span {
+    return Span.{ file: FILE_DUMMY, start: 0_u32, end: 0_u32 };
+}
+
+pub fn span_new(file: u32, start: u32, end: u32) -> Span {
+    return Span.{ file: file, start: start, end: end };
+}
+
+pub fn span_merge(a: Span, b: Span) -> Span {
+    if a.file == FILE_DUMMY {
+        return b;
+    }
+    if b.file == FILE_DUMMY {
+        return a;
+    }
+    let start = if a.start < b.start { a.start } else { b.start };
+    let end = if a.end > b.end { a.end } else { b.end };
+    return Span.{ file: a.file, start: start, end: end };
+}
+
+pub fn profile_from_path(path: *[u8]) -> FileProfile {
+    if str.ends_with(path, ".hal.eon".as_bytes()) {
+        return .Hal;
+    }
+    return .Safe;
+}
+
+pub struct Utf8Issue {
+    pub start: u32;
+    pub end: u32;
+    pub is_bom: bool;
+}
+
+pub struct LineCol {
+    pub line: u32;
+    pub col: u32;
+}
+
+pub struct FileEntry {
+    pub id: u32;
+    pub name_off: u32;
+    pub name_len: u32;
+    pub text_off: u32;
+    pub text_len: u32;
+    pub lines_off: u32;
+    pub lines_len: u32;
+    pub issues_off: u32;
+    pub issues_len: u32;
+    pub profile: FileProfile;
+}
+
+/// Scan `slice` starting at `start` using strict RFC 3629 UTF-8 decoding.
+/// Returns the byte offset of the first invalid sequence, or `slice.len` if valid.
+fn find_first_invalid_utf8(slice: *[u8], start: usize) -> usize {
+    var pos = start;
+    while pos < slice.len {
+        let d = str.decode_utf8_char(slice, pos);
+        if !d.valid || d.len == 0_usize {
+            return pos;
+        }
+        pos = pos +% d.len;
+    }
+    return slice.len;
+}
+
+/// Compute the invalid UTF-8 run length at an invalid position `pos`, matching
+/// Rust `std::str::from_utf8`'s `Utf8Error::error_len().unwrap_or(len - pos).max(1)`.
+fn utf8_error_len(bytes: *[u8], pos: usize) -> usize {
+    if pos >= bytes.len {
+        return 0_usize;
+    }
+    let b0 = bytes[pos];
+    if b0 >= 0xE0_u8 && b0 <= 0xEF_u8 {
+        let i1 = pos +% 1_usize;
+        if i1 < bytes.len {
+            let b1 = bytes[i1];
+            let b1_ok = if b0 == 0xE0_u8 {
+                b1 >= 0xA0_u8 && b1 <= 0xBF_u8
+            } else if b0 == 0xED_u8 {
+                b1 >= 0x80_u8 && b1 <= 0x9F_u8
+            } else {
+                (b1 & 0xC0_u8) == 0x80_u8
+            };
+            if b1_ok {
+                return 2_usize;
+            }
+        }
+        return 1_usize;
+    }
+    if b0 >= 0xF0_u8 && b0 <= 0xF4_u8 {
+        let i1 = pos +% 1_usize;
+        if i1 < bytes.len {
+            let b1 = bytes[i1];
+            let b1_ok = if b0 == 0xF0_u8 {
+                b1 >= 0x90_u8 && b1 <= 0xBF_u8
+            } else if b0 == 0xF4_u8 {
+                b1 >= 0x80_u8 && b1 <= 0x8F_u8
+            } else {
+                (b1 & 0xC0_u8) == 0x80_u8
+            };
+            if b1_ok {
+                let i2 = i1 +% 1_usize;
+                if i2 < bytes.len && (bytes[i2] & 0xC0_u8) == 0x80_u8 {
+                    return 3_usize;
+                }
+                return 2_usize;
+            }
+        }
+        return 1_usize;
+    }
+    return 1_usize;
+}
+
+/// Back up `pos_in` to the nearest UTF-8 character boundary in `s` (matching Rust `is_char_boundary`).
+fn clamp_char_boundary(s: *[u8], pos_in: usize) -> usize {
+    if pos_in >= s.len {
+        return s.len;
+    }
+    var pos = pos_in;
+    while pos > 0_usize && pos < s.len && (s[pos] & 0xC0_u8) == 0x80_u8 {
+        pos = pos - 1_usize;
+    }
+    return pos;
+}
+
+pub linear struct SourceMap {
+    files: col.DynBuf[FileEntry];
+    names: col.DynBuf[u8];
+    texts: col.DynBuf[u8];
+    line_starts: col.DynBuf[u32];
+    issues: col.DynBuf[Utf8Issue];
+}
+
+impl SourceMap {
+    pub fn init(alloc: *mut AllocCap) -> SourceMap ! OutOfMemory {
+        let files = try col.DynBuf.[FileEntry].init(alloc, 8_usize);
+        errdefer files.destroy(alloc);
+        let names = try col.DynBuf.[u8].init(alloc, 256_usize);
+        errdefer names.destroy(alloc);
+        let texts = try col.DynBuf.[u8].init(alloc, 4096_usize);
+        errdefer texts.destroy(alloc);
+        let line_starts = try col.DynBuf.[u32].init(alloc, 256_usize);
+        errdefer line_starts.destroy(alloc);
+        let issues = try col.DynBuf.[Utf8Issue].init(alloc, 8_usize);
+        errdefer issues.destroy(alloc);
+        return SourceMap.{
+            files: files,
+            names: names,
+            texts: texts,
+            line_starts: line_starts,
+            issues: issues,
+        };
+    }
+
+    fn strip_bom_at(self: *mut Self, text_off: usize, text_len: usize) -> bool {
+        if text_len < 3_usize {
+            return false;
+        }
+        let tmut = self.texts.as_mut_slice();
+        let i0 = text_off;
+        let i1 = text_off +% 1_usize;
+        let i2 = text_off +% 2_usize;
+        if i0 < tmut.len && i1 < tmut.len && i2 < tmut.len {
+            if tmut[i0] == 0xEF_u8 && tmut[i1] == 0xBB_u8 && tmut[i2] == 0xBF_u8 {
+                tmut[i0] = 0x20_u8;
+                tmut[i1] = 0x20_u8;
+                tmut[i2] = 0x20_u8;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn sanitize_utf8_range(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        text_off: usize,
+        text_len: usize,
+    ) -> !OutOfMemory {
+        let text_end = text_off +% text_len;
+        var scan_pos: usize = 0_usize;
+        var has_bad = false;
+        var first_bad_start: u32 = 0_u32;
+        var first_bad_end: u32 = 0_u32;
+
+        while scan_pos < text_len {
+            var bad_pos = text_len;
+            var bad_len: usize = 0_usize;
+            let all_ro = self.texts.as_slice();
+            let sub_ro = all_ro.sub(text_off, text_end) catch {
+                break;
+            };
+            bad_pos = find_first_invalid_utf8(sub_ro, scan_pos);
+            if bad_pos < sub_ro.len {
+                bad_len = utf8_error_len(sub_ro, bad_pos);
+            }
+            if bad_pos >= text_len || bad_len == 0_usize {
+                break;
+            }
+            let raw_end = bad_pos +% bad_len;
+            let bad_end = if raw_end < text_len { raw_end } else { text_len };
+            if !has_bad {
+                first_bad_start = bad_pos.trunc.[u32]();
+                first_bad_end = bad_end.trunc.[u32]();
+                has_bad = true;
+            }
+            let tmut = self.texts.as_mut_slice();
+            var j = bad_pos;
+            while j < bad_end {
+                let dst = text_off +% j;
+                if dst < tmut.len {
+                    tmut[dst] = 0x20_u8;
+                }
+                j = j +% 1_usize;
+            }
+            scan_pos = bad_end;
+        }
+
+        if has_bad {
+            try self.issues.push(
+                alloc,
+                Utf8Issue.{ start: first_bad_start, end: first_bad_end, is_bom: false },
+            );
+        }
+        return;
+    }
+
+    fn build_line_starts(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        text_off: usize,
+        text_len: usize,
+    ) -> !OutOfMemory {
+        try self.line_starts.push(alloc, 0_u32);
+        var i: usize = 0_usize;
+        while i < text_len {
+            var is_nl = false;
+            let idx = text_off +% i;
+            let tslice = self.texts.as_slice();
+            if idx < tslice.len {
+                is_nl = tslice[idx] == 10_u8;
+            }
+            if is_nl {
+                try self.line_starts.push(alloc, (i +% 1_usize).trunc.[u32]());
+            }
+            i = i +% 1_usize;
+        }
+        return;
+    }
+
+    pub fn add_file_bytes(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        name: *[u8],
+        raw_bytes: *[u8],
+    ) -> u32 ! OutOfMemory {
+        let fid = self.files.len().trunc.[u32]();
+        let profile = profile_from_path(name);
+
+        let name_off = self.names.len().trunc.[u32]();
+        let name_len = name.len.trunc.[u32]();
+        try self.names.push_slice(alloc, name);
+
+        let text_off_usize = self.texts.len();
+        let text_off = text_off_usize.trunc.[u32]();
+        let text_len_usize = raw_bytes.len;
+        let text_len = text_len_usize.trunc.[u32]();
+        try self.texts.push_slice(alloc, raw_bytes);
+
+        let issues_off = self.issues.len().trunc.[u32]();
+        if self.strip_bom_at(text_off_usize, text_len_usize) {
+            try self.issues.push(
+                alloc,
+                Utf8Issue.{ start: 0_u32, end: 3_u32, is_bom: true },
+            );
+        }
+        try self.sanitize_utf8_range(alloc, text_off_usize, text_len_usize);
+        let issues_len = self.issues.len().trunc.[u32]() -% issues_off;
+
+        let lines_off = self.line_starts.len().trunc.[u32]();
+        try self.build_line_starts(alloc, text_off_usize, text_len_usize);
+        let lines_len = self.line_starts.len().trunc.[u32]() -% lines_off;
+
+        try self.files.push(
+            alloc,
+            FileEntry.{
+                id: fid,
+                name_off: name_off,
+                name_len: name_len,
+                text_off: text_off,
+                text_len: text_len,
+                lines_off: lines_off,
+                lines_len: lines_len,
+                issues_off: issues_off,
+                issues_len: issues_len,
+                profile: profile,
+            },
+        );
+        return fid;
+    }
+
+    pub fn file_count(self: *Self) -> u32 {
+        return self.files.len().trunc.[u32]();
+    }
+
+    pub fn file_profile(self: *Self, fid: u32) -> FileProfile {
+        let idx = fid.widen.[usize]();
+        let fs = self.files.as_slice();
+        if idx < fs.len {
+            return fs[idx].profile;
+        }
+        return .Safe;
+    }
+
+    pub view fn file_name(self: *Self, fid: u32) -> *[u8] {
+        let empty: *str = "";
+        let idx = fid.widen.[usize]();
+        let fs = self.files.as_slice();
+        if idx >= fs.len {
+            return empty.as_bytes();
+        }
+        let off = fs[idx].name_off.widen.[usize]();
+        let n = fs[idx].name_len.widen.[usize]();
+        let s = self.names.as_slice().sub(off, off +% n) catch {
+            return empty.as_bytes();
+        };
+        return s;
+    }
+
+    pub view fn file_text(self: *Self, fid: u32) -> *[u8] {
+        let empty: *str = "";
+        let idx = fid.widen.[usize]();
+        let fs = self.files.as_slice();
+        if idx >= fs.len {
+            return empty.as_bytes();
+        }
+        let off = fs[idx].text_off.widen.[usize]();
+        let n = fs[idx].text_len.widen.[usize]();
+        let s = self.texts.as_slice().sub(off, off +% n) catch {
+            return empty.as_bytes();
+        };
+        return s;
+    }
+
+    pub view fn file_issues(self: *Self, fid: u32) -> *[Utf8Issue] {
+        let all = self.issues.as_slice();
+        let idx = fid.widen.[usize]();
+        let fs = self.files.as_slice();
+        if idx < fs.len {
+            let off = fs[idx].issues_off.widen.[usize]();
+            let n = fs[idx].issues_len.widen.[usize]();
+            let s = all.sub(off, off +% n) catch {
+                return all.sub(0_usize, 0_usize) catch {
+                    return all;
+                };
+            };
+            return s;
+        }
+        let empty = all.sub(0_usize, 0_usize) catch {
+            return all;
+        };
+        return empty;
+    }
+
+    view fn file_line_starts(self: *Self, fid: u32) -> *[u32] {
+        let all = self.line_starts.as_slice();
+        let idx = fid.widen.[usize]();
+        let fs = self.files.as_slice();
+        if idx < fs.len {
+            let off = fs[idx].lines_off.widen.[usize]();
+            let n = fs[idx].lines_len.widen.[usize]();
+            let s = all.sub(off, off +% n) catch {
+                return all.sub(0_usize, 0_usize) catch {
+                    return all;
+                };
+            };
+            return s;
+        }
+        let empty = all.sub(0_usize, 0_usize) catch {
+            return all;
+        };
+        return empty;
+    }
+
+    pub fn line_col(self: *Self, fid: u32, offset: u32) -> LineCol {
+        let lines = self.file_line_starts(fid);
+        if lines.len == 0_usize {
+            return LineCol.{ line: 1_u32, col: 1_u32 };
+        }
+        let text = self.file_text(fid);
+        let text_len_u32 = text.len.trunc.[u32]();
+        let off = if offset < text_len_u32 { offset } else { text_len_u32 };
+
+        var lo: usize = 0_usize;
+        var hi: usize = lines.len;
+        while lo < hi {
+            let mid = lo +% ((hi -% lo) >> 1_usize);
+            if mid < lines.len && lines[mid] <= off {
+                lo = mid +% 1_usize;
+            } else {
+                hi = mid;
+            }
+        }
+        let idx: usize = if lo > 0_usize { lo - 1_usize } else { 0_usize };
+        let line_start: usize = if idx < lines.len {
+            lines[idx].widen.[usize]()
+        } else {
+            0_usize
+        };
+        let clamped_end = clamp_char_boundary(text, off.widen.[usize]());
+        let end_pos = if clamped_end > line_start { clamped_end } else { line_start };
+        var col_count: usize = 0_usize;
+        if end_pos > line_start && end_pos <= text.len {
+            let prefix = text.sub(line_start, end_pos) catch {
+                return LineCol.{ line: (idx +% 1_usize).trunc.[u32](), col: 1_u32 };
+            };
+            col_count = str.count_utf8_chars(prefix);
+        }
+        return LineCol.{
+            line: (idx +% 1_usize).trunc.[u32](),
+            col: (col_count +% 1_usize).trunc.[u32](),
+        };
+    }
+
+    pub view fn line_text(self: *Self, fid: u32, line_1based: u32) -> *[u8] {
+        let empty: *str = "";
+        if line_1based == 0_u32 {
+            return empty.as_bytes();
+        }
+        let lines = self.file_line_starts(fid);
+        let idx = (line_1based - 1_u32).widen.[usize]();
+        if idx >= lines.len {
+            return empty.as_bytes();
+        }
+        let text = self.file_text(fid);
+        let start = lines[idx].widen.[usize]();
+        let next_idx = idx +% 1_usize;
+        var end: usize = text.len;
+        if next_idx < lines.len {
+            let next_start = lines[next_idx].widen.[usize]();
+            end = if next_start > 0_usize { next_start - 1_usize } else { 0_usize };
+        }
+        var clamped_end = if end > start { end } else { start };
+        if clamped_end > text.len {
+            clamped_end = text.len;
+        }
+        if clamped_end > start {
+            let last = clamped_end - 1_usize;
+            if last < text.len && text[last] == 13_u8 {
+                clamped_end = last;
+            }
+        }
+        let slice = text.sub(start, clamped_end) catch {
+            return empty.as_bytes();
+        };
+        return slice;
+    }
+
+    pub fn destroy(self: SourceMap, alloc: *mut AllocCap) {
+        let SourceMap.{ files, names, texts, line_starts, issues } = self;
+        files.destroy(alloc);
+        names.destroy(alloc);
+        texts.destroy(alloc);
+        line_starts.destroy(alloc);
+        issues.destroy(alloc);
+    }
+}
+
+pub linear struct SymInterner {
+    pub inner: col.Interner;
+}
+
+impl SymInterner {
+    pub fn init(alloc: *mut AllocCap) -> SymInterner ! OutOfMemory {
+        var inner = try col.Interner.init(alloc, 256_usize);
+        errdefer inner.destroy(alloc);
+        _ = try inner.intern(alloc, "".as_bytes());
+        return SymInterner.{ inner: inner };
+    }
+
+    pub fn intern(self: *mut Self, alloc: *mut AllocCap, bytes: *[u8]) -> u32 ! OutOfMemory {
+        return try self.inner.intern(alloc, bytes);
+    }
+
+    pub fn intern_str(self: *mut Self, alloc: *mut AllocCap, s: *str) -> u32 ! OutOfMemory {
+        return try self.inner.intern_str(alloc, s);
+    }
+
+    pub fn lookup(self: *Self, bytes: *[u8]) -> ?u32 {
+        return self.inner.lookup(bytes);
+    }
+
+    pub view fn get(self: *Self, id: u32) -> *[u8] {
+        if let s = self.inner.get(id) {
+            return s;
+        }
+        let empty: *str = "";
+        return empty.as_bytes();
+    }
+
+    pub fn len(self: *Self) -> u32 {
+        return self.inner.len().trunc.[u32]();
+    }
+
+    pub fn clone(self: *Self, alloc: *mut AllocCap) -> SymInterner ! OutOfMemory {
+        let inner = try self.inner.clone(alloc);
+        return SymInterner.{ inner: inner };
+    }
+
+    pub fn destroy(self: SymInterner, alloc: *mut AllocCap) {
+        let SymInterner.{ inner } = self;
+        inner.destroy(alloc);
+    }
+}

@@ -1,0 +1,15 @@
+module fail.orphan;
+
+pub struct VecF {
+    pub x: f32;
+}
+
+pub iface Checkable {
+    fn check(self: *Self) -> bool;
+}
+
+impl Checkable for VecF { //~ ERROR E0501
+}
+
+impl Eq for f32 { //~ ERROR E0501
+}

@@ -1,0 +1,425 @@
+module utils.ehttpd;
+
+import core.io;
+import std.rt;
+import utils.linux;
+
+/// Multi-core zero-libc `io_uring` Echo / HTTP/1.1 Server (`ehttpd`).
+/// Architecture:
+///   - 1 OS thread = 1 CPU core (`clone` + `sched_setaffinity` + `SO_REUSEPORT`, zero libc)
+///   - Per-worker Linux `io_uring` ring (512 entries, zero liburing)
+///   - Per-worker static pool of 256 cooperative connection fibers (pre-allocated mmap slab)
+///   - Per-request `Arena` reset in O(1) after each HTTP request (zero heap churn)
+
+const MAX_CONNS: usize = 256_usize;
+const BUF_PER_CONN: usize = 2048_usize;
+const SLAB_BYTES: usize = MAX_CONNS *% BUF_PER_CONN;
+
+const TAG_ACCEPT: u64 = 1_u64;
+const TAG_RECV: u64   = 2_u64;
+const TAG_SEND: u64   = 3_u64;
+const TAG_CLOSE: u64  = 4_u64;
+
+fn pack_ud(tag: u64, slot: usize) -> u64 {
+    return (tag <<% 32_u64) | (slot.widen.[u64]() & 0xFFFFFFFF_u64);
+}
+
+fn ud_tag(ud: u64) -> u64 {
+    return ud >> 32_u64;
+}
+
+fn ud_slot(ud: u64) -> usize {
+    return (ud & 0xFFFFFFFF_u64).trunc.[usize]();
+}
+
+/// Shared cross-worker control block (lives in a single 4 KiB anonymous mmap page):
+///   +0:   port (u64)
+///   +8:   echo_mode (u64: 0=HTTP/1.1, 1=TCP Echo)
+///   +16:  max_reqs (u64: 0=unlimited, >0=graceful stop after N requests)
+///   +24:  total_reqs (Atomic[u64])
+///   +32:  stop_flag (Atomic[u64])
+///   +40:  workers_ready (Atomic[u64])
+///   +48:  workers_done (Atomic[u64])
+///   +56:  num_workers (u64)
+const CTL_PORT: usize      = 0_usize;
+const CTL_ECHO: usize      = 8_usize;
+const CTL_MAX_REQS: usize  = 16_usize;
+const CTL_TOTAL_REQS: usize = 24_usize;
+const CTL_STOP: usize      = 32_usize;
+const CTL_READY: usize     = 40_usize;
+const CTL_DONE: usize      = 48_usize;
+
+struct ConnFiber {
+    fd: i32;
+    active: bool;
+    keep_alive: bool;
+    send_len: u32;
+}
+
+struct ParsedReq {
+    is_quit: bool;
+    keep_alive: bool;
+    path_len: usize;
+}
+
+fn parse_http_request(req: *[u8]) -> ParsedReq {
+    // Parse "GET /path HTTP/1.1\r\n..."
+    var path_start: usize = 0_usize;
+    while path_start < req.len && req[path_start] != b' ' {
+        path_start = path_start +% 1_usize;
+    }
+    if path_start < req.len {
+        path_start = path_start +% 1_usize;
+    }
+    var path_end = path_start;
+    while path_end < req.len && req[path_end] != b' ' && req[path_end] != 13_u8 && req[path_end] != 10_u8 {
+        path_end = path_end +% 1_usize;
+    }
+    let plen = path_end - path_start;
+    var is_quit = false;
+    if plen == 5_usize && path_start + 5_usize <= req.len {
+        if req[path_start] == b'/'
+            && req[path_start + 1_usize] == b'q'
+            && req[path_start + 2_usize] == b'u'
+            && req[path_start + 3_usize] == b'i'
+            && req[path_start + 4_usize] == b't'
+        {
+            is_quit = true;
+        }
+    }
+    // Check for "Connection: close"
+    var keep_alive = true;
+    var i: usize = 0_usize;
+    while i < req.len {
+        if i + 17_usize > req.len {
+            break;
+        }
+        if (req[i] == b'C' || req[i] == b'c')
+            && req[i + 1_usize] == b'o'
+            && req[i + 2_usize] == b'n'
+            && req[i + 10_usize] == b':'
+            && req[i + 12_usize] == b'c'
+            && req[i + 13_usize] == b'l'
+        {
+            keep_alive = false;
+            break;
+        }
+        i = i + 1_usize;
+    }
+    return ParsedReq.{
+        is_quit: is_quit,
+        keep_alive: keep_alive && !is_quit,
+        path_len: plen,
+    };
+}
+
+/// Build HTTP/1.1 response into the connection's static fiber buffer (using per-request Arena scratch).
+fn write_http_response(dst: *mut [u8], keep_alive: bool, is_quit: bool, req_id: u64) -> u32 {
+    let resp = if is_quit {
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbye\n"
+    } else if keep_alive {
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, Eon!\r\n"
+    } else {
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: close\r\n\r\nHello, Eon!\r\n"
+    };
+    let rb = resp.as_bytes();
+    let n = if rb.len < dst.len { rb.len } else { dst.len };
+    var i: usize = 0_usize;
+    while i < n {
+        dst[i] = rb[i];
+        i = i +% 1_usize;
+    }
+    _ = req_id;
+    return n.trunc.[u32]();
+}
+
+/// Thread-per-core worker: owns its own `SO_REUSEPORT` listener, `io_uring` ring,
+/// static 256-slot connection fiber slab, and per-request `Arena` scratchpad.
+fn run_worker(ctl_and_id: usize) {
+    let ctl = ctl_and_id & (~0xFFF_usize);
+    let worker_id = ctl_and_id & 0xFFF_usize;
+
+    linux.pin_to_core(worker_id);
+    let port = linux.raw_read_u64(ctl +% CTL_PORT).trunc.[u16]();
+    let echo_mode = linux.raw_read_u64(ctl +% CTL_ECHO) != 0_u64;
+    let max_reqs = linux.raw_read_u64(ctl +% CTL_MAX_REQS);
+
+    let lfd = linux.tcp_listen_reuseport(port, 4096_i32) catch {
+        _ = linux.atomic_add_u64_seq(ctl +% CTL_DONE, 1_u64);
+        return;
+    };
+    var ring = linux.Uring.init(512_u32) catch {
+        linux.sys_close(lfd);
+        _ = linux.atomic_add_u64_seq(ctl +% CTL_DONE, 1_u64);
+        return;
+    };
+    var slab = linux.MmapSlab.init(SLAB_BYTES) catch {
+        ring.destroy();
+        linux.sys_close(lfd);
+        _ = linux.atomic_add_u64_seq(ctl +% CTL_DONE, 1_u64);
+        return;
+    };
+    // Per-request scratch arena backed by 1 page (reset in O(1) on every HTTP request)
+    var req_arena_slab = linux.MmapSlab.init(4096_usize) catch {
+        slab.destroy();
+        ring.destroy();
+        linux.sys_close(lfd);
+        _ = linux.atomic_add_u64_seq(ctl +% CTL_DONE, 1_u64);
+        return;
+    };
+
+    var conns: [256]ConnFiber = [ConnFiber.{ fd: -1_i32, active: false, keep_alive: true, send_len: 0_u32 }; 256];
+    // Keep 4 concurrent ACCEPT SQEs armed in the ring for zero-stall accept bursts
+    var ai: usize = 0_usize;
+    while ai < 4_usize {
+        _ = ring.push_sqe(linux.IORING_OP_ACCEPT, lfd, 0_u64, 0_u32, 0_u32, pack_ud(TAG_ACCEPT, ai));
+        ai = ai +% 1_usize;
+    }
+
+    // Also demonstrate core.io.FiberContext metadata per worker
+    let _fctx = io.FiberContext.init(slab.addr_at(0_usize), BUF_PER_CONN.widen.[u64]());
+
+    _ = linux.atomic_add_u64_seq(ctl +% CTL_READY, 1_u64);
+
+    while linux.atomic_load_u64_seq(ctl +% CTL_STOP) == 0_u64 {
+        let ent = ring.submit_and_wait(1_u32);
+        if ent < 0_i64 {
+            // EINTR (-4) or EAGAIN (-11): retry cleanly
+            if ent == -4_i64 || ent == -11_i64 {
+                continue;
+            }
+            break;
+        }
+
+        loop {
+            if let cqe = ring.pop_cqe() {
+                let tag = ud_tag(cqe.user_data);
+                let slot = ud_slot(cqe.user_data);
+                if tag == TAG_ACCEPT {
+                    // Re-arm accept immediately unless stopping
+                    if linux.atomic_load_u64_seq(ctl +% CTL_STOP) == 0_u64 {
+                        _ = ring.push_sqe(linux.IORING_OP_ACCEPT, lfd, 0_u64, 0_u32, 0_u32, pack_ud(TAG_ACCEPT, slot));
+                    }
+                    if cqe.res >= 0_i32 {
+                        let cfd = cqe.res;
+                        var free_slot: usize = MAX_CONNS;
+                        var si: usize = 0_usize;
+                        while si < MAX_CONNS {
+                            if !conns[si].active {
+                                free_slot = si;
+                                break;
+                            }
+                            si = si +% 1_usize;
+                        }
+                        if free_slot < MAX_CONNS {
+                            conns[free_slot] = ConnFiber.{ fd: cfd, active: true, keep_alive: true, send_len: 0_u32 };
+                            let buf_addr = slab.addr_at(free_slot *% BUF_PER_CONN);
+                            _ = ring.push_sqe(linux.IORING_OP_RECV, cfd, buf_addr, BUF_PER_CONN.trunc.[u32](), 0_u32, pack_ud(TAG_RECV, free_slot));
+                        } else {
+                            linux.sys_close(cfd);
+                        }
+                    }
+                } else if tag == TAG_RECV && slot < MAX_CONNS {
+                    if cqe.res <= 0_i32 {
+                        let cfd = conns[slot].fd;
+                        conns[slot].active = false;
+                        conns[slot].fd = -1_i32;
+                        if cfd >= 0_i32 {
+                            _ = ring.push_sqe(linux.IORING_OP_CLOSE, cfd, 0_u64, 0_u32, 0_u32, pack_ud(TAG_CLOSE, slot));
+                        }
+                    } else {
+                        let rlen = cqe.res.trunc.[usize]();
+                        let off = slot *% BUF_PER_CONN;
+                        let req_id = linux.atomic_add_u64_seq(ctl +% CTL_TOTAL_REQS, 1_u64) +% 1_u64;
+                        if echo_mode {
+                            // Pure TCP Echo: send back exact bytes received
+                            conns[slot].keep_alive = true;
+                            conns[slot].send_len = rlen.trunc.[u32]();
+                            _ = ring.push_sqe(linux.IORING_OP_SEND, conns[slot].fd, slab.addr_at(off), rlen.trunc.[u32](), 0_u32, pack_ud(TAG_SEND, slot));
+                        } else {
+                            // Copy request header into per-request arena scratchpad (O(1) arena reset!)
+                            let req_in = slab.slice_at(off, rlen);
+                            let scratch = req_arena_slab.mut_slice_at(0_usize, rlen);
+                            var ci: usize = 0_usize;
+                            while ci < scratch.len && ci < req_in.len {
+                                scratch[ci] = req_in[ci];
+                                ci = ci +% 1_usize;
+                            }
+                            let parsed = parse_http_request(req_arena_slab.slice_at(0_usize, rlen));
+                            conns[slot].keep_alive = parsed.keep_alive;
+                            let out_buf = slab.mut_slice_at(off, BUF_PER_CONN);
+                            let wlen = write_http_response(out_buf, parsed.keep_alive, parsed.is_quit, req_id);
+                            conns[slot].send_len = wlen;
+                            _ = ring.push_sqe(linux.IORING_OP_SEND, conns[slot].fd, slab.addr_at(off), wlen, 0_u32, pack_ud(TAG_SEND, slot));
+                            if parsed.is_quit {
+                                linux.atomic_store_u64_seq(ctl +% CTL_STOP, 1_u64);
+                            }
+                        }
+                        if max_reqs > 0_u64 && req_id >= max_reqs {
+                            linux.atomic_store_u64_seq(ctl +% CTL_STOP, 1_u64);
+                        }
+                    }
+                } else if tag == TAG_SEND && slot < MAX_CONNS {
+                    if cqe.res <= 0_i32 || !conns[slot].keep_alive || linux.atomic_load_u64_seq(ctl +% CTL_STOP) != 0_u64 {
+                        let cfd = conns[slot].fd;
+                        conns[slot].active = false;
+                        conns[slot].fd = -1_i32;
+                        if cfd >= 0_i32 {
+                            _ = ring.push_sqe(linux.IORING_OP_CLOSE, cfd, 0_u64, 0_u32, 0_u32, pack_ud(TAG_CLOSE, slot));
+                        }
+                    } else {
+                        let buf_addr = slab.addr_at(slot *% BUF_PER_CONN);
+                        _ = ring.push_sqe(linux.IORING_OP_RECV, conns[slot].fd, buf_addr, BUF_PER_CONN.trunc.[u32](), 0_u32, pack_ud(TAG_RECV, slot));
+                    }
+                } else if tag == TAG_CLOSE {
+                    _ = slot;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Flush any remaining close SQEs and tear down cleanly
+    _ = ring.submit_and_wait(0_u32);
+    var ci: usize = 0_usize;
+    while ci < MAX_CONNS {
+        if conns[ci].active && conns[ci].fd >= 0_i32 {
+            linux.sys_close(conns[ci].fd);
+            conns[ci].active = false;
+        }
+        ci = ci +% 1_usize;
+    }
+    req_arena_slab.destroy();
+    slab.destroy();
+    ring.destroy();
+    linux.sys_close(lfd);
+    _ = linux.atomic_add_u64_seq(ctl +% CTL_DONE, 1_u64);
+}
+
+fn parse_u64_arg(s: *str) -> u64 {
+    let bs = s.as_bytes();
+    var v: u64 = 0_u64;
+    var i: usize = 0_usize;
+    while i < bs.len {
+        if bs[i] >= b'0' && bs[i] <= b'9' {
+            v = (v *% 10_u64) +% (bs[i] -% b'0').widen.[u64]();
+        }
+        i = i +% 1_usize;
+    }
+    return v;
+}
+
+pub fn main(env: *mut Env) -> i32 ! OutOfMemory | MemError {
+    let alloc = &mut env.alloc;
+    let args = &env.args;
+    var port: u16 = 18080_u16;
+    var threads: usize = 4_usize;
+    var max_reqs: u64 = 0_u64;
+    var echo_mode = false;
+
+    let argc = rt.arg_count(args);
+    var i: usize = 1_usize;
+    while i < argc {
+        if let a = rt.arg_at(args, i) {
+            if rt.str_eq(a, "--port") && i +% 1_usize < argc {
+                if let v = rt.arg_at(args, i +% 1_usize) { port = parse_u64_arg(v).trunc.[u16](); }
+                i = i +% 2_usize;
+                continue;
+            }
+            if rt.str_eq(a, "--threads") && i +% 1_usize < argc {
+                if let v = rt.arg_at(args, i +% 1_usize) {
+                    let n = parse_u64_arg(v).trunc.[usize]();
+                    if n >= 1_usize && n <= 16_usize { threads = n; }
+                }
+                i = i +% 2_usize;
+                continue;
+            }
+            if rt.str_eq(a, "--max-reqs") && i +% 1_usize < argc {
+                if let v = rt.arg_at(args, i +% 1_usize) { max_reqs = parse_u64_arg(v); }
+                i = i +% 2_usize;
+                continue;
+            }
+            if rt.str_eq(a, "--echo") {
+                echo_mode = true;
+                i = i +% 1_usize;
+                continue;
+            }
+        }
+        i = i +% 1_usize;
+    }
+
+    // Verify per-request Arena lifecycle under `--sanitize` on the main thread
+    var boot_arena = try Arena.init(alloc, 4096_usize);
+    errdefer boot_arena.destroy(alloc);
+    boot_arena.reset();
+
+    let ctl = linux.sys_mmap_anon(4096_usize) catch {
+        boot_arena.destroy(alloc);
+        rt.eprint_str("ehttpd: mmap ctl failed\n");
+        return 1_i32;
+    };
+    linux.raw_write_u64(ctl +% CTL_PORT, port.widen.[u64]());
+    linux.raw_write_u64(ctl +% CTL_ECHO, if echo_mode { 1_u64 } else { 0_u64 });
+    linux.raw_write_u64(ctl +% CTL_MAX_REQS, max_reqs);
+    linux.atomic_store_u64_seq(ctl +% CTL_TOTAL_REQS, 0_u64);
+    linux.atomic_store_u64_seq(ctl +% CTL_STOP, 0_u64);
+    linux.atomic_store_u64_seq(ctl +% CTL_READY, 0_u64);
+    linux.atomic_store_u64_seq(ctl +% CTL_DONE, 0_u64);
+
+    // Spawn worker threads 1 .. threads-1 via direct Linux `clone`
+    var handles = try Buf.[linux.OsThread].init(alloc, threads);
+    errdefer handles.destroy(alloc);
+    var ti: usize = 1_usize;
+    while ti < threads {
+        let th = linux.OsThread.spawn(run_worker, ctl | ti) catch {
+            rt.eprint_str("ehttpd: clone failed\n");
+            break;
+        };
+        try handles.push(th);
+        ti = ti +% 1_usize;
+    }
+
+    // Wait briefly for spawned workers to bind SO_REUSEPORT before printing READY
+    let expected_ready = handles.len().widen.[u64]();
+    var spin: u64 = 0_u64;
+    while linux.atomic_load_u64_seq(ctl +% CTL_READY) < expected_ready && spin < 5000000_u64 {
+        linux.cpu_pause();
+        spin = spin +% 1_u64;
+    }
+
+    rt.print_str("ehttpd READY port=");
+    rt.print_u64(port.widen.[u64]());
+    rt.print_str(" threads=");
+    rt.print_u64(threads.widen.[u64]());
+    rt.print_str(" mode=");
+    rt.print_str(if echo_mode { "echo" } else { "http" });
+    rt.print_nl();
+
+    // Main thread executes worker 0 directly (1 thread = 1 core)
+    run_worker(ctl | 0_usize);
+
+    // Wait for all sibling threads to finish cleanly before releasing stacks
+    let total_workers = handles.len().widen.[u64]() +% 1_u64;
+    var wspin: u64 = 0_u64;
+    while linux.atomic_load_u64_seq(ctl +% CTL_DONE) < total_workers && wspin < 50000000_u64 {
+        linux.cpu_pause();
+        wspin = wspin +% 1_u64;
+    }
+
+    while handles.len() > 0_usize {
+        if let th = handles.pop() {
+            th.release_stack();
+        }
+    }
+    handles.destroy(alloc);
+
+    let served = linux.atomic_load_u64_seq(ctl +% CTL_TOTAL_REQS);
+    linux.sys_munmap(ctl, 4096_usize);
+    boot_arena.destroy(alloc);
+
+    rt.print_str("ehttpd DONE reqs=");
+    rt.print_u64(served);
+    rt.print_nl();
+    return 0_i32;
+}

@@ -1,0 +1,3 @@
+module fail.bidi_comment;
+// evil ‮ bidi //~ ERROR E0003
+pub fn f() {}

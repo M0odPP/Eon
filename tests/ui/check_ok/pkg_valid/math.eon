@@ -1,0 +1,10 @@
+module pkg.math;
+
+pub struct Vec2 {
+    pub x: i32;
+    pub y: i32;
+}
+
+pub fn dot(a: Vec2, b: Vec2) -> i32 {
+    return (a.x *% b.x) +% (a.y *% b.y);
+}

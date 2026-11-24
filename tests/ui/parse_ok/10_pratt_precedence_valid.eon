@@ -1,0 +1,39 @@
+module tests.pratt_precedence;
+
+import core.mem;
+import ui.core as uic;
+import kernel.pmm.{PhysPage, PhysAddr as PAddr,};
+
+pub enum Ordering : u8 {
+    Relaxed = 0,
+    Acquire = 1,
+    Release = 2,
+    AcqRel,
+    SeqCst,
+}
+
+pub type AlignedBuf[T, comptime N: usize] where N > 0_usize = [N]T;
+
+pub fn pratt_valid(a: u32, b: u32, c: u32, ev: UiEvent) -> u32 {
+    let x = ((a & 0xFF_u32) == 0_u32) && ((b | c) != 0_u32);
+    let y = (a << 2_u32) + b * c;
+    let z = a <<% 3_u32 | (b ^ 0x0F_u32);
+    let q = (a < b) || (x && (b <= c));
+    let m = if q { y +% z } else { y -% z };
+
+    let is_quit = ev is .Quit;
+    let tag = match ev {
+        .MouseMove(p) if p.x > 0.0_f32 => 1_u32,
+        .KeyDown(code) => {
+            let masked = code & 0xFF_u32;
+            masked
+        }
+        .Resize(.{ w, h: _ }) => w,
+        _ => if is_quit { 0_u32 } else { 2_u32 },
+    };
+
+    run_cb(|| { return; });
+    run_cb2(|v: u32, w| { v +% w });
+
+    return m +| tag;
+}

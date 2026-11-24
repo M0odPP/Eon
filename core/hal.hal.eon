@@ -1,0 +1,53 @@
+module core.hal @hal;
+
+pub struct DmaBuf {
+    pub phys: PhysAddr;
+    pub virt: VirtAddr;
+    pub dma: DmaAddr;
+    pub len: usize;
+}
+
+pub fn phys_align_up(addr: PhysAddr, align: u64) -> PhysAddr {
+    if align <= 1_u64 {
+        return addr;
+    }
+    let mask = align -% 1_u64;
+    let raw_v = (addr.as_u64() +% mask) & (~mask);
+    return PhysAddr.from_usize(raw_v.trunc.[usize]());
+}
+
+pub fn phys_align_down(addr: PhysAddr, align: u64) -> PhysAddr {
+    if align <= 1_u64 {
+        return addr;
+    }
+    let mask = align -% 1_u64;
+    let raw_v = addr.as_u64() & (~mask);
+    return PhysAddr.from_usize(raw_v.trunc.[usize]());
+}
+
+pub fn virt_page_offset(addr: VirtAddr) -> u64 {
+    return addr.as_u64() & 0xFFF_u64;
+}
+
+pub fn dma_barrier_to_device(buf: *DmaBuf) {
+    let _ = buf.len;
+    comptime if @target_arch() == .X86_64 {
+        // x86_64 DMA is cache-coherent; compiler + SeqCst fence suffices.
+        let fence = Atomic.[u32].new(0_u32);
+        fence.store(1_u32, .SeqCst);
+    } else {
+        let fence = Atomic.[u32].new(0_u32);
+        fence.store(1_u32, .SeqCst);
+    }
+}
+
+pub fn dma_barrier_from_device(buf: *mut DmaBuf) {
+    let _ = buf.len;
+    let fence = Atomic.[u32].new(0_u32);
+    let _ = fence.load(.SeqCst);
+}
+
+pub fn mmio_barrier() {
+    let fence = Atomic.[u32].new(0_u32);
+    fence.store(0_u32, .SeqCst);
+}

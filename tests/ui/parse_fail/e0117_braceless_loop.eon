@@ -1,0 +1,4 @@
+module fail.braceless_loop;
+pub fn f() {
+    loop break; //~ ERROR E0117
+}

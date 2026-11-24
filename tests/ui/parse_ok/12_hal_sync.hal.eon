@@ -1,0 +1,20 @@
+module core.sync @hal;
+
+pub linear struct SpinGuard[T] {
+    lock: rawptr_mut[SpinLock[T]];
+}
+
+impl[T] SpinGuard[T] {
+    pub view fn get_mut(self: *mut Self) -> *mut T {
+        raw {
+            return &mut self.lock.data;
+        }
+    }
+
+    pub fn unlock(self: SpinGuard[T]) {
+        let SpinGuard.{ lock } = self;
+        raw {
+            lock.flag.store(false, .Release);
+        }
+    }
+}

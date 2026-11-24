@@ -1,0 +1,835 @@
+module bench.json_dom;
+
+import core.mem;
+import core.str;
+import std.rt;
+
+pub error JsonError {
+    UnexpectedEof,
+    UnexpectedToken,
+    InvalidEscape,
+    InvalidNumber,
+    TrailingData,
+    DepthLimit,
+}
+
+pub enum JsonKind : u8 {
+    Null = 0,
+    Bool = 1,
+    Int = 2,
+    Str = 3,
+    Array = 4,
+    Object = 5,
+}
+
+/// Compact 16-byte 2-column Pre-Order Tape SoA DOM pool:
+/// - `meta`: `kind:3 | key_len:20 | key_start:33 | key_first_byte:8`
+/// - `payload`: Int value / Str `(first<<8|last):16 | start:24 | len:24` / Container `end_idx:32 | child_count:32`
+pub pool JsonNode {
+    pub meta: u64;
+    pub payload: u64;
+}
+
+pub struct StrSpan {
+    pub start: u32;
+    pub len: u32;
+}
+
+pub struct ParserState {
+    pub pos: usize;
+    pub depth: u32;
+}
+
+fn next_u64(state: *mut u64) -> u64 {
+    var x = state.*;
+    x = x ^ (x <<% 13_u64);
+    x = x ^ (x >> 7_u64);
+    x = x ^ (x <<% 17_u64);
+    state.* = x;
+    return x;
+}
+
+fn push_gen_string(alloc: *mut AllocCap, out: *mut str.StrBuf, rng: *mut u64, with_escapes: bool) -> !OutOfMemory {
+    try out.push_byte_grow(alloc, b'"');
+    let n = 6_usize +% (next_u64(rng) % 18_u64).trunc.[usize]();
+    var i: usize = 0_usize;
+    while i < n {
+        let v = (next_u64(rng) % 64_u64).trunc.[u8]();
+        if with_escapes && v == 0_u8 {
+            try out.push_str_grow(alloc, "\\\"");
+        } else if with_escapes && v == 1_u8 {
+            try out.push_str_grow(alloc, "\\\\");
+        } else if with_escapes && v == 2_u8 {
+            try out.push_str_grow(alloc, "\\n");
+        } else if with_escapes && v == 3_u8 {
+            try out.push_str_grow(alloc, "\\t");
+        } else {
+            let c = v % 36_u8;
+            if c < 26_u8 {
+                try out.push_byte_grow(alloc, b'a' +% c);
+            } else {
+                try out.push_byte_grow(alloc, b'0' +% (c -% 26_u8));
+            }
+        }
+        i = i +% 1_usize;
+    }
+    try out.push_byte_grow(alloc, b'"');
+    return;
+}
+
+fn generate_json_doc(alloc: *mut AllocCap, num_records: usize) -> str.StrBuf ! OutOfMemory {
+    var out = try str.StrBuf.init(alloc, num_records *% 620_usize +% 128_usize);
+    errdefer out.destroy(alloc);
+    var rng: u64 = 0x123456789ABCDEF0_u64;
+
+    try out.push_str_grow(alloc, "{\"version\": 2, \"generator\": \"eon-bench-01\", \"records\": [\n");
+    var r: usize = 0_usize;
+    while r < num_records {
+        if r > 0_usize {
+            try out.push_str_grow(alloc, ",\n");
+        }
+        try out.push_str_grow(alloc, "  {\"id\": ");
+        try out.push_u64_grow(alloc, r.widen.[u64]());
+        try out.push_str_grow(alloc, ", \"active\": ");
+        if (next_u64(&mut rng) & 1_u64) == 0_u64 {
+            try out.push_str_grow(alloc, "true");
+        } else {
+            try out.push_str_grow(alloc, "false");
+        }
+        try out.push_str_grow(alloc, ", \"tag\": ");
+        try push_gen_string(alloc, &mut out, &mut rng, true);
+
+        try out.push_str_grow(alloc, ", \"score\": ");
+        let score = (next_u64(&mut rng) % 1000000001_u64).bitcast.[i64]() -% 500000000_i64;
+        try out.push_i64_grow(alloc, score);
+
+        try out.push_str_grow(alloc, ", \"meta\": {\"zone\": ");
+        try push_gen_string(alloc, &mut out, &mut rng, false);
+        try out.push_str_grow(alloc, ", \"flags\": [");
+        var fi: usize = 0_usize;
+        while fi < 4_usize {
+            if fi > 0_usize {
+                try out.push_str_grow(alloc, ", ");
+            }
+            let fv = next_u64(&mut rng) % 3_u64;
+            if fv == 0_u64 {
+                try out.push_str_grow(alloc, "true");
+            } else if fv == 1_u64 {
+                try out.push_str_grow(alloc, "false");
+            } else {
+                try out.push_str_grow(alloc, "null");
+            }
+            fi = fi +% 1_usize;
+        }
+        try out.push_str_grow(alloc, "], \"counts\": [");
+        var ci: usize = 0_usize;
+        while ci < 6_usize {
+            if ci > 0_usize {
+                try out.push_str_grow(alloc, ", ");
+            }
+            let cv = (next_u64(&mut rng) % 200001_u64).bitcast.[i64]() -% 100000_i64;
+            try out.push_i64_grow(alloc, cv);
+            ci = ci +% 1_usize;
+        }
+        try out.push_str_grow(alloc, "]}, \"items\": [");
+        let n_items = 2_usize +% (next_u64(&mut rng) % 3_u64).trunc.[usize]();
+        var ii: usize = 0_usize;
+        while ii < n_items {
+            if ii > 0_usize {
+                try out.push_str_grow(alloc, ", ");
+            }
+            try out.push_str_grow(alloc, "{\"k\": ");
+            try push_gen_string(alloc, &mut out, &mut rng, false);
+            try out.push_str_grow(alloc, ", \"v\": ");
+            let iv = (next_u64(&mut rng) % 2000001_u64).bitcast.[i64]() -% 1000000_i64;
+            try out.push_i64_grow(alloc, iv);
+            try out.push_str_grow(alloc, ", \"ok\": ");
+            if (next_u64(&mut rng) & 1_u64) == 0_u64 {
+                try out.push_str_grow(alloc, "true");
+            } else {
+                try out.push_str_grow(alloc, "false");
+            }
+            try out.push_str_grow(alloc, ", \"note\": ");
+            try push_gen_string(alloc, &mut out, &mut rng, true);
+            try out.push_byte_grow(alloc, b'}');
+            ii = ii +% 1_usize;
+        }
+        try out.push_str_grow(alloc, "], \"extra\": [");
+        let e0 = (next_u64(&mut rng) % 99991_u64).bitcast.[i64]();
+        try out.push_i64_grow(alloc, e0);
+        try out.push_str_grow(alloc, ", ");
+        try push_gen_string(alloc, &mut out, &mut rng, true);
+        try out.push_str_grow(alloc, ", null, [");
+        let e1 = (next_u64(&mut rng) % 65536_u64).bitcast.[i64]() -% 32768_i64;
+        let e2 = (next_u64(&mut rng) % 65536_u64).bitcast.[i64]() -% 32768_i64;
+        try out.push_i64_grow(alloc, e1);
+        try out.push_str_grow(alloc, ", ");
+        try out.push_i64_grow(alloc, e2);
+        try out.push_str_grow(alloc, "]]}");
+        r = r +% 1_usize;
+    }
+    try out.push_str_grow(alloc, "\n]}\n");
+    return out;
+}
+
+@inline
+fn load_u8x32_at(src: *[u8], p: usize) -> u8x32
+    where p + 32_usize <= src.len
+{
+    return .{
+        src[p], src[p + 1_usize], src[p + 2_usize], src[p + 3_usize],
+        src[p + 4_usize], src[p + 5_usize], src[p + 6_usize], src[p + 7_usize],
+        src[p + 8_usize], src[p + 9_usize], src[p + 10_usize], src[p + 11_usize],
+        src[p + 12_usize], src[p + 13_usize], src[p + 14_usize], src[p + 15_usize],
+        src[p + 16_usize], src[p + 17_usize], src[p + 18_usize], src[p + 19_usize],
+        src[p + 20_usize], src[p + 21_usize], src[p + 22_usize], src[p + 23_usize],
+        src[p + 24_usize], src[p + 25_usize], src[p + 26_usize], src[p + 27_usize],
+        src[p + 28_usize], src[p + 29_usize], src[p + 30_usize], src[p + 31_usize],
+    };
+}
+
+@inline
+fn scan_str_simd_pinned(
+    src: *[u8],
+    pos0: usize,
+    v_quote: u8x32,
+    v_bslash: u8x32,
+    v_e0: u8x32,
+    v_zero: u8x32,
+) -> usize {
+    var pos = pos0;
+    while pos < src.len {
+        var hit = pos;
+        if src.len >= 32_usize && pos <= src.len - 32_usize {
+            let v = load_u8x32_at(src, pos);
+            let qm = v.cmpeq(v_quote).bitmask();
+            let bm = v.cmpeq(v_bslash).bitmask()
+                | (v & v_e0).cmpeq(v_zero).bitmask();
+            let m = qm | bm;
+            if m == 0_u64 {
+                pos = pos +% 32_usize;
+                continue;
+            }
+            let low_m = m & (0_u64 -% m);
+            let off = (@tzcnt(m) & 31_u64).trunc.[usize]();
+            if (qm & low_m) != 0_u64 {
+                return pos +% off;
+            }
+            hit = pos + off;
+        }
+        if hit >= src.len {
+            return src.len;
+        }
+        let sc = src[hit];
+        if sc == b'"' {
+            return hit;
+        }
+        if sc == b'\\' {
+            let np = hit + 1_usize;
+            if np >= src.len {
+                return src.len;
+            }
+            let esc = src[np];
+            if esc != b'"' && esc != b'\\' && esc != b'/' && esc != b'b'
+                && esc != b'f' && esc != b'n' && esc != b'r' && esc != b't'
+            {
+                return src.len +% 1_usize;
+            }
+            pos = np + 1_usize;
+            continue;
+        }
+        if sc < 0x20_u8 {
+            return src.len +% 2_usize;
+        }
+        pos = hit + 1_usize;
+    }
+    return src.len;
+}
+
+@inline
+fn read_str_pair(src: *[u8], sstart: usize, send: usize) -> u64 {
+    if send > sstart && sstart < src.len && send <= src.len {
+        let slast = send - 1_usize;
+        return (src[sstart].widen.[u64]() <<% 8_u64) | src[slast].widen.[u64]();
+    }
+    return 0_u64;
+}
+
+@inline
+fn skip_ws_fast(src: *[u8], p0: usize) -> usize {
+    var p = p0;
+    while p < src.len {
+        let wb = src[p];
+        if wb > b' ' {
+            break;
+        }
+        if wb != b' ' && wb != b'\t' && wb != b'\n' && wb != b'\r' {
+            break;
+        }
+        p = p + 1_usize;
+    }
+    return p;
+}
+
+@inline
+fn skip_sep_ws(src: *[u8], p0: usize) -> usize {
+    var p = p0;
+    if p < src.len && src[p] == b' ' {
+        p = p + 1_usize;
+    }
+    if p < src.len && src[p] <= b' ' {
+        p = skip_ws_fast(src, p);
+    }
+    return p;
+}
+
+/// Zero-call, 2-column 16-byte Pre-Order Tape JSON DOM parser (pinned YMM0..YMM3, 2-loop TAGE-isolated!).
+/// Zero `first_child`/`next_sibling`/`parent` columns -> 2 sequential `u64` stores per node!
+fn parse_json_doc(
+    src: *[u8],
+    nodes: *mut ArenaPool[JsonNode],
+) -> Id[nodes] ! JsonError | MemError | BoundsError {
+    let v_quote = u8x32.splat(b'"');
+    let v_bslash = u8x32.splat(b'\\');
+    let v_e0 = u8x32.splat(0xE0_u8);
+    let v_zero = u8x32.splat(0_u8);
+
+    var pos = skip_ws_fast(src, 0_usize);
+    if pos >= src.len {
+        return .UnexpectedEof;
+    }
+    let root_ch = src[pos];
+    if root_ch != b'{' && root_ch != b'[' {
+        return .UnexpectedToken;
+    }
+    let root_is_obj = root_ch == b'{';
+    pos = pos + 1_usize;
+    let root = try nodes.push(.{
+        meta: if root_is_obj { 5_u64 } else { 4_u64 },
+        payload: 1_u64 <<% 32_u64,
+    });
+
+    pos = skip_ws_fast(src, pos);
+    let root_close = if root_is_obj { b'}' } else { b']' };
+    if pos < src.len && src[pos] == root_close {
+        pos = skip_ws_fast(src, pos + 1_usize);
+        if pos != src.len {
+            return .TrailingData;
+        }
+        return root;
+    }
+
+    // Stack of open containers: `st_meta[d] = (open_idx << 32) | parent_cnt` (only touched on container open/close!)
+    var st_open: [64]u64 = [0_u64; 64];
+    var obj_mask: u64 = if root_is_obj { 1_u64 } else { 0_u64 };
+    var depth: usize = 1_usize;
+    var cur_open_idx: u32 = 0_u32;
+    var cur_cnt: u32 = 0_u32;
+    var in_obj: bool = root_is_obj;
+
+    loop {
+        if in_obj {
+            // Specialized Object-fields loop (zero sibling linking, 2-column append, pinned YMMs!)
+            loop {
+                if pos >= src.len || src[pos] != b'"' {
+                    return .UnexpectedToken;
+                }
+                pos = pos + 1_usize;
+                let kstart = pos;
+                let kend = scan_str_simd_pinned(src, pos, v_quote, v_bslash, v_e0, v_zero);
+                if kend >= src.len {
+                    if kend == src.len { return .UnexpectedEof; }
+                    if kend == src.len +% 1_usize { return .InvalidEscape; }
+                    return .UnexpectedToken;
+                }
+                let klen = kend -% kstart;
+                let kfb: u64 = if kstart < kend && kstart < src.len { src[kstart].widen.[u64]() } else { 0_u64 };
+                let key_meta = (kfb <<% 56_u64)
+                    | ((kstart.widen.[u64]() & 0x1FFFFFFFF_u64) <<% 23_u64)
+                    | ((klen.widen.[u64]() & 0xFFFFF_u64) <<% 3_u64);
+                pos = kend + 1_usize;
+                if pos + 2_usize < src.len && src[pos] == b':' && src[pos + 1_usize] == b' ' && src[pos + 2_usize] > b' ' {
+                    pos = pos + 2_usize;
+                } else {
+                    if pos < src.len && src[pos] <= b' ' { pos = skip_ws_fast(src, pos); }
+                    if pos >= src.len || src[pos] != b':' { return .UnexpectedToken; }
+                    pos = skip_sep_ws(src, pos + 1_usize);
+                }
+                if pos >= src.len {
+                    return .UnexpectedEof;
+                }
+
+                let ch = src[pos];
+                var vkind: u64 = 0_u64;
+                var vpay: u64 = 0_u64;
+                var opened: u8 = 0_u8;
+
+                if ch == b'"' {
+                    pos = pos + 1_usize;
+                    let sstart = pos;
+                    let send = scan_str_simd_pinned(src, pos, v_quote, v_bslash, v_e0, v_zero);
+                    if send >= src.len {
+                        if send == src.len { return .UnexpectedEof; }
+                        if send == src.len +% 1_usize { return .InvalidEscape; }
+                        return .UnexpectedToken;
+                    }
+                    let slen = send -% sstart;
+                    let spair = read_str_pair(src, sstart, send);
+                    vkind = 3_u64;
+                    vpay = (spair <<% 48_u64)
+                        | ((sstart.widen.[u64]() & 0xFFFFFF_u64) <<% 24_u64)
+                        | (slen.widen.[u64]() & 0xFFFFFF_u64);
+                    pos = send + 1_usize;
+                } else if (ch -% b'0') <= 9_u8 || ch == b'-' {
+                    var neg = false;
+                    if ch == b'-' {
+                        neg = true;
+                        pos = pos + 1_usize;
+                    }
+                    if pos >= src.len { return .InvalidNumber; }
+                    let d0 = src[pos] -% b'0';
+                    if d0 > 9_u8 { return .InvalidNumber; }
+                    var acc: u64 = d0.widen.[u64]();
+                    pos = pos + 1_usize;
+                    while pos < src.len {
+                        let d = src[pos] -% b'0';
+                        if d > 9_u8 { break; }
+                        acc = (acc *% 10_u64) +% d.widen.[u64]();
+                        pos = pos + 1_usize;
+                    }
+                    vkind = 2_u64;
+                    vpay = if neg { 0_u64 -% acc } else { acc };
+                } else if ch == b'[' {
+                    pos = pos + 1_usize;
+                    vkind = 4_u64;
+                    opened = 1_u8;
+                } else if ch == b'{' {
+                    pos = pos + 1_usize;
+                    vkind = 5_u64;
+                    opened = 2_u8;
+                } else if ch == b't' {
+                    if pos + 3_usize >= src.len || src[pos + 1_usize] != b'r' || src[pos + 2_usize] != b'u' || src[pos + 3_usize] != b'e' {
+                        return .UnexpectedToken;
+                    }
+                    pos = pos + 4_usize;
+                    vkind = 1_u64;
+                    vpay = 1_u64;
+                } else if ch == b'f' {
+                    if pos + 4_usize >= src.len || src[pos + 1_usize] != b'a' || src[pos + 2_usize] != b'l' || src[pos + 3_usize] != b's' || src[pos + 4_usize] != b'e' {
+                        return .UnexpectedToken;
+                    }
+                    pos = pos + 5_usize;
+                    vkind = 1_u64;
+                    vpay = 0_u64;
+                } else if ch == b'n' {
+                    if pos + 3_usize >= src.len || src[pos + 1_usize] != b'u' || src[pos + 2_usize] != b'l' || src[pos + 3_usize] != b'l' {
+                        return .UnexpectedToken;
+                    }
+                    pos = pos + 4_usize;
+                    vkind = 0_u64;
+                } else {
+                    return .UnexpectedToken;
+                }
+
+                let nid = try nodes.push(.{
+                    meta: key_meta | vkind,
+                    payload: vpay,
+                });
+                cur_cnt = cur_cnt +% 1_u32;
+
+                if opened != 0_u8 {
+                    let cur_len = nodes.len().trunc.[u32]();
+                    if pos < src.len && src[pos] <= b' ' {
+                        pos = skip_ws_fast(src, pos);
+                    }
+                    let cc = if opened == 2_u8 { b'}' } else { b']' };
+                    if pos < src.len && src[pos] == cc {
+                        nodes.payload[nid] = cur_len.widen.[u64]() <<% 32_u64;
+                        pos = pos + 1_usize;
+                    } else {
+                        if depth >= 64_usize { return .DepthLimit; }
+                        st_open[depth] = (cur_open_idx.widen.[u64]() <<% 32_u64) | cur_cnt.widen.[u64]();
+                        let bit = 1_u64 <<% (depth & 63_usize).widen.[u64]();
+                        if opened == 2_u8 {
+                            obj_mask = obj_mask | bit;
+                            in_obj = true;
+                        } else {
+                            obj_mask = obj_mask & (~bit);
+                            in_obj = false;
+                        }
+                        cur_open_idx = cur_len -% 1_u32;
+                        cur_cnt = 0_u32;
+                        depth = depth + 1_usize;
+                        if in_obj { continue; }
+                        break;
+                    }
+                }
+
+                if pos < src.len {
+                    let sep0 = src[pos];
+                    if sep0 == b',' {
+                        if pos + 2_usize < src.len && src[pos + 1_usize] == b' ' && src[pos + 2_usize] > b' ' {
+                            pos = pos + 2_usize;
+                        } else {
+                            pos = skip_sep_ws(src, pos + 1_usize);
+                        }
+                        continue;
+                    }
+                    if sep0 == b'}' {
+                        pos = pos + 1_usize;
+                        break;
+                    }
+                }
+                pos = skip_ws_fast(src, pos);
+                if pos >= src.len { return .UnexpectedEof; }
+                let sep = src[pos];
+                if sep == b',' {
+                    pos = skip_sep_ws(src, pos + 1_usize);
+                    continue;
+                }
+                if sep == b'}' {
+                    pos = pos + 1_usize;
+                    break;
+                }
+                return .UnexpectedToken;
+            }
+            if !in_obj {
+                continue;
+            }
+        } else {
+            // Specialized Array-elements loop (zero sibling linking + tight consecutive-int loop!)
+            loop {
+                if pos >= src.len {
+                    return .UnexpectedEof;
+                }
+                let ch = src[pos];
+                if (ch -% b'0') <= 9_u8 || ch == b'-' {
+                    var num_ch = ch;
+                    loop {
+                        var neg = false;
+                        if num_ch == b'-' {
+                            neg = true;
+                            pos = pos + 1_usize;
+                        }
+                        if pos >= src.len { return .InvalidNumber; }
+                        let d0 = src[pos] -% b'0';
+                        if d0 > 9_u8 { return .InvalidNumber; }
+                        var acc: u64 = d0.widen.[u64]();
+                        pos = pos + 1_usize;
+                        while pos < src.len {
+                            let d = src[pos] -% b'0';
+                            if d > 9_u8 { break; }
+                            acc = (acc *% 10_u64) +% d.widen.[u64]();
+                            pos = pos + 1_usize;
+                        }
+                        let vpay = if neg { 0_u64 -% acc } else { acc };
+                        let _ = try nodes.push(.{
+                            meta: 2_u64,
+                            payload: vpay,
+                        });
+                        cur_cnt = cur_cnt +% 1_u32;
+                        if pos + 2_usize < src.len && src[pos] == b',' && src[pos + 1_usize] == b' ' {
+                            let nc = src[pos + 2_usize];
+                            if (nc -% b'0') <= 9_u8 || nc == b'-' {
+                                pos = pos + 2_usize;
+                                num_ch = nc;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    if pos < src.len {
+                        let sep0 = src[pos];
+                        if sep0 == b']' {
+                            pos = pos + 1_usize;
+                            break;
+                        }
+                        if sep0 == b',' {
+                            pos = skip_sep_ws(src, pos + 1_usize);
+                            continue;
+                        }
+                    }
+                    pos = skip_ws_fast(src, pos);
+                    if pos >= src.len { return .UnexpectedEof; }
+                    let sep = src[pos];
+                    if sep == b',' {
+                        pos = skip_sep_ws(src, pos + 1_usize);
+                        continue;
+                    }
+                    if sep == b']' {
+                        pos = pos + 1_usize;
+                        break;
+                    }
+                    return .UnexpectedToken;
+                }
+
+                var vkind: u64 = 0_u64;
+                var vpay: u64 = 0_u64;
+                var opened: u8 = 0_u8;
+
+                if ch == b'{' {
+                    pos = pos + 1_usize;
+                    vkind = 5_u64;
+                    opened = 2_u8;
+                } else if ch == b't' {
+                    if pos + 3_usize >= src.len || src[pos + 1_usize] != b'r' || src[pos + 2_usize] != b'u' || src[pos + 3_usize] != b'e' {
+                        return .UnexpectedToken;
+                    }
+                    pos = pos + 4_usize;
+                    vkind = 1_u64;
+                    vpay = 1_u64;
+                } else if ch == b'f' {
+                    if pos + 4_usize >= src.len || src[pos + 1_usize] != b'a' || src[pos + 2_usize] != b'l' || src[pos + 3_usize] != b's' || src[pos + 4_usize] != b'e' {
+                        return .UnexpectedToken;
+                    }
+                    pos = pos + 5_usize;
+                    vkind = 1_u64;
+                    vpay = 0_u64;
+                } else if ch == b'n' {
+                    if pos + 3_usize >= src.len || src[pos + 1_usize] != b'u' || src[pos + 2_usize] != b'l' || src[pos + 3_usize] != b'l' {
+                        return .UnexpectedToken;
+                    }
+                    pos = pos + 4_usize;
+                    vkind = 0_u64;
+                } else if ch == b'"' {
+                    pos = pos + 1_usize;
+                    let sstart = pos;
+                    let send = scan_str_simd_pinned(src, pos, v_quote, v_bslash, v_e0, v_zero);
+                    if send >= src.len {
+                        if send == src.len { return .UnexpectedEof; }
+                        if send == src.len +% 1_usize { return .InvalidEscape; }
+                        return .UnexpectedToken;
+                    }
+                    let slen = send -% sstart;
+                    let spair = read_str_pair(src, sstart, send);
+                    vkind = 3_u64;
+                    vpay = (spair <<% 48_u64)
+                        | ((sstart.widen.[u64]() & 0xFFFFFF_u64) <<% 24_u64)
+                        | (slen.widen.[u64]() & 0xFFFFFF_u64);
+                    pos = send + 1_usize;
+                } else if ch == b'[' {
+                    pos = pos + 1_usize;
+                    vkind = 4_u64;
+                    opened = 1_u8;
+                } else {
+                    return .UnexpectedToken;
+                }
+
+                let nid = try nodes.push(.{
+                    meta: vkind,
+                    payload: vpay,
+                });
+                cur_cnt = cur_cnt +% 1_u32;
+
+                if opened != 0_u8 {
+                    let cur_len = nodes.len().trunc.[u32]();
+                    if pos < src.len && src[pos] <= b' ' {
+                        pos = skip_ws_fast(src, pos);
+                    }
+                    let cc = if opened == 2_u8 { b'}' } else { b']' };
+                    if pos < src.len && src[pos] == cc {
+                        nodes.payload[nid] = cur_len.widen.[u64]() <<% 32_u64;
+                        pos = pos + 1_usize;
+                    } else {
+                        if depth >= 64_usize { return .DepthLimit; }
+                        st_open[depth] = (cur_open_idx.widen.[u64]() <<% 32_u64) | cur_cnt.widen.[u64]();
+                        let bit = 1_u64 <<% (depth & 63_usize).widen.[u64]();
+                        if opened == 2_u8 {
+                            obj_mask = obj_mask | bit;
+                            in_obj = true;
+                        } else {
+                            obj_mask = obj_mask & (~bit);
+                            in_obj = false;
+                        }
+                        cur_open_idx = cur_len -% 1_u32;
+                        cur_cnt = 0_u32;
+                        depth = depth + 1_usize;
+                        if !in_obj { continue; }
+                        break;
+                    }
+                }
+
+                if pos < src.len {
+                    let sep0 = src[pos];
+                    if sep0 == b',' {
+                        if pos + 2_usize < src.len && src[pos + 1_usize] == b' ' && src[pos + 2_usize] > b' ' {
+                            pos = pos + 2_usize;
+                        } else {
+                            pos = skip_sep_ws(src, pos + 1_usize);
+                        }
+                        continue;
+                    }
+                    if sep0 == b']' {
+                        pos = pos + 1_usize;
+                        break;
+                    }
+                }
+                pos = skip_ws_fast(src, pos);
+                if pos >= src.len { return .UnexpectedEof; }
+                let sep = src[pos];
+                if sep == b',' {
+                    pos = skip_sep_ws(src, pos + 1_usize);
+                    continue;
+                }
+                if sep == b']' {
+                    pos = pos + 1_usize;
+                    break;
+                }
+                return .UnexpectedToken;
+            }
+            if in_obj {
+                continue;
+            }
+        }
+
+        // Container closed: patch `(end_idx << 32) | child_count` on open node, pop stack!
+        var done = false;
+        loop {
+            let cid = try nodes.id_at(cur_open_idx.widen.[usize]());
+            nodes.payload[cid] = (nodes.len().widen.[u64]() <<% 32_u64) | cur_cnt.widen.[u64]();
+            depth = depth -% 1_usize;
+            if depth == 0_usize {
+                done = true;
+                break;
+            }
+            let packed = st_open[depth & 63_usize];
+            cur_open_idx = (packed >> 32_u64).trunc.[u32]();
+            cur_cnt = packed.trunc.[u32]();
+            let par_is_obj = ((obj_mask >> ((depth - 1_usize) & 63_usize).widen.[u64]()) & 1_u64) != 0_u64;
+            in_obj = par_is_obj;
+
+            if pos < src.len && src[pos] <= b' ' {
+                pos = skip_ws_fast(src, pos);
+            }
+            if pos >= src.len { return .UnexpectedEof; }
+            let sep = src[pos];
+            let close_c = if par_is_obj { b'}' } else { b']' };
+            if sep == close_c {
+                pos = pos + 1_usize;
+                continue;
+            }
+            if sep != b',' {
+                return .UnexpectedToken;
+            }
+            pos = skip_sep_ws(src, pos + 1_usize);
+            break;
+        }
+        if done {
+            break;
+        }
+    }
+
+    pos = skip_ws_fast(src, pos);
+    if pos != src.len {
+        return .TrailingData;
+    }
+    return root;
+}
+
+/// Zero-call, 100% linear-sequential hardware-prefetched 2-column Tape DOM hash walk!
+fn walk_dom(
+    nodes: *ArenaPool[JsonNode],
+    _root: Id[nodes],
+    depth0: u64,
+    h_in: u64,
+) -> u64 ! BoundsError {
+    let prime: u64 = 0x00000100000001B3_u64;
+    let n = nodes.len();
+    var h = h_in;
+    var depth = depth0;
+    var st_end: [64]usize = [0_usize; 64];
+    var sp: usize = 0_usize;
+    var next_close: usize = n +% 1_usize;
+    var i: usize = 0_usize;
+
+    while i < n {
+        let id = try nodes.id_at(i);
+        let m = nodes.meta[id];
+        let k = m & 7_u64;
+        h = (h ^ ((k <<% 8_u64) ^ depth)) *% prime;
+        let kl_u64 = (m >> 3_u64) & 0xFFFFF_u64;
+        if kl_u64 > 0_u64 {
+            h = (h ^ kl_u64) *% prime;
+            h = (h ^ (m >> 56_u64)) *% prime;
+        }
+        let pay = nodes.payload[id];
+        if k == 3_u64 {
+            let sl = pay & 0xFFFFFF_u64;
+            h = (h ^ sl) *% prime;
+            if sl > 0_u64 {
+                h = (h ^ (pay >> 48_u64)) *% prime;
+            }
+        } else if k == 2_u64 {
+            h = (h ^ pay) *% prime;
+        } else if k >= 4_u64 {
+            let cnt = pay & 0xFFFFFFFF_u64;
+            let end_idx = (pay >> 32_u64).trunc.[usize]();
+            h = (h ^ cnt) *% prime;
+            if end_idx > i +% 1_usize {
+                st_end[sp & 63_usize] = next_close;
+                sp = sp +% 1_usize;
+                next_close = end_idx;
+                depth = depth +% 1_u64;
+                i = i + 1_usize;
+                continue;
+            }
+            h = (h ^ (0x5555_u64 ^ depth)) *% prime;
+        } else if k == 1_u64 {
+            let bv: u64 = if pay != 0_u64 { 0x1111_u64 } else { 0x2222_u64 };
+            h = (h ^ bv) *% prime;
+        } else {
+            h = (h ^ 0xA5A5_u64) *% prime;
+        }
+        i = i + 1_usize;
+        while i == next_close {
+            depth = depth -% 1_u64;
+            h = (h ^ (0x5555_u64 ^ depth)) *% prime;
+            if sp == 0_usize {
+                break;
+            }
+            sp = sp -% 1_usize;
+            next_close = st_end[sp & 63_usize];
+        }
+    }
+    return h;
+}
+
+pub fn main(env: *mut Env) -> i32 ! OutOfMemory | MemError | JsonError | BoundsError {
+    let alloc = &mut env.alloc;
+    let clock = &env.clock;
+    let num_records: usize = 4100_usize;
+    let iters: usize = 15_usize;
+    let max_nodes: usize = 262144_usize;
+    let prime: u64 = 0x00000100000001B3_u64;
+
+    let doc = try generate_json_doc(alloc, num_records);
+    errdefer doc.destroy(alloc);
+    let src = doc.as_bytes();
+
+    var arena = try mem.FrameArena.init(alloc, 24_usize *% 1024_usize *% 1024_usize);
+    errdefer arena.destroy(alloc);
+
+    let t0 = rt.now_ns(clock);
+    var checksum: u64 = 0xCBF29CE484222325_u64;
+    var iter: usize = 0_usize;
+    while iter < iters {
+        arena.reset();
+        var nodes = try mem.init_frame_pool.[JsonNode](&mut arena, max_nodes);
+        let root = try parse_json_doc(src, &mut nodes);
+        let h = try walk_dom(&nodes, root, 0_u64, 0xCBF29CE484222325_u64);
+        let h2 = (h ^ nodes.len().widen.[u64]()) *% prime;
+        checksum = ((checksum ^ h2) *% prime) +% iter.widen.[u64]();
+        iter = iter +% 1_usize;
+    }
+    let elapsed_ns = rt.elapsed_since(clock, t0);
+
+    arena.destroy(alloc);
+    doc.destroy(alloc);
+
+    rt.print_str("RESULT json_dom checksum=");
+    rt.print_u64(checksum);
+    rt.print_str(" elapsed_ns=");
+    rt.print_u64(elapsed_ns);
+    rt.print_nl();
+    return 0_i32;
+}

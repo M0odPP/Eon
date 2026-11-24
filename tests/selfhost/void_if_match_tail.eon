@@ -1,0 +1,46 @@
+// expect: pass
+module test.void_if_match_tail;
+
+fn sink(x: u64) -> u64 {
+    return x +% 1_u64;
+}
+
+fn dispatch(tag: u32, flag: bool, x: u64) -> u64 {
+    var acc: u64 = x;
+    match tag {
+        0_u32 => {
+            if flag {
+                if acc > 5_u64 {
+                    acc = sink(acc);
+                } else {
+                    acc = acc +% 2_u64;
+                }
+            } else {
+                acc = acc +% 3_u64;
+            }
+        }
+        1_u32 => {
+            match flag {
+                true => { acc = acc +% 10_u64; }
+                false => { acc = acc +% 20_u64; }
+            }
+        }
+        _ => {
+            loop {
+                acc = acc +% 1_u64;
+                break;
+            }
+        }
+    }
+    return acc;
+}
+
+pub fn main() -> i32 {
+    let a = dispatch(0_u32, true, 10_u64);
+    let b = dispatch(1_u32, false, 1_u64);
+    let c = dispatch(2_u32, true, 5_u64);
+    if a == 11_u64 && b == 21_u64 && c == 6_u64 {
+        return 0_i32;
+    }
+    return 1_i32;
+}

@@ -1,0 +1,4 @@
+module fail.shift_arith;
+pub fn f(a: u32, b: u32) -> u32 {
+    return a << 1_u32 + b; //~ ERROR E0120
+}

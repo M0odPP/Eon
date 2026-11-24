@@ -1,0 +1,230 @@
+module bench.alloc_churn;
+
+import std.rt;
+
+const BATCH_SIZE: usize = 32_usize;
+const NUM_BATCHES: usize = 15625_usize; // 15625 * 32 = 500,000 Buf[u8] alloc/free cycles
+const ARENA_EPOCHS: usize = 20_usize;
+const FRAMES_PER_EPOCH: usize = 100_usize; // 20 * 100 = 2,000 frame Arena cycles
+const ARENA_CAP: usize = 262144_usize; // 256 KiB per frame arena
+const SLICES_PER_FRAME: usize = 256_usize; // 2000 * 256 = 512,000 temporary arena slices
+
+@inline
+fn mix64(x: u64) -> u64 {
+    var z = x +% 0x9E3779B97F4A7C15_u64;
+    z = (z ^ (z >> 30_u64)) *% 0xBF58476D1CE4E5B9_u64;
+    z = (z ^ (z >> 27_u64)) *% 0x94D049BB133111EB_u64;
+    return z ^ (z >> 31_u64);
+}
+
+@inline
+fn stamp_buf(s: *mut [u8], tag: u8) {
+    let n = s.len;
+    if n >= 32_usize {
+        s[0_usize] = tag;
+        let q1 = n >> 2_usize;
+        let q2 = n >> 1_usize;
+        let last = n - 1_usize;
+        if q1 < n {
+            s[q1] = tag ^ 0x5A_u8;
+        }
+        if q2 < n {
+            s[q2] = tag +% 0x33_u8;
+        }
+        s[last] = tag ^ 0xA5_u8;
+    }
+}
+
+@inline
+fn checksum_buf(s: *[u8]) -> u64 {
+    let n = s.len;
+    var acc: u64 = n.widen.[u64]();
+    var i: usize = 0_usize;
+    if n >= 64_usize {
+        let lim = n - 48_usize;
+        while i < lim {
+            let c01 = s[i].widen.[u64]() *% 131_u64 +% s[i + 16_usize].widen.[u64]();
+            let c23 = s[i + 32_usize].widen.[u64]() *% 131_u64 +% s[i + 48_usize].widen.[u64]();
+            let chunk4 = c01 *% 17161_u64 +% c23;
+            acc = acc *% 294499921_u64 +% chunk4;
+            i = i +% 64_usize;
+        }
+    }
+    while i < n {
+        acc = (acc *% 131_u64) +% s[i].widen.[u64]();
+        i = i +% 16_usize;
+    }
+    if n > 0_usize {
+        acc = acc ^ (s[n - 1_usize].widen.[u64]() << 24_u64);
+    }
+    return acc;
+}
+
+@inline
+fn write_and_sum_slice(s: *mut [u8], seed: u64) -> u64 {
+    let n = s.len;
+    let base = seed.trunc.[u8]();
+    if n >= 32_usize && (n & 31_usize) == 0_usize {
+        var acc: u64 = n.widen.[u64]();
+        var i: usize = 0_usize;
+        let lim = n - 24_usize;
+        while i < lim {
+            let b0 = base +% i.trunc.[u8]();
+            let b1 = b0 +% 8_u8;
+            let b2 = b0 +% 16_u8;
+            let b3 = b0 +% 24_u8;
+            s[i] = b0;
+            s[i + 8_usize] = b1;
+            s[i + 16_usize] = b2;
+            s[i + 24_usize] = b3;
+            let c01 = b0.widen.[u64]() *% 31_u64 +% b1.widen.[u64]();
+            let c23 = b2.widen.[u64]() *% 31_u64 +% b3.widen.[u64]();
+            acc = acc *% 923521_u64 +% (c01 *% 961_u64 +% c23);
+            i = i +% 32_usize;
+        }
+        let last_v = base ^ 0xC3_u8;
+        s[n - 1_usize] = last_v;
+        return acc ^ (last_v.widen.[u64]() << 16_u64);
+    }
+    var i: usize = 0_usize;
+    while i < n {
+        s[i] = base +% i.trunc.[u8]();
+        i = i +% 8_usize;
+    }
+    if n > 0_usize {
+        s[n - 1_usize] = base ^ 0xC3_u8;
+    }
+    var acc: u64 = n.widen.[u64]();
+    var j: usize = 0_usize;
+    while j < n {
+        acc = (acc *% 31_u64) +% s[j].widen.[u64]();
+        j = j +% 8_usize;
+    }
+    if n > 0_usize {
+        acc = acc ^ (s[n - 1_usize].widen.[u64]() << 16_u64);
+    }
+    return acc;
+}
+
+fn run_buf_churn_phase(
+    alloc: *mut AllocCap,
+    pattern_slice: *[u8],
+    rng: *mut u64,
+) -> u64 ! OutOfMemory | BoundsError {
+    var checksum: u64 = 0_u64;
+    var r_state: u64 = rng.*;
+    var live = try LinearBuf.[Buf[u8]].init(alloc, BATCH_SIZE);
+    errdefer {
+        loop {
+            let leftover = live.pop() orelse break;
+            leftover.destroy(alloc);
+        }
+        live.destroy(alloc);
+    }
+
+    for batch in 0_usize..NUM_BATCHES {
+        for j in 0_usize..BATCH_SIZE {
+            let r = mix64(r_state);
+            r_state = r;
+            let cls = (r & 31_u64).trunc.[usize]();
+            let sz = 32_usize +% (cls *% 32_usize);
+
+            var buf = try Buf.[u8].init(alloc, sz);
+            errdefer buf.destroy(alloc);
+
+            let pat_sub = try pattern_slice.sub(0_usize, sz);
+            try buf.push_slice(pat_sub);
+
+            let tag = (((batch.widen.[u64]() +% j.widen.[u64]()) ^ r) & 255_u64).trunc.[u8]();
+            stamp_buf(buf.as_mut_slice(), tag);
+            try live.push(buf);
+        }
+
+        var batch_acc: u64 = 0_u64;
+        loop {
+            let popped = live.pop() orelse break;
+            batch_acc = batch_acc +% checksum_buf(popped.as_slice());
+            popped.destroy(alloc);
+        }
+        checksum = checksum +% mix64(batch_acc ^ batch.widen.[u64]());
+    }
+
+    rng.* = r_state;
+    live.destroy(alloc);
+    return checksum;
+}
+
+/// Zero-call leaf inner loop for 100 frame arena cycles (eliminates outer init/destroy spills!).
+fn run_arena_frames(
+    arena: *mut Arena,
+    r0: u64,
+    start_frame: usize,
+    out_rng: *mut u64,
+) -> u64 ! MemError {
+    var checksum: u64 = 0_u64;
+    var r_state: u64 = r0;
+    for f in 0_usize..FRAMES_PER_EPOCH {
+        arena.reset();
+        let frame = start_frame +% f;
+        var frame_acc: u64 = 0_u64;
+        for _ in 0_usize..SLICES_PER_FRAME {
+            let r = mix64(r_state);
+            r_state = r;
+            let sz = 32_usize +% ((r & 15_u64).trunc.[usize]() *% 32_usize);
+            let sl = try arena.alloc(sz);
+            frame_acc = frame_acc +% write_and_sum_slice(sl, r);
+        }
+        checksum = checksum +% mix64(frame_acc ^ (frame.widen.[u64]() +% 0x100000_u64));
+    }
+    out_rng.* = r_state;
+    return checksum;
+}
+
+fn run_arena_epoch(
+    alloc: *mut AllocCap,
+    rng: *mut u64,
+    start_frame: usize,
+) -> u64 ! MemError {
+    var arena = try Arena.init(alloc, ARENA_CAP);
+    errdefer arena.destroy(alloc);
+    let checksum = try run_arena_frames(&mut arena, rng.*, start_frame, rng);
+    arena.destroy(alloc);
+    return checksum;
+}
+
+fn run_benchmark(alloc: *mut AllocCap, clock: *ClockCap) -> i32 ! OutOfMemory | MemError | BoundsError {
+    // Untimed setup: 1024-byte deterministic payload template.
+    var pattern_buf = try Buf.[u8].init(alloc, 1024_usize);
+    errdefer pattern_buf.destroy(alloc);
+    for i in 0_usize..1024_usize {
+        let v = (mix64(i.widen.[u64]() ^ 0x517CC1B727220A95_u64) & 255_u64).trunc.[u8]();
+        try pattern_buf.push(v);
+    }
+
+    let t0 = rt.now_ns(clock);
+    var rng: u64 = 0x243F6A8885A308D3_u64;
+
+    // Part (a): 500,000 mixed-size (32 B .. 1024 B) Buf[u8] alloc/write/read/free cycles.
+    var checksum = try run_buf_churn_phase(alloc, pattern_buf.as_slice(), &mut rng);
+
+    // Part (b): 2,000 frame Arena cycles (20 epochs x 100 resets, 256 slices/frame).
+    for epoch in 0_usize..ARENA_EPOCHS {
+        let epoch_sum = try run_arena_epoch(alloc, &mut rng, epoch *% FRAMES_PER_EPOCH);
+        checksum = checksum +% epoch_sum;
+    }
+
+    let elapsed_ns = rt.elapsed_since(clock, t0);
+
+    rt.print_str("RESULT alloc_churn checksum=");
+    rt.print_u64(checksum);
+    rt.print_str(" elapsed_ns=");
+    rt.print_u64(elapsed_ns);
+    rt.print_nl();
+
+    pattern_buf.destroy(alloc);
+    return 0_i32;
+}
+
+pub fn main(env: *mut Env) -> i32 ! OutOfMemory | MemError | BoundsError {
+    return try run_benchmark(&mut env.alloc, &env.clock);
+}

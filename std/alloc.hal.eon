@@ -1,0 +1,39 @@
+module std.alloc @hal;
+
+import core.mem;
+
+/// Derive a child allocator capability capped at `bytes` of live heap budget.
+pub fn sub_budget(alloc: *mut AllocCap, bytes: usize) -> AllocCap {
+    return alloc.sub_budget(bytes);
+}
+
+/// Return the count of currently live allocations tracked by `alloc`.
+pub fn live_allocs(alloc: *AllocCap) -> usize {
+    return alloc.live_allocs();
+}
+
+/// Return the currently live allocated byte count tracked by `alloc`.
+pub fn used_bytes(alloc: *AllocCap) -> usize {
+    return alloc.used_bytes();
+}
+
+/// Return the peak live allocated byte count observed by `alloc`.
+pub fn peak_bytes(alloc: *AllocCap) -> usize {
+    return alloc.peak_bytes();
+}
+
+/// Perform `iters` small `Buf[u64]` allocate/push/destroy cycles, returning elapsed nanoseconds.
+pub fn bench_small_allocs(alloc: *mut AllocCap, clock: *ClockCap, iters: usize) -> u64 ! OutOfMemory {
+    let start = clock.now_ns();
+    for i in 0_usize..iters {
+        var buf = try mem.init_buf.[u64](alloc, 4_usize);
+        errdefer buf.destroy(alloc);
+        try buf.push(i.widen.[u64]());
+        buf.destroy(alloc);
+    }
+    let end = clock.now_ns();
+    if end >= start {
+        return end - start;
+    }
+    return 0_u64;
+}

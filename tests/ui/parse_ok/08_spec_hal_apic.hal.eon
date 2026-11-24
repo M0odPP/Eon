@@ -1,0 +1,23 @@
+module kernel.arch.x86_64.apic @hal;
+
+pub struct ApicRegs {
+    id:  MmioReg[u32, .ReadOnly]      @offset(0x020);
+    eoi: MmioReg[u32, .WriteOnly]     @offset(0x0B0);
+    svr: MmioReg[SvrBits, .ReadWrite] @offset(0x0F0);
+    isr: MmioReg[u32, .Write1ToClear] @offset(0x100);
+}
+
+pub fn read_cr3() -> u64 @noalloc @noblock @stack(32) {
+    var val: u64 = 0_u64;
+    raw {
+        asm("mov %cr3, $0", out(reg) val);
+    }
+    return val;
+}
+
+@naked
+pub fn isr_stub() {
+    raw {
+        asm("iretq", options(noreturn));
+    }
+}

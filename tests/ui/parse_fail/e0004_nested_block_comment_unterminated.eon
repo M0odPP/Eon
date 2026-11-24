@@ -1,0 +1,2 @@
+module fail.nested_cmt;
+/* outer /* inner */ still open //~ ERROR E0004

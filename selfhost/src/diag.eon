@@ -1,0 +1,651 @@
+module eonc.diag;
+
+import core.col;
+import core.str;
+import eonc.span;
+
+// Error code constants matching `compiler/src/diag.rs`.
+pub const E0001: u32 = 1_u32;
+pub const E0002: u32 = 2_u32;
+pub const E0003: u32 = 3_u32;
+pub const E0004: u32 = 4_u32;
+pub const E0005: u32 = 5_u32;
+
+pub const E0101: u32 = 101_u32;
+pub const E0102: u32 = 102_u32;
+pub const E0103: u32 = 103_u32;
+pub const E0104: u32 = 104_u32;
+pub const E0105: u32 = 105_u32;
+pub const E0107: u32 = 107_u32;
+pub const E0108: u32 = 108_u32;
+pub const E0109: u32 = 109_u32;
+pub const E0110: u32 = 110_u32;
+pub const E0111: u32 = 111_u32;
+pub const E0112: u32 = 112_u32;
+pub const E0113: u32 = 113_u32;
+pub const E0114: u32 = 114_u32;
+pub const E0115: u32 = 115_u32;
+pub const E0116: u32 = 116_u32;
+pub const E0117: u32 = 117_u32;
+pub const E0118: u32 = 118_u32;
+pub const E0119: u32 = 119_u32;
+pub const E0120: u32 = 120_u32;
+pub const E0121: u32 = 121_u32;
+pub const E0122: u32 = 122_u32;
+pub const E0124: u32 = 124_u32;
+pub const E0125: u32 = 125_u32;
+pub const E0126: u32 = 126_u32;
+pub const E0131: u32 = 131_u32;
+pub const E0132: u32 = 132_u32;
+pub const E0133: u32 = 133_u32;
+
+pub const E0201: u32 = 201_u32;
+pub const E0202: u32 = 202_u32;
+pub const E0203: u32 = 203_u32;
+pub const E0210: u32 = 210_u32;
+pub const E0211: u32 = 211_u32;
+pub const E0215: u32 = 215_u32;
+pub const E0220: u32 = 220_u32;
+pub const E0230: u32 = 230_u32;
+
+pub const E0301: u32 = 301_u32;
+pub const E0310: u32 = 310_u32;
+pub const E0311: u32 = 311_u32;
+pub const E0320: u32 = 320_u32;
+pub const E0321: u32 = 321_u32;
+pub const E0322: u32 = 322_u32;
+pub const E0323: u32 = 323_u32;
+pub const E0324: u32 = 324_u32;
+pub const E0325: u32 = 325_u32;
+pub const E0326: u32 = 326_u32;
+pub const E0330: u32 = 330_u32;
+pub const E0331: u32 = 331_u32;
+pub const E0332: u32 = 332_u32;
+
+pub const E0501: u32 = 501_u32;
+pub const E0510: u32 = 510_u32;
+pub const E0511: u32 = 511_u32;
+pub const E0512: u32 = 512_u32;
+pub const E0520: u32 = 520_u32;
+pub const E0601: u32 = 601_u32;
+pub const E0602: u32 = 602_u32;
+pub const E0603: u32 = 603_u32;
+pub const E0610: u32 = 610_u32;
+pub const E0701: u32 = 701_u32;
+pub const E0805: u32 = 805_u32;
+pub const E0810: u32 = 810_u32;
+pub const E0820: u32 = 820_u32;
+pub const E0821: u32 = 821_u32;
+pub const E0822: u32 = 822_u32;
+pub const E0823: u32 = 823_u32;
+pub const E0901: u32 = 901_u32;
+
+pub struct DiagEntry {
+    pub code: u32;
+    pub span: span.Span;
+    pub msg_off: u32;
+    pub msg_len: u32;
+}
+
+pub struct LabelEntry {
+    pub diag_idx: u32;
+    pub span: span.Span;
+    pub msg_off: u32;
+    pub msg_len: u32;
+}
+
+pub struct TextEntry {
+    pub diag_idx: u32;
+    pub msg_off: u32;
+    pub msg_len: u32;
+}
+
+fn digit_count_u32(n: u32) -> usize {
+    var v = n;
+    var digits: usize = 1_usize;
+    while v >= 10_u32 {
+        v = v / 10_u32;
+        digits = digits +% 1_usize;
+    }
+    return digits;
+}
+
+fn push_spaces(out: *mut str.StrBuf, alloc: *mut AllocCap, count: usize) -> !OutOfMemory {
+    var i: usize = 0_usize;
+    while i < count {
+        try out.push_byte_grow(alloc, 32_u8);
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+fn push_caret_line(
+    out: *mut str.StrBuf,
+    alloc: *mut AllocCap,
+    pad: usize,
+    src_line: *[u8],
+    caret_start: usize,
+    caret_len: usize,
+) -> !OutOfMemory {
+    try push_spaces(out, alloc, pad);
+    try out.push_str_grow(alloc, " | ");
+    var pos: usize = 0_usize;
+    var taken: usize = 0_usize;
+    while pos < src_line.len && taken < caret_start {
+        let dec = str.decode_utf8_char(src_line, pos);
+        if dec.len == 0_usize {
+            break;
+        }
+        if dec.cp == 9_u32 {
+            try out.push_byte_grow(alloc, 9_u8);
+        } else {
+            try out.push_byte_grow(alloc, 32_u8);
+        }
+        pos = pos +% dec.len;
+        taken = taken +% 1_usize;
+    }
+    var ci: usize = 0_usize;
+    while ci < caret_len {
+        try out.push_byte_grow(alloc, b'^');
+        ci = ci +% 1_usize;
+    }
+    try out.push_byte_grow(alloc, 10_u8);
+    return;
+}
+
+pub linear struct DiagBag {
+    diags: col.DynBuf[DiagEntry];
+    labels: col.DynBuf[LabelEntry];
+    helps: col.DynBuf[TextEntry];
+    notes: col.DynBuf[TextEntry];
+    texts: col.DynBuf[u8];
+}
+
+impl DiagBag {
+    pub fn init(alloc: *mut AllocCap) -> DiagBag ! OutOfMemory {
+        let diags = try col.DynBuf.[DiagEntry].init(alloc, 16_usize);
+        errdefer diags.destroy(alloc);
+        let labels = try col.DynBuf.[LabelEntry].init(alloc, 8_usize);
+        errdefer labels.destroy(alloc);
+        let helps = try col.DynBuf.[TextEntry].init(alloc, 8_usize);
+        errdefer helps.destroy(alloc);
+        let notes = try col.DynBuf.[TextEntry].init(alloc, 8_usize);
+        errdefer notes.destroy(alloc);
+        let texts = try col.DynBuf.[u8].init(alloc, 512_usize);
+        errdefer texts.destroy(alloc);
+        return DiagBag.{
+            diags: diags,
+            labels: labels,
+            helps: helps,
+            notes: notes,
+            texts: texts,
+        };
+    }
+
+    pub fn has_errors(self: *Self) -> bool {
+        return !self.diags.is_empty();
+    }
+
+    pub fn count(self: *Self) -> usize {
+        return self.diags.len();
+    }
+
+    pub fn clear(self: *mut Self) {
+        self.diags.clear();
+        self.labels.clear();
+        self.helps.clear();
+        self.notes.clear();
+        self.texts.clear();
+    }
+
+    pub fn truncate(self: *mut Self, new_len: usize) {
+        while self.diags.len() > new_len {
+            _ = self.diags.pop();
+        }
+        let lim = new_len.trunc.[u32]();
+        loop {
+            let n = self.labels.len();
+            if n == 0_usize {
+                break;
+            }
+            let last_idx = n - 1_usize;
+            var drop_it = false;
+            let ls = self.labels.as_slice();
+            if last_idx < ls.len && ls[last_idx].diag_idx >= lim {
+                drop_it = true;
+            }
+            if !drop_it {
+                break;
+            }
+            _ = self.labels.pop();
+        }
+        loop {
+            let n = self.helps.len();
+            if n == 0_usize {
+                break;
+            }
+            let last_idx = n - 1_usize;
+            var drop_it = false;
+            let hs = self.helps.as_slice();
+            if last_idx < hs.len && hs[last_idx].diag_idx >= lim {
+                drop_it = true;
+            }
+            if !drop_it {
+                break;
+            }
+            _ = self.helps.pop();
+        }
+        loop {
+            let n = self.notes.len();
+            if n == 0_usize {
+                break;
+            }
+            let last_idx = n - 1_usize;
+            var drop_it = false;
+            let ns = self.notes.as_slice();
+            if last_idx < ns.len && ns[last_idx].diag_idx >= lim {
+                drop_it = true;
+            }
+            if !drop_it {
+                break;
+            }
+            _ = self.notes.pop();
+        }
+    }
+
+    pub fn emit_error_bytes(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        code: u32,
+        sp: span.Span,
+        msg: *[u8],
+    ) -> usize ! OutOfMemory {
+        let idx = self.diags.len();
+        let off = self.texts.len().trunc.[u32]();
+        let n = msg.len.trunc.[u32]();
+        try self.texts.push_slice(alloc, msg);
+        try self.diags.push(
+            alloc,
+            DiagEntry.{
+                code: code,
+                span: sp,
+                msg_off: off,
+                msg_len: n,
+            },
+        );
+        return idx;
+    }
+
+    pub fn emit_error(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        code: u32,
+        sp: span.Span,
+        msg: *str,
+    ) -> usize ! OutOfMemory {
+        return try self.emit_error_bytes(alloc, code, sp, msg.as_bytes());
+    }
+
+    pub fn append_diag_range(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        src: *DiagBag,
+        start_idx: u32,
+        count: u32,
+    ) -> !OutOfMemory {
+        if count == 0_u32 {
+            return;
+        }
+        let end_idx = start_idx +% count;
+        let dst_base = self.diags.len().trunc.[u32]();
+        let src_diags = src.diags.as_slice();
+        let src_texts = src.texts.as_slice();
+        var i = start_idx;
+        while i < end_idx {
+            let iu = i.widen.[usize]();
+            if iu < src_diags.len {
+                let d = src_diags[iu];
+                let off = self.texts.len().trunc.[u32]();
+                let ts = d.msg_off.widen.[usize]();
+                let te = ts +% d.msg_len.widen.[usize]();
+                var pushed_len: u32 = 0_u32;
+                if ts <= te && te <= src_texts.len {
+                    let sub = src_texts.sub(ts, te) catch {
+                        return;
+                    };
+                    try self.texts.push_slice(alloc, sub);
+                    pushed_len = sub.len.trunc.[u32]();
+                }
+                try self.diags.push(alloc, DiagEntry.{
+                    code: d.code,
+                    span: d.span,
+                    msg_off: off,
+                    msg_len: pushed_len,
+                });
+            }
+            i = i +% 1_u32;
+        }
+        let src_labels = src.labels.as_slice();
+        var li: usize = 0_usize;
+        while li < src_labels.len {
+            let lb = src_labels[li];
+            if lb.diag_idx >= start_idx && lb.diag_idx < end_idx {
+                let off = self.texts.len().trunc.[u32]();
+                let ts = lb.msg_off.widen.[usize]();
+                let te = ts +% lb.msg_len.widen.[usize]();
+                var pushed_len: u32 = 0_u32;
+                if ts <= te && te <= src_texts.len {
+                    let sub = src_texts.sub(ts, te) catch {
+                        return;
+                    };
+                    try self.texts.push_slice(alloc, sub);
+                    pushed_len = sub.len.trunc.[u32]();
+                }
+                try self.labels.push(alloc, LabelEntry.{
+                    diag_idx: dst_base +% (lb.diag_idx -% start_idx),
+                    span: lb.span,
+                    msg_off: off,
+                    msg_len: pushed_len,
+                });
+            }
+            li = li +% 1_usize;
+        }
+        let src_helps = src.helps.as_slice();
+        var hi: usize = 0_usize;
+        while hi < src_helps.len {
+            let hp = src_helps[hi];
+            if hp.diag_idx >= start_idx && hp.diag_idx < end_idx {
+                let off = self.texts.len().trunc.[u32]();
+                let ts = hp.msg_off.widen.[usize]();
+                let te = ts +% hp.msg_len.widen.[usize]();
+                var pushed_len: u32 = 0_u32;
+                if ts <= te && te <= src_texts.len {
+                    let sub = src_texts.sub(ts, te) catch {
+                        return;
+                    };
+                    try self.texts.push_slice(alloc, sub);
+                    pushed_len = sub.len.trunc.[u32]();
+                }
+                try self.helps.push(alloc, TextEntry.{
+                    diag_idx: dst_base +% (hp.diag_idx -% start_idx),
+                    msg_off: off,
+                    msg_len: pushed_len,
+                });
+            }
+            hi = hi +% 1_usize;
+        }
+        let src_notes = src.notes.as_slice();
+        var ni: usize = 0_usize;
+        while ni < src_notes.len {
+            let nt = src_notes[ni];
+            if nt.diag_idx >= start_idx && nt.diag_idx < end_idx {
+                let off = self.texts.len().trunc.[u32]();
+                let ts = nt.msg_off.widen.[usize]();
+                let te = ts +% nt.msg_len.widen.[usize]();
+                var pushed_len: u32 = 0_u32;
+                if ts <= te && te <= src_texts.len {
+                    let sub = src_texts.sub(ts, te) catch {
+                        return;
+                    };
+                    try self.texts.push_slice(alloc, sub);
+                    pushed_len = sub.len.trunc.[u32]();
+                }
+                try self.notes.push(alloc, TextEntry.{
+                    diag_idx: dst_base +% (nt.diag_idx -% start_idx),
+                    msg_off: off,
+                    msg_len: pushed_len,
+                });
+            }
+            ni = ni +% 1_usize;
+        }
+        return;
+    }
+
+    pub fn add_label(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        diag_idx: usize,
+        sp: span.Span,
+        msg: *str,
+    ) -> !OutOfMemory {
+        if diag_idx >= self.diags.len() {
+            return;
+        }
+        let bytes = msg.as_bytes();
+        let off = self.texts.len().trunc.[u32]();
+        let n = bytes.len.trunc.[u32]();
+        try self.texts.push_slice(alloc, bytes);
+        try self.labels.push(
+            alloc,
+            LabelEntry.{
+                diag_idx: diag_idx.trunc.[u32](),
+                span: sp,
+                msg_off: off,
+                msg_len: n,
+            },
+        );
+        return;
+    }
+
+    pub fn add_help(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        diag_idx: usize,
+        msg: *str,
+    ) -> !OutOfMemory {
+        if diag_idx >= self.diags.len() {
+            return;
+        }
+        let bytes = msg.as_bytes();
+        let off = self.texts.len().trunc.[u32]();
+        let n = bytes.len.trunc.[u32]();
+        try self.texts.push_slice(alloc, bytes);
+        try self.helps.push(
+            alloc,
+            TextEntry.{
+                diag_idx: diag_idx.trunc.[u32](),
+                msg_off: off,
+                msg_len: n,
+            },
+        );
+        return;
+    }
+
+    pub fn add_note(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        diag_idx: usize,
+        msg: *str,
+    ) -> !OutOfMemory {
+        if diag_idx >= self.diags.len() {
+            return;
+        }
+        let bytes = msg.as_bytes();
+        let off = self.texts.len().trunc.[u32]();
+        let n = bytes.len.trunc.[u32]();
+        try self.texts.push_slice(alloc, bytes);
+        try self.notes.push(
+            alloc,
+            TextEntry.{
+                diag_idx: diag_idx.trunc.[u32](),
+                msg_off: off,
+                msg_len: n,
+            },
+        );
+        return;
+    }
+
+    view fn text_slice(self: *Self, off: u32, len: u32) -> *[u8] {
+        let empty: *str = "";
+        let o = off.widen.[usize]();
+        let n = len.widen.[usize]();
+        let s = self.texts.as_slice().sub(o, o +% n) catch {
+            return empty.as_bytes();
+        };
+        return s;
+    }
+
+    fn render_labels(
+        self: *Self,
+        alloc: *mut AllocCap,
+        sm: *span.SourceMap,
+        out: *mut str.StrBuf,
+        diag_idx: u32,
+        pad: usize,
+    ) -> !OutOfMemory {
+        let ls = self.labels.as_slice();
+        let em_dash: [5]u8 = [0x20_u8, 0xE2_u8, 0x80_u8, 0x94_u8, 0x20_u8];
+        var i: usize = 0_usize;
+        while i < ls.len {
+            let entry = ls[i];
+            if entry.diag_idx == diag_idx && entry.span.file != span.FILE_DUMMY {
+                let lc = sm.line_col(entry.span.file, entry.span.start);
+                try push_spaces(out, alloc, pad);
+                try out.push_str_grow(alloc, " = note: ");
+                try out.push_u64_grow(alloc, lc.line.widen.[u64]());
+                try out.push_byte_grow(alloc, b':');
+                try out.push_u64_grow(alloc, lc.col.widen.[u64]());
+                try out.push_bytes_grow(alloc, &em_dash);
+                try out.push_bytes_grow(alloc, self.text_slice(entry.msg_off, entry.msg_len));
+                try out.push_byte_grow(alloc, 10_u8);
+            }
+            i = i +% 1_usize;
+        }
+        return;
+    }
+
+    fn render_helps_and_notes(
+        self: *Self,
+        alloc: *mut AllocCap,
+        out: *mut str.StrBuf,
+        diag_idx: u32,
+        pad: usize,
+    ) -> !OutOfMemory {
+        let hs = self.helps.as_slice();
+        var hi: usize = 0_usize;
+        while hi < hs.len {
+            let entry = hs[hi];
+            if entry.diag_idx == diag_idx {
+                try push_spaces(out, alloc, pad);
+                try out.push_str_grow(alloc, " = help: ");
+                try out.push_bytes_grow(alloc, self.text_slice(entry.msg_off, entry.msg_len));
+                try out.push_byte_grow(alloc, 10_u8);
+            }
+            hi = hi +% 1_usize;
+        }
+        let ns = self.notes.as_slice();
+        var ni: usize = 0_usize;
+        while ni < ns.len {
+            let entry = ns[ni];
+            if entry.diag_idx == diag_idx {
+                try push_spaces(out, alloc, pad);
+                try out.push_str_grow(alloc, " = note: ");
+                try out.push_bytes_grow(alloc, self.text_slice(entry.msg_off, entry.msg_len));
+                try out.push_byte_grow(alloc, 10_u8);
+            }
+            ni = ni +% 1_usize;
+        }
+        return;
+    }
+
+    fn render_one(
+        self: *Self,
+        alloc: *mut AllocCap,
+        sm: *span.SourceMap,
+        out: *mut str.StrBuf,
+        idx: usize,
+    ) -> !OutOfMemory {
+        let ds = self.diags.as_slice();
+        if idx >= ds.len {
+            return;
+        }
+        let d = ds[idx];
+        let diag_idx_u32 = idx.trunc.[u32]();
+
+        try out.push_str_grow(alloc, "error[E");
+        try out.push_u32_pad4_grow(alloc, d.code);
+        try out.push_str_grow(alloc, "]: ");
+        try out.push_bytes_grow(alloc, self.text_slice(d.msg_off, d.msg_len));
+        try out.push_byte_grow(alloc, 10_u8);
+
+        if d.span.file != span.FILE_DUMMY {
+            let lc = sm.line_col(d.span.file, d.span.start);
+            let line = lc.line;
+            let col = lc.col;
+            let pad = digit_count_u32(line);
+
+            try push_spaces(out, alloc, pad);
+            try out.push_str_grow(alloc, "--> ");
+            try out.push_bytes_grow(alloc, sm.file_name(d.span.file));
+            try out.push_byte_grow(alloc, b':');
+            try out.push_u64_grow(alloc, line.widen.[u64]());
+            try out.push_byte_grow(alloc, b':');
+            try out.push_u64_grow(alloc, col.widen.[u64]());
+            try out.push_byte_grow(alloc, 10_u8);
+
+            let src_line = sm.line_text(d.span.file, line);
+            try push_spaces(out, alloc, pad);
+            try out.push_str_grow(alloc, " |\n");
+
+            try out.push_u64_grow(alloc, line.widen.[u64]());
+            try out.push_str_grow(alloc, " | ");
+            try out.push_bytes_grow(alloc, src_line);
+            try out.push_byte_grow(alloc, 10_u8);
+
+            var end_col: u32 = col +% 1_u32;
+            if d.span.end > d.span.start {
+                let elc = sm.line_col(d.span.file, d.span.end);
+                if elc.line == line {
+                    end_col = elc.col;
+                } else {
+                    end_col = str.count_utf8_chars(src_line).trunc.[u32]() +% 1_u32;
+                }
+            }
+            let caret_start: usize = if col > 0_u32 {
+                (col - 1_u32).widen.[usize]()
+            } else {
+                0_usize
+            };
+            let raw_len: u32 = if end_col > col { end_col - col } else { 0_u32 };
+            let caret_len: usize = if raw_len > 1_u32 {
+                raw_len.widen.[usize]()
+            } else {
+                1_usize
+            };
+
+            try push_caret_line(out, alloc, pad, src_line, caret_start, caret_len);
+            try self.render_labels(alloc, sm, out, diag_idx_u32, pad);
+            try self.render_helps_and_notes(alloc, out, diag_idx_u32, pad);
+        } else {
+            try self.render_helps_and_notes(alloc, out, diag_idx_u32, 0_usize);
+        }
+        return;
+    }
+
+    pub fn render_all(
+        self: *Self,
+        alloc: *mut AllocCap,
+        sm: *span.SourceMap,
+        out: *mut str.StrBuf,
+    ) -> !OutOfMemory {
+        let total = self.diags.len();
+        var i: usize = 0_usize;
+        while i < total {
+            if i > 0_usize {
+                try out.push_byte_grow(alloc, 10_u8);
+            }
+            try self.render_one(alloc, sm, out, i);
+            i = i +% 1_usize;
+        }
+        return;
+    }
+
+    pub fn destroy(self: DiagBag, alloc: *mut AllocCap) {
+        let DiagBag.{ diags, labels, helps, notes, texts } = self;
+        diags.destroy(alloc);
+        labels.destroy(alloc);
+        helps.destroy(alloc);
+        notes.destroy(alloc);
+        texts.destroy(alloc);
+    }
+}

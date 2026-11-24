@@ -1,0 +1,4 @@
+module app.bad_vol;
+pub fn f() {
+    let volatile = 1_u32; //~ ERROR E0111
+}

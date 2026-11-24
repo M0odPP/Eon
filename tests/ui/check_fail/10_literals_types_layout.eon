@@ -1,0 +1,34 @@
+module fail.types;
+
+@packed
+pub struct Packed {
+    pub flag: u8;
+    pub val: u64;
+}
+
+pub bitfield BadBits : u32 {
+    a: u8 @bits(0..8);
+    b: u8 @bits(4..12); //~ ERROR E0220
+    c: u8 @bits(28..40); //~ ERROR E0220
+}
+
+pub fn bad_cases(pa: PhysAddr, va: VirtAddr, p: Packed, s: *str, b: bool) -> i32 {
+    let oob: u8 = 300; //~ ERROR E0201
+    let flt: f32 = 1e50_f32; //~ ERROR E0202
+    let untyped = 42; //~ ERROR E0203
+    let rtime_ty = u32; //~ ERROR E0210
+    let bad_addr: PhysAddr = va; //~ ERROR E0211
+    let bad_borrow = &p.val; //~ ERROR E0215
+    let bad_cast = b.bitcast.[u8](); //~ ERROR E0230
+    let bad_slice = s[0_usize..1_usize]; //~ ERROR E0230
+    let _ = pa;
+    let _ = oob;
+    let _ = flt;
+    let _ = untyped;
+    let _ = rtime_ty;
+    let _ = bad_addr;
+    let _ = bad_borrow;
+    let _ = bad_cast;
+    let _ = bad_slice;
+    return 0_i32;
+}

@@ -1,0 +1,2799 @@
+module eonc.resolve;
+
+import core.col;
+import core.str;
+import eonc.span;
+import eonc.diag;
+import eonc.ast;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+pub const UNIT_NONE: u32 = 4294967295_u32;
+pub const MODULE_NONE: u32 = 4294967295_u32;
+pub const DEF_NONE: u32 = 4294967295_u32;
+
+// ---------------------------------------------------------------------------
+// Builtin & Primitive Kinds (matching `compiler/src/resolve.rs`)
+// ---------------------------------------------------------------------------
+
+pub enum PrimKind : u8 {
+    UInt = 0,
+    USize = 1,
+    IInt = 2,
+    ISize = 3,
+    F16 = 4,
+    F32 = 5,
+    F64 = 6,
+    Bool = 7,
+    Char = 8,
+    Void = 9,
+    Never = 10,
+    TypeType = 11,
+    Str = 12,
+    PhysAddr = 13,
+    VirtAddr = 14,
+    DmaAddr = 15,
+}
+
+pub enum BuiltinKind : u8 {
+    Prim = 0,
+    VecType = 1,
+    SimdAlias = 2,
+    ArithError = 3,
+    BoundsError = 4,
+    Utf8Error = 5,
+    OutOfMemory = 6,
+    Ordering = 7,
+    OrdIface = 8,
+    EqIface = 9,
+    RawPtr = 10,
+    MmioReg = 11,
+    Arena = 12,
+    ArenaPool = 13,
+    ArenaStr = 14,
+    SlotPool = 15,
+    Buf = 16,
+    LinearBuf = 17,
+    Link = 18,
+    IdBrand = 19,
+    GenId = 20,
+    AllocCap = 21,
+    Env = 22,
+    FsCap = 23,
+    DirCap = 24,
+    NetCap = 25,
+    ClockCap = 26,
+    IoCap = 27,
+    ArgsCap = 28,
+    BuildCap = 29,
+    IoError = 30,
+    MemError = 31,
+    StaleId = 32,
+    Schedule = 33,
+    Atomic = 34,
+    GpuBuf = 35,
+    GpuImage2D = 36,
+}
+
+pub struct BuiltinInfo {
+    pub kind: BuiltinKind;
+    pub prim: PrimKind;
+    pub prim_bits: u8;
+    pub lanes: u8;
+    pub is_mut: bool;
+}
+
+pub enum TopDefKind : u8 {
+    Fn = 0,
+    Sys = 1,
+    Struct = 2,
+    Pool = 3,
+    Enum = 4,
+    Union = 5,
+    Bitfield = 6,
+    Iface = 7,
+    Error = 8,
+    TypeAlias = 9,
+    Const = 10,
+    ExternFn = 11,
+    ExternStruct = 12,
+    ExternUnion = 13,
+}
+
+pub enum TargetKind : u8 {
+    Def = 0,
+    Module = 1,
+    Builtin = 2,
+}
+
+// ---------------------------------------------------------------------------
+// Core Resolution Records
+// ---------------------------------------------------------------------------
+
+pub struct ScopeEntry {
+    pub name: u32;
+    pub kind: TargetKind;
+    pub target_id: u32;
+    pub is_pub: bool;
+    pub is_import: bool;
+    pub used: bool;
+    pub span: span.Span;
+}
+
+pub struct TopDef {
+    pub id: u32;
+    pub module_id: u32;
+    pub unit_id: u32;
+    pub decl_idx: u32;
+    pub decl_id: u32;
+    pub name: u32;
+    pub kind: TopDefKind;
+    pub is_pub: bool;
+    pub used: bool;
+    pub span: span.Span;
+}
+
+pub struct ImplInfo {
+    pub module_id: u32;
+    pub unit_id: u32;
+    pub decl_idx: u32;
+    pub decl_id: u32;
+    pub span: span.Span;
+}
+
+pub struct ImportEdge {
+    pub from_mod: u32;
+    pub to_mod: u32;
+    pub span: span.Span;
+}
+
+pub struct ImportRec {
+    pub module_id: u32;
+    pub local_sym: u32;
+    pub kind: TargetKind;
+    pub target_id: u32;
+    pub span: span.Span;
+}
+
+pub struct ModuleInfo {
+    pub id: u32;
+    pub unit_id: u32;
+    pub file: u32;
+    pub path_sym: u32;
+    pub profile: span.FileProfile;
+    pub imports_off: u32;
+    pub imports_len: u32;
+    pub scope_off: u32;
+    pub scope_len: u32;
+    pub items_off: u32;
+    pub items_len: u32;
+    pub is_emi_stub: bool;
+}
+
+// ---------------------------------------------------------------------------
+// Builtin Encoding / Decoding & Debug Formatting
+// ---------------------------------------------------------------------------
+
+fn prim_kind_to_u8(p: PrimKind) -> u8 {
+    match p {
+        .UInt => { return 0_u8; }
+        .USize => { return 1_u8; }
+        .IInt => { return 2_u8; }
+        .ISize => { return 3_u8; }
+        .F16 => { return 4_u8; }
+        .F32 => { return 5_u8; }
+        .F64 => { return 6_u8; }
+        .Bool => { return 7_u8; }
+        .Char => { return 8_u8; }
+        .Void => { return 9_u8; }
+        .Never => { return 10_u8; }
+        .TypeType => { return 11_u8; }
+        .Str => { return 12_u8; }
+        .PhysAddr => { return 13_u8; }
+        .VirtAddr => { return 14_u8; }
+        .DmaAddr => { return 15_u8; }
+    }
+}
+
+fn prim_kind_from_u8(v: u8) -> PrimKind {
+    match v {
+        0_u8 => { return .UInt; }
+        1_u8 => { return .USize; }
+        2_u8 => { return .IInt; }
+        3_u8 => { return .ISize; }
+        4_u8 => { return .F16; }
+        5_u8 => { return .F32; }
+        6_u8 => { return .F64; }
+        7_u8 => { return .Bool; }
+        8_u8 => { return .Char; }
+        9_u8 => { return .Void; }
+        10_u8 => { return .Never; }
+        11_u8 => { return .TypeType; }
+        12_u8 => { return .Str; }
+        13_u8 => { return .PhysAddr; }
+        14_u8 => { return .VirtAddr; }
+        15_u8 => { return .DmaAddr; }
+        _ => { return .Void; }
+    }
+}
+
+fn builtin_kind_to_u8(k: BuiltinKind) -> u8 {
+    match k {
+        .Prim => { return 0_u8; }
+        .VecType => { return 1_u8; }
+        .SimdAlias => { return 2_u8; }
+        .ArithError => { return 3_u8; }
+        .BoundsError => { return 4_u8; }
+        .Utf8Error => { return 5_u8; }
+        .OutOfMemory => { return 6_u8; }
+        .Ordering => { return 7_u8; }
+        .OrdIface => { return 8_u8; }
+        .EqIface => { return 9_u8; }
+        .RawPtr => { return 10_u8; }
+        .MmioReg => { return 11_u8; }
+        .Arena => { return 12_u8; }
+        .ArenaPool => { return 13_u8; }
+        .ArenaStr => { return 14_u8; }
+        .SlotPool => { return 15_u8; }
+        .Buf => { return 16_u8; }
+        .LinearBuf => { return 17_u8; }
+        .Link => { return 18_u8; }
+        .IdBrand => { return 19_u8; }
+        .GenId => { return 20_u8; }
+        .AllocCap => { return 21_u8; }
+        .Env => { return 22_u8; }
+        .FsCap => { return 23_u8; }
+        .DirCap => { return 24_u8; }
+        .NetCap => { return 25_u8; }
+        .ClockCap => { return 26_u8; }
+        .IoCap => { return 27_u8; }
+        .ArgsCap => { return 28_u8; }
+        .BuildCap => { return 29_u8; }
+        .IoError => { return 30_u8; }
+        .MemError => { return 31_u8; }
+        .StaleId => { return 32_u8; }
+        .Schedule => { return 33_u8; }
+        .Atomic => { return 34_u8; }
+        .GpuBuf => { return 35_u8; }
+        .GpuImage2D => { return 36_u8; }
+    }
+}
+
+fn builtin_kind_from_u8(v: u8) -> BuiltinKind {
+    match v {
+        0_u8 => { return .Prim; }
+        1_u8 => { return .VecType; }
+        2_u8 => { return .SimdAlias; }
+        3_u8 => { return .ArithError; }
+        4_u8 => { return .BoundsError; }
+        5_u8 => { return .Utf8Error; }
+        6_u8 => { return .OutOfMemory; }
+        7_u8 => { return .Ordering; }
+        8_u8 => { return .OrdIface; }
+        9_u8 => { return .EqIface; }
+        10_u8 => { return .RawPtr; }
+        11_u8 => { return .MmioReg; }
+        12_u8 => { return .Arena; }
+        13_u8 => { return .ArenaPool; }
+        14_u8 => { return .ArenaStr; }
+        15_u8 => { return .SlotPool; }
+        16_u8 => { return .Buf; }
+        17_u8 => { return .LinearBuf; }
+        18_u8 => { return .Link; }
+        19_u8 => { return .IdBrand; }
+        20_u8 => { return .GenId; }
+        21_u8 => { return .AllocCap; }
+        22_u8 => { return .Env; }
+        23_u8 => { return .FsCap; }
+        24_u8 => { return .DirCap; }
+        25_u8 => { return .NetCap; }
+        26_u8 => { return .ClockCap; }
+        27_u8 => { return .IoCap; }
+        28_u8 => { return .ArgsCap; }
+        29_u8 => { return .BuildCap; }
+        30_u8 => { return .IoError; }
+        31_u8 => { return .MemError; }
+        32_u8 => { return .StaleId; }
+        33_u8 => { return .Schedule; }
+        34_u8 => { return .Atomic; }
+        35_u8 => { return .GpuBuf; }
+        36_u8 => { return .GpuImage2D; }
+        _ => { return .Prim; }
+    }
+}
+
+pub fn encode_builtin_simple(kind: BuiltinKind) -> u32 {
+    return builtin_kind_to_u8(kind).widen.[u32]();
+}
+
+pub fn encode_builtin_prim(prim: PrimKind, bits: u8) -> u32 {
+    let b0 = builtin_kind_to_u8(.Prim).widen.[u32]();
+    let b1 = prim_kind_to_u8(prim).widen.[u32]() <<% 8_u32;
+    let b2 = bits.widen.[u32]() <<% 16_u32;
+    return b0 | b1 | b2;
+}
+
+pub fn encode_builtin_simd(prim: PrimKind, bits: u8, lanes: u8) -> u32 {
+    let b0 = builtin_kind_to_u8(.SimdAlias).widen.[u32]();
+    let b1 = prim_kind_to_u8(prim).widen.[u32]() <<% 8_u32;
+    let b2 = bits.widen.[u32]() <<% 16_u32;
+    let b3 = lanes.widen.[u32]() <<% 24_u32;
+    return b0 | b1 | b2 | b3;
+}
+
+pub fn encode_builtin_rawptr(is_mut: bool) -> u32 {
+    let b0 = builtin_kind_to_u8(.RawPtr).widen.[u32]();
+    let b3: u32 = if is_mut { 1_u32 <<% 24_u32 } else { 0_u32 };
+    return b0 | b3;
+}
+
+pub fn decode_builtin(id: u32) -> BuiltinInfo {
+    let kind = builtin_kind_from_u8((id & 0xFF_u32).trunc.[u8]());
+    let prim = prim_kind_from_u8(((id >> 8_u32) & 0xFF_u32).trunc.[u8]());
+    let prim_bits = ((id >> 16_u32) & 0xFF_u32).trunc.[u8]();
+    let aux = ((id >> 24_u32) & 0xFF_u32).trunc.[u8]();
+    let lanes: u8 = if kind == .SimdAlias { aux } else { 0_u8 };
+    let is_mut = kind == .RawPtr && aux != 0_u8;
+    return BuiltinInfo.{
+        kind: kind,
+        prim: prim,
+        prim_bits: prim_bits,
+        lanes: lanes,
+        is_mut: is_mut,
+    };
+}
+
+fn write_prim_debug(
+    alloc: *mut AllocCap,
+    prim: PrimKind,
+    bits: u8,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    match prim {
+        .UInt => {
+            try out.push_str_grow(alloc, "UInt(");
+            try out.push_u64_grow(alloc, bits.widen.[u64]());
+            try out.push_byte_grow(alloc, b')');
+        }
+        .USize => { try out.push_str_grow(alloc, "USize"); }
+        .IInt => {
+            try out.push_str_grow(alloc, "IInt(");
+            try out.push_u64_grow(alloc, bits.widen.[u64]());
+            try out.push_byte_grow(alloc, b')');
+        }
+        .ISize => { try out.push_str_grow(alloc, "ISize"); }
+        .F16 => { try out.push_str_grow(alloc, "F16"); }
+        .F32 => { try out.push_str_grow(alloc, "F32"); }
+        .F64 => { try out.push_str_grow(alloc, "F64"); }
+        .Bool => { try out.push_str_grow(alloc, "Bool"); }
+        .Char => { try out.push_str_grow(alloc, "Char"); }
+        .Void => { try out.push_str_grow(alloc, "Void"); }
+        .Never => { try out.push_str_grow(alloc, "Never"); }
+        .TypeType => { try out.push_str_grow(alloc, "TypeType"); }
+        .Str => { try out.push_str_grow(alloc, "Str"); }
+        .PhysAddr => { try out.push_str_grow(alloc, "PhysAddr"); }
+        .VirtAddr => { try out.push_str_grow(alloc, "VirtAddr"); }
+        .DmaAddr => { try out.push_str_grow(alloc, "DmaAddr"); }
+    }
+    return;
+}
+
+fn write_builtin_simple_debug(
+    alloc: *mut AllocCap,
+    kind: BuiltinKind,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    match kind {
+        .Prim => { try out.push_str_grow(alloc, "Prim"); }
+        .VecType => { try out.push_str_grow(alloc, "VecType"); }
+        .SimdAlias => { try out.push_str_grow(alloc, "SimdAlias"); }
+        .ArithError => { try out.push_str_grow(alloc, "ArithError"); }
+        .BoundsError => { try out.push_str_grow(alloc, "BoundsError"); }
+        .Utf8Error => { try out.push_str_grow(alloc, "Utf8Error"); }
+        .OutOfMemory => { try out.push_str_grow(alloc, "OutOfMemory"); }
+        .Ordering => { try out.push_str_grow(alloc, "Ordering"); }
+        .OrdIface => { try out.push_str_grow(alloc, "OrdIface"); }
+        .EqIface => { try out.push_str_grow(alloc, "EqIface"); }
+        .RawPtr => { try out.push_str_grow(alloc, "RawPtr"); }
+        .MmioReg => { try out.push_str_grow(alloc, "MmioReg"); }
+        .Arena => { try out.push_str_grow(alloc, "Arena"); }
+        .ArenaPool => { try out.push_str_grow(alloc, "ArenaPool"); }
+        .ArenaStr => { try out.push_str_grow(alloc, "ArenaStr"); }
+        .SlotPool => { try out.push_str_grow(alloc, "SlotPool"); }
+        .Buf => { try out.push_str_grow(alloc, "Buf"); }
+        .LinearBuf => { try out.push_str_grow(alloc, "LinearBuf"); }
+        .Link => { try out.push_str_grow(alloc, "Link"); }
+        .IdBrand => { try out.push_str_grow(alloc, "IdBrand"); }
+        .GenId => { try out.push_str_grow(alloc, "GenId"); }
+        .AllocCap => { try out.push_str_grow(alloc, "AllocCap"); }
+        .Env => { try out.push_str_grow(alloc, "Env"); }
+        .FsCap => { try out.push_str_grow(alloc, "FsCap"); }
+        .DirCap => { try out.push_str_grow(alloc, "DirCap"); }
+        .NetCap => { try out.push_str_grow(alloc, "NetCap"); }
+        .ClockCap => { try out.push_str_grow(alloc, "ClockCap"); }
+        .IoCap => { try out.push_str_grow(alloc, "IoCap"); }
+        .ArgsCap => { try out.push_str_grow(alloc, "ArgsCap"); }
+        .BuildCap => { try out.push_str_grow(alloc, "BuildCap"); }
+        .IoError => { try out.push_str_grow(alloc, "IoError"); }
+        .MemError => { try out.push_str_grow(alloc, "MemError"); }
+        .StaleId => { try out.push_str_grow(alloc, "StaleId"); }
+        .Schedule => { try out.push_str_grow(alloc, "Schedule"); }
+        .Atomic => { try out.push_str_grow(alloc, "Atomic"); }
+        .GpuBuf => { try out.push_str_grow(alloc, "GpuBuf"); }
+        .GpuImage2D => { try out.push_str_grow(alloc, "GpuImage2D"); }
+    }
+    return;
+}
+
+/// Formats `builtin_id` identically to Rust `format!("{bk:?}")` on `BuiltinKind`.
+pub fn write_builtin_debug(
+    alloc: *mut AllocCap,
+    builtin_id: u32,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let info = decode_builtin(builtin_id);
+    if info.kind == .Prim {
+        try out.push_str_grow(alloc, "Prim(");
+        try write_prim_debug(alloc, info.prim, info.prim_bits, out);
+        try out.push_byte_grow(alloc, b')');
+        return;
+    }
+    if info.kind == .SimdAlias {
+        try out.push_str_grow(alloc, "SimdAlias(");
+        try write_prim_debug(alloc, info.prim, info.prim_bits, out);
+        try out.push_str_grow(alloc, ", ");
+        try out.push_u64_grow(alloc, info.lanes.widen.[u64]());
+        try out.push_byte_grow(alloc, b')');
+        return;
+    }
+    if info.kind == .RawPtr {
+        if info.is_mut {
+            try out.push_str_grow(alloc, "RawPtr { is_mut: true }");
+        } else {
+            try out.push_str_grow(alloc, "RawPtr { is_mut: false }");
+        }
+        return;
+    }
+    try write_builtin_simple_debug(alloc, info.kind, out);
+    return;
+}
+
+pub fn write_top_def_kind(
+    alloc: *mut AllocCap,
+    kind: TopDefKind,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    match kind {
+        .Fn => { try out.push_str_grow(alloc, "fn"); }
+        .Sys => { try out.push_str_grow(alloc, "sys"); }
+        .Struct => { try out.push_str_grow(alloc, "struct"); }
+        .Pool => { try out.push_str_grow(alloc, "pool"); }
+        .Enum => { try out.push_str_grow(alloc, "enum"); }
+        .Union => { try out.push_str_grow(alloc, "union"); }
+        .Bitfield => { try out.push_str_grow(alloc, "bitfield"); }
+        .Iface => { try out.push_str_grow(alloc, "iface"); }
+        .Error => { try out.push_str_grow(alloc, "error"); }
+        .TypeAlias => { try out.push_str_grow(alloc, "type"); }
+        .Const => { try out.push_str_grow(alloc, "const"); }
+        .ExternFn => { try out.push_str_grow(alloc, "extern_fn"); }
+        .ExternStruct => { try out.push_str_grow(alloc, "extern_struct"); }
+        .ExternUnion => { try out.push_str_grow(alloc, "extern_union"); }
+    }
+    return;
+}
+
+/// Lexicographical rank of `top_def_kind` display string ("bitfield" < "const" < ... < "union").
+fn top_def_kind_lex_rank(kind: TopDefKind) -> u8 {
+    match kind {
+        .Bitfield => { return 0_u8; }
+        .Const => { return 1_u8; }
+        .Enum => { return 2_u8; }
+        .Error => { return 3_u8; }
+        .ExternFn => { return 4_u8; }
+        .ExternStruct => { return 5_u8; }
+        .ExternUnion => { return 6_u8; }
+        .Fn => { return 7_u8; }
+        .Iface => { return 8_u8; }
+        .Pool => { return 9_u8; }
+        .Struct => { return 10_u8; }
+        .Sys => { return 11_u8; }
+        .TypeAlias => { return 12_u8; }
+        .Union => { return 13_u8; }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Low-level Key, Slice & Sorting Helpers
+// ---------------------------------------------------------------------------
+
+fn scope_key(mod_id: u32, name_sym: u32) -> u64 {
+    return (mod_id.widen.[u64]() <<% 32_u64) | name_sym.widen.[u64]();
+}
+
+view fn slice_range_u32[T](all: *[T], off: u32, len: u32) -> *[T] {
+    let start = off.widen.[usize]();
+    let end = start +% len.widen.[usize]();
+    let s = all.sub(start, end) catch {
+        return all.sub(0_usize, 0_usize) catch {
+            return all;
+        };
+    };
+    return s;
+}
+
+fn cmp_bytes(a: *[u8], b: *[u8]) -> i32 {
+    let min_len = if a.len < b.len { a.len } else { b.len };
+    var i: usize = 0_usize;
+    while i < min_len {
+        if i < a.len && i < b.len {
+            let ca = a[i];
+            let cb = b[i];
+            if ca < cb {
+                return -1_i32;
+            }
+            if ca > cb {
+                return 1_i32;
+            }
+        }
+        i = i +% 1_usize;
+    }
+    if a.len < b.len {
+        return -1_i32;
+    }
+    if a.len > b.len {
+        return 1_i32;
+    }
+    return 0_i32;
+}
+
+fn sort_scope_entries_by_name(entries: *mut [ScopeEntry]) {
+    let n = entries.len;
+    if n <= 1_usize {
+        return;
+    }
+    var gap: usize = 1_usize;
+    let third = n / 3_usize;
+    while gap < third {
+        gap = (gap *% 3_usize) +% 1_usize;
+    }
+    while gap > 0_usize {
+        var i = gap;
+        while i < n {
+            let cur = entries[i];
+            var j = i;
+            while j >= gap {
+                let prev = j - gap;
+                if entries[prev].name <= cur.name {
+                    break;
+                }
+                entries[j] = entries[prev];
+                j = prev;
+            }
+            entries[j] = cur;
+            i = i +% 1_usize;
+        }
+        gap = gap / 3_usize;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ResolvedProgram (flat linear arena + O(1) lookup tables)
+// ---------------------------------------------------------------------------
+
+pub linear struct ResolvedIndices {
+    pub scope_map: col.HashMap[u32];
+    pub module_by_name: col.HashMap[u32];
+    pub prelude: col.HashMap[u32];
+}
+
+impl ResolvedIndices {
+    pub fn init(alloc: *mut AllocCap) -> ResolvedIndices ! OutOfMemory {
+        let scope_map = try col.HashMap.[u32].init(alloc, 64_usize);
+        errdefer scope_map.destroy(alloc);
+        let module_by_name = try col.HashMap.[u32].init(alloc, 32_usize);
+        errdefer module_by_name.destroy(alloc);
+        let prelude = try col.HashMap.[u32].init(alloc, 256_usize);
+        errdefer prelude.destroy(alloc);
+        return ResolvedIndices.{
+            scope_map: scope_map,
+            module_by_name: module_by_name,
+            prelude: prelude,
+        };
+    }
+
+    pub fn destroy(self: ResolvedIndices, alloc: *mut AllocCap) {
+        let ResolvedIndices.{ scope_map, module_by_name, prelude } = self;
+        scope_map.destroy(alloc);
+        module_by_name.destroy(alloc);
+        prelude.destroy(alloc);
+    }
+
+    pub fn clone_from(alloc: *mut AllocCap, src: *ResolvedIndices) -> ResolvedIndices ! OutOfMemory {
+        var scope_map = try col.HashMap.[u32].init(alloc, src.scope_map.cap());
+        errdefer scope_map.destroy(alloc);
+        try scope_map.copy_from(alloc, &src.scope_map);
+        var module_by_name = try col.HashMap.[u32].init(alloc, src.module_by_name.cap());
+        errdefer module_by_name.destroy(alloc);
+        try module_by_name.copy_from(alloc, &src.module_by_name);
+        var prelude = try col.HashMap.[u32].init(alloc, src.prelude.cap());
+        errdefer prelude.destroy(alloc);
+        try prelude.copy_from(alloc, &src.prelude);
+        return ResolvedIndices.{
+            scope_map: scope_map,
+            module_by_name: module_by_name,
+            prelude: prelude,
+        };
+    }
+}
+
+pub linear struct ResolvedProgram {
+    pub modules: col.DynBuf[ModuleInfo];
+    pub defs: col.DynBuf[TopDef];
+    pub impls: col.DynBuf[ImplInfo];
+    pub scopes: col.DynBuf[ScopeEntry];
+    pub import_edges: col.DynBuf[ImportEdge];
+    pub import_recs: col.DynBuf[ImportRec];
+    pub indices: ResolvedIndices;
+    pub has_emi_stubs: bool;
+}
+
+struct ImportDumpRow {
+    local_sym: u32;
+    target_off: u32;
+    target_len: u32;
+}
+
+impl ResolvedProgram {
+    pub fn init(alloc: *mut AllocCap) -> ResolvedProgram ! OutOfMemory {
+        let modules = try col.DynBuf.[ModuleInfo].init(alloc, 16_usize);
+        errdefer modules.destroy(alloc);
+        let defs = try col.DynBuf.[TopDef].init(alloc, 64_usize);
+        errdefer defs.destroy(alloc);
+        let impls = try col.DynBuf.[ImplInfo].init(alloc, 16_usize);
+        errdefer impls.destroy(alloc);
+        let scopes = try col.DynBuf.[ScopeEntry].init(alloc, 64_usize);
+        errdefer scopes.destroy(alloc);
+        let import_edges = try col.DynBuf.[ImportEdge].init(alloc, 32_usize);
+        errdefer import_edges.destroy(alloc);
+        let import_recs = try col.DynBuf.[ImportRec].init(alloc, 32_usize);
+        errdefer import_recs.destroy(alloc);
+        let indices = try ResolvedIndices.init(alloc);
+        errdefer indices.destroy(alloc);
+        return ResolvedProgram.{
+            modules: modules,
+            defs: defs,
+            impls: impls,
+            scopes: scopes,
+            import_edges: import_edges,
+            import_recs: import_recs,
+            indices: indices,
+            has_emi_stubs: false,
+        };
+    }
+
+    pub fn destroy(self: ResolvedProgram, alloc: *mut AllocCap) {
+        let ResolvedProgram.{
+            modules,
+            defs,
+            impls,
+            scopes,
+            import_edges,
+            import_recs,
+            indices,
+            has_emi_stubs: _,
+        } = self;
+        modules.destroy(alloc);
+        defs.destroy(alloc);
+        impls.destroy(alloc);
+        scopes.destroy(alloc);
+        import_edges.destroy(alloc);
+        import_recs.destroy(alloc);
+        indices.destroy(alloc);
+    }
+
+    pub fn clone_for_worker(self: *Self, alloc: *mut AllocCap) -> ResolvedProgram ! OutOfMemory {
+        var modules = try col.DynBuf.[ModuleInfo].init(alloc, self.modules.len() +% 1_usize);
+        errdefer modules.destroy(alloc);
+        try modules.push_slice(alloc, self.modules.as_slice());
+        var defs = try col.DynBuf.[TopDef].init(alloc, self.defs.len() +% 1_usize);
+        errdefer defs.destroy(alloc);
+        try defs.push_slice(alloc, self.defs.as_slice());
+        var impls = try col.DynBuf.[ImplInfo].init(alloc, self.impls.len() +% 1_usize);
+        errdefer impls.destroy(alloc);
+        try impls.push_slice(alloc, self.impls.as_slice());
+        var scopes = try col.DynBuf.[ScopeEntry].init(alloc, self.scopes.len() +% 1_usize);
+        errdefer scopes.destroy(alloc);
+        try scopes.push_slice(alloc, self.scopes.as_slice());
+        var import_edges = try col.DynBuf.[ImportEdge].init(alloc, self.import_edges.len() +% 1_usize);
+        errdefer import_edges.destroy(alloc);
+        try import_edges.push_slice(alloc, self.import_edges.as_slice());
+        var import_recs = try col.DynBuf.[ImportRec].init(alloc, self.import_recs.len() +% 1_usize);
+        errdefer import_recs.destroy(alloc);
+        try import_recs.push_slice(alloc, self.import_recs.as_slice());
+        let indices = try ResolvedIndices.clone_from(alloc, &self.indices);
+        return ResolvedProgram.{
+            modules: modules,
+            defs: defs,
+            impls: impls,
+            scopes: scopes,
+            import_edges: import_edges,
+            import_recs: import_recs,
+            indices: indices,
+            has_emi_stubs: self.has_emi_stubs,
+        };
+    }
+
+    pub fn merge_used_from(self: *mut Self, src: *ResolvedProgram) {
+        let d_dst = self.defs.as_mut_slice();
+        let d_src = src.defs.as_slice();
+        var i: usize = 0_usize;
+        while i < d_dst.len && i < d_src.len {
+            if d_src[i].used {
+                d_dst[i].used = true;
+            }
+            i = i +% 1_usize;
+        }
+        let s_dst = self.scopes.as_mut_slice();
+        let s_src = src.scopes.as_slice();
+        var j: usize = 0_usize;
+        while j < s_dst.len && j < s_src.len {
+            if s_src[j].used {
+                s_dst[j].used = true;
+            }
+            j = j +% 1_usize;
+        }
+    }
+
+    pub fn module_count(self: *Self) -> u32 {
+        return self.modules.len().trunc.[u32]();
+    }
+
+    pub fn def_count(self: *Self) -> u32 {
+        return self.defs.len().trunc.[u32]();
+    }
+
+    pub fn impl_count(self: *Self) -> u32 {
+        return self.impls.len().trunc.[u32]();
+    }
+
+    pub view fn get_module(self: *Self, mod_id: u32) -> ?*ModuleInfo {
+        return self.modules.get(mod_id.widen.[usize]());
+    }
+
+    pub view fn get_def(self: *Self, def_id: u32) -> ?*TopDef {
+        return self.defs.get(def_id.widen.[usize]());
+    }
+
+    pub view fn module_scopes(self: *Self, mod_id: u32) -> *[ScopeEntry] {
+        let all = self.scopes.as_slice();
+        if let m = self.modules.get(mod_id.widen.[usize]()) {
+            return slice_range_u32.[ScopeEntry](all, m.scope_off, m.scope_len);
+        }
+        return all.sub(0_usize, 0_usize) catch {
+            return all;
+        };
+    }
+
+    pub view fn module_defs(self: *Self, mod_id: u32) -> *[TopDef] {
+        let all = self.defs.as_slice();
+        if let m = self.modules.get(mod_id.widen.[usize]()) {
+            return slice_range_u32.[TopDef](all, m.items_off, m.items_len);
+        }
+        return all.sub(0_usize, 0_usize) catch {
+            return all;
+        };
+    }
+
+    pub view fn module_edges(self: *Self, mod_id: u32) -> *[ImportEdge] {
+        let all = self.import_edges.as_slice();
+        if let m = self.modules.get(mod_id.widen.[usize]()) {
+            return slice_range_u32.[ImportEdge](all, m.imports_off, m.imports_len);
+        }
+        return all.sub(0_usize, 0_usize) catch {
+            return all;
+        };
+    }
+
+    pub fn lookup_module_by_sym(self: *Self, path_sym: u32) -> ?u32 {
+        return self.indices.module_by_name.get(path_sym.widen.[u64]());
+    }
+
+    pub fn lookup_prelude(self: *Self, name_sym: u32) -> ?u32 {
+        return self.indices.prelude.get(name_sym.widen.[u64]());
+    }
+
+    pub fn lookup_in_module(self: *Self, mod_id: u32, name_sym: u32) -> ?ScopeEntry {
+        if let sidx = self.indices.scope_map.get(scope_key(mod_id, name_sym)) {
+            let ss = self.scopes.as_slice();
+            let idx = sidx.widen.[usize]();
+            if idx < ss.len {
+                return ss[idx];
+            }
+        }
+        if let bid = self.indices.prelude.get(name_sym.widen.[u64]()) {
+            return ScopeEntry.{
+                name: name_sym,
+                kind: .Builtin,
+                target_id: bid,
+                is_pub: true,
+                is_import: false,
+                used: true,
+                span: span.span_dummy(),
+            };
+        }
+        return null;
+    }
+
+    pub fn lookup_export(self: *Self, mod_id: u32, name_sym: u32) -> ?ScopeEntry {
+        if let sidx = self.indices.scope_map.get(scope_key(mod_id, name_sym)) {
+            let ss = self.scopes.as_slice();
+            let idx = sidx.widen.[usize]();
+            if idx < ss.len {
+                let entry = ss[idx];
+                if !entry.is_import && entry.is_pub {
+                    return entry;
+                }
+            }
+        }
+        return null;
+    }
+
+    pub fn mark_module_binding_used(self: *mut Self, mod_id: u32, name_sym: u32) {
+        if let sidx = self.indices.scope_map.get(scope_key(mod_id, name_sym)) {
+            let idx = sidx.widen.[usize]();
+            var def_to_mark = DEF_NONE;
+            let ss = self.scopes.as_mut_slice();
+            if idx < ss.len {
+                ss[idx].used = true;
+                if ss[idx].kind == .Def {
+                    def_to_mark = ss[idx].target_id;
+                }
+            }
+            if def_to_mark != DEF_NONE {
+                self.mark_def_used(def_to_mark);
+            }
+        }
+    }
+
+    pub fn mark_def_used(self: *mut Self, def_id: u32) {
+        let idx = def_id.widen.[usize]();
+        let ds = self.defs.as_mut_slice();
+        if idx < ds.len {
+            ds[idx].used = true;
+        }
+    }
+
+    /// ZM-01: Report unused imports and unused private functions (called after typechecking).
+    pub fn check_unused_module_items(
+        self: *Self,
+        alloc: *mut AllocCap,
+        diags: *mut diag.DiagBag,
+    ) -> !OutOfMemory {
+        let mods = self.modules.as_slice();
+        var mi: usize = 0_usize;
+        while mi < mods.len {
+            let m = mods[mi];
+            if m.unit_id != UNIT_NONE && !m.is_emi_stub && !self.has_emi_stubs {
+                let sc = self.module_scopes(m.id);
+                var si: usize = 0_usize;
+                while si < sc.len {
+                    let b = sc[si];
+                    if b.is_import && !b.used {
+                        _ = try diags.emit_error(
+                            alloc,
+                            diag.E0101,
+                            b.span,
+                            "ZM-01: unused `import`",
+                        );
+                    }
+                    si = si +% 1_usize;
+                }
+            }
+            mi = mi +% 1_usize;
+        }
+
+        if self.has_emi_stubs {
+            return;
+        }
+        let ds = self.defs.as_slice();
+        var di: usize = 0_usize;
+        while di < ds.len {
+            let def = ds[di];
+            if !def.is_pub && !def.used && def.kind == .Fn {
+                _ = try diags.emit_error(
+                    alloc,
+                    diag.E0101,
+                    def.span,
+                    "ZM-01: unused private function",
+                );
+            }
+            di = di +% 1_usize;
+        }
+        return;
+    }
+
+    /// Canonical textual dump matching `compiler/src/resolve.rs::ResolvedProgram::dump_canonical` byte-for-byte.
+    pub fn dump_canonical(
+        self: *Self,
+        alloc: *mut AllocCap,
+        interner: *span.SymInterner,
+        out: *mut str.StrBuf,
+    ) -> !OutOfMemory {
+        var mod_ids = try col.DynBuf.[u32].init(alloc, self.modules.len() +% 1_usize);
+        errdefer mod_ids.destroy(alloc);
+
+        let mods = self.modules.as_slice();
+        var mi: usize = 0_usize;
+        while mi < mods.len {
+            if mods[mi].unit_id != UNIT_NONE {
+                try mod_ids.push(alloc, mods[mi].id);
+            }
+            mi = mi +% 1_usize;
+        }
+        sort_module_ids_canonical(mods, interner, mod_ids.as_mut_slice());
+
+        var rows = try col.DynBuf.[ImportDumpRow].init(alloc, 16_usize);
+        errdefer rows.destroy(alloc);
+        var target_buf = try str.StrBuf.init(alloc, 256_usize);
+        errdefer target_buf.destroy(alloc);
+        var def_ids = try col.DynBuf.[u32].init(alloc, 32_usize);
+        errdefer def_ids.destroy(alloc);
+
+        let ordered = mod_ids.as_slice();
+        var oi: usize = 0_usize;
+        while oi < ordered.len {
+            try dump_single_module_canonical(
+                self,
+                alloc,
+                interner,
+                ordered[oi],
+                &mut rows,
+                &mut target_buf,
+                &mut def_ids,
+                out,
+            );
+            oi = oi +% 1_usize;
+        }
+
+        def_ids.destroy(alloc);
+        target_buf.destroy(alloc);
+        rows.destroy(alloc);
+        mod_ids.destroy(alloc);
+        return;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical Dump Sorting & Formatting Helpers
+// ---------------------------------------------------------------------------
+
+fn cmp_module_ids_canonical(
+    mods: *[ModuleInfo],
+    interner: *span.SymInterner,
+    a_id: u32,
+    b_id: u32,
+) -> i32 {
+    let ai = a_id.widen.[usize]();
+    let bi = b_id.widen.[usize]();
+    if ai >= mods.len || bi >= mods.len {
+        if a_id < b_id {
+            return -1_i32;
+        }
+        if a_id > b_id {
+            return 1_i32;
+        }
+        return 0_i32;
+    }
+    let ord = cmp_bytes(interner.get(mods[ai].path_sym), interner.get(mods[bi].path_sym));
+    if ord != 0_i32 {
+        return ord;
+    }
+    if a_id < b_id {
+        return -1_i32;
+    }
+    if a_id > b_id {
+        return 1_i32;
+    }
+    return 0_i32;
+}
+
+fn sort_module_ids_canonical(
+    mods: *[ModuleInfo],
+    interner: *span.SymInterner,
+    ids: *mut [u32],
+) {
+    let n = ids.len;
+    if n <= 1_usize {
+        return;
+    }
+    var gap: usize = 1_usize;
+    let third = n / 3_usize;
+    while gap < third {
+        gap = (gap *% 3_usize) +% 1_usize;
+    }
+    while gap > 0_usize {
+        var i = gap;
+        while i < n {
+            let cur = ids[i];
+            var j = i;
+            while j >= gap {
+                let prev = j - gap;
+                if cmp_module_ids_canonical(mods, interner, ids[prev], cur) <= 0_i32 {
+                    break;
+                }
+                ids[j] = ids[prev];
+                j = prev;
+            }
+            ids[j] = cur;
+            i = i +% 1_usize;
+        }
+        gap = gap / 3_usize;
+    }
+}
+
+fn cmp_import_rows(
+    interner: *span.SymInterner,
+    target_bytes: *[u8],
+    a: ImportDumpRow,
+    b: ImportDumpRow,
+) -> i32 {
+    let ord = cmp_bytes(interner.get(a.local_sym), interner.get(b.local_sym));
+    if ord != 0_i32 {
+        return ord;
+    }
+    let ta = slice_range_u32.[u8](target_bytes, a.target_off, a.target_len);
+    let tb = slice_range_u32.[u8](target_bytes, b.target_off, b.target_len);
+    return cmp_bytes(ta, tb);
+}
+
+fn sort_import_rows(
+    interner: *span.SymInterner,
+    target_bytes: *[u8],
+    rows: *mut [ImportDumpRow],
+) {
+    let n = rows.len;
+    if n <= 1_usize {
+        return;
+    }
+    var gap: usize = 1_usize;
+    let third = n / 3_usize;
+    while gap < third {
+        gap = (gap *% 3_usize) +% 1_usize;
+    }
+    while gap > 0_usize {
+        var i = gap;
+        while i < n {
+            let cur = rows[i];
+            var j = i;
+            while j >= gap {
+                let prev = j - gap;
+                if cmp_import_rows(interner, target_bytes, rows[prev], cur) <= 0_i32 {
+                    break;
+                }
+                rows[j] = rows[prev];
+                j = prev;
+            }
+            rows[j] = cur;
+            i = i +% 1_usize;
+        }
+        gap = gap / 3_usize;
+    }
+}
+
+fn cmp_def_ids_canonical(
+    defs: *[TopDef],
+    interner: *span.SymInterner,
+    a_id: u32,
+    b_id: u32,
+) -> i32 {
+    let ai = a_id.widen.[usize]();
+    let bi = b_id.widen.[usize]();
+    if ai >= defs.len || bi >= defs.len {
+        return 0_i32;
+    }
+    let da = defs[ai];
+    let db = defs[bi];
+    let ord = cmp_bytes(interner.get(da.name), interner.get(db.name));
+    if ord != 0_i32 {
+        return ord;
+    }
+    let ra = top_def_kind_lex_rank(da.kind);
+    let rb = top_def_kind_lex_rank(db.kind);
+    if ra < rb {
+        return -1_i32;
+    }
+    if ra > rb {
+        return 1_i32;
+    }
+    return 0_i32;
+}
+
+fn sort_def_ids_canonical(
+    defs: *[TopDef],
+    interner: *span.SymInterner,
+    ids: *mut [u32],
+) {
+    let n = ids.len;
+    if n <= 1_usize {
+        return;
+    }
+    var gap: usize = 1_usize;
+    let third = n / 3_usize;
+    while gap < third {
+        gap = (gap *% 3_usize) +% 1_usize;
+    }
+    while gap > 0_usize {
+        var i = gap;
+        while i < n {
+            let cur = ids[i];
+            var j = i;
+            while j >= gap {
+                let prev = j - gap;
+                if cmp_def_ids_canonical(defs, interner, ids[prev], cur) <= 0_i32 {
+                    break;
+                }
+                ids[j] = ids[prev];
+                j = prev;
+            }
+            ids[j] = cur;
+            i = i +% 1_usize;
+        }
+        gap = gap / 3_usize;
+    }
+}
+
+fn format_import_target(
+    prog: *ResolvedProgram,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    entry: *ScopeEntry,
+    target_buf: *mut str.StrBuf,
+) -> !OutOfMemory {
+    match entry.kind {
+        .Module => {
+            try target_buf.push_str_grow(alloc, "module ");
+            if let tm = prog.get_module(entry.target_id) {
+                try target_buf.push_bytes_grow(alloc, interner.get(tm.path_sym));
+            }
+        }
+        .Def => {
+            try target_buf.push_str_grow(alloc, "item ");
+            if let def = prog.get_def(entry.target_id) {
+                if let tm = prog.get_module(def.module_id) {
+                    try target_buf.push_bytes_grow(alloc, interner.get(tm.path_sym));
+                }
+                try target_buf.push_byte_grow(alloc, b'.');
+                try target_buf.push_bytes_grow(alloc, interner.get(def.name));
+            }
+        }
+        .Builtin => {
+            try target_buf.push_str_grow(alloc, "builtin ");
+            try write_builtin_debug(alloc, entry.target_id, target_buf);
+        }
+    }
+    return;
+}
+
+fn dump_single_module_canonical(
+    prog: *ResolvedProgram,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    mod_id: u32,
+    rows: *mut col.DynBuf[ImportDumpRow],
+    target_buf: *mut str.StrBuf,
+    def_ids: *mut col.DynBuf[u32],
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let m = prog.get_module(mod_id) orelse {
+        return;
+    };
+    let mname = interner.get(m.path_sym);
+    try out.push_str_grow(alloc, "module ");
+    if mname.len == 0_usize {
+        try out.push_str_grow(alloc, "<unnamed>");
+    } else {
+        try out.push_bytes_grow(alloc, mname);
+    }
+    if m.profile == .Hal {
+        try out.push_str_grow(alloc, " @hal");
+    }
+    try out.push_byte_grow(alloc, 10_u8);
+
+    rows.clear();
+    target_buf.clear();
+    let sc = prog.module_scopes(mod_id);
+    var si: usize = 0_usize;
+    while si < sc.len {
+        let b = sc[si];
+        if b.is_import {
+            let off = target_buf.len().trunc.[u32]();
+            try format_import_target(prog, alloc, interner, &b, target_buf);
+            let tlen = target_buf.len().trunc.[u32]() -% off;
+            try rows.push(
+                alloc,
+                ImportDumpRow.{
+                    local_sym: b.name,
+                    target_off: off,
+                    target_len: tlen,
+                },
+            );
+        }
+        si = si +% 1_usize;
+    }
+
+    let tbytes = target_buf.as_bytes();
+    sort_import_rows(interner, tbytes, rows.as_mut_slice());
+    let rslice = rows.as_slice();
+    var ri: usize = 0_usize;
+    while ri < rslice.len {
+        let row = rslice[ri];
+        try out.push_str_grow(alloc, "  import ");
+        try out.push_bytes_grow(alloc, interner.get(row.local_sym));
+        try out.push_str_grow(alloc, " -> ");
+        try out.push_bytes_grow(alloc, slice_range_u32.[u8](tbytes, row.target_off, row.target_len));
+        try out.push_byte_grow(alloc, 10_u8);
+        ri = ri +% 1_usize;
+    }
+
+    def_ids.clear();
+    let mdefs = prog.module_defs(mod_id);
+    var di: usize = 0_usize;
+    while di < mdefs.len {
+        try def_ids.push(alloc, mdefs[di].id);
+        di = di +% 1_usize;
+    }
+    let all_defs = prog.defs.as_slice();
+    sort_def_ids_canonical(all_defs, interner, def_ids.as_mut_slice());
+
+    let sorted_defs = def_ids.as_slice();
+    var k: usize = 0_usize;
+    while k < sorted_defs.len {
+        let did = sorted_defs[k].widen.[usize]();
+        if did < all_defs.len {
+            let def = all_defs[did];
+            try out.push_str_grow(alloc, "  ");
+            if def.is_pub {
+                try out.push_str_grow(alloc, "pub ");
+            }
+            try write_top_def_kind(alloc, def.kind, out);
+            try out.push_byte_grow(alloc, b' ');
+            try out.push_bytes_grow(alloc, interner.get(def.name));
+            try out.push_byte_grow(alloc, 10_u8);
+        }
+        k = k +% 1_usize;
+    }
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// Prelude & Virtual `core.*` Module Registration
+// ---------------------------------------------------------------------------
+
+fn add_prelude_entry(
+    alloc: *mut AllocCap,
+    interner: *mut span.SymInterner,
+    prelude: *mut col.HashMap[u32],
+    name: *str,
+    builtin_id: u32,
+) -> !OutOfMemory {
+    let sym = try interner.intern_str(alloc, name);
+    try prelude.insert(alloc, sym.widen.[u64](), builtin_id);
+    return;
+}
+
+fn populate_int_prims(
+    alloc: *mut AllocCap,
+    interner: *mut span.SymInterner,
+    prelude: *mut col.HashMap[u32],
+    prefix: u8,
+    prim: PrimKind,
+) -> !OutOfMemory {
+    var buf: [4]u8 = [0_u8; 4];
+    buf[0_usize] = prefix;
+    var bits: u8 = 1_u8;
+    while bits <= 64_u8 {
+        var nlen: usize = 2_usize;
+        if bits < 10_u8 {
+            buf[1_usize] = b'0' +% bits;
+        } else {
+            buf[1_usize] = b'0' +% (bits / 10_u8);
+            buf[2_usize] = b'0' +% (bits % 10_u8);
+            nlen = 3_usize;
+        }
+        let sref: *[u8] = &buf;
+        let name_slice = sref.sub(0_usize, nlen) catch {
+            return;
+        };
+        let sym = try interner.intern(alloc, name_slice);
+        try prelude.insert(alloc, sym.widen.[u64](), encode_builtin_prim(prim, bits));
+        bits = bits +% 1_u8;
+    }
+    return;
+}
+
+fn build_prelude_primitives_and_simd(
+    alloc: *mut AllocCap,
+    interner: *mut span.SymInterner,
+    prelude: *mut col.HashMap[u32],
+) -> !OutOfMemory {
+    try populate_int_prims(alloc, interner, prelude, b'u', .UInt);
+    try add_prelude_entry(alloc, interner, prelude, "u128", encode_builtin_prim(.UInt, 128_u8));
+    try add_prelude_entry(alloc, interner, prelude, "usize", encode_builtin_prim(.USize, 0_u8));
+
+    try populate_int_prims(alloc, interner, prelude, b'i', .IInt);
+    try add_prelude_entry(alloc, interner, prelude, "i128", encode_builtin_prim(.IInt, 128_u8));
+    try add_prelude_entry(alloc, interner, prelude, "isize", encode_builtin_prim(.ISize, 0_u8));
+
+    try add_prelude_entry(alloc, interner, prelude, "f16", encode_builtin_prim(.F16, 0_u8));
+    try add_prelude_entry(alloc, interner, prelude, "f32", encode_builtin_prim(.F32, 0_u8));
+    try add_prelude_entry(alloc, interner, prelude, "f64", encode_builtin_prim(.F64, 0_u8));
+    try add_prelude_entry(alloc, interner, prelude, "bool", encode_builtin_prim(.Bool, 0_u8));
+    try add_prelude_entry(alloc, interner, prelude, "char", encode_builtin_prim(.Char, 0_u8));
+    try add_prelude_entry(alloc, interner, prelude, "str", encode_builtin_prim(.Str, 0_u8));
+
+    try add_prelude_entry(alloc, interner, prelude, "vec", encode_builtin_simple(.VecType));
+    try add_prelude_entry(alloc, interner, prelude, "f32x2", encode_builtin_simd(.F32, 0_u8, 2_u8));
+    try add_prelude_entry(alloc, interner, prelude, "f32x4", encode_builtin_simd(.F32, 0_u8, 4_u8));
+    try add_prelude_entry(alloc, interner, prelude, "f32x8", encode_builtin_simd(.F32, 0_u8, 8_u8));
+    try add_prelude_entry(alloc, interner, prelude, "f64x2", encode_builtin_simd(.F64, 0_u8, 2_u8));
+    try add_prelude_entry(alloc, interner, prelude, "f64x4", encode_builtin_simd(.F64, 0_u8, 4_u8));
+    try add_prelude_entry(alloc, interner, prelude, "i32x4", encode_builtin_simd(.IInt, 32_u8, 4_u8));
+    try add_prelude_entry(alloc, interner, prelude, "i32x8", encode_builtin_simd(.IInt, 32_u8, 8_u8));
+    try add_prelude_entry(alloc, interner, prelude, "u8x4", encode_builtin_simd(.UInt, 8_u8, 4_u8));
+    try add_prelude_entry(alloc, interner, prelude, "u8x16", encode_builtin_simd(.UInt, 8_u8, 16_u8));
+    try add_prelude_entry(alloc, interner, prelude, "u8x32", encode_builtin_simd(.UInt, 8_u8, 32_u8));
+    try add_prelude_entry(alloc, interner, prelude, "u32x2", encode_builtin_simd(.UInt, 32_u8, 2_u8));
+    try add_prelude_entry(alloc, interner, prelude, "u32x4", encode_builtin_simd(.UInt, 32_u8, 4_u8));
+    return;
+}
+
+fn build_prelude_builtins(
+    alloc: *mut AllocCap,
+    interner: *mut span.SymInterner,
+    prelude: *mut col.HashMap[u32],
+) -> !OutOfMemory {
+    try add_prelude_entry(alloc, interner, prelude, "PhysAddr", encode_builtin_prim(.PhysAddr, 0_u8));
+    try add_prelude_entry(alloc, interner, prelude, "VirtAddr", encode_builtin_prim(.VirtAddr, 0_u8));
+    try add_prelude_entry(alloc, interner, prelude, "DmaAddr", encode_builtin_prim(.DmaAddr, 0_u8));
+
+    try add_prelude_entry(alloc, interner, prelude, "ArithError", encode_builtin_simple(.ArithError));
+    try add_prelude_entry(alloc, interner, prelude, "BoundsError", encode_builtin_simple(.BoundsError));
+    try add_prelude_entry(alloc, interner, prelude, "Utf8Error", encode_builtin_simple(.Utf8Error));
+    try add_prelude_entry(alloc, interner, prelude, "OutOfMemory", encode_builtin_simple(.OutOfMemory));
+    try add_prelude_entry(alloc, interner, prelude, "MemError", encode_builtin_simple(.MemError));
+    try add_prelude_entry(alloc, interner, prelude, "StaleId", encode_builtin_simple(.StaleId));
+    try add_prelude_entry(alloc, interner, prelude, "IoError", encode_builtin_simple(.IoError));
+    try add_prelude_entry(alloc, interner, prelude, "Ordering", encode_builtin_simple(.Ordering));
+    try add_prelude_entry(alloc, interner, prelude, "Ord", encode_builtin_simple(.OrdIface));
+    try add_prelude_entry(alloc, interner, prelude, "Eq", encode_builtin_simple(.EqIface));
+
+    try add_prelude_entry(alloc, interner, prelude, "rawptr", encode_builtin_rawptr(false));
+    try add_prelude_entry(alloc, interner, prelude, "rawptr_mut", encode_builtin_rawptr(true));
+    try add_prelude_entry(alloc, interner, prelude, "MmioReg", encode_builtin_simple(.MmioReg));
+    try add_prelude_entry(alloc, interner, prelude, "Arena", encode_builtin_simple(.Arena));
+    try add_prelude_entry(alloc, interner, prelude, "ArenaPool", encode_builtin_simple(.ArenaPool));
+    try add_prelude_entry(alloc, interner, prelude, "ArenaStr", encode_builtin_simple(.ArenaStr));
+    try add_prelude_entry(alloc, interner, prelude, "SlotPool", encode_builtin_simple(.SlotPool));
+    try add_prelude_entry(alloc, interner, prelude, "Buf", encode_builtin_simple(.Buf));
+    try add_prelude_entry(alloc, interner, prelude, "LinearBuf", encode_builtin_simple(.LinearBuf));
+    try add_prelude_entry(alloc, interner, prelude, "Link", encode_builtin_simple(.Link));
+    try add_prelude_entry(alloc, interner, prelude, "Id", encode_builtin_simple(.IdBrand));
+    try add_prelude_entry(alloc, interner, prelude, "GenId", encode_builtin_simple(.GenId));
+    try add_prelude_entry(alloc, interner, prelude, "AllocCap", encode_builtin_simple(.AllocCap));
+    try add_prelude_entry(alloc, interner, prelude, "Env", encode_builtin_simple(.Env));
+    try add_prelude_entry(alloc, interner, prelude, "FsCap", encode_builtin_simple(.FsCap));
+    try add_prelude_entry(alloc, interner, prelude, "DirCap", encode_builtin_simple(.DirCap));
+    try add_prelude_entry(alloc, interner, prelude, "NetCap", encode_builtin_simple(.NetCap));
+    try add_prelude_entry(alloc, interner, prelude, "ClockCap", encode_builtin_simple(.ClockCap));
+    try add_prelude_entry(alloc, interner, prelude, "IoCap", encode_builtin_simple(.IoCap));
+    try add_prelude_entry(alloc, interner, prelude, "ArgsCap", encode_builtin_simple(.ArgsCap));
+    try add_prelude_entry(alloc, interner, prelude, "BuildCap", encode_builtin_simple(.BuildCap));
+    try add_prelude_entry(alloc, interner, prelude, "Schedule", encode_builtin_simple(.Schedule));
+    try add_prelude_entry(alloc, interner, prelude, "Atomic", encode_builtin_simple(.Atomic));
+    try add_prelude_entry(alloc, interner, prelude, "GpuBuf", encode_builtin_simple(.GpuBuf));
+    try add_prelude_entry(alloc, interner, prelude, "GpuImage2D", encode_builtin_simple(.GpuImage2D));
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// Temporary Raw Scope Builder (compacted into per-module slices after imports)
+// ---------------------------------------------------------------------------
+
+linear struct RawScopePool {
+    entries: col.DynBuf[ScopeEntry];
+    owners: col.DynBuf[u32];
+}
+
+impl RawScopePool {
+    fn init(alloc: *mut AllocCap) -> RawScopePool ! OutOfMemory {
+        let entries = try col.DynBuf.[ScopeEntry].init(alloc, 64_usize);
+        errdefer entries.destroy(alloc);
+        let owners = try col.DynBuf.[u32].init(alloc, 64_usize);
+        errdefer owners.destroy(alloc);
+        return RawScopePool.{ entries: entries, owners: owners };
+    }
+
+    fn push_entry(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        scope_map: *mut col.HashMap[u32],
+        mod_id: u32,
+        entry: ScopeEntry,
+    ) -> !OutOfMemory {
+        let idx = self.entries.len().trunc.[u32]();
+        let sym = entry.name;
+        try self.entries.push(alloc, entry);
+        try self.owners.push(alloc, mod_id);
+        try scope_map.insert(alloc, scope_key(mod_id, sym), idx);
+        return;
+    }
+
+    fn destroy(self: RawScopePool, alloc: *mut AllocCap) {
+        let RawScopePool.{ entries, owners } = self;
+        entries.destroy(alloc);
+        owners.destroy(alloc);
+    }
+}
+
+fn add_virtual_builtin(
+    alloc: *mut AllocCap,
+    interner: *mut span.SymInterner,
+    prog: *mut ResolvedProgram,
+    spool: *mut RawScopePool,
+    mod_id: u32,
+    item_name: *str,
+    builtin_id: u32,
+) -> !OutOfMemory {
+    let sym = try interner.intern_str(alloc, item_name);
+    let entry = ScopeEntry.{
+        name: sym,
+        kind: .Builtin,
+        target_id: builtin_id,
+        is_pub: true,
+        is_import: false,
+        used: true,
+        span: span.span_dummy(),
+    };
+    try spool.push_entry(alloc, &mut prog.indices.scope_map, mod_id, entry);
+    return;
+}
+
+fn begin_virtual_module(
+    alloc: *mut AllocCap,
+    interner: *mut span.SymInterner,
+    prog: *mut ResolvedProgram,
+    mod_name: *str,
+) -> ?u32 ! OutOfMemory {
+    let path_sym = try interner.intern_str(alloc, mod_name);
+    if prog.indices.module_by_name.contains(path_sym.widen.[u64]()) {
+        return null;
+    }
+    let mod_id = prog.modules.len().trunc.[u32]();
+    try prog.indices.module_by_name.insert(alloc, path_sym.widen.[u64](), mod_id);
+    try prog.modules.push(
+        alloc,
+        ModuleInfo.{
+            id: mod_id,
+            unit_id: UNIT_NONE,
+            file: span.FILE_DUMMY,
+            path_sym: path_sym,
+            profile: .Safe,
+            imports_off: 0_u32,
+            imports_len: 0_u32,
+            scope_off: 0_u32,
+            scope_len: 0_u32,
+            items_off: 0_u32,
+            items_len: 0_u32,
+            is_emi_stub: false,
+        },
+    );
+    return mod_id;
+}
+
+fn register_virtual_core_modules(
+    alloc: *mut AllocCap,
+    interner: *mut span.SymInterner,
+    prog: *mut ResolvedProgram,
+    spool: *mut RawScopePool,
+) -> !OutOfMemory {
+    if let addr_id = try begin_virtual_module(alloc, interner, prog, "core.addr") {
+        try add_virtual_builtin(alloc, interner, prog, spool, addr_id, "PhysAddr", encode_builtin_prim(.PhysAddr, 0_u8));
+        try add_virtual_builtin(alloc, interner, prog, spool, addr_id, "VirtAddr", encode_builtin_prim(.VirtAddr, 0_u8));
+        try add_virtual_builtin(alloc, interner, prog, spool, addr_id, "DmaAddr", encode_builtin_prim(.DmaAddr, 0_u8));
+    }
+
+    if let err_id = try begin_virtual_module(alloc, interner, prog, "core.err") {
+        try add_virtual_builtin(alloc, interner, prog, spool, err_id, "ArithError", encode_builtin_simple(.ArithError));
+        try add_virtual_builtin(alloc, interner, prog, spool, err_id, "BoundsError", encode_builtin_simple(.BoundsError));
+        try add_virtual_builtin(alloc, interner, prog, spool, err_id, "Utf8Error", encode_builtin_simple(.Utf8Error));
+        try add_virtual_builtin(alloc, interner, prog, spool, err_id, "OutOfMemory", encode_builtin_simple(.OutOfMemory));
+        try add_virtual_builtin(alloc, interner, prog, spool, err_id, "MemError", encode_builtin_simple(.MemError));
+        try add_virtual_builtin(alloc, interner, prog, spool, err_id, "StaleId", encode_builtin_simple(.StaleId));
+        try add_virtual_builtin(alloc, interner, prog, spool, err_id, "IoError", encode_builtin_simple(.IoError));
+    }
+
+    if let mem_id = try begin_virtual_module(alloc, interner, prog, "core.mem") {
+        try add_virtual_builtin(alloc, interner, prog, spool, mem_id, "Arena", encode_builtin_simple(.Arena));
+        try add_virtual_builtin(alloc, interner, prog, spool, mem_id, "ArenaPool", encode_builtin_simple(.ArenaPool));
+        try add_virtual_builtin(alloc, interner, prog, spool, mem_id, "ArenaStr", encode_builtin_simple(.ArenaStr));
+        try add_virtual_builtin(alloc, interner, prog, spool, mem_id, "SlotPool", encode_builtin_simple(.SlotPool));
+        try add_virtual_builtin(alloc, interner, prog, spool, mem_id, "Buf", encode_builtin_simple(.Buf));
+        try add_virtual_builtin(alloc, interner, prog, spool, mem_id, "LinearBuf", encode_builtin_simple(.LinearBuf));
+        try add_virtual_builtin(alloc, interner, prog, spool, mem_id, "AllocCap", encode_builtin_simple(.AllocCap));
+        try add_virtual_builtin(alloc, interner, prog, spool, mem_id, "Env", encode_builtin_simple(.Env));
+        try add_virtual_builtin(alloc, interner, prog, spool, mem_id, "FsCap", encode_builtin_simple(.FsCap));
+        try add_virtual_builtin(alloc, interner, prog, spool, mem_id, "DirCap", encode_builtin_simple(.DirCap));
+        try add_virtual_builtin(alloc, interner, prog, spool, mem_id, "NetCap", encode_builtin_simple(.NetCap));
+        try add_virtual_builtin(alloc, interner, prog, spool, mem_id, "ClockCap", encode_builtin_simple(.ClockCap));
+        try add_virtual_builtin(alloc, interner, prog, spool, mem_id, "IoCap", encode_builtin_simple(.IoCap));
+        try add_virtual_builtin(alloc, interner, prog, spool, mem_id, "ArgsCap", encode_builtin_simple(.ArgsCap));
+        try add_virtual_builtin(alloc, interner, prog, spool, mem_id, "BuildCap", encode_builtin_simple(.BuildCap));
+    }
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: Register User Modules & Top-Level Declarations
+// ---------------------------------------------------------------------------
+
+struct DeclMeta {
+    valid: bool;
+    name: ast.IdentSpan;
+    kind: TopDefKind;
+    is_auto_used: bool;
+}
+
+fn join_ident_path(
+    alloc: *mut AllocCap,
+    arena: *ast.AstArena,
+    segs_range: ast.IdRange,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    out.clear();
+    let segs = arena.idents_range(segs_range);
+    var i: usize = 0_usize;
+    while i < segs.len {
+        if i > 0_usize {
+            try out.push_byte_grow(alloc, b'.');
+        }
+        try out.push_bytes_grow(alloc, interner.get(segs[i].sym));
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+fn fn_has_export_attr(
+    arena: *ast.AstArena,
+    attrs_range: ast.IdRange,
+    interner: *span.SymInterner,
+) -> bool {
+    let attrs = arena.attrs_range(attrs_range);
+    var i: usize = 0_usize;
+    while i < attrs.len {
+        let aname = interner.get(attrs[i].name.sym);
+        if str.bytes_eq(aname, "extern".as_bytes())
+            || str.bytes_eq(aname, "naked".as_bytes())
+            || str.bytes_eq(aname, "interrupt".as_bytes())
+        {
+            return true;
+        }
+        i = i +% 1_usize;
+    }
+    return false;
+}
+
+fn extract_decl_meta_tail(arena: *ast.AstArena, decl: *ast.DeclNode) -> DeclMeta {
+    let invalid = DeclMeta.{
+        valid: false,
+        name: ast.ident_none(),
+        kind: .Fn,
+        is_auto_used: false,
+    };
+    match decl.kind {
+        .Bitfield => {
+            if let b = arena.get_bitfield_decl(decl.payload) {
+                return DeclMeta.{ valid: true, name: b.name, kind: .Bitfield, is_auto_used: false };
+            }
+        }
+        .Iface => {
+            if let ic = arena.get_iface_decl(decl.payload) {
+                return DeclMeta.{ valid: true, name: ic.name, kind: .Iface, is_auto_used: false };
+            }
+        }
+        .Error => {
+            if let er = arena.get_error_decl(decl.payload) {
+                return DeclMeta.{ valid: true, name: er.name, kind: .Error, is_auto_used: false };
+            }
+        }
+        .TypeAlias => {
+            if let t = arena.get_type_decl(decl.payload) {
+                return DeclMeta.{ valid: true, name: t.name, kind: .TypeAlias, is_auto_used: false };
+            }
+        }
+        .Const => {
+            if let c = arena.get_const_decl(decl.payload) {
+                return DeclMeta.{ valid: true, name: c.name, kind: .Const, is_auto_used: false };
+            }
+        }
+        .ExternFn => {
+            if let ex = arena.get_extern_decl(decl.payload) {
+                return DeclMeta.{ valid: true, name: ex.name, kind: .ExternFn, is_auto_used: false };
+            }
+        }
+        .ExternStruct => {
+            if let ex = arena.get_extern_decl(decl.payload) {
+                return DeclMeta.{ valid: true, name: ex.name, kind: .ExternStruct, is_auto_used: false };
+            }
+        }
+        .ExternUnion => {
+            if let ex = arena.get_extern_decl(decl.payload) {
+                return DeclMeta.{ valid: true, name: ex.name, kind: .ExternUnion, is_auto_used: false };
+            }
+        }
+        _ => {}
+    }
+    return invalid;
+}
+
+fn extract_decl_meta(
+    arena: *ast.AstArena,
+    decl: *ast.DeclNode,
+    interner: *span.SymInterner,
+) -> DeclMeta {
+    let invalid = DeclMeta.{
+        valid: false,
+        name: ast.ident_none(),
+        kind: .Fn,
+        is_auto_used: false,
+    };
+    match decl.kind {
+        .Fn => {
+            if let f = arena.get_fn_decl(decl.payload) {
+                let is_main = str.bytes_eq(interner.get(f.name.sym), "main".as_bytes());
+                let is_exp = fn_has_export_attr(arena, decl.attrs, interner);
+                return DeclMeta.{
+                    valid: true,
+                    name: f.name,
+                    kind: .Fn,
+                    is_auto_used: is_main || is_exp,
+                };
+            }
+            return invalid;
+        }
+        .Sys => {
+            if let s = arena.get_sys_decl(decl.payload) {
+                return DeclMeta.{ valid: true, name: s.name, kind: .Sys, is_auto_used: false };
+            }
+            return invalid;
+        }
+        .Struct => {
+            if let s = arena.get_struct_decl(decl.payload) {
+                return DeclMeta.{ valid: true, name: s.name, kind: .Struct, is_auto_used: false };
+            }
+            return invalid;
+        }
+        .Pool => {
+            if let p = arena.get_struct_decl(decl.payload) {
+                return DeclMeta.{ valid: true, name: p.name, kind: .Pool, is_auto_used: false };
+            }
+            return invalid;
+        }
+        .Enum => {
+            if let e = arena.get_enum_decl(decl.payload) {
+                return DeclMeta.{ valid: true, name: e.name, kind: .Enum, is_auto_used: false };
+            }
+            return invalid;
+        }
+        .Union => {
+            if let u = arena.get_union_decl(decl.payload) {
+                return DeclMeta.{ valid: true, name: u.name, kind: .Union, is_auto_used: false };
+            }
+            return invalid;
+        }
+        _ => {
+            return extract_decl_meta_tail(arena, decl);
+        }
+    }
+}
+
+fn register_user_unit(
+    alloc: *mut AllocCap,
+    arena: *ast.AstArena,
+    unit_id: u32,
+    interner: *mut span.SymInterner,
+    diags: *mut diag.DiagBag,
+    prog: *mut ResolvedProgram,
+    spool: *mut RawScopePool,
+    scratch: *mut str.StrBuf,
+    msg_buf: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let unit = arena.get_unit(unit_id) orelse {
+        return;
+    };
+    let mod_id = prog.modules.len().trunc.[u32]();
+
+    try join_ident_path(alloc, arena, unit.module_path, interner, scratch);
+    let path_sym: u32 = if scratch.len() == 0_usize {
+        span.SYM_EMPTY
+    } else {
+        try interner.intern(alloc, scratch.as_bytes())
+    };
+
+    if path_sym != span.SYM_EMPTY {
+        if prog.indices.module_by_name.contains(path_sym.widen.[u64]()) {
+            let segs = arena.idents_range(unit.module_path);
+            let sp = if segs.len > 0_usize { segs[0_usize].span } else { span.span_dummy() };
+            msg_buf.clear();
+            try msg_buf.push_str_grow(alloc, "duplicate module `");
+            try msg_buf.push_bytes_grow(alloc, interner.get(path_sym));
+            try msg_buf.push_byte_grow(alloc, b'`');
+            _ = try diags.emit_error_bytes(alloc, diag.E0132, sp, msg_buf.as_bytes());
+        } else {
+            try prog.indices.module_by_name.insert(alloc, path_sym.widen.[u64](), mod_id);
+        }
+    }
+
+    let items_off = prog.defs.len().trunc.[u32]();
+    let decls = arena.decl_list_range(unit.decls);
+    var di: usize = 0_usize;
+    while di < decls.len {
+        let decl_id = decls[di];
+        if let decl = arena.get_decl(decl_id) {
+            if decl.kind == .Impl {
+                try prog.impls.push(
+                    alloc,
+                    ImplInfo.{
+                        module_id: mod_id,
+                        unit_id: unit_id,
+                        decl_idx: di.trunc.[u32](),
+                        decl_id: decl_id,
+                        span: decl.span,
+                    },
+                );
+            } else {
+                let meta = extract_decl_meta(arena, decl, interner);
+                if meta.valid {
+                    let skey = scope_key(mod_id, meta.name.sym);
+                    if prog.indices.scope_map.contains(skey) {
+                        msg_buf.clear();
+                        try msg_buf.push_str_grow(alloc, "duplicate definition of `");
+                        try msg_buf.push_bytes_grow(alloc, interner.get(meta.name.sym));
+                        try msg_buf.push_str_grow(alloc, "` in module `");
+                        try msg_buf.push_bytes_grow(alloc, interner.get(path_sym));
+                        try msg_buf.push_byte_grow(alloc, b'`');
+                        _ = try diags.emit_error_bytes(alloc, diag.E0132, meta.name.span, msg_buf.as_bytes());
+                    } else {
+                        let def_id = prog.defs.len().trunc.[u32]();
+                        try prog.defs.push(
+                            alloc,
+                            TopDef.{
+                                id: def_id,
+                                module_id: mod_id,
+                                unit_id: unit_id,
+                                decl_idx: di.trunc.[u32](),
+                                decl_id: decl_id,
+                                name: meta.name.sym,
+                                kind: meta.kind,
+                                is_pub: decl.is_pub,
+                                used: meta.is_auto_used,
+                                span: meta.name.span,
+                            },
+                        );
+                        try spool.push_entry(
+                            alloc,
+                            &mut prog.indices.scope_map,
+                            mod_id,
+                            ScopeEntry.{
+                                name: meta.name.sym,
+                                kind: .Def,
+                                target_id: def_id,
+                                is_pub: decl.is_pub,
+                                is_import: false,
+                                used: meta.is_auto_used,
+                                span: meta.name.span,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        di = di +% 1_usize;
+    }
+
+    if unit.is_emi_stub {
+        prog.has_emi_stubs = true;
+    } else {
+        let uds = arena.decl_list_range(unit.decls);
+        var udi: usize = 0_usize;
+        while udi < uds.len {
+            if let d = arena.get_decl(uds[udi]) {
+                if d.kind == .Fn {
+                    if let fn_n = arena.get_fn_decl(d.payload) {
+                        if fn_n.is_emi_stub_body {
+                            prog.has_emi_stubs = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            udi = udi +% 1_usize;
+        }
+    }
+    let items_len = prog.defs.len().trunc.[u32]() -% items_off;
+    try prog.modules.push(
+        alloc,
+        ModuleInfo.{
+            id: mod_id,
+            unit_id: unit_id,
+            file: unit.file,
+            path_sym: path_sym,
+            profile: unit.profile,
+            imports_off: 0_u32,
+            imports_len: 0_u32,
+            scope_off: 0_u32,
+            scope_len: 0_u32,
+            items_off: items_off,
+            items_len: items_len,
+            is_emi_stub: unit.is_emi_stub,
+        },
+    );
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Resolve Imports & Visibility Across Modules
+// ---------------------------------------------------------------------------
+
+fn insert_import_binding(
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+    prog: *mut ResolvedProgram,
+    spool: *mut RawScopePool,
+    mod_id: u32,
+    sym: u32,
+    sp: span.Span,
+    kind: TargetKind,
+    target_id: u32,
+    msg_buf: *mut str.StrBuf,
+) -> !OutOfMemory {
+    if prog.indices.scope_map.contains(scope_key(mod_id, sym)) {
+        msg_buf.clear();
+        try msg_buf.push_str_grow(alloc, "import `");
+        try msg_buf.push_bytes_grow(alloc, interner.get(sym));
+        try msg_buf.push_str_grow(
+            alloc,
+            "` conflicts with an existing definition or import in this module",
+        );
+        _ = try diags.emit_error_bytes(alloc, diag.E0132, sp, msg_buf.as_bytes());
+        return;
+    }
+    try spool.push_entry(
+        alloc,
+        &mut prog.indices.scope_map,
+        mod_id,
+        ScopeEntry.{
+            name: sym,
+            kind: kind,
+            target_id: target_id,
+            is_pub: false,
+            is_import: true,
+            used: false,
+            span: sp,
+        },
+    );
+    try prog.import_recs.push(
+        alloc,
+        ImportRec.{
+            module_id: mod_id,
+            local_sym: sym,
+            kind: kind,
+            target_id: target_id,
+            span: sp,
+        },
+    );
+    return;
+}
+
+fn resolve_import_items(
+    alloc: *mut AllocCap,
+    arena: *ast.AstArena,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+    prog: *mut ResolvedProgram,
+    spool: *mut RawScopePool,
+    mod_id: u32,
+    target_id: u32,
+    target_name: *[u8],
+    items_range: ast.IdRange,
+    msg_buf: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let items = arena.import_items_range(items_range);
+    var ii: usize = 0_usize;
+    while ii < items.len {
+        let item = items[ii];
+        var found = false;
+        var exported = false;
+        var found_kind: TargetKind = .Def;
+        var found_tid: u32 = 0_u32;
+
+        if let sidx = prog.indices.scope_map.get(scope_key(target_id, item.name.sym)) {
+            let es = spool.entries.as_slice();
+            let idx = sidx.widen.[usize]();
+            if idx < es.len {
+                let ent = es[idx];
+                found = true;
+                if !ent.is_import && ent.is_pub {
+                    exported = true;
+                    found_kind = ent.kind;
+                    found_tid = ent.target_id;
+                }
+            }
+        }
+
+        if exported {
+            let bind = if ast.ident_is_some(item.alias) { item.alias } else { item.name };
+            try insert_import_binding(
+                alloc,
+                interner,
+                diags,
+                prog,
+                spool,
+                mod_id,
+                bind.sym,
+                bind.span,
+                found_kind,
+                found_tid,
+                msg_buf,
+            );
+        } else if found {
+            msg_buf.clear();
+            try msg_buf.push_str_grow(alloc, "symbol `");
+            try msg_buf.push_bytes_grow(alloc, interner.get(item.name.sym));
+            try msg_buf.push_str_grow(alloc, "` in module `");
+            try msg_buf.push_bytes_grow(alloc, target_name);
+            try msg_buf.push_str_grow(alloc, "` is private (missing `pub`)");
+            _ = try diags.emit_error_bytes(alloc, diag.E0133, item.name.span, msg_buf.as_bytes());
+        } else {
+            msg_buf.clear();
+            try msg_buf.push_str_grow(alloc, "symbol `");
+            try msg_buf.push_bytes_grow(alloc, interner.get(item.name.sym));
+            try msg_buf.push_str_grow(alloc, "` not found in module `");
+            try msg_buf.push_bytes_grow(alloc, target_name);
+            try msg_buf.push_byte_grow(alloc, b'`');
+            _ = try diags.emit_error_bytes(alloc, diag.E0132, item.name.span, msg_buf.as_bytes());
+        }
+        ii = ii +% 1_usize;
+    }
+    return;
+}
+
+fn resolve_module_imports(
+    alloc: *mut AllocCap,
+    arena: *ast.AstArena,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+    prog: *mut ResolvedProgram,
+    spool: *mut RawScopePool,
+    mod_id: u32,
+    unit_id: u32,
+    scratch: *mut str.StrBuf,
+    msg_buf: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let unit = arena.get_unit(unit_id) orelse {
+        return;
+    };
+    let imports_off = prog.import_edges.len().trunc.[u32]();
+    let imps = arena.imports_range(unit.imports);
+    var ii: usize = 0_usize;
+    while ii < imps.len {
+        let imp = imps[ii];
+        try join_ident_path(alloc, arena, imp.path, interner, scratch);
+        let tname = scratch.as_bytes();
+
+        var has_target = false;
+        var target_id: u32 = 0_u32;
+        if tname.len > 0_usize {
+            if let tsym = interner.lookup(tname) {
+                if let tid = prog.indices.module_by_name.get(tsym.widen.[u64]()) {
+                    has_target = true;
+                    target_id = tid;
+                }
+            }
+        }
+
+        if !has_target {
+            msg_buf.clear();
+            try msg_buf.push_str_grow(alloc, "unresolved module `");
+            try msg_buf.push_bytes_grow(alloc, tname);
+            try msg_buf.push_byte_grow(alloc, b'`');
+            _ = try diags.emit_error_bytes(alloc, diag.E0132, imp.span, msg_buf.as_bytes());
+        } else if target_id == mod_id {
+            msg_buf.clear();
+            try msg_buf.push_str_grow(alloc, "ZM: module `");
+            try msg_buf.push_bytes_grow(alloc, tname);
+            try msg_buf.push_str_grow(alloc, "` cannot import itself (cycle)");
+            _ = try diags.emit_error_bytes(alloc, diag.E0131, imp.span, msg_buf.as_bytes());
+        } else {
+            try prog.import_edges.push(
+                alloc,
+                ImportEdge.{
+                    from_mod: mod_id,
+                    to_mod: target_id,
+                    span: imp.span,
+                },
+            );
+            match imp.tail_kind {
+                .None => {
+                    let psegs = arena.idents_range(imp.path);
+                    if psegs.len > 0_usize {
+                        let last = psegs[psegs.len - 1_usize];
+                        try insert_import_binding(
+                            alloc,
+                            interner,
+                            diags,
+                            prog,
+                            spool,
+                            mod_id,
+                            last.sym,
+                            last.span,
+                            .Module,
+                            target_id,
+                            msg_buf,
+                        );
+                    }
+                }
+                .Alias => {
+                    if ast.ident_is_some(imp.alias) {
+                        try insert_import_binding(
+                            alloc,
+                            interner,
+                            diags,
+                            prog,
+                            spool,
+                            mod_id,
+                            imp.alias.sym,
+                            imp.alias.span,
+                            .Module,
+                            target_id,
+                            msg_buf,
+                        );
+                    }
+                }
+                .Items => {
+                    try resolve_import_items(
+                        alloc,
+                        arena,
+                        interner,
+                        diags,
+                        prog,
+                        spool,
+                        mod_id,
+                        target_id,
+                        tname,
+                        imp.items,
+                        msg_buf,
+                    );
+                }
+            }
+        }
+        ii = ii +% 1_usize;
+    }
+
+    let imports_len = prog.import_edges.len().trunc.[u32]() -% imports_off;
+    let m_idx = mod_id.widen.[usize]();
+    let mods_mut = prog.modules.as_mut_slice();
+    if m_idx < mods_mut.len {
+        mods_mut[m_idx].imports_off = imports_off;
+        mods_mut[m_idx].imports_len = imports_len;
+    }
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// Scope Compaction (contiguous per-module slices + O(1) index rebuild)
+// ---------------------------------------------------------------------------
+
+fn compact_scopes(
+    alloc: *mut AllocCap,
+    prog: *mut ResolvedProgram,
+    spool: *RawScopePool,
+) -> !OutOfMemory {
+    let mod_cnt = prog.modules.len();
+    let raw_entries = spool.entries.as_slice();
+    let raw_owners = spool.owners.as_slice();
+    let total = raw_entries.len;
+
+    var counts = try col.DynBuf.[u32].init(alloc, mod_cnt +% 1_usize);
+    errdefer counts.destroy(alloc);
+    var cursors = try col.DynBuf.[u32].init(alloc, mod_cnt +% 1_usize);
+    errdefer cursors.destroy(alloc);
+
+    var ci: usize = 0_usize;
+    while ci < mod_cnt {
+        try counts.push(alloc, 0_u32);
+        try cursors.push(alloc, 0_u32);
+        ci = ci +% 1_usize;
+    }
+
+    let counts_mut = counts.as_mut_slice();
+    var ri: usize = 0_usize;
+    while ri < total && ri < raw_owners.len {
+        let owner = raw_owners[ri].widen.[usize]();
+        if owner < counts_mut.len {
+            counts_mut[owner] = counts_mut[owner] +% 1_u32;
+        }
+        ri = ri +% 1_usize;
+    }
+
+    var running: u32 = 0_u32;
+    let mods_mut = prog.modules.as_mut_slice();
+    let counts_ro = counts.as_slice();
+    let cur_mut = cursors.as_mut_slice();
+    var mi: usize = 0_usize;
+    while mi < mod_cnt && mi < mods_mut.len && mi < counts_ro.len && mi < cur_mut.len {
+        mods_mut[mi].scope_off = running;
+        mods_mut[mi].scope_len = counts_ro[mi];
+        cur_mut[mi] = running;
+        running = running +% counts_ro[mi];
+        mi = mi +% 1_usize;
+    }
+
+    let dummy = ScopeEntry.{
+        name: 0_u32,
+        kind: .Def,
+        target_id: 0_u32,
+        is_pub: false,
+        is_import: false,
+        used: false,
+        span: span.span_dummy(),
+    };
+    try prog.scopes.reserve(alloc, running.widen.[usize]());
+    var fi: u32 = 0_u32;
+    while fi < running {
+        try prog.scopes.push(alloc, dummy);
+        fi = fi +% 1_u32;
+    }
+
+    let dst_mut = prog.scopes.as_mut_slice();
+    let cur_mut2 = cursors.as_mut_slice();
+    var si: usize = 0_usize;
+    while si < total && si < raw_owners.len {
+        let owner = raw_owners[si].widen.[usize]();
+        if owner < cur_mut2.len {
+            let pos = cur_mut2[owner].widen.[usize]();
+            if pos < dst_mut.len {
+                dst_mut[pos] = raw_entries[si];
+                cur_mut2[owner] = cur_mut2[owner] +% 1_u32;
+            }
+        }
+        si = si +% 1_usize;
+    }
+
+    // Sort each module's scope entries by symbol ID ascending (matches Rust `BTreeMap<Symbol, _>`)
+    // and rebuild `scope_map` to point to final packed indices.
+    prog.indices.scope_map.clear();
+    let mods_ro = prog.modules.as_slice();
+    var m2: usize = 0_usize;
+    while m2 < mods_ro.len {
+        let off = mods_ro[m2].scope_off.widen.[usize]();
+        let slen = mods_ro[m2].scope_len.widen.[usize]();
+        let end = off +% slen;
+        let scopes_mut = prog.scopes.as_mut_slice();
+        if off <= end && end <= scopes_mut.len {
+            let sub_mut = scopes_mut.sub_mut(off, end) catch {
+                m2 = m2 +% 1_usize;
+                continue;
+            };
+            sort_scope_entries_by_name(sub_mut);
+        }
+        var idx = off;
+        while idx < end {
+            var sym_to_bind: u32 = 0_u32;
+            var have_sym = false;
+            let scopes_ro = prog.scopes.as_slice();
+            if idx < scopes_ro.len {
+                sym_to_bind = scopes_ro[idx].name;
+                have_sym = true;
+            }
+            if have_sym {
+                try prog.indices.scope_map.insert(
+                    alloc,
+                    scope_key(m2.trunc.[u32](), sym_to_bind),
+                    idx.trunc.[u32](),
+                );
+            }
+            idx = idx +% 1_usize;
+        }
+        m2 = m2 +% 1_usize;
+    }
+
+    cursors.destroy(alloc);
+    counts.destroy(alloc);
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: Cyclic Module Dependency Detection (iterative 3-color DFS)
+// ---------------------------------------------------------------------------
+
+struct DfsFrame {
+    mod_id: u32;
+    edge_idx: u32;
+}
+
+fn emit_cycle_diag(
+    alloc: *mut AllocCap,
+    prog: *ResolvedProgram,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+    frames: *[DfsFrame],
+    target_mod: u32,
+    edge_span: span.Span,
+    msg_buf: *mut str.StrBuf,
+) -> !OutOfMemory {
+    var pos: usize = 0_usize;
+    var fi: usize = 0_usize;
+    while fi < frames.len {
+        if frames[fi].mod_id == target_mod {
+            pos = fi;
+            break;
+        }
+        fi = fi +% 1_usize;
+    }
+
+    msg_buf.clear();
+    try msg_buf.push_str_grow(alloc, "cyclic module dependency detected: ");
+    var k = pos;
+    while k < frames.len {
+        if k > pos {
+            try msg_buf.push_str_grow(alloc, " -> ");
+        }
+        if let m = prog.get_module(frames[k].mod_id) {
+            try msg_buf.push_bytes_grow(alloc, interner.get(m.path_sym));
+        }
+        k = k +% 1_usize;
+    }
+    try msg_buf.push_str_grow(alloc, " -> ");
+    if let dm = prog.get_module(target_mod) {
+        try msg_buf.push_bytes_grow(alloc, interner.get(dm.path_sym));
+    }
+    _ = try diags.emit_error_bytes(alloc, diag.E0131, edge_span, msg_buf.as_bytes());
+    return;
+}
+
+fn check_module_cycles(
+    alloc: *mut AllocCap,
+    prog: *ResolvedProgram,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+    msg_buf: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let mod_cnt = prog.modules.len();
+    var colors = try col.DynBuf.[u8].init(alloc, mod_cnt +% 1_usize);
+    errdefer colors.destroy(alloc);
+    var frames = try col.DynBuf.[DfsFrame].init(alloc, 16_usize);
+    errdefer frames.destroy(alloc);
+
+    var ci: usize = 0_usize;
+    while ci < mod_cnt {
+        try colors.push(alloc, 0_u8);
+        ci = ci +% 1_usize;
+    }
+
+    let mods = prog.modules.as_slice();
+    let edges = prog.import_edges.as_slice();
+    var start: usize = 0_usize;
+    while start < mod_cnt {
+        var should_visit = false;
+        let col_ro = colors.as_slice();
+        if start < col_ro.len && start < mods.len {
+            if col_ro[start] == 0_u8 && mods[start].unit_id != UNIT_NONE {
+                should_visit = true;
+            }
+        }
+        if should_visit {
+            let col_m0 = colors.as_mut_slice();
+            if start < col_m0.len {
+                col_m0[start] = 1_u8;
+            }
+            try frames.push(alloc, DfsFrame.{ mod_id: start.trunc.[u32](), edge_idx: 0_u32 });
+
+            while !frames.is_empty() {
+                let flen = frames.len();
+                if flen == 0_usize {
+                    break;
+                }
+                let top_idx = flen - 1_usize;
+                var cur_mod: u32 = 0_u32;
+                var cur_eidx: u32 = 0_u32;
+                let f_ro = frames.as_slice();
+                if top_idx < f_ro.len {
+                    cur_mod = f_ro[top_idx].mod_id;
+                    cur_eidx = f_ro[top_idx].edge_idx;
+                }
+                let cm_usize = cur_mod.widen.[usize]();
+                var imp_off: u32 = 0_u32;
+                var imp_len: u32 = 0_u32;
+                if cm_usize < mods.len {
+                    imp_off = mods[cm_usize].imports_off;
+                    imp_len = mods[cm_usize].imports_len;
+                }
+
+                if cur_eidx < imp_len {
+                    let f_mut = frames.as_mut_slice();
+                    if top_idx < f_mut.len {
+                        f_mut[top_idx].edge_idx = cur_eidx +% 1_u32;
+                    }
+                    let e_pos = (imp_off +% cur_eidx).widen.[usize]();
+                    if e_pos < edges.len {
+                        let edge = edges[e_pos];
+                        let dep = edge.to_mod.widen.[usize]();
+                        var dep_color: u8 = 2_u8;
+                        let col_chk = colors.as_slice();
+                        if dep < col_chk.len {
+                            dep_color = col_chk[dep];
+                        }
+                        if dep_color == 0_u8 {
+                            let col_m1 = colors.as_mut_slice();
+                            if dep < col_m1.len {
+                                col_m1[dep] = 1_u8;
+                            }
+                            try frames.push(alloc, DfsFrame.{ mod_id: edge.to_mod, edge_idx: 0_u32 });
+                        } else if dep_color == 1_u8 {
+                            try emit_cycle_diag(
+                                alloc,
+                                prog,
+                                interner,
+                                diags,
+                                frames.as_slice(),
+                                edge.to_mod,
+                                edge.span,
+                                msg_buf,
+                            );
+                        }
+                    }
+                } else {
+                    _ = frames.pop();
+                    let col_m2 = colors.as_mut_slice();
+                    if cm_usize < col_m2.len {
+                        col_m2[cm_usize] = 2_u8;
+                    }
+                }
+            }
+        }
+        start = start +% 1_usize;
+    }
+
+    frames.destroy(alloc);
+    colors.destroy(alloc);
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// Public Resolution Entrypoint
+// ---------------------------------------------------------------------------
+
+pub fn resolve_program(
+    alloc: *mut AllocCap,
+    arena: *ast.AstArena,
+    unit_ids: *[u32],
+    interner: *mut span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> ResolvedProgram ! OutOfMemory {
+    var prog = try ResolvedProgram.init(alloc);
+    errdefer prog.destroy(alloc);
+
+    var spool = try RawScopePool.init(alloc);
+    errdefer spool.destroy(alloc);
+    var scratch = try str.StrBuf.init(alloc, 128_usize);
+    errdefer scratch.destroy(alloc);
+    var msg_buf = try str.StrBuf.init(alloc, 256_usize);
+    errdefer msg_buf.destroy(alloc);
+
+    // 0. Populate builtin prelude table.
+    try build_prelude_primitives_and_simd(alloc, interner, &mut prog.indices.prelude);
+    try build_prelude_builtins(alloc, interner, &mut prog.indices.prelude);
+
+    // 1. Register user modules & top-level items.
+    var ui: usize = 0_usize;
+    while ui < unit_ids.len {
+        try register_user_unit(
+            alloc,
+            arena,
+            unit_ids[ui],
+            interner,
+            diags,
+            &mut prog,
+            &mut spool,
+            &mut scratch,
+            &mut msg_buf,
+        );
+        ui = ui +% 1_usize;
+    }
+
+    // 2. Register virtual built-in `core.*` modules if not overridden by user files.
+    try register_virtual_core_modules(alloc, interner, &mut prog, &mut spool);
+
+    // 3. Resolve imports across user modules.
+    var mi: usize = 0_usize;
+    while mi < unit_ids.len {
+        try resolve_module_imports(
+            alloc,
+            arena,
+            interner,
+            diags,
+            &mut prog,
+            &mut spool,
+            mi.trunc.[u32](),
+            unit_ids[mi],
+            &mut scratch,
+            &mut msg_buf,
+        );
+        mi = mi +% 1_usize;
+    }
+
+    // Compact temporary scope pool into contiguous sorted per-module slices & O(1) index.
+    try compact_scopes(alloc, &mut prog, &spool);
+
+    // 4. Detect cyclic module dependencies (DAG invariant).
+    try check_module_cycles(alloc, &prog, interner, diags, &mut msg_buf);
+
+    msg_buf.destroy(alloc);
+    scratch.destroy(alloc);
+    spool.destroy(alloc);
+    return prog;
+}
+
+// ---------------------------------------------------------------------------
+// Transitive `core.*` / `std.*` Stdlib Path-Discovery Helpers (for CLI driver)
+// ---------------------------------------------------------------------------
+
+/// Collects all `core.*` and `std.*` module paths referenced by `unit_id`'s imports
+/// (including grouped `import core.{ col, str };` syntax) as interned symbol IDs.
+pub fn collect_unit_stdlib_imports(
+    alloc: *mut AllocCap,
+    arena: *ast.AstArena,
+    unit_id: u32,
+    interner: *mut span.SymInterner,
+    out_mods: *mut col.DynBuf[u32],
+) -> !OutOfMemory {
+    let unit = arena.get_unit(unit_id) orelse {
+        return;
+    };
+    var scratch = try str.StrBuf.init(alloc, 64_usize);
+    errdefer scratch.destroy(alloc);
+
+    let imps = arena.imports_range(unit.imports);
+    var ii: usize = 0_usize;
+    while ii < imps.len {
+        let imp = imps[ii];
+        let psegs = arena.idents_range(imp.path);
+        if psegs.len > 0_usize {
+            let root = interner.get(psegs[0_usize].sym);
+            let is_stdlib = str.bytes_eq(root, "core".as_bytes())
+                || str.bytes_eq(root, "std".as_bytes());
+            if is_stdlib {
+                if psegs.len == 1_usize && imp.tail_kind == .Items {
+                    let items = arena.import_items_range(imp.items);
+                    var ji: usize = 0_usize;
+                    while ji < items.len {
+                        scratch.clear();
+                        try scratch.push_bytes_grow(alloc, interner.get(psegs[0_usize].sym));
+                        try scratch.push_byte_grow(alloc, b'.');
+                        try scratch.push_bytes_grow(alloc, interner.get(items[ji].name.sym));
+                        let sym = try interner.intern(alloc, scratch.as_bytes());
+                        try out_mods.push(alloc, sym);
+                        ji = ji +% 1_usize;
+                    }
+                } else if psegs.len >= 2_usize {
+                    try join_ident_path(alloc, arena, imp.path, interner, &mut scratch);
+                    let sym = try interner.intern(alloc, scratch.as_bytes());
+                    try out_mods.push(alloc, sym);
+                }
+            }
+        }
+        ii = ii +% 1_usize;
+    }
+
+    scratch.destroy(alloc);
+    return;
+}
+
+fn push_joined_path(
+    alloc: *mut AllocCap,
+    dir: *[u8],
+    name: *[u8],
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    out.clear();
+    try out.push_bytes_grow(alloc, dir);
+    if dir.len > 0_usize && dir[dir.len - 1_usize] != b'/' {
+        try out.push_byte_grow(alloc, b'/');
+    }
+    try out.push_bytes_grow(alloc, name);
+    return;
+}
+
+/// Returns `true` iff `dir_path` is a directory containing at least one regular `*.eon` file.
+pub fn dir_has_eon_file(
+    alloc: *mut AllocCap,
+    fs: *FsCap,
+    dir_path: *str,
+) -> bool {
+    if !fs.is_dir(dir_path) {
+        return false;
+    }
+    let entries = fs.list_dir(alloc, dir_path) catch {
+        return false;
+    };
+    var joined = str.StrBuf.init(alloc, 128_usize) catch {
+        entries.destroy(alloc);
+        return false;
+    };
+
+    let entry_bytes = entries.as_slice();
+    var pos: usize = 0_usize;
+    var found = false;
+    while pos < entry_bytes.len {
+        let nstart = pos;
+        while pos < entry_bytes.len && entry_bytes[pos] != b'\n' {
+            pos = pos +% 1_usize;
+        }
+        let nend = pos;
+        if pos < entry_bytes.len && entry_bytes[pos] == b'\n' {
+            pos = pos +% 1_usize;
+        }
+        if nend <= nstart {
+            continue;
+        }
+        let name = entry_bytes.sub(nstart, nend) catch {
+            continue;
+        };
+        if str.ends_with(name, ".eon".as_bytes()) {
+            push_joined_path(alloc, dir_path.as_bytes(), name, &mut joined) catch {
+                break;
+            };
+            let jstr = joined.as_str() catch {
+                continue;
+            };
+            if !fs.is_dir(jstr) {
+                found = true;
+                break;
+            }
+        }
+    }
+
+    joined.destroy(alloc);
+    entries.destroy(alloc);
+    return found;
+}
+
+fn is_stdlib_root_dir(
+    alloc: *mut AllocCap,
+    fs: *FsCap,
+    dir_bytes: *[u8],
+    probe: *mut str.StrBuf,
+) -> bool ! OutOfMemory | Utf8Error {
+    try push_joined_path(alloc, dir_bytes, "core".as_bytes(), probe);
+    let core_str = try probe.as_str();
+    if dir_has_eon_file(alloc, fs, core_str) {
+        return true;
+    }
+    try push_joined_path(alloc, dir_bytes, "std".as_bytes(), probe);
+    let std_str = try probe.as_str();
+    return dir_has_eon_file(alloc, fs, std_str);
+}
+
+fn parent_dir_len(path: *[u8]) -> usize {
+    var end = path.len;
+    while end > 1_usize && path[end - 1_usize] == b'/' {
+        end = end - 1_usize;
+    }
+    var i = end;
+    while i > 0_usize {
+        i = i - 1_usize;
+        if path[i] == b'/' {
+            if i == 0_usize {
+                return 1_usize;
+            }
+            return i;
+        }
+    }
+    return 0_usize;
+}
+
+/// Walks parent directories starting at `start_path` looking for a directory containing
+/// `core/*.eon` or `std/*.eon`. Writes the discovered root into `out_root` and returns `true`.
+pub fn find_stdlib_root_from(
+    alloc: *mut AllocCap,
+    fs: *FsCap,
+    start_path: *[u8],
+    out_root: *mut str.StrBuf,
+) -> bool ! OutOfMemory | Utf8Error {
+    if start_path.len == 0_usize {
+        return false;
+    }
+    var cur = try str.StrBuf.init(alloc, start_path.len +% 16_usize);
+    errdefer cur.destroy(alloc);
+    var probe = try str.StrBuf.init(alloc, start_path.len +% 32_usize);
+    errdefer probe.destroy(alloc);
+
+    try cur.push_bytes_grow(alloc, start_path);
+    let start_str = try cur.as_str();
+    if !fs.is_dir(start_str) {
+        let plen = parent_dir_len(cur.as_bytes());
+        cur.clear();
+        if plen == 0_usize {
+            try cur.push_str_grow(alloc, ".");
+        } else {
+            let sub = start_path.sub(0_usize, plen) catch {
+                probe.destroy(alloc);
+                cur.destroy(alloc);
+                return false;
+            };
+            try cur.push_bytes_grow(alloc, sub);
+        }
+    }
+
+    var tried_dot = false;
+    loop {
+        if try is_stdlib_root_dir(alloc, fs, cur.as_bytes(), &mut probe) {
+            out_root.clear();
+            try out_root.push_bytes_grow(alloc, cur.as_bytes());
+            probe.destroy(alloc);
+            cur.destroy(alloc);
+            return true;
+        }
+        let cbytes = cur.as_bytes();
+        if str.bytes_eq(cbytes, "/".as_bytes()) || str.bytes_eq(cbytes, ".".as_bytes()) {
+            break;
+        }
+        let plen = parent_dir_len(cbytes);
+        if plen == 0_usize {
+            if tried_dot {
+                break;
+            }
+            tried_dot = true;
+            cur.clear();
+            try cur.push_str_grow(alloc, ".");
+        } else {
+            probe.clear();
+            let sub = cbytes.sub(0_usize, plen) catch {
+                break;
+            };
+            try probe.push_bytes_grow(alloc, sub);
+            cur.clear();
+            try cur.push_bytes_grow(alloc, probe.as_bytes());
+        }
+    }
+
+    probe.destroy(alloc);
+    cur.destroy(alloc);
+    return false;
+}
+
+fn dir_contains_regular_file(
+    alloc: *mut AllocCap,
+    fs: *FsCap,
+    dir_bytes: *[u8],
+    target_name: *[u8],
+    out_path: *mut str.StrBuf,
+) -> bool ! OutOfMemory | Utf8Error {
+    let dir_str = try dir_bytes.as_str();
+    if !fs.is_dir(dir_str) {
+        return false;
+    }
+    let entries = fs.list_dir(alloc, dir_str) catch {
+        return false;
+    };
+    errdefer entries.destroy(alloc);
+
+    let entry_bytes = entries.as_slice();
+    var pos: usize = 0_usize;
+    var found = false;
+    while pos < entry_bytes.len {
+        let nstart = pos;
+        while pos < entry_bytes.len && entry_bytes[pos] != b'\n' {
+            pos = pos +% 1_usize;
+        }
+        let nend = pos;
+        if pos < entry_bytes.len && entry_bytes[pos] == b'\n' {
+            pos = pos +% 1_usize;
+        }
+        if nend <= nstart {
+            continue;
+        }
+        let name = entry_bytes.sub(nstart, nend) catch {
+            continue;
+        };
+        if str.bytes_eq(name, target_name) {
+            try push_joined_path(alloc, dir_bytes, target_name, out_path);
+            let cand_str = try out_path.as_str();
+            if !fs.is_dir(cand_str) {
+                found = true;
+                break;
+            }
+        }
+    }
+
+    entries.destroy(alloc);
+    return found;
+}
+
+/// Resolves a dotted module path like `"core.sync"` under `stdlib_root` to
+/// `<root>/core/sync.eon` or `<root>/core/sync.hal.eon`.
+pub fn resolve_stdlib_module_file(
+    alloc: *mut AllocCap,
+    fs: *FsCap,
+    stdlib_root: *[u8],
+    mod_path: *[u8],
+    out_path: *mut str.StrBuf,
+) -> bool ! OutOfMemory | Utf8Error {
+    if mod_path.len == 0_usize {
+        return false;
+    }
+    var last_dot = mod_path.len;
+    var i: usize = 0_usize;
+    while i < mod_path.len {
+        if mod_path[i] == b'.' {
+            last_dot = i;
+        }
+        i = i +% 1_usize;
+    }
+    if last_dot == mod_path.len || last_dot == 0_usize || last_dot +% 1_usize >= mod_path.len {
+        return false;
+    }
+
+    var dir_buf = try str.StrBuf.init(alloc, stdlib_root.len +% mod_path.len +% 8_usize);
+    errdefer dir_buf.destroy(alloc);
+    var cand_name = try str.StrBuf.init(alloc, 64_usize);
+    errdefer cand_name.destroy(alloc);
+
+    try dir_buf.push_bytes_grow(alloc, stdlib_root);
+    if stdlib_root.len > 0_usize && stdlib_root[stdlib_root.len - 1_usize] != b'/' {
+        try dir_buf.push_byte_grow(alloc, b'/');
+    }
+    var pi: usize = 0_usize;
+    while pi < last_dot {
+        let ch = mod_path[pi];
+        if ch == b'.' {
+            try dir_buf.push_byte_grow(alloc, b'/');
+        } else {
+            try dir_buf.push_byte_grow(alloc, ch);
+        }
+        pi = pi +% 1_usize;
+    }
+
+    let stem = mod_path.sub(last_dot +% 1_usize, mod_path.len) catch {
+        cand_name.destroy(alloc);
+        dir_buf.destroy(alloc);
+        return false;
+    };
+
+    cand_name.clear();
+    try cand_name.push_bytes_grow(alloc, stem);
+    try cand_name.push_str_grow(alloc, ".eon");
+    if try dir_contains_regular_file(alloc, fs, dir_buf.as_bytes(), cand_name.as_bytes(), out_path) {
+        cand_name.destroy(alloc);
+        dir_buf.destroy(alloc);
+        return true;
+    }
+
+    cand_name.clear();
+    try cand_name.push_bytes_grow(alloc, stem);
+    try cand_name.push_str_grow(alloc, ".hal.eon");
+    let found_hal = try dir_contains_regular_file(
+        alloc,
+        fs,
+        dir_buf.as_bytes(),
+        cand_name.as_bytes(),
+        out_path,
+    );
+    cand_name.destroy(alloc);
+    dir_buf.destroy(alloc);
+    return found_hal;
+}

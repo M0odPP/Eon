@@ -1,0 +1,30 @@
+module fail.brands;
+
+pub pool Node {
+    pub v: u32;
+}
+
+pub struct StoreId {
+    pub saved: Id[p]; //~ ERROR E0332
+}
+
+fn write_node(p: *mut ArenaPool[Node], id: Id[p], val: u32) {
+    p.v[id] = val;
+}
+
+pub fn bad_brands(arena1: *mut Arena, arena2: *mut Arena) -> !MemError {
+    var p1 = try ArenaPool.[Node].init(arena1, 16_usize);
+    var p2 = try ArenaPool.[Node].init(arena2, 16_usize);
+
+    let id1 = try p1.push(.{ v: 1_u32 });
+    let id2 = try p2.push(.{ v: 2_u32 });
+
+    // Cross-pool index & function brand mismatch:
+    p1.v[id2] = 10_u32; //~ ERROR E0330
+    write_node(&mut p2, id1, 20_u32); //~ ERROR E0330
+
+    // Epoch invalidation after reset():
+    p1 = p1.reset();
+    p1.v[id1] = 99_u32; //~ ERROR E0331
+    return;
+}

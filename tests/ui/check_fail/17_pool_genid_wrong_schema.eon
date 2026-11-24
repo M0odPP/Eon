@@ -1,0 +1,42 @@
+module fail.genid_schema;
+
+pub pool NodeA {
+    pub val: u32;
+    pub parent: ?Link[Self];
+}
+
+pub pool NodeB {
+    pub tag: u32;
+}
+
+pub fn bad_genid_and_link(
+    alloc: *mut AllocCap,
+    arena1: *mut Arena,
+    arena2: *mut Arena,
+) -> !OutOfMemory | MemError | StaleId {
+    var sp1 = try SlotPool.[NodeA].init(alloc, 4_usize);
+    errdefer sp1.destroy(alloc);
+    var sp2 = try SlotPool.[NodeB].init(alloc, 4_usize);
+    errdefer sp2.destroy(alloc);
+
+    let id_a = try sp1.insert(alloc, .{ val: 1_u32, parent: null });
+    let id_b = try sp2.insert(alloc, .{ tag: 2_u32 });
+
+    let _bad_get = sp1.get(id_b); //~ ERROR E0230
+    let _bad_mut = sp1.get_mut(id_b); //~ ERROR E0230
+    let _bad_at = sp1.at(id_b); //~ ERROR E0230
+    let _bad_col = sp1.val[id_b]; //~ ERROR E0230
+    sp1.parent[id_a] = id_b; //~ ERROR E0230
+    let _ = try sp1.insert(alloc, .{ val: 9_u32, parent: id_b }); //~ ERROR E0230
+    let _ = try sp1.remove(id_b); //~ ERROR E0230
+
+    var ap1 = try ArenaPool.[NodeA].init(arena1, 4_usize);
+    var ap2 = try ArenaPool.[NodeA].init(arena2, 4_usize);
+    let _ = try ap1.push(.{ val: 1_u32, parent: null });
+    let aid2 = try ap2.push(.{ val: 2_u32, parent: null });
+    let _ = try ap1.push(.{ val: 3_u32, parent: aid2 }); //~ ERROR E0330
+
+    sp2.destroy(alloc);
+    sp1.destroy(alloc);
+    return;
+}

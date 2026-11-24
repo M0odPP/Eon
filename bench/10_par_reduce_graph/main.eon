@@ -1,0 +1,307 @@
+module bench.par_reduce_graph;
+
+import std.rt;
+
+const NUM_NODES: usize = 262144_usize;
+const NODE_MASK: u64 = 262143_u64;
+const NUM_ITERS: usize = 20_usize;
+const CHUNK_SIZE: usize = 2048_usize;
+const NUM_CHUNKS: usize = 128_usize;
+const INIT_RANK: u64 = 1048576_u64;
+const TELEPORT_BASE: u64 = 157286_u64;
+
+/// Static CSR topology in SoA `ArenaPool` (read-only across all 20 parallel iterations).
+pub pool GraphTopo {
+    pub in_off: u32;
+    pub in_deg: u32;
+    pub out_deg: u32;
+}
+
+@inline
+fn mix64(x: u64) -> u64 {
+    var z = x +% 0x9E3779B97F4A7C15_u64;
+    z = (z ^ (z >> 30_u64)) *% 0xBF58476D1CE4E5B9_u64;
+    z = (z ^ (z >> 27_u64)) *% 0x94D049BB133111EB_u64;
+    return z ^ (z >> 31_u64);
+}
+
+/// Zero-allocation, double-buffered parallel chunk worker:
+/// - Reads `cur_contrib`/`cur_label` + static CSR `topo`/`in_edges`
+/// - Writes directly into `nxt_contrib`/`nxt_label` (eliminates 320 MB serial `commit_step`!)
+/// - Accumulates per-chunk `(sum, xor)` in registers (eliminates 40 extra barrier dispatches!)
+fn step_chunk(
+    ci: usize,
+    topo: *ArenaPool[GraphTopo],
+    in_edges: *[u32],
+    cur_contrib: *[u64],
+    cur_label: *[u32],
+    nxt_contrib: *mut [u64],
+    nxt_label: *mut [u32],
+    chunk_sums: *mut [u64],
+    chunk_xors: *mut [u64],
+) {
+    let start = ci *% CHUNK_SIZE;
+    let end = start +% CHUNK_SIZE;
+    let n_edges = in_edges.len;
+    let n_nodes = topo.len();
+    var lim = end;
+    if n_nodes < lim { lim = n_nodes; }
+    if cur_label.len < lim { lim = cur_label.len; }
+    if nxt_contrib.len < lim { lim = nxt_contrib.len; }
+    if nxt_label.len < lim { lim = nxt_label.len; }
+
+    var local_sum: u64 = 0_u64;
+    var local_xor: u64 = 0_u64;
+    var u = start;
+    while u < lim && u < topo.len() && u < cur_label.len && u < nxt_contrib.len && u < nxt_label.len {
+        let uid = topo.id_at(u) catch {
+            u = u +% 1_usize;
+            continue;
+        };
+        let off = topo.in_off[uid].widen.[usize]();
+        let deg = topo.in_deg[uid].widen.[usize]();
+        let od32 = topo.out_deg[uid];
+
+        var sum_contrib: u64 = 0_u64;
+        var best_label: u32 = cur_label[u];
+
+        if off <= n_edges && deg <= n_edges - off {
+            let e_end = off +% deg;
+            var k = off;
+            while k < e_end && k < in_edges.len {
+                let src = in_edges[k].widen.[usize]();
+                if src < cur_contrib.len && src < cur_label.len {
+                    sum_contrib = sum_contrib +% cur_contrib[src];
+                    let sl = cur_label[src];
+                    if sl < best_label {
+                        best_label = sl;
+                    }
+                }
+                k = k +% 1_usize;
+            }
+        }
+
+        let new_rank = ((sum_contrib *% 217_u64) >> 8_u64) +% TELEPORT_BASE;
+        var new_contrib = new_rank;
+        if od32 > 1_u32 {
+            if new_rank <= 0xFFFFFFFF_u64 {
+                new_contrib = (new_rank.trunc.[u32]() / od32).widen.[u64]();
+            } else {
+                new_contrib = new_rank / od32.widen.[u64]();
+            }
+        }
+
+        nxt_contrib[u] = new_contrib;
+        nxt_label[u] = best_label;
+
+        let u_u64 = u.widen.[u64]();
+        let h = mix64(
+            new_rank
+                ^ (best_label.widen.[u64]() << 32_u64)
+                ^ (u_u64 *% 0x9E3779B97F4A7C15_u64),
+        );
+        local_sum = local_sum +% h;
+        local_xor = local_xor ^ h;
+        u = u +% 1_usize;
+    }
+
+    if ci < chunk_sums.len && ci < chunk_xors.len {
+        chunk_sums[ci] = local_sum;
+        chunk_xors[ci] = local_xor;
+    }
+}
+
+fn par_step_ping_pong(
+    topo: *ArenaPool[GraphTopo],
+    in_edges: *[u32],
+    cur_contrib: *[u64],
+    cur_label: *[u32],
+    nxt_contrib: *mut [u64],
+    nxt_label: *mut [u32],
+    chunk_sums: *mut [u64],
+    chunk_xors: *mut [u64],
+) {
+    par for ci in 0_usize..NUM_CHUNKS {
+        step_chunk(
+            ci,
+            topo,
+            in_edges,
+            cur_contrib,
+            cur_label,
+            nxt_contrib,
+            nxt_label,
+            chunk_sums,
+            chunk_xors,
+        );
+    }
+}
+
+fn run_benchmark(alloc: *mut AllocCap, clock: *ClockCap) -> i32 ! OutOfMemory | MemError {
+    // 1. Deterministic CSR incoming-edge graph construction (untimed setup).
+    var in_offs = try Buf.[u32].init(alloc, NUM_NODES);
+    errdefer in_offs.destroy(alloc);
+    var in_degs = try Buf.[u32].init(alloc, NUM_NODES);
+    errdefer in_degs.destroy(alloc);
+    var out_degs = try Buf.[u32].init(alloc, NUM_NODES);
+    errdefer out_degs.destroy(alloc);
+
+    for _ in 0_usize..NUM_NODES {
+        try out_degs.push(0_u32);
+    }
+
+    var in_edges = try Buf.[u32].init(alloc, NUM_NODES *% 16_usize);
+    errdefer in_edges.destroy(alloc);
+
+    let out_degs_mut = out_degs.as_mut_slice();
+    var edge_cursor: u32 = 0_u32;
+    for u in 0_usize..NUM_NODES {
+        let uu = u.widen.[u64]();
+        let h0 = mix64(uu ^ 0xA0761D6478BD642F_u64);
+        let deg_u64 = 8_u64 +% (h0 & 7_u64);
+        let deg_u32 = deg_u64.trunc.[u32]();
+        try in_offs.push(edge_cursor);
+        try in_degs.push(deg_u32);
+
+        var k: u64 = 0_u64;
+        while k < deg_u64 {
+            let src_u64 = if (k & 1_u64) == 0_u64 {
+                let sh = ((k & 7_u64) *% 6_u64) & 63_u64;
+                let step = 1_u64 +% ((h0 >> sh) & 63_u64);
+                (uu +% step) & NODE_MASK
+            } else {
+                mix64(h0 ^ ((k +% 1_u64) *% 0x9E3779B97F4A7C15_u64)) & NODE_MASK
+            };
+            let src_u32 = src_u64.trunc.[u32]();
+            try in_edges.push(src_u32);
+            let src_idx = src_u64.trunc.[usize]();
+            if src_idx < out_degs_mut.len {
+                out_degs_mut[src_idx] = out_degs_mut[src_idx] +% 1_u32;
+            }
+            k = k +% 1_u64;
+        }
+        edge_cursor = edge_cursor +% deg_u32;
+    }
+
+    for u in 0_usize..out_degs_mut.len {
+        if out_degs_mut[u] == 0_u32 {
+            out_degs_mut[u] = 1_u32;
+        }
+    }
+
+    // 2. Populate SoA ArenaPool[GraphTopo] + double-buffered contrib/label arrays.
+    var arena = try Arena.init(alloc, 8_usize *% 1024_usize *% 1024_usize);
+    errdefer arena.destroy(alloc);
+    var topo = try ArenaPool.[GraphTopo].init(&mut arena, NUM_NODES);
+
+    var contrib_a = try Buf.[u64].init(alloc, NUM_NODES);
+    errdefer contrib_a.destroy(alloc);
+    var contrib_b = try Buf.[u64].init(alloc, NUM_NODES);
+    errdefer contrib_b.destroy(alloc);
+    var label_a = try Buf.[u32].init(alloc, NUM_NODES);
+    errdefer label_a.destroy(alloc);
+    var label_b = try Buf.[u32].init(alloc, NUM_NODES);
+    errdefer label_b.destroy(alloc);
+
+    var chunk_sums = try Buf.[u64].init(alloc, NUM_CHUNKS);
+    errdefer chunk_sums.destroy(alloc);
+    var chunk_xors = try Buf.[u64].init(alloc, NUM_CHUNKS);
+    errdefer chunk_xors.destroy(alloc);
+    for _ in 0_usize..NUM_CHUNKS {
+        try chunk_sums.push(0_u64);
+        try chunk_xors.push(0_u64);
+    }
+
+    let offs_s = in_offs.as_slice();
+    let degs_s = in_degs.as_slice();
+    let odegs_s = out_degs.as_slice();
+
+    for u in 0_usize..NUM_NODES {
+        let uu = u.widen.[u64]();
+        let od = if u < odegs_s.len { odegs_s[u] } else { 1_u32 };
+        let od64 = od.widen.[u64]();
+        let init_contrib = if od64 > 0_u64 { INIT_RANK / od64 } else { INIT_RANK };
+        let init_label = (mix64(uu ^ 0xE7037ED1A0B428DB_u64) & 0x3FFFFFFF_u64).trunc.[u32]();
+        let ioff = if u < offs_s.len { offs_s[u] } else { 0_u32 };
+        let ideg = if u < degs_s.len { degs_s[u] } else { 0_u32 };
+
+        let _id = try topo.push(.{
+            in_off: ioff,
+            in_deg: ideg,
+            out_deg: od,
+        });
+        try contrib_a.push(init_contrib);
+        try contrib_b.push(init_contrib);
+        try label_a.push(init_label);
+        try label_b.push(init_label);
+    }
+
+    in_offs.destroy(alloc);
+    in_degs.destroy(alloc);
+    out_degs.destroy(alloc);
+
+    let edges_slice = in_edges.as_slice();
+
+    // 3. Timed workload: 20 iterations of double-buffered parallel CSR PageRank + Label Propagation.
+    let t0 = rt.now_ns(clock);
+    var checksum: u64 = 0_u64;
+
+    for iter in 0_usize..NUM_ITERS {
+        if (iter & 1_usize) == 0_usize {
+            par_step_ping_pong(
+                &topo,
+                edges_slice,
+                contrib_a.as_slice(),
+                label_a.as_slice(),
+                contrib_b.as_mut_slice(),
+                label_b.as_mut_slice(),
+                chunk_sums.as_mut_slice(),
+                chunk_xors.as_mut_slice(),
+            );
+        } else {
+            par_step_ping_pong(
+                &topo,
+                edges_slice,
+                contrib_b.as_slice(),
+                label_b.as_slice(),
+                contrib_a.as_mut_slice(),
+                label_a.as_mut_slice(),
+                chunk_sums.as_mut_slice(),
+                chunk_xors.as_mut_slice(),
+            );
+        }
+
+        let cs = chunk_sums.as_slice();
+        let cx = chunk_xors.as_slice();
+        var iter_sum: u64 = 0_u64;
+        var iter_xor: u64 = 0_u64;
+        var ci: usize = 0_usize;
+        while ci < cs.len && ci < cx.len {
+            iter_sum = iter_sum +% cs[ci];
+            iter_xor = iter_xor ^ cx[ci];
+            ci = ci +% 1_usize;
+        }
+        checksum = checksum +% mix64(iter_sum ^ iter_xor ^ (iter.widen.[u64]() +% 1_u64));
+    }
+
+    let elapsed_ns = rt.elapsed_since(clock, t0);
+
+    rt.print_str("RESULT par_reduce_graph checksum=");
+    rt.print_u64(checksum);
+    rt.print_str(" elapsed_ns=");
+    rt.print_u64(elapsed_ns);
+    rt.print_nl();
+
+    chunk_xors.destroy(alloc);
+    chunk_sums.destroy(alloc);
+    label_b.destroy(alloc);
+    label_a.destroy(alloc);
+    contrib_b.destroy(alloc);
+    contrib_a.destroy(alloc);
+    in_edges.destroy(alloc);
+    arena.destroy(alloc);
+    return 0_i32;
+}
+
+pub fn main(env: *mut Env) -> i32 ! OutOfMemory | MemError {
+    return try run_benchmark(&mut env.alloc, &env.clock);
+}

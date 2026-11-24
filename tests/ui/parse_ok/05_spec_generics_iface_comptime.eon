@@ -1,0 +1,88 @@
+module example.generics_ok;
+
+pub fn min_val[T: Ord](a: T, b: T) -> T {
+    if a.cmp(&b) == .Less {
+        return a;
+    }
+    return b;
+}
+
+pub struct RingBuf[T, comptime N: usize]
+    where N > 0_usize && (N & (N - 1_usize)) == 0_usize
+{
+    data: [N]T;
+    head: usize;
+    tail: usize;
+}
+
+pub iface BlockDevice {
+    fn sector_size(self: *Self) -> usize @pure @noalloc @stack(64);
+    fn read_sector(self: *mut Self, lba: u64, dst: *mut [u8]) -> !IoError
+        @noalloc @stack(1024)
+        where dst.len >= 512_usize;
+}
+
+pub struct NvmeDrive {
+    lba_bytes: usize;
+}
+
+impl BlockDevice for NvmeDrive {
+    fn sector_size(self: *Self) -> usize @pure @noalloc @stack(64) {
+        return self.lba_bytes;
+    }
+
+    fn read_sector(self: *mut Self, lba: u64, dst: *mut [u8]) -> !IoError
+        @noalloc @stack(1024)
+        where dst.len >= 512_usize
+    {
+        return self.submit_read(lba, dst);
+    }
+}
+
+pub fn read_mbr[D: BlockDevice](dev: *mut D, buf: *mut [512]u8) -> !IoError {
+    return dev.read_sector(0_u64, &mut buf[0_usize..512_usize]);
+}
+
+pub const CRC32_TABLE: [256]u32 = comptime {
+    var table: [256]u32 = [0_u32; 256];
+    for i in 0_usize..256_usize {
+        var c: u32 = i.trunc.[u32]();
+        for _ in 0_usize..8_usize {
+            if (c & 1_u32) != 0_u32 {
+                c = 0xEDB8_8320_u32 ^ (c >> 1_u32);
+            } else {
+                c = c >> 1_u32;
+            }
+        }
+        table[i] = c;
+    }
+    table
+};
+
+pub fn arch_check() -> u32 {
+    comptime if @target_arch() == .X86_64 {
+        return 1_u32;
+    } else comptime if @target_arch() == .Arm64 {
+        return 2_u32;
+    } else {
+        @compile_error("Unsupported architecture");
+        return 0_u32;
+    }
+}
+
+pub iface Hasher {
+    fn write(self: *mut Self, data: *[u8]) @noalloc @stack(128);
+    fn finish(self: *Self) -> u64 @pure @noalloc @stack(64);
+}
+
+pub fn hash_dyn(h: *mut dyn Hasher, msg: *str) -> u64 @noalloc @stack(256) {
+    h.write(msg.as_bytes());
+    return h.finish();
+}
+
+pub fn parse_demo(text: *str, arena: *mut Arena) ! ParseError {
+    let port = try parse_uint.[u16](text);
+    let _p = try ArenaPool.[RingBuf[u8, 64_usize]].init(arena, 1024_usize);
+    _ = port;
+    return;
+}

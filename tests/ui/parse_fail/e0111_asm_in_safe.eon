@@ -1,0 +1,4 @@
+module app.bad_asm;
+pub fn f() {
+    asm("nop"); //~ ERROR E0111
+}

@@ -1,0 +1,541 @@
+module bench.radix_pdqsort;
+
+import std.rt;
+
+struct Record {
+    key: u64;
+    payload: u64;
+}
+
+struct Rng {
+    state: u64;
+}
+
+impl Rng {
+    fn next(self: *mut Self) -> u64 {
+        var x = self.state;
+        x = x ^ (x >> 12_u64);
+        x = x ^ (x <<% 25_u64);
+        x = x ^ (x >> 27_u64);
+        self.state = x;
+        return x *% 0x2545F4914F6CDD1D_u64;
+    }
+}
+
+fn insertion_sort_u64(arr: *mut [u64], lo: usize, hi: usize)
+    where hi <= arr.len
+{
+    if hi <= lo +% 1_usize {
+        return;
+    }
+    var i = lo +% 1_usize;
+    while i < hi {
+        let cur = arr[i];
+        var j = i;
+        while j > lo {
+            let prev = j - 1_usize;
+            let pv = arr[prev];
+            if pv <= cur {
+                break;
+            }
+            arr[j] = pv;
+            j = prev;
+        }
+        arr[j] = cur;
+        i = i + 1_usize;
+    }
+}
+
+/// 6-byte LSD fallback for skewed sub-buckets with > 48 elements (guarantees O(N) worst case).
+fn radix_lsd6_fallback(
+    keys: *mut [u64],
+    scratch: *mut [u64],
+) {
+    let n = keys.len;
+    if n != scratch.len || n <= 1_usize {
+        return;
+    }
+    var h0: [256]u32 = [0_u32; 256];
+    var h1: [256]u32 = [0_u32; 256];
+    var h2: [256]u32 = [0_u32; 256];
+    var h3: [256]u32 = [0_u32; 256];
+    var h4: [256]u32 = [0_u32; 256];
+    var h5: [256]u32 = [0_u32; 256];
+    var i: usize = 0_usize;
+    while i < keys.len {
+        let v = keys[i];
+        h0[(v & 255_u64).trunc.[usize]()] = h0[(v & 255_u64).trunc.[usize]()] +% 1_u32;
+        h1[((v >> 8_u64) & 255_u64).trunc.[usize]()] = h1[((v >> 8_u64) & 255_u64).trunc.[usize]()] +% 1_u32;
+        h2[((v >> 16_u64) & 255_u64).trunc.[usize]()] = h2[((v >> 16_u64) & 255_u64).trunc.[usize]()] +% 1_u32;
+        h3[((v >> 24_u64) & 255_u64).trunc.[usize]()] = h3[((v >> 24_u64) & 255_u64).trunc.[usize]()] +% 1_u32;
+        h4[((v >> 32_u64) & 255_u64).trunc.[usize]()] = h4[((v >> 32_u64) & 255_u64).trunc.[usize]()] +% 1_u32;
+        h5[((v >> 40_u64) & 255_u64).trunc.[usize]()] = h5[((v >> 40_u64) & 255_u64).trunc.[usize]()] +% 1_u32;
+        i = i + 1_usize;
+    }
+    var sum: u32 = 0_u32;
+    var b: usize = 0_usize;
+    while b < 256_usize { let c = h0[b]; h0[b] = sum; sum = sum +% c; b = b + 1_usize; }
+    i = 0_usize;
+    while i < keys.len { let v = keys[i]; let bi = (v & 255_u64).trunc.[usize](); let p = h0[bi].widen.[usize](); h0[bi] = (p +% 1_usize).trunc.[u32](); if p < scratch.len { scratch[p] = v; } i = i + 1_usize; }
+
+    sum = 0_u32; b = 0_usize;
+    while b < 256_usize { let c = h1[b]; h1[b] = sum; sum = sum +% c; b = b + 1_usize; }
+    i = 0_usize;
+    while i < scratch.len { let v = scratch[i]; let bi = ((v >> 8_u64) & 255_u64).trunc.[usize](); let p = h1[bi].widen.[usize](); h1[bi] = (p +% 1_usize).trunc.[u32](); if p < keys.len { keys[p] = v; } i = i + 1_usize; }
+
+    sum = 0_u32; b = 0_usize;
+    while b < 256_usize { let c = h2[b]; h2[b] = sum; sum = sum +% c; b = b + 1_usize; }
+    i = 0_usize;
+    while i < keys.len { let v = keys[i]; let bi = ((v >> 16_u64) & 255_u64).trunc.[usize](); let p = h2[bi].widen.[usize](); h2[bi] = (p +% 1_usize).trunc.[u32](); if p < scratch.len { scratch[p] = v; } i = i + 1_usize; }
+
+    sum = 0_u32; b = 0_usize;
+    while b < 256_usize { let c = h3[b]; h3[b] = sum; sum = sum +% c; b = b + 1_usize; }
+    i = 0_usize;
+    while i < scratch.len { let v = scratch[i]; let bi = ((v >> 24_u64) & 255_u64).trunc.[usize](); let p = h3[bi].widen.[usize](); h3[bi] = (p +% 1_usize).trunc.[u32](); if p < keys.len { keys[p] = v; } i = i + 1_usize; }
+
+    sum = 0_u32; b = 0_usize;
+    while b < 256_usize { let c = h4[b]; h4[b] = sum; sum = sum +% c; b = b + 1_usize; }
+    i = 0_usize;
+    while i < keys.len { let v = keys[i]; let bi = ((v >> 32_u64) & 255_u64).trunc.[usize](); let p = h4[bi].widen.[usize](); h4[bi] = (p +% 1_usize).trunc.[u32](); if p < scratch.len { scratch[p] = v; } i = i + 1_usize; }
+
+    sum = 0_u32; b = 0_usize;
+    while b < 256_usize { let c = h5[b]; h5[b] = sum; sum = sum +% c; b = b + 1_usize; }
+    i = 0_usize;
+    while i < scratch.len { let v = scratch[i]; let bi = ((v >> 40_u64) & 255_u64).trunc.[usize](); let p = h5[bi].widen.[usize](); h5[bi] = (p +% 1_usize).trunc.[u32](); if p < keys.len { keys[p] = v; } i = i + 1_usize; }
+}
+
+/// Level-2 MSD radix partition (bits 46..54) on a ~7.8 KiB L1d-resident bucket:
+/// scatters `src` -> `dst` into 256 ~3.8-element sub-buckets and finishes with tiny L1d insertion sort
+/// (or 6-byte LSD fallback if a sub-bucket exceeds 48 elements).
+fn radix_msd2_bucket(
+    src: *mut [u64],
+    dst: *mut [u64],
+) {
+    let n = src.len;
+    if n != dst.len || n == 0_usize {
+        return;
+    }
+    if n <= 32_usize {
+        var ci: usize = 0_usize;
+        while ci < src.len {
+            dst[ci] = src[ci];
+            ci = ci + 1_usize;
+        }
+        insertion_sort_u64(dst, 0_usize, dst.len);
+        return;
+    }
+    var h: [256]u32 = [0_u32; 256];
+    var i: usize = 0_usize;
+    while i < src.len {
+        let bi = ((src[i] >> 46_u64) & 255_u64).trunc.[usize]();
+        h[bi] = h[bi] +% 1_u32;
+        i = i + 1_usize;
+    }
+    var starts: [256]u32 = [0_u32; 256];
+    var sum: u32 = 0_u32;
+    var b: usize = 0_usize;
+    while b < 256_usize {
+        starts[b] = sum;
+        let c = h[b];
+        h[b] = sum;
+        sum = sum +% c;
+        b = b + 1_usize;
+    }
+    i = 0_usize;
+    while i < src.len {
+        let v = src[i];
+        let bi = ((v >> 46_u64) & 255_u64).trunc.[usize]();
+        let pos = h[bi].widen.[usize]();
+        h[bi] = (pos +% 1_usize).trunc.[u32]();
+        if pos < dst.len {
+            dst[pos] = v;
+        }
+        i = i + 1_usize;
+    }
+    b = 0_usize;
+    while b < 256_usize {
+        let lo = starts[b].widen.[usize]();
+        let hi = h[b].widen.[usize]();
+        if hi > lo +% 1_usize && hi <= dst.len && hi <= src.len {
+            let blen = hi - lo;
+            if blen <= 48_usize {
+                insertion_sort_u64(dst, lo, hi);
+            } else {
+                let d_sub = dst.sub_mut(lo, hi) catch { b = b + 1_usize; continue; };
+                let s_sub = src.sub_mut(lo, hi) catch { b = b + 1_usize; continue; };
+                radix_lsd6_fallback(d_sub, s_sub);
+            }
+        }
+        b = b + 1_usize;
+    }
+}
+
+fn radix_sort_u64(keys: *mut [u64], scratch: *mut [u64]) {
+    let n = keys.len;
+    if n != scratch.len || n <= 1_usize {
+        return;
+    }
+    // Pass 1: 10-bit (1024-bin, 4 KiB L1d-resident) top MSD partition (bits 54..64)
+    var h_top: [1024]u32 = [0_u32; 1024];
+    var i: usize = 0_usize;
+    while i < keys.len {
+        let bi = (keys[i] >> 54_u64).trunc.[usize]();
+        h_top[bi] = h_top[bi] +% 1_u32;
+        i = i + 1_usize;
+    }
+    var starts: [1024]u32 = [0_u32; 1024];
+    var sum: u32 = 0_u32;
+    var b: usize = 0_usize;
+    while b < 1024_usize {
+        starts[b] = sum;
+        let c = h_top[b];
+        h_top[b] = sum;
+        sum = sum +% c;
+        b = b + 1_usize;
+    }
+    i = 0_usize;
+    while i < keys.len {
+        let v = keys[i];
+        let bi = (v >> 54_u64).trunc.[usize]();
+        let pos = h_top[bi].widen.[usize]();
+        h_top[bi] = (pos +% 1_usize).trunc.[u32]();
+        if pos < scratch.len { scratch[pos] = v; }
+        i = i + 1_usize;
+    }
+    b = 0_usize;
+    while b < 1024_usize {
+        let lo = starts[b].widen.[usize]();
+        let hi = h_top[b].widen.[usize]();
+        if lo < hi && hi <= scratch.len && hi <= keys.len {
+            let s_sub = scratch.sub_mut(lo, hi) catch { b = b + 1_usize; continue; };
+            let k_sub = keys.sub_mut(lo, hi) catch { b = b + 1_usize; continue; };
+            radix_msd2_bucket(s_sub, k_sub);
+        }
+        b = b + 1_usize;
+    }
+}
+
+fn insertion_sort(keys: *mut [u64], pays: *mut [u64], lo: usize, hi: usize)
+    where hi <= keys.len && hi <= pays.len
+{
+    if hi <= lo +% 1_usize {
+        return;
+    }
+    var i = lo +% 1_usize;
+    while i < hi {
+        let cur_key = keys[i];
+        let cur_pay = pays[i];
+        var j = i;
+        while j > lo {
+            let prev_idx = j - 1_usize;
+            let pk = keys[prev_idx];
+            if pk <= cur_key {
+                break;
+            }
+            keys[j] = pk;
+            pays[j] = pays[prev_idx];
+            j = prev_idx;
+        }
+        keys[j] = cur_key;
+        pays[j] = cur_pay;
+        i = i + 1_usize;
+    }
+}
+
+fn sift_down(keys: *mut [u64], pays: *mut [u64], base: usize, start: usize, count: usize) {
+    var root = start;
+    loop {
+        let child = (root *% 2_usize) +% 1_usize;
+        if child >= count {
+            break;
+        }
+        var best = child;
+        let right = child +% 1_usize;
+        if right < count {
+            let bi = base +% best;
+            let ri = base +% right;
+            if bi < keys.len && ri < keys.len {
+                if keys[ri] > keys[bi] {
+                    best = right;
+                }
+            }
+        }
+        let rti = base +% root;
+        let bsi = base +% best;
+        if rti >= keys.len || bsi >= keys.len || rti >= pays.len || bsi >= pays.len {
+            break;
+        }
+        if keys[rti] < keys[bsi] {
+            let tk = keys[rti];
+            keys[rti] = keys[bsi];
+            keys[bsi] = tk;
+            let tp = pays[rti];
+            pays[rti] = pays[bsi];
+            pays[bsi] = tp;
+            root = best;
+        } else {
+            break;
+        }
+    }
+}
+
+fn heapsort_range(keys: *mut [u64], pays: *mut [u64], lo: usize, hi: usize) {
+    if hi <= lo || hi > keys.len || hi > pays.len {
+        return;
+    }
+    let count = hi - lo;
+    if count <= 1_usize {
+        return;
+    }
+    var start = count >> 1_usize;
+    while start > 0_usize {
+        start = start - 1_usize;
+        sift_down(keys, pays, lo, start, count);
+    }
+    var end = count;
+    while end > 1_usize {
+        end = end - 1_usize;
+        let ei = lo +% end;
+        if lo < keys.len && ei < keys.len && lo < pays.len && ei < pays.len {
+            let tk = keys[ei];
+            keys[ei] = keys[lo];
+            keys[lo] = tk;
+            let tp = pays[ei];
+            pays[ei] = pays[lo];
+            pays[lo] = tp;
+        }
+        sift_down(keys, pays, lo, 0_usize, end);
+    }
+}
+
+/// Non-inlined branchless cyclic Lomuto partition (ipnsort algorithm) over SoA `(keys, pays)` columns:
+/// Zero stack spills (keeps `pivot` in register!), single-instruction SIB addressing, zero branches!
+fn partition_lomuto_branchless(
+    keys: *mut [u64],
+    pays: *mut [u64],
+    lo: usize,
+    hi: usize,
+) -> usize
+    where lo < hi && hi <= keys.len && hi <= pays.len
+{
+    let pivot = keys[lo];
+    let pivot_pay = pays[lo];
+    var left = lo;
+    var right = lo + 1_usize;
+    while right < hi {
+        let rk = keys[right];
+        let rp = pays[right];
+        let is_lt: usize = if rk < pivot { 1_usize } else { 0_usize };
+        keys[left] = rk;
+        pays[left] = rp;
+        let next_left = left + is_lt;
+        if next_left < hi {
+            keys[right] = keys[next_left];
+            pays[right] = pays[next_left];
+            left = next_left;
+        }
+        right = right + 1_usize;
+    }
+    keys[left] = pivot;
+    pays[left] = pivot_pay;
+    return left;
+}
+
+fn introsort_records(keys: *mut [u64], pays: *mut [u64]) {
+    let n = keys.len;
+    if n <= 1_usize || pays.len != n {
+        return;
+    }
+
+    var lo_stack: [64]usize = [0_usize; 64];
+    var hi_stack: [64]usize = [0_usize; 64];
+    var dp_stack: [64]u32 = [0_u32; 64];
+    var sp: usize = 0_usize;
+
+    var lo: usize = 0_usize;
+    var hi: usize = n;
+    var depth: u32 = 36_u32;
+
+    loop {
+        if hi <= lo || hi > keys.len || hi > pays.len {
+            if sp == 0_usize {
+                break;
+            }
+            sp = sp - 1_usize;
+            if sp < 64_usize {
+                lo = lo_stack[sp];
+                hi = hi_stack[sp];
+                depth = dp_stack[sp];
+            }
+            continue;
+        }
+        let len = hi - lo;
+        if len <= 20_usize {
+            insertion_sort(keys, pays, lo, hi);
+            if sp == 0_usize {
+                break;
+            }
+            sp = sp - 1_usize;
+            if sp < 64_usize {
+                lo = lo_stack[sp];
+                hi = hi_stack[sp];
+                depth = dp_stack[sp];
+            }
+            continue;
+        }
+        if depth == 0_u32 {
+            heapsort_range(keys, pays, lo, hi);
+            if sp == 0_usize {
+                break;
+            }
+            sp = sp - 1_usize;
+            if sp < 64_usize {
+                lo = lo_stack[sp];
+                hi = hi_stack[sp];
+                depth = dp_stack[sp];
+            }
+            continue;
+        }
+
+        // Median-of-three pivot selection -> place pivot at `lo`
+        let last = hi - 1_usize;
+        let mid = lo +% (len >> 1_usize);
+        if mid >= keys.len || mid >= pays.len {
+            break;
+        }
+        if keys[mid] < keys[lo] {
+            let tk = keys[lo]; keys[lo] = keys[mid]; keys[mid] = tk;
+            let tp = pays[lo]; pays[lo] = pays[mid]; pays[mid] = tp;
+        }
+        if keys[last] < keys[lo] {
+            let tk = keys[lo]; keys[lo] = keys[last]; keys[last] = tk;
+            let tp = pays[lo]; pays[lo] = pays[last]; pays[last] = tp;
+        }
+        if keys[last] < keys[mid] {
+            let tk = keys[mid]; keys[mid] = keys[last]; keys[last] = tk;
+            let tp = pays[mid]; pays[mid] = pays[last]; pays[last] = tp;
+        }
+        // Swap median `mid` into `lo` for cyclic Lomuto
+        let pk = keys[mid]; keys[mid] = keys[lo]; keys[lo] = pk;
+        let pp = pays[mid]; pays[mid] = pays[lo]; pays[lo] = pp;
+
+        let p = partition_lomuto_branchless(keys, pays, lo, hi);
+        let next_depth = depth - 1_u32;
+        let left_len = p -% lo;
+        let right_lo = p +% 1_usize;
+        let right_len = if hi > right_lo { hi - right_lo } else { 0_usize };
+
+        // Push larger partition, iterate on smaller to bound stack depth <= log2(n)
+        if left_len > right_len {
+            if sp < 64_usize {
+                lo_stack[sp] = lo;
+                hi_stack[sp] = p;
+                dp_stack[sp] = next_depth;
+                sp = sp + 1_usize;
+            }
+            lo = right_lo;
+            depth = next_depth;
+        } else {
+            if sp < 64_usize {
+                lo_stack[sp] = right_lo;
+                hi_stack[sp] = hi;
+                dp_stack[sp] = next_depth;
+                sp = sp + 1_usize;
+            }
+            hi = p;
+            depth = next_depth;
+        }
+    }
+}
+
+pub fn main(env: *mut Env) -> i32 ! OutOfMemory | BoundsError {
+    let n_radix: usize = 1000000_usize;
+    let n_records: usize = 200000_usize;
+
+    var rng = Rng.{ state: 0x9E3779B97F4A7C15_u64 };
+
+    var keys_buf = try Buf.[u64].init(&mut env.alloc, n_radix);
+    errdefer keys_buf.destroy(&mut env.alloc);
+    var scratch_buf = try Buf.[u64].init(&mut env.alloc, n_radix);
+    errdefer scratch_buf.destroy(&mut env.alloc);
+    var rec_keys_buf = try Buf.[u64].init(&mut env.alloc, n_records);
+    errdefer rec_keys_buf.destroy(&mut env.alloc);
+    var rec_pays_buf = try Buf.[u64].init(&mut env.alloc, n_records);
+    errdefer rec_pays_buf.destroy(&mut env.alloc);
+
+    var i: usize = 0_usize;
+    while i < n_radix {
+        try keys_buf.push(rng.next());
+        try scratch_buf.push(0_u64);
+        i = i + 1_usize;
+    }
+
+    i = 0_usize;
+    while i < n_records {
+        let key = rng.next();
+        let rot = (key <<% 17_u64) | (key >> 47_u64);
+        let payload = (i.widen.[u64]() *% 0xD1B54A32D192ED03_u64) ^ rot;
+        try rec_keys_buf.push(key);
+        try rec_pays_buf.push(payload);
+        i = i + 1_usize;
+    }
+
+    let keys = keys_buf.as_mut_slice();
+    let scratch = scratch_buf.as_mut_slice();
+    let rec_keys = rec_keys_buf.as_mut_slice();
+    let rec_pays = rec_pays_buf.as_mut_slice();
+
+    let t0 = rt.now_ns(&env.clock);
+    radix_sort_u64(keys, scratch);
+    introsort_records(rec_keys, rec_pays);
+    let elapsed_ns = rt.elapsed_since(&env.clock, t0);
+
+    var ok = true;
+    var k: usize = 1_usize;
+    while k < keys.len {
+        if keys[k - 1_usize] > keys[k] {
+            ok = false;
+            break;
+        }
+        k = k + 1_usize;
+    }
+    if ok {
+        var r: usize = 1_usize;
+        while r < rec_keys.len {
+            if rec_keys[r - 1_usize] > rec_keys[r] {
+                ok = false;
+                break;
+            }
+            r = r + 1_usize;
+        }
+    }
+
+    var h: u64 = if ok { 0xCBF29CE484222325_u64 } else { 0_u64 };
+    k = 0_usize;
+    while k < keys.len {
+        h = (h ^ keys[k]) *% 0x100000001B3_u64;
+        k = k + 1_usize;
+    }
+    var r: usize = 0_usize;
+    while r < rec_keys.len && r < rec_pays.len {
+        h = (h ^ rec_keys[r]) *% 0x100000001B3_u64;
+        h = (h ^ rec_pays[r]) *% 0x100000001B3_u64;
+        r = r + 1_usize;
+    }
+
+    keys_buf.destroy(&mut env.alloc);
+    scratch_buf.destroy(&mut env.alloc);
+    rec_keys_buf.destroy(&mut env.alloc);
+    rec_pays_buf.destroy(&mut env.alloc);
+
+    rt.print_str("RESULT radix_pdqsort checksum=");
+    rt.print_u64(h);
+    rt.print_str(" elapsed_ns=");
+    rt.print_u64(elapsed_ns);
+    rt.print_nl();
+
+    if !ok {
+        return 1_i32;
+    }
+    return 0_i32;
+}

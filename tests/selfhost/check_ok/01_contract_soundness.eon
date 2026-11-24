@@ -1,0 +1,76 @@
+module ok.contract_soundness;
+
+pub fn clamp_u32(x: u32, hi: u32) -> u32
+    ensures return <= hi
+{
+    if x > hi {
+        return hi;
+    }
+    return x;
+}
+
+pub fn always_five() -> u32
+    ensures return == 5_u32
+{
+    return 5_u32;
+}
+
+pub fn req_eq_five(x: u32) -> u32
+    where x == 5_u32
+    ensures return == 6_u32
+{
+    return x + 1_u32;
+}
+
+pub fn req_or_proven(a: u32, b: u32) -> u32
+    where (a > 10_u32 || b > 10_u32)
+{
+    return a +% b;
+}
+
+pub fn req_tautology(x: u32) -> u32
+    where (x < 5_u32 || x >= 5_u32)
+{
+    return x;
+}
+
+pub fn req_not(x: u32) -> u32
+    where !(x == 0_u32)
+{
+    return 100_u32 / x;
+}
+
+pub fn req_plus_const(a: u32, b: u32) -> u32
+    where a + 1_u32 <= b + 2_u32 && a + 1_u32 <= 100_u32
+{
+    return (a + 1_u32) +% b;
+}
+
+pub fn call_all(xs: *[u8], x: u32) -> u32 {
+    let f = always_five();
+    let s = req_eq_five(f);
+    let _t = req_tautology(x);
+    let _n = req_not(s);
+    let _o = req_or_proven(15_u32, 0_u32);
+    let _p = req_plus_const(10_u32, 20_u32);
+    if xs.len > 0_usize {
+        let hi = (xs.len - 1_usize).trunc.[u32]();
+        let idx = clamp_u32(x, hi);
+        if idx.widen.[usize]() < xs.len {
+            return xs[idx.widen.[usize]()].widen.[u32]() +% s;
+        }
+    }
+    return s;
+}
+
+pub fn good_loop_inv(xs: *[u8]) -> u64 {
+    var acc: u64 = 0_u64;
+    var i: usize = 0_usize;
+    while i < xs.len
+        where i <= xs.len
+    {
+        acc = acc +% xs[i].widen.[u64]();
+        i = i + 1_usize;
+    }
+    return acc;
+}

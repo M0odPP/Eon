@@ -1,0 +1,157 @@
+module kernel.arch.x86_64.paging @hal;
+
+import kernel.arch.x86_64.cpu;
+
+/// Hardware x86_64 4-level page-table entry (PML4E / PDPTE / PDE / PTE) using Eon `bitfield`.
+pub bitfield PageEntry : u64 {
+    present: u1 @bits(0..1);
+    writable: u1 @bits(1..2);
+    user: u1 @bits(2..3);
+    pwt: u1 @bits(3..4);
+    pcd: u1 @bits(4..5);
+    accessed: u1 @bits(5..6);
+    dirty: u1 @bits(6..7);
+    huge: u1 @bits(7..8);
+    global: u1 @bits(8..9);
+    pfn: u40 @bits(12..52);
+    nx: u1 @bits(63..64);
+}
+
+pub fn make_table_entry(next_table: PhysAddr) -> PageEntry @noalloc @noblock {
+    let pfn_val = ((next_table.as_u64() >> 12_u64) & 0xFFFFFFFFFF_u64).trunc.[u40]();
+    return PageEntry.{
+        present: 1_u1,
+        writable: 1_u1,
+        user: 0_u1,
+        pwt: 0_u1,
+        pcd: 0_u1,
+        accessed: 0_u1,
+        dirty: 0_u1,
+        huge: 0_u1,
+        global: 0_u1,
+        pfn: pfn_val,
+        nx: 0_u1,
+    };
+}
+
+pub fn make_leaf_4k_entry(frame: PhysAddr, writable: bool) -> PageEntry @noalloc @noblock {
+    let pfn_val = ((frame.as_u64() >> 12_u64) & 0xFFFFFFFFFF_u64).trunc.[u40]();
+    return PageEntry.{
+        present: 1_u1,
+        writable: if writable { 1_u1 } else { 0_u1 },
+        user: 0_u1,
+        pwt: 0_u1,
+        pcd: 0_u1,
+        accessed: 0_u1,
+        dirty: 0_u1,
+        huge: 0_u1,
+        global: 0_u1,
+        pfn: pfn_val,
+        nx: if writable { 1_u1 } else { 0_u1 },
+    };
+}
+
+pub fn entry_phys_addr(e: PageEntry) -> PhysAddr @noalloc @noblock {
+    let raw_pa = e.pfn.widen.[u64]() <<% 12_u64;
+    return PhysAddr.from_usize(raw_pa.trunc.[usize]());
+}
+
+fn read_pte(table_pa: PhysAddr, idx: usize) -> PageEntry @noalloc @noblock {
+    let raw_bits = cpu.mem_read_u64(table_pa.as_u64().trunc.[usize]() +% (idx *% 8_usize));
+    return raw_bits.bitcast.[PageEntry]();
+}
+
+fn write_pte(table_pa: PhysAddr, idx: usize, entry: PageEntry) @noalloc @noblock {
+    let raw_bits = entry.bitcast.[u64]();
+    cpu.mem_write_u64(table_pa.as_u64().trunc.[usize]() +% (idx *% 8_usize), raw_bits);
+}
+
+pub fn zero_frame(frame: PhysAddr) @noalloc @noblock {
+    cpu.mem_zero(frame.as_u64().trunc.[usize](), 4096_usize);
+}
+
+/// Install a real 4-level page table (PML4 -> PDPT -> PD -> PT) for the 2 MiB window
+/// containing `va`, replacing the boot 2 MiB huge PDE with `pt_frame` and mapping `va -> pa`.
+pub fn map_4k_in_cr3(va: VirtAddr, pa: PhysAddr, pt_frame: PhysAddr, writable: bool) -> bool @noalloc @noblock {
+    let cr3_pa = PhysAddr.from_usize((cpu.read_cr3() & 0x000FFFFFFFFFF000_u64).trunc.[usize]());
+    let v = va.as_u64();
+    let pml4_i = ((v >> 39_u64) & 0x1FF_u64).trunc.[usize]();
+    let pdpt_i = ((v >> 30_u64) & 0x1FF_u64).trunc.[usize]();
+    let pd_i   = ((v >> 21_u64) & 0x1FF_u64).trunc.[usize]();
+    let pt_i   = ((v >> 12_u64) & 0x1FF_u64).trunc.[usize]();
+
+    let pml4e = read_pte(cr3_pa, pml4_i);
+    if pml4e.present == 0_u1 { return false; }
+    let pdpt_pa = entry_phys_addr(pml4e);
+
+    let pdpte = read_pte(pdpt_pa, pdpt_i);
+    if pdpte.present == 0_u1 { return false; }
+    let pd_pa = entry_phys_addr(pdpte);
+
+    // Replace the 2 MiB huge PDE with a freshly zeroed 4 KiB PT table
+    zero_frame(pt_frame);
+    let leaf = make_leaf_4k_entry(pa, writable);
+    write_pte(pt_frame, pt_i, leaf);
+    let new_pde = make_table_entry(pt_frame);
+    write_pte(pd_pa, pd_i, new_pde);
+
+    cpu.invlpg_raw(v);
+    cpu.write_cr3(cpu.read_cr3());
+    return true;
+}
+
+/// Walk the live hardware 4-level CR3 page tables and translate `va` to its `PhysAddr`.
+pub fn translate_4k(va: VirtAddr) -> ?PhysAddr @noalloc @noblock {
+    let cr3_pa = PhysAddr.from_usize((cpu.read_cr3() & 0x000FFFFFFFFFF000_u64).trunc.[usize]());
+    let v = va.as_u64();
+    let pml4_i = ((v >> 39_u64) & 0x1FF_u64).trunc.[usize]();
+    let pdpt_i = ((v >> 30_u64) & 0x1FF_u64).trunc.[usize]();
+    let pd_i   = ((v >> 21_u64) & 0x1FF_u64).trunc.[usize]();
+    let pt_i   = ((v >> 12_u64) & 0x1FF_u64).trunc.[usize]();
+
+    let pml4e = read_pte(cr3_pa, pml4_i);
+    if pml4e.present == 0_u1 { return null; }
+    let pdpte = read_pte(entry_phys_addr(pml4e), pdpt_i);
+    if pdpte.present == 0_u1 { return null; }
+    let pde = read_pte(entry_phys_addr(pdpte), pd_i);
+    if pde.present == 0_u1 || pde.huge != 0_u1 { return null; }
+    let pte = read_pte(entry_phys_addr(pde), pt_i);
+    if pte.present == 0_u1 { return null; }
+
+    let pa_full = entry_phys_addr(pte).as_u64() | (v & 0xFFF_u64);
+    return PhysAddr.from_usize(pa_full.trunc.[usize]());
+}
+
+/// Unmap a 4 KiB PTE and flush its TLB entry with `invlpg`.
+pub fn unmap_4k_in_cr3(va: VirtAddr) -> bool @noalloc @noblock {
+    let cr3_pa = PhysAddr.from_usize((cpu.read_cr3() & 0x000FFFFFFFFFF000_u64).trunc.[usize]());
+    let v = va.as_u64();
+    let pml4_i = ((v >> 39_u64) & 0x1FF_u64).trunc.[usize]();
+    let pdpt_i = ((v >> 30_u64) & 0x1FF_u64).trunc.[usize]();
+    let pd_i   = ((v >> 21_u64) & 0x1FF_u64).trunc.[usize]();
+    let pt_i   = ((v >> 12_u64) & 0x1FF_u64).trunc.[usize]();
+
+    let pml4e = read_pte(cr3_pa, pml4_i);
+    if pml4e.present == 0_u1 { return false; }
+    let pdpte = read_pte(entry_phys_addr(pml4e), pdpt_i);
+    if pdpte.present == 0_u1 { return false; }
+    let pde = read_pte(entry_phys_addr(pdpte), pd_i);
+    if pde.present == 0_u1 || pde.huge != 0_u1 { return false; }
+
+    let empty = (0_u64).bitcast.[PageEntry]();
+    write_pte(entry_phys_addr(pde), pt_i, empty);
+    cpu.invlpg_raw(v);
+    return true;
+}
+
+pub fn write_virt_u64(va: VirtAddr, val: u64) @noalloc @noblock {
+    cpu.mem_write_u64(va.as_u64().trunc.[usize](), val);
+}
+
+pub fn read_virt_u64(va: VirtAddr) -> u64 @noalloc @noblock {
+    return cpu.mem_read_u64(va.as_u64().trunc.[usize]());
+}
+
+pub fn read_phys_u64(pa: PhysAddr) -> u64 @noalloc @noblock {
+    return cpu.mem_read_u64(pa.as_u64().trunc.[usize]());
+}

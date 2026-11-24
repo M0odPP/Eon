@@ -1,0 +1,4 @@
+module fail.read_fn;
+pub fn f(x: read Buf[u8]) { //~ ERROR E0823
+    _ = x;
+}

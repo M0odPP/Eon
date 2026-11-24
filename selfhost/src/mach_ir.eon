@@ -1,0 +1,1580 @@
+module eonc.mach_ir;
+
+import core.col;
+import eonc.span;
+import eonc.ast;
+import eonc.x64_asm;
+
+// ============================================================================
+// Section 1: Virtual Registers, Register Classes & Physical Register Pools
+// ============================================================================
+
+pub type VReg = u32;
+
+pub const VREG_NONE: u32 = 4294967295_u32;
+pub const PHYS_NONE: u8 = 255_u8;
+pub const LABEL_NONE: u32 = 4294967295_u32;
+pub const BLOCK_NONE: u32 = 4294967295_u32;
+
+pub enum RegClass : u8 {
+    Gpr = 0,
+    Vec128 = 1,
+    Vec256 = 2,
+    Flags = 3,
+}
+
+pub fn reg_class_is_vec(cls: RegClass) -> bool {
+    return cls == .Vec128 || cls == .Vec256;
+}
+
+// x86_64 physical GPR IDs (matching x64_asm.Reg)
+pub const PHYS_RAX: u8 = 0_u8;
+pub const PHYS_RCX: u8 = 1_u8;
+pub const PHYS_RDX: u8 = 2_u8;
+pub const PHYS_RBX: u8 = 3_u8;
+pub const PHYS_RSP: u8 = 4_u8;
+pub const PHYS_RBP: u8 = 5_u8;
+pub const PHYS_RSI: u8 = 6_u8;
+pub const PHYS_RDI: u8 = 7_u8;
+pub const PHYS_R8: u8 = 8_u8;
+pub const PHYS_R9: u8 = 9_u8;
+pub const PHYS_R10: u8 = 10_u8;
+pub const PHYS_R11: u8 = 11_u8;
+pub const PHYS_R12: u8 = 12_u8;
+pub const PHYS_R13: u8 = 13_u8;
+pub const PHYS_R14: u8 = 14_u8;
+pub const PHYS_R15: u8 = 15_u8;
+
+// Dedicated spill/reload & parallel-copy scratch registers (excluded from alloc pool)
+pub const SCRATCH_GPR0: u8 = 10_u8; // R10
+pub const SCRATCH_GPR1: u8 = 11_u8; // R11
+pub const SCRATCH_VEC0: u8 = 14_u8; // Xmm14 / Ymm14
+pub const SCRATCH_VEC1: u8 = 15_u8; // Xmm15 / Ymm15
+
+// Bitmasks (bit i == physical register ID i)
+// Caller-saved GPRs: Rax(0), Rcx(1), Rdx(2), Rsi(6), Rdi(7), R8(8), R9(9), R10(10), R11(11)
+pub const CALLER_SAVED_GPRS_MASK: u16 = 0x0FC7_u16;
+// Callee-saved GPRs: Rbx(3), R12(12), R13(13), R14(14), R15(15)
+pub const CALLEE_SAVED_GPRS_MASK: u16 = 0xF008_u16;
+// EonCall error-union call default clobbers: caller-saved GPRs + R15(15)
+pub const EON_CALL_ERR_CLOBBER_GPRS: u16 = 0x8FC7_u16;
+// 12 allocatable GPRs: Rax, Rcx, Rdx, Rbx, Rsi, Rdi, R8, R9, R12, R13, R14, R15
+pub const ALLOC_GPRS_ALL_MASK: u16 = 0xF3CF_u16;
+// 11 allocatable GPRs when R15 is reserved for ErrorUnion return channel
+pub const ALLOC_GPRS_NO_R15_MASK: u16 = 0x73CF_u16;
+// Caller-saved XMM/YMM (all 16 in SysV & EonCall)
+pub const CALLER_SAVED_XMMS_MASK: u16 = 0xFFFF_u16;
+// 14 allocatable XMM/YMM registers: Xmm0..Xmm13 (Xmm14/Xmm15 reserved as scratch)
+pub const ALLOC_XMMS_MASK: u16 = 0x3FFF_u16;
+
+pub const ALLOC_GPR_COUNT: usize = 12_usize;
+pub const ALLOC_VEC_COUNT: usize = 14_usize;
+
+pub fn phys_bit(phys: u8) -> u16 {
+    if phys >= 16_u8 {
+        return 0_u16;
+    }
+    return 1_u16 <<% phys.widen.[u16]();
+}
+
+pub fn is_callee_saved_gpr(phys: u8) -> bool {
+    return (CALLEE_SAVED_GPRS_MASK & phys_bit(phys)) != 0_u16;
+}
+
+/// Preferred allocation order across the 12 allocatable x86_64 GPRs:
+/// caller-saved first (zero prologue push/pop), then callee-saved.
+pub fn alloc_gpr_order(idx: usize) -> u8 {
+    match idx {
+        0_usize => { return PHYS_RAX; }
+        1_usize => { return PHYS_RCX; }
+        2_usize => { return PHYS_RDX; }
+        3_usize => { return PHYS_RSI; }
+        4_usize => { return PHYS_RDI; }
+        5_usize => { return PHYS_R8; }
+        6_usize => { return PHYS_R9; }
+        7_usize => { return PHYS_RBX; }
+        8_usize => { return PHYS_R12; }
+        9_usize => { return PHYS_R13; }
+        10_usize => { return PHYS_R14; }
+        11_usize => { return PHYS_R15; }
+        _ => { return PHYS_NONE; }
+    }
+}
+
+/// Preferred allocation order across the 14 allocatable XMM/YMM registers (0..13).
+pub fn alloc_vec_order(idx: usize) -> u8 {
+    if idx < ALLOC_VEC_COUNT {
+        return idx.trunc.[u8]();
+    }
+    return PHYS_NONE;
+}
+
+pub fn reg_to_phys(r: x64_asm.Reg) -> u8 {
+    return r.id();
+}
+
+pub fn xmm_to_phys(x: x64_asm.Xmm) -> u8 {
+    return x.id();
+}
+
+pub fn phys_to_reg(phys: u8) -> x64_asm.Reg {
+    match phys {
+        0_u8 => { return .Rax; }
+        1_u8 => { return .Rcx; }
+        2_u8 => { return .Rdx; }
+        3_u8 => { return .Rbx; }
+        4_u8 => { return .Rsp; }
+        5_u8 => { return .Rbp; }
+        6_u8 => { return .Rsi; }
+        7_u8 => { return .Rdi; }
+        8_u8 => { return .R8; }
+        9_u8 => { return .R9; }
+        10_u8 => { return .R10; }
+        11_u8 => { return .R11; }
+        12_u8 => { return .R12; }
+        13_u8 => { return .R13; }
+        14_u8 => { return .R14; }
+        _ => { return .R15; }
+    }
+}
+
+pub fn phys_to_xmm(phys: u8) -> x64_asm.Xmm {
+    match phys {
+        0_u8 => { return .Xmm0; }
+        1_u8 => { return .Xmm1; }
+        2_u8 => { return .Xmm2; }
+        3_u8 => { return .Xmm3; }
+        4_u8 => { return .Xmm4; }
+        5_u8 => { return .Xmm5; }
+        6_u8 => { return .Xmm6; }
+        7_u8 => { return .Xmm7; }
+        8_u8 => { return .Xmm8; }
+        9_u8 => { return .Xmm9; }
+        10_u8 => { return .Xmm10; }
+        11_u8 => { return .Xmm11; }
+        12_u8 => { return .Xmm12; }
+        13_u8 => { return .Xmm13; }
+        14_u8 => { return .Xmm14; }
+        _ => { return .Xmm15; }
+    }
+}
+
+pub struct VRegInfo {
+    pub cls: RegClass;
+    pub fixed_phys: u8;
+    pub hint_phys: u8;
+    pub hint_vreg: VReg;
+    pub assigned_phys: u8;
+    /// `0` when not spilled; strictly negative `rbp`-relative displacement when spilled.
+    pub spill_off: i32;
+}
+
+// ============================================================================
+// Section 2: Target-Neutral Memory Addressing (`MemKind`, `MemAddr`)
+// ============================================================================
+
+pub enum MemKind : u8 {
+    None = 0,
+    BaseDisp = 1,
+    Sib = 2,
+    RipSym = 3,
+    RipLabel = 4,
+    StackSlot = 5,
+}
+
+pub struct MemAddr {
+    pub kind: MemKind;
+    pub base: VReg;
+    pub base_phys: u8;
+    pub idx: VReg;
+    pub idx_phys: u8;
+    pub scale: u8;
+    pub disp: i32;
+    pub sym: u32;
+    pub label: u32;
+}
+
+pub fn mem_none() -> MemAddr {
+    return MemAddr.{
+        kind: .None,
+        base: VREG_NONE,
+        base_phys: PHYS_NONE,
+        idx: VREG_NONE,
+        idx_phys: PHYS_NONE,
+        scale: 1_u8,
+        disp: 0_i32,
+        sym: span.SYM_EMPTY,
+        label: LABEL_NONE,
+    };
+}
+
+pub fn mem_base_disp(base: VReg, disp: i32) -> MemAddr {
+    return MemAddr.{
+        kind: .BaseDisp,
+        base: base,
+        base_phys: PHYS_NONE,
+        idx: VREG_NONE,
+        idx_phys: PHYS_NONE,
+        scale: 1_u8,
+        disp: disp,
+        sym: span.SYM_EMPTY,
+        label: LABEL_NONE,
+    };
+}
+
+pub fn mem_phys_disp(base_phys: u8, disp: i32) -> MemAddr {
+    return MemAddr.{
+        kind: .BaseDisp,
+        base: VREG_NONE,
+        base_phys: base_phys,
+        idx: VREG_NONE,
+        idx_phys: PHYS_NONE,
+        scale: 1_u8,
+        disp: disp,
+        sym: span.SYM_EMPTY,
+        label: LABEL_NONE,
+    };
+}
+
+pub fn mem_stack_slot(rbp_disp: i32) -> MemAddr {
+    return MemAddr.{
+        kind: .StackSlot,
+        base: VREG_NONE,
+        base_phys: PHYS_RBP,
+        idx: VREG_NONE,
+        idx_phys: PHYS_NONE,
+        scale: 1_u8,
+        disp: rbp_disp,
+        sym: span.SYM_EMPTY,
+        label: LABEL_NONE,
+    };
+}
+
+pub fn mem_sib(base: VReg, idx: VReg, scale: u8, disp: i32) -> MemAddr {
+    return MemAddr.{
+        kind: .Sib,
+        base: base,
+        base_phys: PHYS_NONE,
+        idx: idx,
+        idx_phys: PHYS_NONE,
+        scale: scale,
+        disp: disp,
+        sym: span.SYM_EMPTY,
+        label: LABEL_NONE,
+    };
+}
+
+pub fn mem_sib_phys(base_phys: u8, idx_phys: u8, scale: u8, disp: i32) -> MemAddr {
+    return MemAddr.{
+        kind: .Sib,
+        base: VREG_NONE,
+        base_phys: base_phys,
+        idx: VREG_NONE,
+        idx_phys: idx_phys,
+        scale: scale,
+        disp: disp,
+        sym: span.SYM_EMPTY,
+        label: LABEL_NONE,
+    };
+}
+
+pub fn mem_rip_sym(sym: u32, disp: i32) -> MemAddr {
+    return MemAddr.{
+        kind: .RipSym,
+        base: VREG_NONE,
+        base_phys: PHYS_NONE,
+        idx: VREG_NONE,
+        idx_phys: PHYS_NONE,
+        scale: 1_u8,
+        disp: disp,
+        sym: sym,
+        label: LABEL_NONE,
+    };
+}
+
+pub fn mem_rip_label(label: u32) -> MemAddr {
+    return MemAddr.{
+        kind: .RipLabel,
+        base: VREG_NONE,
+        base_phys: PHYS_NONE,
+        idx: VREG_NONE,
+        idx_phys: PHYS_NONE,
+        scale: 1_u8,
+        disp: 0_i32,
+        sym: span.SYM_EMPTY,
+        label: label,
+    };
+}
+
+// ============================================================================
+// Section 3: Universal Machine Operations (`MachOp`) & `MachInst`
+// ============================================================================
+
+/// Universal target-neutral machine operations (lowered to x86_64 today;
+/// cleanly structured for future AArch64 and RISC-V emitters).
+///
+/// Operand conventions:
+/// - 2-address x86_64 GPR ALU ops set `tied_src0 = true` (`dst` tied to `src0`).
+/// - `Cmov`: `dst = if cc { src1 } else { src0 }`, `tied_src0 = true`.
+/// - `VFmadd231*` / `VFnMadd231PS`: `dst = +/- src1 * src2 + src0`, `tied_src0 = true`.
+///   For `*Mem` variants, `src2` is replaced by `mem`.
+/// - `Div` / `Idiv` / `Div32` / `Idiv32` / `Mul128` / `Imul128`:
+///   `src0` = dividend/lhs (RAX), `src1` = divisor/rhs (non-RAX/RDX GPR),
+///   `dst` = quotient/lo (RAX), `dst2` = remainder/hi (RDX).
+/// - Variable shifts (`Shl`, `Shr`, `Sar`, `Shl32`, `Shr32`, `Sar32`):
+///   `dst` tied to `src0`, `src1` = shift count (lowered to RCX/CL).
+/// - `DefFixed`: defines `dst` from incoming physical register `src0_phys`.
+/// - `UseFixed`: copies `src0` into outgoing physical register `dst_phys`.
+/// - `Jmp` / `Jcc` / `LabelDef`: target label ID in `mem.label`.
+/// - `CallSym` / `JmpSym`: symbol ID in `mem.sym`, optional relocation kind in `imm`.
+/// - `JmpTable`: index GPR in `src0`, jump-table index (`mf.jump_tables`) in `imm`.
+pub enum MachOp : u8 {
+    // --- Data movement & address (0..13) ---
+    Mov = 0,
+    Mov32 = 1,
+    MovImm = 2,
+    MovImm32 = 3,
+    Lea = 4,
+    Load = 5,
+    Store = 6,
+    StoreImm = 7,
+    LoadSX = 8,
+    Extend = 9,
+    Push = 10,
+    Pop = 11,
+    MemCopy = 12,
+    MemZero = 13,
+
+    // --- GPR ALU (14..59) ---
+    Add = 14,
+    AddImm = 15,
+    Sub = 16,
+    SubImm = 17,
+    Mul = 18,
+    MulImm = 19,
+    Imul128 = 20,
+    Mul128 = 21,
+    Div = 22,
+    Idiv = 23,
+    Div32 = 24,
+    Idiv32 = 25,
+    Add32 = 26,
+    Add32Imm = 27,
+    Sub32 = 28,
+    Sub32Imm = 29,
+    Mul32 = 30,
+    Mul32Imm = 31,
+    And = 32,
+    AndImm = 33,
+    And32 = 34,
+    And32Imm = 35,
+    Or = 36,
+    OrImm = 37,
+    Or32 = 38,
+    Or32Imm = 39,
+    Xor = 40,
+    XorImm = 41,
+    Xor32 = 42,
+    Xor32Imm = 43,
+    Shl = 44,
+    ShlImm = 45,
+    Shr = 46,
+    ShrImm = 47,
+    Sar = 48,
+    SarImm = 49,
+    Shl32 = 50,
+    Shl32Imm = 51,
+    Shr32 = 52,
+    Shr32Imm = 53,
+    Sar32 = 54,
+    Sar32Imm = 55,
+    Neg = 56,
+    Neg32 = 57,
+    Not = 58,
+    Not32 = 59,
+
+    // --- Bit ops & branchless (60..66) ---
+    Tzcnt = 60,
+    Lzcnt = 61,
+    Popcnt = 62,
+    Bswap = 63,
+    Bextr = 64,
+    Cmov = 65,
+    Setcc = 66,
+
+    // --- Comparisons & Control flow (67..89) ---
+    Cmp = 67,
+    CmpImm = 68,
+    Cmp32 = 69,
+    Cmp32Imm = 70,
+    Test = 71,
+    TestImm = 72,
+    Test32 = 73,
+    Test32Imm = 74,
+    Jmp = 75,
+    Jcc = 76,
+    JmpReg = 77,
+    JmpTable = 78,
+    JmpSym = 79,
+    CallSym = 80,
+    CallReg = 81,
+    Ret = 82,
+    Iretq = 83,
+    Ud2 = 84,
+    Clc = 85,
+    Stc = 86,
+    Nop = 87,
+    InlineAsmRaw = 88,
+    RawBytes = 89,
+
+    // --- Atomics (90..92) ---
+    LockXadd = 90,
+    LockCmpxchg = 91,
+    XchgMem = 92,
+
+    // --- Scalar Float VEX (93..124) ---
+    VMovSSLoad = 93,
+    VMovSSStore = 94,
+    VMovSDLoad = 95,
+    VMovSDStore = 96,
+    VMovVecReg = 97,
+    VAddSS = 98,
+    VSubSS = 99,
+    VMulSS = 100,
+    VDivSS = 101,
+    VMinSS = 102,
+    VMaxSS = 103,
+    VSqrtSS = 104,
+    VFmadd231SS = 105,
+    VAddSD = 106,
+    VSubSD = 107,
+    VMulSD = 108,
+    VDivSD = 109,
+    VMinSD = 110,
+    VMaxSD = 111,
+    VSqrtSD = 112,
+    VFmadd231SD = 113,
+    VUcomiSS = 114,
+    VUcomiSD = 115,
+    VCvtSI2SS = 116,
+    VCvtSI2SD = 117,
+    VCvtTTSS2SI = 118,
+    VCvtTTSD2SI = 119,
+    VCvtSS2SD = 120,
+    VCvtSD2SS = 121,
+    VMovDToXmm = 122,
+    VMovDFromXmm = 123,
+    VMovQToXmm = 124,
+    VMovQFromXmm = 125,
+
+    // --- Packed Vector 128-bit & 256-bit AVX2/FMA3 (`flag0` = `l256`) (126..191) ---
+    VMovUpsLoad = 126,
+    VMovUpsStore = 127,
+    VMovApsLoad = 128,
+    VMovApsStore = 129,
+    VMovDquLoad = 130,
+    VMovDquStore = 131,
+    VBroadcastSS = 132,
+    VBroadcastSD = 133,
+    VAddPS = 134,
+    VAddPSMem = 135,
+    VSubPS = 136,
+    VSubPSMem = 137,
+    VMulPS = 138,
+    VMulPSMem = 139,
+    VDivPS = 140,
+    VMinPS = 141,
+    VMaxPS = 142,
+    VSqrtPS = 143,
+    VRsqrtPS = 144,
+    VFmadd231PS = 145,
+    VFmadd231PSMem = 146,
+    VFnMadd231PS = 147,
+    VAddPD = 148,
+    VSubPD = 149,
+    VMulPD = 150,
+    VDivPD = 151,
+    VMinPD = 152,
+    VMaxPD = 153,
+    VSqrtPD = 154,
+    VFmadd231PD = 155,
+    VFmadd231PDMem = 156,
+    VXorPS = 157,
+    VAndPS = 158,
+    VOrPS = 159,
+    VXorPD = 160,
+    VAndPD = 161,
+    VOrPD = 162,
+    VCmpPS = 163,
+    VBlendVPS = 164,
+    VShufPS = 165,
+    VHAddPS = 166,
+    VExtractF128 = 167,
+    VInsertF128 = 168,
+    VPXor = 169,
+    VPAnd = 170,
+    VPOr = 171,
+    VPAddB = 172,
+    VPSubB = 173,
+    VPAddD = 174,
+    VPSubD = 175,
+    VPMullD = 176,
+    VPAddQ = 177,
+    VPSubQ = 178,
+    VPMinSD = 179,
+    VPMaxSD = 180,
+    VPCmpEqB = 181,
+    VPCmpEqD = 182,
+    VPCmpGtD = 183,
+    VPMovMskB = 184,
+    VPSllDImm = 185,
+    VPSrlDImm = 186,
+    VPSraDImm = 187,
+    VPSllWImm = 188,
+    VPBroadcastB = 189,
+    VPBroadcastD = 190,
+    VZeroUpper = 191,
+
+    // --- SSA / RegAlloc pseudo-ops (192..197) ---
+    Copy = 192,
+    ParallelCopy = 193,
+    DefFixed = 194,
+    UseFixed = 195,
+    CallBarrier = 196,
+    LabelDef = 197,
+    RorImm = 198,
+    Ror32Imm = 199,
+    // --- Reg-Mem 64-bit GPR ALU/CMP (spilled operand folding, 200..206) ---
+    CmpMem = 200,
+    AddMem = 201,
+    SubMem = 202,
+    MulMem = 203,
+    AndMem = 204,
+    OrMem = 205,
+    XorMem = 206,
+}
+
+pub struct MachInst {
+    pub op: MachOp;
+    pub size_bytes: u8;
+    pub cc: x64_asm.Cond;
+    pub flag0: bool;
+    pub tied_src0: bool;
+    pub dst: VReg;
+    pub dst_phys: u8;
+    pub dst2: VReg;
+    pub dst2_phys: u8;
+    pub src0: VReg;
+    pub src0_phys: u8;
+    pub src1: VReg;
+    pub src1_phys: u8;
+    pub src2: VReg;
+    pub src2_phys: u8;
+    pub imm: i64;
+    pub mem: MemAddr;
+    pub clobber_gprs: u16;
+    pub clobber_xmms: u16;
+    pub extra_range: ast.IdRange;
+    pub span: span.Span;
+}
+
+/// Returns true if `op` defines `dst` when `dst` / `dst_phys` is populated.
+pub fn op_has_dst(op: MachOp) -> bool {
+    match op {
+        .Store => { return false; }
+        .StoreImm => { return false; }
+        .Push => { return false; }
+        .MemCopy => { return false; }
+        .MemZero => { return false; }
+        .Cmp => { return false; }
+        .CmpImm => { return false; }
+        .Cmp32 => { return false; }
+        .Cmp32Imm => { return false; }
+        .CmpMem => { return false; }
+        .Test => { return false; }
+        .TestImm => { return false; }
+        .Test32 => { return false; }
+        .Test32Imm => { return false; }
+        .Jmp => { return false; }
+        .Jcc => { return false; }
+        .JmpReg => { return false; }
+        .JmpTable => { return false; }
+        .JmpSym => { return false; }
+        .Ret => { return false; }
+        .Iretq => { return false; }
+        .Ud2 => { return false; }
+        .Clc => { return false; }
+        .Stc => { return false; }
+        .Nop => { return false; }
+        .InlineAsmRaw => { return false; }
+        .RawBytes => { return false; }
+        .VMovSSStore => { return false; }
+        .VMovSDStore => { return false; }
+        .VUcomiSS => { return false; }
+        .VUcomiSD => { return false; }
+        .VMovUpsStore => { return false; }
+        .VMovApsStore => { return false; }
+        .VMovDquStore => { return false; }
+        .VZeroUpper => { return false; }
+        .ParallelCopy => { return false; }
+        .UseFixed => { return false; }
+        .CallBarrier => { return false; }
+        .LabelDef => { return false; }
+        _ => { return true; }
+    }
+}
+
+/// Returns true if `op` writes its primary `dst` in the XMM/YMM vector register file.
+pub fn op_dst_is_vec(op: MachOp) -> bool {
+    match op {
+        .VMovSSLoad => { return true; }
+        .VMovSDLoad => { return true; }
+        .VMovVecReg => { return true; }
+        .VAddSS => { return true; }
+        .VSubSS => { return true; }
+        .VMulSS => { return true; }
+        .VDivSS => { return true; }
+        .VMinSS => { return true; }
+        .VMaxSS => { return true; }
+        .VSqrtSS => { return true; }
+        .VFmadd231SS => { return true; }
+        .VAddSD => { return true; }
+        .VSubSD => { return true; }
+        .VMulSD => { return true; }
+        .VDivSD => { return true; }
+        .VMinSD => { return true; }
+        .VMaxSD => { return true; }
+        .VSqrtSD => { return true; }
+        .VFmadd231SD => { return true; }
+        .VCvtSI2SS => { return true; }
+        .VCvtSI2SD => { return true; }
+        .VCvtSS2SD => { return true; }
+        .VCvtSD2SS => { return true; }
+        .VMovDToXmm => { return true; }
+        .VMovQToXmm => { return true; }
+        .VMovUpsLoad => { return true; }
+        .VMovApsLoad => { return true; }
+        .VMovDquLoad => { return true; }
+        .VBroadcastSS => { return true; }
+        .VBroadcastSD => { return true; }
+        .VAddPS => { return true; }
+        .VAddPSMem => { return true; }
+        .VSubPS => { return true; }
+        .VSubPSMem => { return true; }
+        .VMulPS => { return true; }
+        .VMulPSMem => { return true; }
+        .VDivPS => { return true; }
+        .VMinPS => { return true; }
+        .VMaxPS => { return true; }
+        .VSqrtPS => { return true; }
+        .VRsqrtPS => { return true; }
+        .VFmadd231PS => { return true; }
+        .VFmadd231PSMem => { return true; }
+        .VFnMadd231PS => { return true; }
+        .VAddPD => { return true; }
+        .VSubPD => { return true; }
+        .VMulPD => { return true; }
+        .VDivPD => { return true; }
+        .VMinPD => { return true; }
+        .VMaxPD => { return true; }
+        .VSqrtPD => { return true; }
+        .VFmadd231PD => { return true; }
+        .VFmadd231PDMem => { return true; }
+        .VXorPS => { return true; }
+        .VAndPS => { return true; }
+        .VOrPS => { return true; }
+        .VXorPD => { return true; }
+        .VAndPD => { return true; }
+        .VOrPD => { return true; }
+        .VCmpPS => { return true; }
+        .VBlendVPS => { return true; }
+        .VShufPS => { return true; }
+        .VHAddPS => { return true; }
+        .VExtractF128 => { return true; }
+        .VInsertF128 => { return true; }
+        .VPXor => { return true; }
+        .VPAnd => { return true; }
+        .VPOr => { return true; }
+        .VPAddB => { return true; }
+        .VPSubB => { return true; }
+        .VPAddD => { return true; }
+        .VPSubD => { return true; }
+        .VPMullD => { return true; }
+        .VPAddQ => { return true; }
+        .VPSubQ => { return true; }
+        .VPMinSD => { return true; }
+        .VPMaxSD => { return true; }
+        .VPCmpEqB => { return true; }
+        .VPCmpEqD => { return true; }
+        .VPCmpGtD => { return true; }
+        .VPSllDImm => { return true; }
+        .VPSrlDImm => { return true; }
+        .VPSraDImm => { return true; }
+        .VPSllWImm => { return true; }
+        .VPBroadcastB => { return true; }
+        .VPBroadcastD => { return true; }
+        _ => { return false; }
+    }
+}
+
+pub fn op_is_call(op: MachOp) -> bool {
+    return op == .CallSym || op == .CallReg || op == .CallBarrier;
+}
+
+pub fn op_is_var_shift(op: MachOp) -> bool {
+    return op == .Shl || op == .Shr || op == .Sar
+        || op == .Shl32 || op == .Shr32 || op == .Sar32;
+}
+
+pub fn op_is_div_or_mul128(op: MachOp) -> bool {
+    return op == .Div || op == .Idiv || op == .Div32 || op == .Idiv32
+        || op == .Mul128 || op == .Imul128;
+}
+
+pub fn op_is_terminator(op: MachOp) -> bool {
+    return op == .Jmp || op == .Jcc || op == .JmpReg || op == .JmpTable
+        || op == .JmpSym || op == .Ret || op == .Iretq || op == .Ud2;
+}
+
+pub fn op_is_uncond_terminator(op: MachOp) -> bool {
+    return op == .Jmp || op == .JmpReg || op == .JmpTable
+        || op == .JmpSym || op == .Ret || op == .Iretq || op == .Ud2;
+}
+
+/// Returns true if `inst` executes a 256-bit YMM AVX/AVX2 instruction (needing `vzeroupper`).
+pub fn inst_uses_ymm(inst: *MachInst) -> bool {
+    if !inst.flag0 {
+        return inst.op == .VExtractF128 || inst.op == .VInsertF128;
+    }
+    match inst.op {
+        .VMovVecReg => { return true; }
+        .VMovUpsLoad => { return true; }
+        .VMovUpsStore => { return true; }
+        .VMovApsLoad => { return true; }
+        .VMovApsStore => { return true; }
+        .VMovDquLoad => { return true; }
+        .VMovDquStore => { return true; }
+        .VBroadcastSS => { return true; }
+        .VBroadcastSD => { return true; }
+        .VAddPS => { return true; }
+        .VAddPSMem => { return true; }
+        .VSubPS => { return true; }
+        .VSubPSMem => { return true; }
+        .VMulPS => { return true; }
+        .VMulPSMem => { return true; }
+        .VDivPS => { return true; }
+        .VMinPS => { return true; }
+        .VMaxPS => { return true; }
+        .VSqrtPS => { return true; }
+        .VRsqrtPS => { return true; }
+        .VFmadd231PS => { return true; }
+        .VFmadd231PSMem => { return true; }
+        .VFnMadd231PS => { return true; }
+        .VAddPD => { return true; }
+        .VSubPD => { return true; }
+        .VMulPD => { return true; }
+        .VDivPD => { return true; }
+        .VMinPD => { return true; }
+        .VMaxPD => { return true; }
+        .VSqrtPD => { return true; }
+        .VFmadd231PD => { return true; }
+        .VFmadd231PDMem => { return true; }
+        .VXorPS => { return true; }
+        .VAndPS => { return true; }
+        .VOrPS => { return true; }
+        .VXorPD => { return true; }
+        .VAndPD => { return true; }
+        .VOrPD => { return true; }
+        .VCmpPS => { return true; }
+        .VBlendVPS => { return true; }
+        .VShufPS => { return true; }
+        .VHAddPS => { return true; }
+        .VExtractF128 => { return true; }
+        .VInsertF128 => { return true; }
+        .VPXor => { return true; }
+        .VPAnd => { return true; }
+        .VPOr => { return true; }
+        .VPAddB => { return true; }
+        .VPSubB => { return true; }
+        .VPAddD => { return true; }
+        .VPSubD => { return true; }
+        .VPMullD => { return true; }
+        .VPAddQ => { return true; }
+        .VPSubQ => { return true; }
+        .VPMinSD => { return true; }
+        .VPMaxSD => { return true; }
+        .VPCmpEqB => { return true; }
+        .VPCmpEqD => { return true; }
+        .VPCmpGtD => { return true; }
+        .VPMovMskB => { return true; }
+        .VPSllDImm => { return true; }
+        .VPSrlDImm => { return true; }
+        .VPSraDImm => { return true; }
+        .VPSllWImm => { return true; }
+        .VPBroadcastB => { return true; }
+        .VPBroadcastD => { return true; }
+        _ => { return false; }
+    }
+}
+
+// --- Clean `MachInst` Constructors ---
+
+pub fn inst_empty(op: MachOp, sp: span.Span) -> MachInst {
+    return MachInst.{
+        op: op,
+        size_bytes: 8_u8,
+        cc: .E,
+        flag0: false,
+        tied_src0: false,
+        dst: VREG_NONE,
+        dst_phys: PHYS_NONE,
+        dst2: VREG_NONE,
+        dst2_phys: PHYS_NONE,
+        src0: VREG_NONE,
+        src0_phys: PHYS_NONE,
+        src1: VREG_NONE,
+        src1_phys: PHYS_NONE,
+        src2: VREG_NONE,
+        src2_phys: PHYS_NONE,
+        imm: 0_i64,
+        mem: mem_none(),
+        clobber_gprs: 0_u16,
+        clobber_xmms: 0_u16,
+        extra_range: ast.range_empty(),
+        span: sp,
+    };
+}
+
+pub fn inst_mov(dst: VReg, src: VReg, sp: span.Span) -> MachInst {
+    var m = inst_empty(.Mov, sp);
+    m.dst = dst;
+    m.src0 = src;
+    return m;
+}
+
+pub fn inst_mov_phys(dst_phys: u8, src_phys: u8, sp: span.Span) -> MachInst {
+    var m = inst_empty(.Mov, sp);
+    m.dst_phys = dst_phys;
+    m.src0_phys = src_phys;
+    return m;
+}
+
+pub fn inst_vmov_vec_phys(dst_phys: u8, src_phys: u8, l256: bool, sp: span.Span) -> MachInst {
+    var m = inst_empty(.VMovVecReg, sp);
+    m.size_bytes = if l256 { 32_u8 } else { 16_u8 };
+    m.flag0 = l256;
+    m.dst_phys = dst_phys;
+    m.src0_phys = src_phys;
+    return m;
+}
+
+pub fn inst_copy(dst: VReg, src: VReg, sp: span.Span) -> MachInst {
+    var m = inst_empty(.Copy, sp);
+    m.dst = dst;
+    m.src0 = src;
+    return m;
+}
+
+pub fn inst_mov_imm(dst: VReg, imm: i64, sp: span.Span) -> MachInst {
+    var m = inst_empty(.MovImm, sp);
+    m.dst = dst;
+    m.imm = imm;
+    return m;
+}
+
+pub fn inst_load(dst: VReg, mem: MemAddr, size_bytes: u8, sp: span.Span) -> MachInst {
+    var m = inst_empty(.Load, sp);
+    m.size_bytes = size_bytes;
+    m.dst = dst;
+    m.mem = mem;
+    return m;
+}
+
+pub fn inst_load_phys(dst_phys: u8, mem: MemAddr, size_bytes: u8, sp: span.Span) -> MachInst {
+    var m = inst_empty(.Load, sp);
+    m.size_bytes = size_bytes;
+    m.dst_phys = dst_phys;
+    m.mem = mem;
+    return m;
+}
+
+pub fn inst_store(mem: MemAddr, src: VReg, size_bytes: u8, sp: span.Span) -> MachInst {
+    var m = inst_empty(.Store, sp);
+    m.size_bytes = size_bytes;
+    m.src0 = src;
+    m.mem = mem;
+    return m;
+}
+
+pub fn inst_store_phys(mem: MemAddr, src_phys: u8, size_bytes: u8, sp: span.Span) -> MachInst {
+    var m = inst_empty(.Store, sp);
+    m.size_bytes = size_bytes;
+    m.src0_phys = src_phys;
+    m.mem = mem;
+    return m;
+}
+
+pub fn inst_vload_ups_phys(dst_phys: u8, mem: MemAddr, l256: bool, sp: span.Span) -> MachInst {
+    var m = inst_empty(.VMovUpsLoad, sp);
+    m.size_bytes = if l256 { 32_u8 } else { 16_u8 };
+    m.flag0 = l256;
+    m.dst_phys = dst_phys;
+    m.mem = mem;
+    return m;
+}
+
+pub fn inst_vstore_ups_phys(mem: MemAddr, src_phys: u8, l256: bool, sp: span.Span) -> MachInst {
+    var m = inst_empty(.VMovUpsStore, sp);
+    m.size_bytes = if l256 { 32_u8 } else { 16_u8 };
+    m.flag0 = l256;
+    m.src0_phys = src_phys;
+    m.mem = mem;
+    return m;
+}
+
+pub fn inst_lea(dst: VReg, mem: MemAddr, sp: span.Span) -> MachInst {
+    var m = inst_empty(.Lea, sp);
+    m.dst = dst;
+    m.mem = mem;
+    return m;
+}
+
+pub fn inst_lea_phys(dst_phys: u8, mem: MemAddr, sp: span.Span) -> MachInst {
+    var m = inst_empty(.Lea, sp);
+    m.dst_phys = dst_phys;
+    m.mem = mem;
+    return m;
+}
+
+pub fn inst_def_fixed(dst: VReg, phys: u8, sp: span.Span) -> MachInst {
+    var m = inst_empty(.DefFixed, sp);
+    m.dst = dst;
+    m.src0_phys = phys;
+    return m;
+}
+
+pub fn inst_use_fixed(src: VReg, phys: u8, sp: span.Span) -> MachInst {
+    var m = inst_empty(.UseFixed, sp);
+    m.src0 = src;
+    m.dst_phys = phys;
+    return m;
+}
+
+pub fn inst_call_sym(
+    sym_id: u32,
+    clobber_gprs: u16,
+    clobber_xmms: u16,
+    sp: span.Span,
+) -> MachInst {
+    var m = inst_empty(.CallSym, sp);
+    m.mem = mem_rip_sym(sym_id, 0_i32);
+    m.clobber_gprs = clobber_gprs;
+    m.clobber_xmms = clobber_xmms;
+    return m;
+}
+
+pub fn inst_call_reg(
+    target: VReg,
+    clobber_gprs: u16,
+    clobber_xmms: u16,
+    sp: span.Span,
+) -> MachInst {
+    var m = inst_empty(.CallReg, sp);
+    m.src0 = target;
+    m.clobber_gprs = clobber_gprs;
+    m.clobber_xmms = clobber_xmms;
+    return m;
+}
+
+pub fn inst_call_barrier(clobber_gprs: u16, clobber_xmms: u16, sp: span.Span) -> MachInst {
+    var m = inst_empty(.CallBarrier, sp);
+    m.clobber_gprs = clobber_gprs;
+    m.clobber_xmms = clobber_xmms;
+    return m;
+}
+
+pub fn inst_jmp(label: u32, sp: span.Span) -> MachInst {
+    var m = inst_empty(.Jmp, sp);
+    m.mem = mem_rip_label(label);
+    return m;
+}
+
+pub fn inst_jcc(cc: x64_asm.Cond, label: u32, sp: span.Span) -> MachInst {
+    var m = inst_empty(.Jcc, sp);
+    m.cc = cc;
+    m.mem = mem_rip_label(label);
+    return m;
+}
+
+pub fn inst_label_def(label: u32, sp: span.Span) -> MachInst {
+    var m = inst_empty(.LabelDef, sp);
+    m.mem = mem_rip_label(label);
+    return m;
+}
+
+pub fn inst_ret(sp: span.Span) -> MachInst {
+    return inst_empty(.Ret, sp);
+}
+
+// ============================================================================
+// Section 4: Blocks, Jump Tables, Rodata & `MachFunc` Flat Pool Container
+// ============================================================================
+
+pub struct PCopyPair {
+    pub dst: VReg;
+    pub src: VReg;
+    pub dst_phys: u8;
+    pub src_phys: u8;
+    pub cls: RegClass;
+}
+
+pub struct MachJumpTable {
+    pub sym_id: u32;
+    pub entries: ast.IdRange;
+    pub default_label: u32;
+}
+
+pub struct MachRodataItem {
+    pub sym_id: u32;
+    pub data_off: u32;
+    pub data_len: u32;
+    pub align: u32;
+    pub reloc_start: u32;
+    pub reloc_len: u32;
+}
+
+pub struct MachRodataReloc {
+    pub offset: u32;
+    pub target_sym: u32;
+    pub addend: i64;
+}
+
+pub struct MachBlock {
+    pub id: u32;
+    pub label: u32;
+    pub loop_depth: u8;
+    pub insts: ast.IdRange;
+    pub preds: ast.IdRange;
+    pub succs: ast.IdRange;
+    pub start_pos: u32;
+    pub end_pos: u32;
+}
+
+view fn slice_id_range[T](all: *[T], r: ast.IdRange) -> *[T] {
+    let start = r.start.widen.[usize]();
+    let end = start +% r.len.widen.[usize]();
+    let s = all.sub(start, end) catch {
+        return all.sub(0_usize, 0_usize) catch {
+            return all;
+        };
+    };
+    return s;
+}
+
+pub linear struct MachFunc {
+    pub sym_id: u32;
+    pub fn_id: u32;
+    pub entry_block: u32;
+    pub vregs: col.DynBuf[VRegInfo];
+    pub blocks: col.DynBuf[MachBlock];
+    pub insts: col.DynBuf[MachInst];
+    pub block_edges: col.DynBuf[u32];
+    pub rpo: col.DynBuf[u32];
+    pub pcopy_pairs: col.DynBuf[PCopyPair];
+    pub jump_tables: col.DynBuf[MachJumpTable];
+    pub jtable_targets: col.DynBuf[u32];
+    pub rodata_items: col.DynBuf[MachRodataItem];
+    pub rodata_bytes: col.DynBuf[u8];
+    pub rodata_relocs: col.DynBuf[MachRodataReloc];
+    pub raw_bytes: col.DynBuf[u8];
+    pub raw_relocs: col.DynBuf[x64_asm.FnReloc];
+    pub used_helpers: col.DynBuf[u32];
+    pub frame_cursor: usize;
+    pub first_spill_off: i32;
+    pub uses_r15_error: bool;
+    pub uses_ymm: bool;
+    pub used_callee_gprs: u16;
+    pub ipra_clobber_gprs: u16;
+    pub ipra_clobber_xmms: u16;
+    pub has_calls: bool;
+    pub is_leaf: bool;
+    pub is_naked: bool;
+    pub is_interrupt: bool;
+    pub save_simd: bool;
+    pub target_avx2: bool;
+}
+
+impl MachFunc {
+    pub fn init(alloc: *mut AllocCap, sym_id: u32, fn_id: u32) -> MachFunc ! OutOfMemory {
+        let vregs = try col.DynBuf.[VRegInfo].init(alloc, 32_usize);
+        errdefer vregs.destroy(alloc);
+        let blocks = try col.DynBuf.[MachBlock].init(alloc, 8_usize);
+        errdefer blocks.destroy(alloc);
+        let insts = try col.DynBuf.[MachInst].init(alloc, 64_usize);
+        errdefer insts.destroy(alloc);
+        let block_edges = try col.DynBuf.[u32].init(alloc, 16_usize);
+        errdefer block_edges.destroy(alloc);
+        let rpo = try col.DynBuf.[u32].init(alloc, 8_usize);
+        errdefer rpo.destroy(alloc);
+        let pcopy_pairs = try col.DynBuf.[PCopyPair].init(alloc, 16_usize);
+        errdefer pcopy_pairs.destroy(alloc);
+        let jump_tables = try col.DynBuf.[MachJumpTable].init(alloc, 4_usize);
+        errdefer jump_tables.destroy(alloc);
+        let jtable_targets = try col.DynBuf.[u32].init(alloc, 8_usize);
+        errdefer jtable_targets.destroy(alloc);
+        let rodata_items = try col.DynBuf.[MachRodataItem].init(alloc, 4_usize);
+        errdefer rodata_items.destroy(alloc);
+        let rodata_bytes = try col.DynBuf.[u8].init(alloc, 32_usize);
+        errdefer rodata_bytes.destroy(alloc);
+        let rodata_relocs = try col.DynBuf.[MachRodataReloc].init(alloc, 4_usize);
+        errdefer rodata_relocs.destroy(alloc);
+        let raw_bytes = try col.DynBuf.[u8].init(alloc, 16_usize);
+        errdefer raw_bytes.destroy(alloc);
+        let raw_relocs = try col.DynBuf.[x64_asm.FnReloc].init(alloc, 4_usize);
+        errdefer raw_relocs.destroy(alloc);
+        let used_helpers = try col.DynBuf.[u32].init(alloc, 4_usize);
+        errdefer used_helpers.destroy(alloc);
+        return MachFunc.{
+            sym_id: sym_id,
+            fn_id: fn_id,
+            entry_block: 0_u32,
+            vregs: vregs,
+            blocks: blocks,
+            insts: insts,
+            block_edges: block_edges,
+            rpo: rpo,
+            pcopy_pairs: pcopy_pairs,
+            jump_tables: jump_tables,
+            jtable_targets: jtable_targets,
+            rodata_items: rodata_items,
+            rodata_bytes: rodata_bytes,
+            rodata_relocs: rodata_relocs,
+            raw_bytes: raw_bytes,
+            raw_relocs: raw_relocs,
+            used_helpers: used_helpers,
+            frame_cursor: 0_usize,
+            first_spill_off: 0_i32,
+            uses_r15_error: false,
+            uses_ymm: false,
+            used_callee_gprs: 0_u16,
+            ipra_clobber_gprs: 0_u16,
+            ipra_clobber_xmms: 0_u16,
+            has_calls: false,
+            is_leaf: true,
+            is_naked: false,
+            is_interrupt: false,
+            save_simd: false,
+            target_avx2: true,
+        };
+    }
+
+    pub fn destroy(self: MachFunc, alloc: *mut AllocCap) {
+        let MachFunc.{
+            sym_id: _,
+            fn_id: _,
+            entry_block: _,
+            vregs,
+            blocks,
+            insts,
+            block_edges,
+            rpo,
+            pcopy_pairs,
+            jump_tables,
+            jtable_targets,
+            rodata_items,
+            rodata_bytes,
+            rodata_relocs,
+            raw_bytes,
+            raw_relocs,
+            used_helpers,
+            frame_cursor: _,
+            first_spill_off: _,
+            uses_r15_error: _,
+            uses_ymm: _,
+            used_callee_gprs: _,
+            ipra_clobber_gprs: _,
+            ipra_clobber_xmms: _,
+            has_calls: _,
+            is_leaf: _,
+            is_naked: _,
+            is_interrupt: _,
+            save_simd: _,
+            target_avx2: _,
+        } = self;
+        vregs.destroy(alloc);
+        blocks.destroy(alloc);
+        insts.destroy(alloc);
+        block_edges.destroy(alloc);
+        rpo.destroy(alloc);
+        pcopy_pairs.destroy(alloc);
+        jump_tables.destroy(alloc);
+        jtable_targets.destroy(alloc);
+        rodata_items.destroy(alloc);
+        rodata_bytes.destroy(alloc);
+        rodata_relocs.destroy(alloc);
+        raw_bytes.destroy(alloc);
+        raw_relocs.destroy(alloc);
+        used_helpers.destroy(alloc);
+    }
+
+    // --- Virtual Register Builders ---
+
+    pub fn new_vreg(self: *mut Self, alloc: *mut AllocCap, cls: RegClass) -> VReg ! OutOfMemory {
+        let id = self.vregs.len().trunc.[u32]();
+        try self.vregs.push(alloc, VRegInfo.{
+            cls: cls,
+            fixed_phys: PHYS_NONE,
+            hint_phys: PHYS_NONE,
+            hint_vreg: VREG_NONE,
+            assigned_phys: PHYS_NONE,
+            spill_off: 0_i32,
+        });
+        if cls == .Vec256 {
+            self.uses_ymm = true;
+        }
+        return id;
+    }
+
+    pub fn new_vreg_fixed(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        cls: RegClass,
+        phys: u8,
+    ) -> VReg ! OutOfMemory {
+        let id = self.vregs.len().trunc.[u32]();
+        try self.vregs.push(alloc, VRegInfo.{
+            cls: cls,
+            fixed_phys: phys,
+            hint_phys: phys,
+            hint_vreg: VREG_NONE,
+            assigned_phys: PHYS_NONE,
+            spill_off: 0_i32,
+        });
+        if cls == .Vec256 {
+            self.uses_ymm = true;
+        }
+        return id;
+    }
+
+    pub fn new_vreg_hint(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        cls: RegClass,
+        hint_phys: u8,
+    ) -> VReg ! OutOfMemory {
+        let id = self.vregs.len().trunc.[u32]();
+        try self.vregs.push(alloc, VRegInfo.{
+            cls: cls,
+            fixed_phys: PHYS_NONE,
+            hint_phys: hint_phys,
+            hint_vreg: VREG_NONE,
+            assigned_phys: PHYS_NONE,
+            spill_off: 0_i32,
+        });
+        if cls == .Vec256 {
+            self.uses_ymm = true;
+        }
+        return id;
+    }
+
+    pub fn set_vreg_hint_phys(self: *mut Self, v: VReg, phys: u8) {
+        let idx = v.widen.[usize]();
+        let vs = self.vregs.as_mut_slice();
+        if idx < vs.len && vs[idx].hint_phys == PHYS_NONE {
+            vs[idx].hint_phys = phys;
+        }
+    }
+
+    pub fn set_vreg_hint_vreg(self: *mut Self, v: VReg, target: VReg) {
+        let idx = v.widen.[usize]();
+        let vs = self.vregs.as_mut_slice();
+        if idx < vs.len && vs[idx].hint_vreg == VREG_NONE && target != v {
+            vs[idx].hint_vreg = target;
+        }
+    }
+
+    pub fn vreg_class(self: *Self, v: VReg) -> RegClass {
+        let idx = v.widen.[usize]();
+        let vs = self.vregs.as_slice();
+        if idx < vs.len {
+            return vs[idx].cls;
+        }
+        return .Gpr;
+    }
+
+    pub fn vreg_count(self: *Self) -> usize {
+        return self.vregs.len();
+    }
+
+    // --- Stack Slot Allocation ---
+
+    /// Allocates an `rbp`-relative local or spill stack slot and returns its
+    /// strictly negative displacement (`[rbp + ret]`).
+    pub fn alloc_stack_slot(self: *mut Self, size: usize, align: usize) -> i32 {
+        let eff_sz: usize = if size < 8_usize { 8_usize } else { size };
+        let eff_al: usize = if align <= 8_usize {
+            8_usize
+        } else if align <= 16_usize {
+            16_usize
+        } else {
+            32_usize
+        };
+        let mask = eff_al -% 1_usize;
+        let next = ((self.frame_cursor +% eff_sz) +% mask) & (~mask);
+        self.frame_cursor = next;
+        return 0_i32 -% next.trunc.[i32]();
+    }
+
+    // --- Block & Instruction Builders ---
+
+    pub fn add_block(self: *mut Self, alloc: *mut AllocCap, loop_depth: u8) -> u32 ! OutOfMemory {
+        let id = self.blocks.len().trunc.[u32]();
+        try self.blocks.push(alloc, MachBlock.{
+            id: id,
+            label: id,
+            loop_depth: loop_depth,
+            insts: ast.range_empty(),
+            preds: ast.range_empty(),
+            succs: ast.range_empty(),
+            start_pos: 0_u32,
+            end_pos: 0_u32,
+        });
+        return id;
+    }
+
+    pub fn begin_block_insts(self: *mut Self, bb: u32) {
+        let idx = bb.widen.[usize]();
+        let start = self.insts.len().trunc.[u32]();
+        let bs = self.blocks.as_mut_slice();
+        if idx < bs.len {
+            bs[idx].insts = ast.range_new(start, 0_u32);
+        }
+    }
+
+    pub fn end_block_insts(self: *mut Self, bb: u32) {
+        let idx = bb.widen.[usize]();
+        let cur = self.insts.len().trunc.[u32]();
+        let bs = self.blocks.as_mut_slice();
+        if idx < bs.len {
+            let start = bs[idx].insts.start;
+            let len = if cur >= start { cur -% start } else { 0_u32 };
+            bs[idx].insts = ast.range_new(start, len);
+        }
+    }
+
+    pub fn emit_inst(self: *mut Self, alloc: *mut AllocCap, inst: MachInst) -> !OutOfMemory {
+        if op_is_call(inst.op) {
+            self.has_calls = true;
+            self.is_leaf = false;
+        }
+        if inst_uses_ymm(&inst) {
+            self.uses_ymm = true;
+        }
+        try self.insts.push(alloc, inst);
+        return;
+    }
+
+    pub fn set_block_preds(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        bb: u32,
+        preds: *[u32],
+    ) -> !OutOfMemory {
+        let start = self.block_edges.len().trunc.[u32]();
+        try self.block_edges.push_slice(alloc, preds);
+        let idx = bb.widen.[usize]();
+        let bs = self.blocks.as_mut_slice();
+        if idx < bs.len {
+            bs[idx].preds = ast.range_new(start, preds.len.trunc.[u32]());
+        }
+        return;
+    }
+
+    pub fn set_block_succs(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        bb: u32,
+        succs: *[u32],
+    ) -> !OutOfMemory {
+        let start = self.block_edges.len().trunc.[u32]();
+        try self.block_edges.push_slice(alloc, succs);
+        let idx = bb.widen.[usize]();
+        let bs = self.blocks.as_mut_slice();
+        if idx < bs.len {
+            bs[idx].succs = ast.range_new(start, succs.len.trunc.[u32]());
+        }
+        return;
+    }
+
+    pub fn set_rpo(self: *mut Self, alloc: *mut AllocCap, order: *[u32]) -> !OutOfMemory {
+        self.rpo.clear();
+        try self.rpo.push_slice(alloc, order);
+        return;
+    }
+
+    pub fn add_pcopy_pair(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        dst: VReg,
+        src: VReg,
+    ) -> !OutOfMemory {
+        let cls = if dst != VREG_NONE {
+            self.vreg_class(dst)
+        } else if src != VREG_NONE {
+            self.vreg_class(src)
+        } else {
+            .Gpr
+        };
+        try self.pcopy_pairs.push(alloc, PCopyPair.{
+            dst: dst,
+            src: src,
+            dst_phys: PHYS_NONE,
+            src_phys: PHYS_NONE,
+            cls: cls,
+        });
+        return;
+    }
+
+    pub fn add_pcopy_pair_phys(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        dst: VReg,
+        dst_phys: u8,
+        src: VReg,
+        src_phys: u8,
+        cls: RegClass,
+    ) -> !OutOfMemory {
+        try self.pcopy_pairs.push(alloc, PCopyPair.{
+            dst: dst,
+            src: src,
+            dst_phys: dst_phys,
+            src_phys: src_phys,
+            cls: cls,
+        });
+        return;
+    }
+
+    pub fn emit_parallel_copy(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        pair_start: u32,
+        pair_len: u32,
+        sp: span.Span,
+    ) -> !OutOfMemory {
+        if pair_len == 0_u32 {
+            return;
+        }
+        var m = inst_empty(.ParallelCopy, sp);
+        m.extra_range = ast.range_new(pair_start, pair_len);
+        try self.insts.push(alloc, m);
+        return;
+    }
+
+    pub fn add_jump_table(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        sym_id: u32,
+        targets: *[u32],
+        default_label: u32,
+    ) -> u32 ! OutOfMemory {
+        let entry_start = self.jtable_targets.len().trunc.[u32]();
+        try self.jtable_targets.push_slice(alloc, targets);
+        let jt_id = self.jump_tables.len().trunc.[u32]();
+        try self.jump_tables.push(alloc, MachJumpTable.{
+            sym_id: sym_id,
+            entries: ast.range_new(entry_start, targets.len.trunc.[u32]()),
+            default_label: default_label,
+        });
+        return jt_id;
+    }
+
+    pub fn add_rodata(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        sym_id: u32,
+        bytes: *[u8],
+        align: u32,
+    ) -> u32 ! OutOfMemory {
+        let data_off = self.rodata_bytes.len().trunc.[u32]();
+        try self.rodata_bytes.push_slice(alloc, bytes);
+        let item_id = self.rodata_items.len().trunc.[u32]();
+        try self.rodata_items.push(alloc, MachRodataItem.{
+            sym_id: sym_id,
+            data_off: data_off,
+            data_len: bytes.len.trunc.[u32](),
+            align: align,
+            reloc_start: 0_u32,
+            reloc_len: 0_u32,
+        });
+        return item_id;
+    }
+
+    pub fn add_raw_bytes(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        bytes: *[u8],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.raw_bytes.len().trunc.[u32]();
+        try self.raw_bytes.push_slice(alloc, bytes);
+        return ast.range_new(start, bytes.len.trunc.[u32]());
+    }
+
+    pub fn add_used_helper(self: *mut Self, alloc: *mut AllocCap, helper_sym: u32) -> !OutOfMemory {
+        let hs = self.used_helpers.as_slice();
+        var i: usize = 0_usize;
+        while i < hs.len {
+            if hs[i] == helper_sym {
+                return;
+            }
+            i = i +% 1_usize;
+        }
+        try self.used_helpers.push(alloc, helper_sym);
+        return;
+    }
+
+    pub fn replace_insts(self: *mut Self, alloc: *mut AllocCap, new_insts: col.DynBuf[MachInst]) {
+        self.insts.destroy(alloc);
+        self.insts = new_insts;
+    }
+
+    // --- View Slice Accessors ---
+
+    pub view fn block_insts(self: *Self, bb: u32) -> *[MachInst] {
+        let idx = bb.widen.[usize]();
+        let bs = self.blocks.as_slice();
+        if idx < bs.len {
+            return slice_id_range.[MachInst](self.insts.as_slice(), bs[idx].insts);
+        }
+        return slice_id_range.[MachInst](self.insts.as_slice(), ast.range_empty());
+    }
+
+    pub view fn block_preds(self: *Self, bb: u32) -> *[u32] {
+        let idx = bb.widen.[usize]();
+        let bs = self.blocks.as_slice();
+        if idx < bs.len {
+            return slice_id_range.[u32](self.block_edges.as_slice(), bs[idx].preds);
+        }
+        return slice_id_range.[u32](self.block_edges.as_slice(), ast.range_empty());
+    }
+
+    pub view fn block_succs(self: *Self, bb: u32) -> *[u32] {
+        let idx = bb.widen.[usize]();
+        let bs = self.blocks.as_slice();
+        if idx < bs.len {
+            return slice_id_range.[u32](self.block_edges.as_slice(), bs[idx].succs);
+        }
+        return slice_id_range.[u32](self.block_edges.as_slice(), ast.range_empty());
+    }
+
+    pub view fn pcopy_slice(self: *Self, r: ast.IdRange) -> *[PCopyPair] {
+        return slice_id_range.[PCopyPair](self.pcopy_pairs.as_slice(), r);
+    }
+
+    pub view fn jtable_slice(self: *Self, r: ast.IdRange) -> *[u32] {
+        return slice_id_range.[u32](self.jtable_targets.as_slice(), r);
+    }
+
+    pub view fn raw_bytes_slice(self: *Self, r: ast.IdRange) -> *[u8] {
+        return slice_id_range.[u8](self.raw_bytes.as_slice(), r);
+    }
+}

@@ -1,0 +1,11 @@
+module fail.zm16;
+
+pub struct Rect {
+    pub x: i32;
+    pub y: i32;
+    pub w: i32 = 10_i32;
+}
+
+pub fn make_rect() -> Rect {
+    return Rect.{ x: 1_i32 }; //~ ERROR E0116
+}

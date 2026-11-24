@@ -1,0 +1,103 @@
+module kernel.pmm;
+
+/// Errors returned by the Safe Eon Physical Memory Manager.
+pub error PmmError {
+    OutOfPages,
+    SimulatedRollback,
+}
+
+/// Linear physical page frame ownership token: cannot be silently dropped or double-freed.
+pub linear struct PhysPage {
+    pub addr: PhysAddr;
+    pub order: u8;
+}
+
+/// Managed physical RAM window: 0x00400000 .. 0x00800000 (1024 x 4 KiB pages = 4 MiB).
+const PMM_BASE: u64 = 0x00400000_u64;
+const PAGE_BYTES: u64 = 4096_u64;
+const TOTAL_PAGES: usize = 1024_usize;
+const BITMAP_WORDS: usize = 16_usize; // 16 * 64 = 1024 bits
+
+/// 100% Safe Eon bitmap Physical Memory Manager (no heap, no `@hal`, no `raw`).
+pub struct Pmm {
+    pub bitmap: [16]u64;
+    pub free_count: usize;
+    pub alloc_ops: u64;
+    pub free_ops: u64;
+}
+
+impl Pmm {
+    pub fn init() -> Pmm @noalloc @noblock {
+        return Pmm.{
+            bitmap: [0_u64; 16],
+            free_count: TOTAL_PAGES,
+            alloc_ops: 0_u64,
+            free_ops: 0_u64,
+        };
+    }
+
+    pub fn alloc_page(self: *mut Self) -> PhysPage ! PmmError @noalloc @noblock {
+        var wi: usize = 0_usize;
+        while wi < BITMAP_WORDS {
+            let w = self.bitmap[wi];
+            if w != 0xFFFFFFFFFFFFFFFF_u64 {
+                var bi: u32 = 0_u32;
+                while bi < 64_u32 {
+                    let bit = 1_u64 <<% bi.widen.[u64]();
+                    if (w & bit) == 0_u64 {
+                        self.bitmap[wi] = w | bit;
+                        if self.free_count > 0_usize {
+                            self.free_count = self.free_count - 1_usize;
+                        }
+                        self.alloc_ops = self.alloc_ops +% 1_u64;
+                        let page_idx = (wi *% 64_usize) +% bi.widen.[usize]();
+                        let pa_u64 = PMM_BASE +% (page_idx.widen.[u64]() *% PAGE_BYTES);
+                        return PhysPage.{
+                            addr: PhysAddr.from_usize(pa_u64.trunc.[usize]()),
+                            order: 0_u8,
+                        };
+                    }
+                    bi = bi +% 1_u32;
+                }
+            }
+            wi = wi +% 1_usize;
+        }
+        return .OutOfPages;
+    }
+
+    pub fn free_page(self: *mut Self, page: PhysPage) @noalloc @noblock {
+        let PhysPage.{ addr, order: _ } = page;
+        let raw_pa = addr.as_u64();
+        if raw_pa < PMM_BASE {
+            return;
+        }
+        let page_idx = ((raw_pa -% PMM_BASE) / PAGE_BYTES).trunc.[usize]();
+        if page_idx >= TOTAL_PAGES {
+            return;
+        }
+        let wi = page_idx / 64_usize;
+        let bi = (page_idx % 64_usize).trunc.[u64]();
+        let bit = 1_u64 <<% bi;
+        if wi < BITMAP_WORDS && (self.bitmap[wi] & bit) != 0_u64 {
+            self.bitmap[wi] = self.bitmap[wi] & (~bit);
+            self.free_count = self.free_count +% 1_usize;
+            self.free_ops = self.free_ops +% 1_u64;
+        }
+    }
+
+    /// Allocates two linear `PhysPage` frames guarded by `errdefer` and intentionally fails
+    /// to verify compile-time-enforced linear cleanup with zero leaked physical frames.
+    pub fn rollback_probe(self: *mut Self, should_fail: bool) -> u64 ! PmmError @noalloc @noblock {
+        let p0 = try self.alloc_page();
+        errdefer self.free_page(p0);
+        let p1 = try self.alloc_page();
+        errdefer self.free_page(p1);
+        let sum = p0.addr.as_u64() +% p1.addr.as_u64();
+        if should_fail {
+            return .SimulatedRollback;
+        }
+        self.free_page(p1);
+        self.free_page(p0);
+        return sum;
+    }
+}

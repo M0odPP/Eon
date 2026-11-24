@@ -1,0 +1,99 @@
+module kernel.arch.x86_64.uart @hal;
+
+import kernel.arch.x86_64.cpu;
+
+/// Typed MMIO UART 16550 register block (demonstrating `MmioReg` `.ReadOnly`/`.WriteOnly` access control).
+pub struct Uart16550Mmio {
+    pub tx: MmioReg[u8, .WriteOnly] @offset(0x00);
+    pub lsr: MmioReg[u8, .ReadOnly] @offset(0x05);
+}
+
+const COM1_PORT: u16 = 0x03F8_u16;
+
+/// Write a byte to a memory-mapped UART 16550 register block using typed `MmioReg`.
+pub fn mmio_write_byte(uart_base: usize, byte: u8) @noalloc @noblock {
+    raw {
+        let u = rawptr_mut.[Uart16550Mmio].from_usize(uart_base);
+        while (u.*.lsr.read() & 0x20_u8) == 0_u8 {}
+        u.*.tx.write(byte);
+    }
+}
+
+/// Self-test typed `MmioReg` reads/writes against a scratch MMIO page at `0x00204000`.
+pub fn mmio_self_test() -> bool @noalloc @noblock {
+    let scratch: usize = 0x00204000_usize;
+    cpu.mem_write_u8(scratch +% 0_usize, 0_u8);
+    cpu.mem_write_u8(scratch +% 5_usize, 0x20_u8); // LSR THRE ready
+    mmio_write_byte(scratch, 0x5A_u8);
+    return cpu.mem_read_u8(scratch) == 0x5A_u8;
+}
+
+/// Initialize COM1 (16550 UART, 115200 8N1) for QEMU `-nographic` serial console.
+pub fn init() @noalloc @noblock {
+    cpu.outb(COM1_PORT +% 1_u16, 0x00_u8); // Disable interrupts
+    cpu.outb(COM1_PORT +% 3_u16, 0x80_u8); // Enable DLAB
+    cpu.outb(COM1_PORT +% 0_u16, 0x01_u8); // Divisor low (115200 baud)
+    cpu.outb(COM1_PORT +% 1_u16, 0x00_u8); // Divisor high
+    cpu.outb(COM1_PORT +% 3_u16, 0x03_u8); // 8 bits, no parity, 1 stop
+    cpu.outb(COM1_PORT +% 2_u16, 0xC7_u8); // Enable FIFO, clear, 14-byte threshold
+    cpu.outb(COM1_PORT +% 4_u16, 0x0B_u8); // IRQs enabled, RTS/DSR set
+}
+
+pub fn putc(b: u8) @noalloc @noblock {
+    var spin: u32 = 0_u32;
+    while (cpu.inb(COM1_PORT +% 5_u16) & 0x20_u8) == 0_u8 && spin < 100000_u32 {
+        cpu.pause();
+        spin = spin +% 1_u32;
+    }
+    cpu.outb(COM1_PORT, b);
+}
+
+pub fn puts(s: *str) @noalloc @noblock {
+    let bs = s.as_bytes();
+    var i: usize = 0_usize;
+    while i < bs.len {
+        let ch = bs[i];
+        if ch == 10_u8 {
+            putc(13_u8);
+        }
+        putc(ch);
+        i = i +% 1_usize;
+    }
+}
+
+pub fn put_u64(v_in: u64) @noalloc @noblock {
+    if v_in == 0_u64 {
+        putc(b'0');
+        return;
+    }
+    var buf: [24]u8 = [0_u8; 24];
+    var n: usize = 0_usize;
+    var v = v_in;
+    while v > 0_u64 && n < 24_usize {
+        let d = (v % 10_u64).trunc.[u8]();
+        buf[n] = b'0' +% d;
+        v = v / 10_u64;
+        n = n +% 1_usize;
+    }
+    while n > 0_usize {
+        n = n - 1_usize;
+        if n < 24_usize {
+            putc(buf[n]);
+        }
+    }
+}
+
+pub fn put_hex(v: u64) @noalloc @noblock {
+    puts("0x");
+    var shift: u32 = 60_u32;
+    var step: u32 = 0_u32;
+    while step < 16_u32 {
+        let nib = ((v >> shift.widen.[u64]()) & 0xF_u64).trunc.[u8]();
+        let ch = if nib < 10_u8 { b'0' +% nib } else { b'a' +% (nib -% 10_u8) };
+        putc(ch);
+        if shift >= 4_u32 {
+            shift = shift - 4_u32;
+        }
+        step = step +% 1_u32;
+    }
+}

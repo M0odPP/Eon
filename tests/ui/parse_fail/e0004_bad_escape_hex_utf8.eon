@@ -1,0 +1,2 @@
+module fail.bad_hex;
+pub const S: *str = "\xFF"; //~ ERROR E0004

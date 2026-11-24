@@ -1,0 +1,15 @@
+module fail.u128_verify;
+
+pub fn bad_u128_add(x: u128) -> u128 {
+    return x + 1_u128; //~ ERROR E0108
+}
+
+fn req_i128_range(x: u128) -> u128
+    where x <= 170141183460469231731687303715884105727_u128
+{
+    return x;
+}
+
+pub fn bad_u128_where_i128_max(x: u128) -> u128 {
+    return req_i128_range(x); //~ ERROR E0107
+}

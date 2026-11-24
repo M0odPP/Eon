@@ -1,0 +1,216 @@
+name: Eon CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  seed-rust:
+    name: Stage 0 Seed (Rust)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Clippy (zero warnings, unsafe forbidden)
+        working-directory: compiler
+        run: cargo clippy --all-targets
+
+      - name: Rust unit & integration test suite
+        working-directory: compiler
+        run: cargo test
+
+      - name: Build release Stage 0 seed (eonc0)
+        working-directory: compiler
+        run: cargo build --release
+
+      - name: UI diagnostic suite (eonc0)
+        run: compiler/target/release/eonc test tests/ui
+
+      - name: Zero-C isolated-PATH check (eonc0)
+        run: |
+          set -euo pipefail
+          EONC="$(pwd)/compiler/target/release/eonc"
+          ISO_BIN="$(mktemp -d)"
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "$ISO_BIN" "$WORK"' EXIT
+          ln -s "$(command -v sed)" "$ISO_BIN/sed"
+          (
+            export PATH="$ISO_BIN"
+            for tool in gcc clang cc ld as; do
+              if command -v "$tool" >/dev/null 2>&1; then
+                echo "ERROR: $tool unexpectedly found in isolated PATH" >&2
+                exit 1
+              fi
+            done
+            for ex in examples/compiler_spike examples/json_parser examples/layout_proto; do
+              name="${ex##*/}"
+              i_out="$("$EONC" run --interp "$ex" | sed -E 's/ elapsed_ns=[0-9]+//g')"
+              "$EONC" build -o "$WORK/${name}_pie" "$ex"
+              n_out="$("$WORK/${name}_pie" | sed -E 's/ elapsed_ns=[0-9]+//g')"
+              "$EONC" build --sanitize -o "$WORK/${name}_san" "$ex"
+              s_out="$("$WORK/${name}_san" | sed -E 's/ elapsed_ns=[0-9]+//g')"
+              test "$i_out" = "$n_out"
+              test "$n_out" = "$s_out"
+              echo "OK (eonc0): $ex"
+            done
+          )
+
+      - name: Upload Stage 0 seed binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: eonc0-linux-x86_64
+          path: compiler/target/release/eonc
+          retention-days: 1
+
+  bootstrap-and-verify:
+    name: Triple Bootstrap, Determinism & Regressions
+    runs-on: ubuntu-latest
+    needs: seed-rust
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install gdb for DWARF5 verification
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gdb
+
+      - name: Download Stage 0 seed binary
+        uses: actions/download-artifact@v4
+        with:
+          name: eonc0-linux-x86_64
+          path: compiler/target/release
+
+      - name: Make Stage 0 binary executable
+        run: chmod +x compiler/target/release/eonc
+
+      - name: Stage 1 + Stage 2 == Stage 3 Triple Bootstrap (--release)
+        run: python3 tools/bootstrap_stage3.py --release
+
+      - name: Stage 2 == Stage 3 Triple Bootstrap (--dev)
+        run: python3 tools/bootstrap_stage3.py --skip-stage1
+
+      - name: Multi-threaded determinism matrix (-j 1 == -j 4 == auto)
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, shutil, subprocess, tempfile
+          tmp = tempfile.mkdtemp(prefix="eon_ci_det_")
+          try:
+              for mode, flags in [("rel", ["--release"]), ("dev", [])]:
+                  hashes = {}
+                  for j in ["1", "4", "auto"]:
+                      outp = os.path.join(tmp, f"sh_{mode}_{j}")
+                      cmd = ["selfhost/out/eonc2_rel", "build"] + flags + (["-j", j] if j != "auto" else []) + ["selfhost/src", "-o", outp]
+                      subprocess.run(cmd, check=True)
+                      hashes[j] = hashlib.sha256(open(outp, "rb").read()).hexdigest()
+                  assert len(set(hashes.values())) == 1, f"Non-deterministic {mode}: {hashes}"
+                  print(f"[PASS] selfhost {mode} determinism: {hashes['auto']}")
+          finally:
+              shutil.rmtree(tmp, ignore_errors=True)
+          PY
+
+      - name: Selfhost soundness regressions (UI, .emi, @stack, DWARF5 + gdb)
+        run: |
+          python3 tests/selfhost/run_regressions.py --eonc selfhost/out/eonc2_rel
+          python3 tests/selfhost/run_regressions.py --eonc selfhost/out/eonc2
+
+      - name: Zero-C isolated-PATH check & --audit-tcb (eonc2_rel)
+        run: |
+          set -euo pipefail
+          EONC="$(pwd)/selfhost/out/eonc2_rel"
+          "$EONC" build --audit-tcb selfhost/src -o /tmp/eonc_tcb_chk
+          rm -f /tmp/eonc_tcb_chk
+          ISO_BIN="$(mktemp -d)"
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "$ISO_BIN" "$WORK"' EXIT
+          ln -s "$(command -v sed)" "$ISO_BIN/sed"
+          (
+            export PATH="$ISO_BIN"
+            for tool in gcc clang cc ld as; do
+              if command -v "$tool" >/dev/null 2>&1; then
+                echo "ERROR: $tool unexpectedly found in isolated PATH" >&2
+                exit 1
+              fi
+            done
+            for ex in examples/compiler_spike examples/json_parser examples/layout_proto; do
+              name="${ex##*/}"
+              i_out="$("$EONC" run --interp "$ex" | sed -E 's/ elapsed_ns=[0-9]+//g')"
+              "$EONC" build --release -o "$WORK/${name}_rel" "$ex"
+              n_out="$("$WORK/${name}_rel" | sed -E 's/ elapsed_ns=[0-9]+//g')"
+              "$EONC" build --sanitize -o "$WORK/${name}_san" "$ex"
+              s_out="$("$WORK/${name}_san" | sed -E 's/ elapsed_ns=[0-9]+//g')"
+              test "$i_out" = "$n_out"
+              test "$n_out" = "$s_out"
+              echo "OK (eonc2_rel): $ex"
+            done
+          )
+
+      - name: Upload Stage 2 self-hosted compiler (eonc2_rel)
+        uses: actions/upload-artifact@v4
+        with:
+          name: eonc2-rel-linux-x86_64
+          path: selfhost/out/eonc2_rel
+          retention-days: 1
+
+  fuzz-release:
+    name: Differential & Soundness Fuzzing
+    runs-on: ubuntu-latest
+    needs: bootstrap-and-verify
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Stage 2 compiler
+        uses: actions/download-artifact@v4
+        with:
+          name: eonc2-rel-linux-x86_64
+          path: selfhost/out
+
+      - name: Make Stage 2 compiler executable
+        run: chmod +x selfhost/out/eonc2_rel
+
+      - name: Soundness mutation fuzzer (3,000 mutations)
+        run: python3 tests/fuzz/soundness_fuzz.py -n 3000 --jobs 4 --eonc selfhost/out/eonc2_rel
+
+      - name: Differential fuzzer (Interp == --dev == --release with --verify-opt)
+        run: python3 tests/fuzz/diff_backends.py -n 5000 --jobs 4 --release --verify-opt --eonc selfhost/out/eonc2_rel
+
+      - name: 3-way Sanitizer differential fuzzer (Interp == --dev == --sanitize)
+        run: python3 tests/fuzz/diff_backends.py -n 2000 --jobs 4 --eonc selfhost/out/eonc2_rel
+
+  kernel-and-utils:
+    name: EonOS-Micro (QEMU) & Zero-libc Utilities
+    runs-on: ubuntu-latest
+    needs: bootstrap-and-verify
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust (for utility reference parity) & QEMU
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install qemu-system-x86
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86
+
+      - name: Download Stage 2 compiler
+        uses: actions/download-artifact@v4
+        with:
+          name: eonc2-rel-linux-x86_64
+          path: selfhost/out
+
+      - name: Make Stage 2 compiler executable
+        run: chmod +x selfhost/out/eonc2_rel
+
+      - name: Boot EonOS-Micro in QEMU (SMP=2, 1,000 timer IRQs, paging, PMM, W^X)
+        run: python3 kernel/run_qemu.py --eonc selfhost/out/eonc2_rel
+
+      - name: Verify zero-libc utilities & multi-core io_uring server (ewc, egrep, ehttpd)
+        run: python3 utils/bench_utils.py --eonc selfhost/out/eonc2_rel --save utils/results/ci_phase10_utils.json

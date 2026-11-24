@@ -1,0 +1,13 @@
+module fail.zm01;
+
+import core.mem; //~ ERROR E0101
+
+fn dead_helper() -> i32 { //~ ERROR E0101
+    return 1_i32;
+}
+
+pub fn entry(unused_param: i32) -> i32 { //~ ERROR E0101
+    let unused_local: i32 = 10_i32; //~ ERROR E0101
+    let used: i32 = 5_i32;
+    return used;
+}

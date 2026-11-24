@@ -1,0 +1,5 @@
+module fail.if_expr;
+pub fn f(c: bool) {
+    let x = if c { 1_u32 }; //~ ERROR E0005
+    _ = x;
+}

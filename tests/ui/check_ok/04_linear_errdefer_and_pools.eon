@@ -1,0 +1,94 @@
+module ok.linear_pools;
+
+pub linear struct PhysPage {
+    pub base: PhysAddr;
+}
+
+pub pool Widget {
+    pub x: f32;
+    pub color: u32;
+    pub parent: ?Link[Self];
+}
+
+fn alloc_page(ok: bool) -> PhysPage ! MemError {
+    if !ok {
+        return .OutOfMemory;
+    }
+    return PhysPage.{ base: dummy_addr() };
+}
+
+fn dummy_addr() -> PhysAddr {
+    let addr_bits: u64 = 0x1000_u64;
+    return addr_bits.bitcast.[PhysAddr]();
+}
+
+fn free_page(page: PhysPage) {
+    let PhysPage.{ base: _ } = page;
+}
+
+fn map_pair(a: *PhysPage, b: *PhysPage, should_fail: bool) -> !MemError {
+    let _ = a.base;
+    let _ = b.base;
+    if should_fail {
+        return .OutOfMemory;
+    }
+    return;
+}
+
+pub fn map_two_pages(flag: bool) -> (PhysPage, PhysPage) ! MemError {
+    let p1 = try alloc_page(true);
+    errdefer free_page(p1);
+
+    let p2 = try alloc_page(flag);
+    errdefer free_page(p2);
+
+    try map_pair(&p1, &p2, false);
+    return (p1, p2);
+}
+
+pub fn with_defer(flag: bool) -> !MemError {
+    let p = try alloc_page(true);
+    defer free_page(p);
+    try map_pair(&p, &p, flag);
+    return;
+}
+
+pub fn drain_linear_buf(buf: LinearBuf[PhysPage], alloc: *mut AllocCap) {
+    buf.drain(alloc, |page| {
+        free_page(page);
+    });
+}
+
+fn move_widget(p: *mut ArenaPool[Widget], id: Id[p], dx: f32) {
+    p.x[id] = p.x[id] + dx;
+}
+
+pub fn pool_workflow(arena: *mut Arena, alloc: *mut AllocCap) -> !MemError {
+    var ui = try ArenaPool.[Widget].init(arena, 64_usize);
+    let root = try ui.push(.{ x: 0.0_f32, color: 1_u32, parent: null });
+    let child = try ui.push(.{ x: 5.0_f32, color: 2_u32, parent: root });
+    move_widget(&mut ui, child, 10.0_f32);
+    let _last_id = ui.x[root];
+
+    // Safe to reset epoch after last use of root/child!
+    ui = ui.reset();
+    let fresh = try ui.push(.{ x: 1.0_f32, color: 3_u32, parent: null });
+    let _x = ui.x[fresh];
+
+    let slots = try SlotPool.[Widget].init(alloc, 16_usize);
+    slots.destroy(alloc);
+    return;
+}
+
+pub fn loop_linear_break(cond: bool) {
+    let p = PhysPage.{ base: dummy_addr() };
+    loop {
+        if cond {
+            free_page(p);
+            break;
+        }
+        let tmp = PhysPage.{ base: dummy_addr() };
+        free_page(tmp);
+    }
+    return;
+}

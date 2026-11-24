@@ -1,0 +1,454 @@
+module app.compiler_spike;
+
+// Compiler-shaped spike: lexer -> Pratt parser -> AST pool -> interner/resolver -> evaluator.
+// Mini language:   let x = <expr>;   print <expr>;   expr: ints, names, + - * /, parens.
+// Demonstrates Phase 5.5 ergonomics: `view struct`, `.Variant` inference, `orelse { ... }`,
+// `sub` / `push_slice`, and relational DBM arithmetic/bounds proofs with zero forced wrapping.
+
+import core.mem;
+import core.str;
+import rt.hal;
+
+pub error CompileError {
+    UnexpectedChar,
+    UnexpectedToken,
+    UnexpectedEof,
+    UnknownName,
+    Redefined,
+    DivByZero,
+    TooDeep,
+}
+
+pub enum TokKind : u8 {
+    Eof = 0,
+    Int = 1,
+    Ident = 2,
+    KwLet = 3,
+    KwPrint = 4,
+    Plus = 5,
+    Minus = 6,
+    Star = 7,
+    Slash = 8,
+    LParen = 9,
+    RParen = 10,
+    Eq = 11,
+    Semi = 12,
+}
+
+pub struct Token {
+    pub kind: TokKind;
+    pub start: u32;
+    pub len: u32;
+}
+
+pub enum AstKind : u8 {
+    Int = 0,
+    Name = 1,
+    Binary = 2,
+    Let = 3,
+    Print = 4,
+}
+
+pub pool Ast {
+    pub kind: AstKind;
+    pub op: TokKind;
+    pub num: i64;
+    pub sym: u32;
+    pub tok: u32;
+    pub lhs: ?Link[Self];
+    pub rhs: ?Link[Self];
+    pub next: ?Link[Self];
+}
+
+pub struct Diag {
+    pub tok: u32;
+}
+
+pub struct SymSpan {
+    pub start: u32;
+    pub len: u32;
+}
+
+// ----------------------------------------------------------------------------
+// Lexer
+// ----------------------------------------------------------------------------
+
+fn is_digit(b: u8) -> bool { return b >= b'0' && b <= b'9'; }
+fn is_alpha(b: u8) -> bool { return (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') || b == b'_'; }
+
+fn kw_or_ident(word: *[u8]) -> TokKind {
+    if str.bytes_eq(word, "let".as_bytes()) { return .KwLet; }
+    if str.bytes_eq(word, "print".as_bytes()) { return .KwPrint; }
+    return .Ident;
+}
+
+fn punct(b: u8) -> ?TokKind {
+    if b == b'+' { return .Plus; }
+    if b == b'-' { return .Minus; }
+    if b == b'*' { return .Star; }
+    if b == b'/' { return .Slash; }
+    if b == b'(' { return .LParen; }
+    if b == b')' { return .RParen; }
+    if b == b'=' { return .Eq; }
+    if b == b';' { return .Semi; }
+    return null;
+}
+
+fn lex(src: *[u8], toks: *mut Buf[Token], diag: *mut Diag) -> !CompileError | OutOfMemory | ArithError {
+    var p: usize = 0_usize;
+    while p < src.len {
+        let b = src[p];
+        if b == b' ' || b == b'\n' || b == b'\t' || b == b'\r' {
+            p = p + 1_usize;
+            continue;
+        }
+        let start = p;
+        var kind: TokKind = .Eof;
+        if is_digit(b) {
+            while p < src.len {
+                if !is_digit(src[p]) { break; }
+                p = p + 1_usize;
+            }
+            kind = .Int;
+        } else if is_alpha(b) {
+            while p < src.len {
+                if !is_alpha(src[p]) && !is_digit(src[p]) { break; }
+                p = p + 1_usize;
+            }
+            kind = .Ident;
+        } else {
+            kind = punct(b) orelse {
+                diag.tok = try start.try_into.[u32]();
+                return .UnexpectedChar;
+            };
+            p = p + 1_usize;
+        }
+        // Verifier proves `start <= p <= src.len` across the monotonic scanning loops!
+        if kind == .Ident {
+            kind = kw_or_ident(src[start..p]);
+        }
+        let tok_start = try start.try_into.[u32]();
+        let tok_len = try (p - start).try_into.[u32]();
+        try toks.push(Token.{ kind: kind, start: tok_start, len: tok_len });
+    }
+    let eof_pos = try src.len.try_into.[u32]();
+    try toks.push(Token.{ kind: .Eof, start: eof_pos, len: 0_u32 });
+    return;
+}
+
+// ----------------------------------------------------------------------------
+// Interner (open addressing over byte spans stored in one Buf[u8])
+// ----------------------------------------------------------------------------
+
+fn hash_bytes(s: *[u8]) -> u64 {
+    var h: u64 = 0xcbf29ce484222325_u64;
+    for i in 0_usize..s.len {
+        h = (h ^ s[i].widen.[u64]()) *% 0x100000001b3_u64;
+    }
+    return h;
+}
+
+fn sym_bytes_eq(bytes: *[u8], sp: *SymSpan, s: *[u8]) -> bool ! ArithError {
+    let slen = sp.len.widen.[usize]();
+    if slen != s.len {
+        return false;
+    }
+    let base = sp.start.widen.[usize]();
+    let end = try (base +? slen);
+    let existing = bytes.sub(base, end) catch { return false; };
+    return str.bytes_eq(existing, s);
+}
+
+pub view struct Interner {
+    pub bytes: *mut Buf[u8];
+    pub spans: *mut Buf[SymSpan];
+    pub table: *mut [u32];
+}
+
+impl Interner {
+    fn intern(self: *mut Self, s: *[u8]) -> u32 ! CompileError | OutOfMemory | ArithError | BoundsError {
+        if self.table.len == 0_usize {
+            return .UnexpectedEof;
+        }
+        let mask = self.table.len - 1_usize;
+        var slot = (hash_bytes(s).trunc.[usize]()) & mask;
+        loop {
+            let cell = self.table.get(slot) orelse return .UnexpectedEof;
+            let entry = cell.*;
+            if entry == 0_u32 {
+                break;
+            }
+            let idx = (entry - 1_u32).widen.[usize]();
+            let sp = self.spans.get(idx) orelse return .UnexpectedEof;
+            if try sym_bytes_eq(self.bytes.as_slice(), sp, s) {
+                return entry - 1_u32;
+            }
+            let next_slot = try (slot +? 1_usize);
+            slot = next_slot & mask;
+        }
+        let start = try self.bytes.len().try_into.[u32]();
+        try self.bytes.push_slice(s);
+        let id = try self.spans.len().try_into.[u32]();
+        try self.spans.push(SymSpan.{ start: start, len: try s.len.try_into.[u32]() });
+        let cell = self.table.get_mut(slot) orelse return .UnexpectedEof;
+        cell.* = try (id +? 1_u32);
+        return id;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Parser (recursive Pratt) held cleanly inside a second-class `view struct`
+// ----------------------------------------------------------------------------
+
+fn binding_power(k: TokKind) -> u8 {
+    match k {
+        .Plus => { return 10_u8; }
+        .Minus => { return 10_u8; }
+        .Star => { return 20_u8; }
+        .Slash => { return 20_u8; }
+        _ => { return 0_u8; }
+    }
+}
+
+pub view struct Parser {
+    pub src: *[u8];
+    pub toks: *[Token];
+    pub pos: usize;
+    pub depth: u32;
+    pub diag: Diag;
+    pub interner: Interner;
+}
+
+impl Parser {
+    fn peek(self: *Self) -> TokKind {
+        if self.pos < self.toks.len {
+            return self.toks[self.pos].kind;
+        }
+        return .Eof;
+    }
+
+    fn expect(self: *mut Self, k: TokKind) -> !CompileError | ArithError {
+        if self.pos >= self.toks.len || self.toks[self.pos].kind != k {
+            self.diag.tok = try self.pos.try_into.[u32]();
+            return .UnexpectedToken;
+        }
+        self.pos = self.pos + 1_usize;
+        return;
+    }
+
+    @recursive
+    fn parse_expr(
+        self: *mut Self,
+        ast: *mut ArenaPool[Ast],
+        min_bp: u8,
+    ) -> Id[ast] ! CompileError | OutOfMemory | ArithError | BoundsError | MemError {
+        if self.depth >= 64_u32 {
+            return .TooDeep;
+        }
+        self.depth = self.depth + 1_u32;
+        if self.pos >= self.toks.len {
+            return .UnexpectedEof;
+        }
+        let tpos = self.pos;
+        let t = self.toks[tpos].kind;
+        let tstart = self.toks[tpos].start.widen.[usize]();
+        let tlen = self.toks[tpos].len.widen.[usize]();
+        self.pos = tpos + 1_usize;
+        var lhs: Id[ast] = try ast.push(.{
+            kind: .Int, op: .Eof, num: 0_i64, sym: 0_u32, tok: try tpos.try_into.[u32](),
+            lhs: null, rhs: null, next: null,
+        });
+        match t {
+            .Int => {
+                let tend = try (tstart +? tlen);
+                let lit = self.src.sub(tstart, tend) catch { return .UnexpectedEof; };
+                let v = try str.parse_u64(lit);
+                ast.num[lhs] = try v.try_into.[i64]();
+            }
+            .Ident => {
+                let tend = try (tstart +? tlen);
+                let name = self.src.sub(tstart, tend) catch { return .UnexpectedEof; };
+                ast.kind[lhs] = .Name;
+                ast.sym[lhs] = try self.interner.intern(name);
+            }
+            .LParen => {
+                lhs = try self.parse_expr(ast, 0_u8);
+                try self.expect(.RParen);
+            }
+            _ => {
+                self.diag.tok = try tpos.try_into.[u32]();
+                return .UnexpectedToken;
+            }
+        }
+        loop {
+            let op = self.peek();
+            let bp = binding_power(op);
+            if bp == 0_u8 || bp <= min_bp {
+                break;
+            }
+            if self.pos >= self.toks.len {
+                return .UnexpectedEof;
+            }
+            self.pos = self.pos + 1_usize;
+            let rhs = try self.parse_expr(ast, bp);
+            let node = try ast.push(.{
+                kind: .Binary, op: op, num: 0_i64, sym: 0_u32, tok: 0_u32,
+                lhs: lhs, rhs: rhs, next: null,
+            });
+            lhs = node;
+        }
+        self.depth = try (self.depth -? 1_u32);
+        return lhs;
+    }
+
+    fn parse_stmt(
+        self: *mut Self,
+        ast: *mut ArenaPool[Ast],
+    ) -> ?Id[ast] ! CompileError | OutOfMemory | ArithError | BoundsError | MemError {
+        let k = self.peek();
+        if k == .Eof {
+            return null;
+        }
+        if self.pos >= self.toks.len {
+            return .UnexpectedEof;
+        }
+        let stmt_tok = try self.pos.try_into.[u32]();
+        self.pos = self.pos + 1_usize;
+        var sym: u32 = 0_u32;
+        var kind: AstKind = .Print;
+        if k == .KwLet {
+            if self.pos >= self.toks.len || self.toks[self.pos].kind != .Ident {
+                return .UnexpectedToken;
+            }
+            let ip = self.pos;
+            let s0 = self.toks[ip].start.widen.[usize]();
+            let nlen = self.toks[ip].len.widen.[usize]();
+            let s1 = try (s0 +? nlen);
+            let name = self.src.sub(s0, s1) catch { return .UnexpectedEof; };
+            sym = try self.interner.intern(name);
+            self.pos = ip + 1_usize;
+            try self.expect(.Eq);
+            kind = .Let;
+        } else if k != .KwPrint {
+            return .UnexpectedToken;
+        }
+        let e = try self.parse_expr(ast, 0_u8);
+        try self.expect(.Semi);
+        let st = try ast.push(.{
+            kind: kind, op: .Eof, num: 0_i64, sym: sym, tok: stmt_tok,
+            lhs: e, rhs: null, next: null,
+        });
+        return st;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Evaluator (recursive tree walk); variable values indexed by symbol id.
+// ----------------------------------------------------------------------------
+
+@recursive
+fn eval(ast: *ArenaPool[Ast], n: Id[ast], vals: *[i64], defined: *[u8]) -> i64 ! CompileError | ArithError {
+    match ast.kind[n] {
+        .Int => { return ast.num[n]; }
+        .Name => {
+            let s = ast.sym[n].widen.[usize]();
+            let d = defined.get(s) orelse return .UnknownName;
+            if d.* == 0_u8 {
+                return .UnknownName;
+            }
+            let v = vals.get(s) orelse return .UnknownName;
+            return v.*;
+        }
+        .Binary => {
+            let l_id = ast.lhs[n] orelse return .UnexpectedToken;
+            let r_id = ast.rhs[n] orelse return .UnexpectedToken;
+            let l = try eval(ast, l_id, vals, defined);
+            let r = try eval(ast, r_id, vals, defined);
+            let op = ast.op[n];
+            if op == .Plus { return try (l +? r); }
+            if op == .Minus { return try (l -? r); }
+            if op == .Star { return try (l *? r); }
+            let q = (l /? r) catch { return .DivByZero; };
+            return q;
+        }
+        _ => { return .UnexpectedToken; }
+    }
+}
+
+pub fn main(alloc: *mut AllocCap) -> i32 ! CompileError | OutOfMemory | ArithError | BoundsError | MemError | Utf8Error {
+    let program = "let a = 3;\nlet b = a * (a + 4) - 2;\nlet c = b / (a - 1) + 100;\nprint b + a;\nprint c * 2 - b;\n";
+    let src = program.as_bytes();
+    try str.validate_utf8(src);
+
+    var toks = try Buf.[Token].init(alloc, 64_usize);
+    errdefer toks.destroy(alloc);
+    var diag = Diag.{ tok: 0_u32 };
+    try lex(src, &mut toks, &mut diag);
+
+    var bytes = try Buf.[u8].init(alloc, 256_usize);
+    errdefer bytes.destroy(alloc);
+    var spans = try Buf.[SymSpan].init(alloc, 32_usize);
+    errdefer spans.destroy(alloc);
+    var table_store: [64]u32 = [0_u32; 64];
+    var arena = try mem.FrameArena.init(alloc, 16384_usize);
+    errdefer arena.destroy(alloc);
+    var ast = try mem.init_frame_pool.[Ast](&mut arena, 256_usize);
+
+    var first: ?Id[ast] = null;
+    var last: ?Id[ast] = null;
+    var parser = Parser.{
+        src: src,
+        toks: toks.as_slice(),
+        pos: 0_usize,
+        depth: 0_u32,
+        diag: diag,
+        interner: Interner.{
+            bytes: &mut bytes,
+            spans: &mut spans,
+            table: &mut table_store,
+        },
+    };
+    loop {
+        let st_opt = try parser.parse_stmt(&mut ast);
+        let st = st_opt orelse break;
+        if let l = last {
+            ast.next[l] = st;
+        } else {
+            first = st;
+        }
+        last = st;
+    }
+
+    // Execute.
+    var vals: [32]i64 = [0_i64; 32];
+    var defined: [32]u8 = [0_u8; 32];
+    var cur = first;
+    loop {
+        let s = cur orelse break;
+        let e = ast.lhs[s] orelse return .UnexpectedToken;
+        let v = try eval(&ast, e, &vals, &defined);
+        if ast.kind[s] == .Let {
+            let idx = ast.sym[s].widen.[usize]();
+            let slot = vals.get_mut(idx) orelse return .UnknownName;
+            slot.* = v;
+            let d = defined.get_mut(idx) orelse return .UnknownName;
+            d.* = 1_u8;
+        } else {
+            hal.print_i64(v);
+            hal.print_nl();
+        }
+        cur = ast.next[s];
+    }
+
+    hal.print_str("symbols=");
+    hal.print_u64(spans.len().widen.[u64]());
+    hal.print_str(" ast_nodes=");
+    hal.print_u64(ast.len().widen.[u64]());
+    hal.print_nl();
+
+    arena.destroy(alloc);
+    spans.destroy(alloc);
+    bytes.destroy(alloc);
+    toks.destroy(alloc);
+    return 0_i32;
+}

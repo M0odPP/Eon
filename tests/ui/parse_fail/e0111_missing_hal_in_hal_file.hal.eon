@@ -1,0 +1,2 @@
+module kernel.forgot_hal; //~ ERROR E0111
+pub fn f() {}

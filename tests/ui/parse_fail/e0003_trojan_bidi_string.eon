@@ -1,0 +1,2 @@
+module fail.bidi_str;
+pub const S: *str = "abc⁦def"; //~ ERROR E0003

@@ -1,0 +1,2662 @@
+module eonc.mach_opt_x64;
+
+import core.col;
+import eonc.span;
+import eonc.ast;
+import eonc.eir;
+import eonc.x64_asm;
+import eonc.elf64;
+import eonc.mach_ir;
+
+// ============================================================================
+// Section 1: Public Emission Result (`MachEmitOut`) & Helper Utilities
+// ============================================================================
+
+pub linear struct MachEmitOut {
+    pub ok: bool;
+    pub own_stack_bytes: u64;
+    pub code: col.DynBuf[u8];
+    pub relocs: col.DynBuf[x64_asm.FnReloc];
+    pub rodata_items: col.DynBuf[mach_ir.MachRodataItem];
+    pub rodata_bytes: col.DynBuf[u8];
+    pub rodata_relocs: col.DynBuf[mach_ir.MachRodataReloc];
+    pub used_helpers: col.DynBuf[u32];
+    pub line_entries: col.DynBuf[elf64.LineEntry];
+}
+
+impl MachEmitOut {
+    pub fn init(alloc: *mut AllocCap) -> MachEmitOut ! OutOfMemory {
+        let code = try col.DynBuf.[u8].init(alloc, 128_usize);
+        errdefer code.destroy(alloc);
+        let relocs = try col.DynBuf.[x64_asm.FnReloc].init(alloc, 8_usize);
+        errdefer relocs.destroy(alloc);
+        let rodata_items = try col.DynBuf.[mach_ir.MachRodataItem].init(alloc, 4_usize);
+        errdefer rodata_items.destroy(alloc);
+        let rodata_bytes = try col.DynBuf.[u8].init(alloc, 32_usize);
+        errdefer rodata_bytes.destroy(alloc);
+        let rodata_relocs = try col.DynBuf.[mach_ir.MachRodataReloc].init(alloc, 4_usize);
+        errdefer rodata_relocs.destroy(alloc);
+        let used_helpers = try col.DynBuf.[u32].init(alloc, 4_usize);
+        errdefer used_helpers.destroy(alloc);
+        let line_entries = try col.DynBuf.[elf64.LineEntry].init(alloc, 16_usize);
+        errdefer line_entries.destroy(alloc);
+        return MachEmitOut.{
+            ok: false,
+            own_stack_bytes: 0_u64,
+            code: code,
+            relocs: relocs,
+            rodata_items: rodata_items,
+            rodata_bytes: rodata_bytes,
+            rodata_relocs: rodata_relocs,
+            used_helpers: used_helpers,
+            line_entries: line_entries,
+        };
+    }
+
+    pub fn destroy(self: MachEmitOut, alloc: *mut AllocCap) {
+        let MachEmitOut.{
+            ok: _,
+            own_stack_bytes: _,
+            code,
+            relocs,
+            rodata_items,
+            rodata_bytes,
+            rodata_relocs,
+            used_helpers,
+            line_entries,
+        } = self;
+        code.destroy(alloc);
+        relocs.destroy(alloc);
+        rodata_items.destroy(alloc);
+        rodata_bytes.destroy(alloc);
+        rodata_relocs.destroy(alloc);
+        used_helpers.destroy(alloc);
+        line_entries.destroy(alloc);
+    }
+}
+
+fn align_up_usize(val: usize, align: usize) -> usize {
+    if align <= 1_usize {
+        return val;
+    }
+    let mask = align -% 1_usize;
+    return (val +% mask) & (~mask);
+}
+
+fn invert_cond(cc: x64_asm.Cond) -> x64_asm.Cond {
+    match cc {
+        .O => { return .No; }
+        .No => { return .O; }
+        .B => { return .Ae; }
+        .Ae => { return .B; }
+        .E => { return .Ne; }
+        .Ne => { return .E; }
+        .Be => { return .A; }
+        .A => { return .Be; }
+        .S => { return .Ns; }
+        .Ns => { return .S; }
+        .P => { return .Np; }
+        .Np => { return .P; }
+        .L => { return .Ge; }
+        .Ge => { return .L; }
+        .Le => { return .G; }
+        .G => { return .Le; }
+    }
+}
+
+fn cond_only_zf_sf(cc: x64_asm.Cond) -> bool {
+    return cc == .E || cc == .Ne || cc == .S || cc == .Ns;
+}
+
+// ============================================================================
+// Section 2: Instruction Effect Analysis (Registers, Flags, Memory, Latency)
+// ============================================================================
+
+struct InstEffects {
+    read_gprs: u16;
+    write_gprs: u16;
+    read_xmms: u16;
+    write_xmms: u16;
+    reads_flags: bool;
+    writes_flags: bool;
+    reads_mem: bool;
+    writes_mem: bool;
+    is_barrier: bool;
+    latency: u8;
+}
+
+fn op_reads_flags(op: mach_ir.MachOp) -> bool {
+    return op == .Jcc || op == .Cmov || op == .Setcc || op == .Ret || op == .Iretq;
+}
+
+fn op_writes_flags(op: mach_ir.MachOp) -> bool {
+    match op {
+        .Add => { return true; }
+        .AddImm => { return true; }
+        .Sub => { return true; }
+        .SubImm => { return true; }
+        .Mul => { return true; }
+        .MulImm => { return true; }
+        .Imul128 => { return true; }
+        .Mul128 => { return true; }
+        .Div => { return true; }
+        .Idiv => { return true; }
+        .Div32 => { return true; }
+        .Idiv32 => { return true; }
+        .Add32 => { return true; }
+        .Add32Imm => { return true; }
+        .Sub32 => { return true; }
+        .Sub32Imm => { return true; }
+        .Mul32 => { return true; }
+        .Mul32Imm => { return true; }
+        .And => { return true; }
+        .AndImm => { return true; }
+        .And32 => { return true; }
+        .And32Imm => { return true; }
+        .Or => { return true; }
+        .OrImm => { return true; }
+        .Or32 => { return true; }
+        .Or32Imm => { return true; }
+        .Xor => { return true; }
+        .XorImm => { return true; }
+        .Xor32 => { return true; }
+        .Xor32Imm => { return true; }
+        .Shl => { return true; }
+        .ShlImm => { return true; }
+        .Shr => { return true; }
+        .ShrImm => { return true; }
+        .Sar => { return true; }
+        .SarImm => { return true; }
+        .Shl32 => { return true; }
+        .Shl32Imm => { return true; }
+        .Shr32 => { return true; }
+        .Shr32Imm => { return true; }
+        .Sar32 => { return true; }
+        .Sar32Imm => { return true; }
+        .RorImm => { return true; }
+        .Ror32Imm => { return true; }
+        .Neg => { return true; }
+        .Neg32 => { return true; }
+        .Tzcnt => { return true; }
+        .Lzcnt => { return true; }
+        .Popcnt => { return true; }
+        .Bextr => { return true; }
+        .Cmp => { return true; }
+        .CmpImm => { return true; }
+        .Cmp32 => { return true; }
+        .Cmp32Imm => { return true; }
+        .CmpMem => { return true; }
+        .AddMem => { return true; }
+        .SubMem => { return true; }
+        .MulMem => { return true; }
+        .AndMem => { return true; }
+        .OrMem => { return true; }
+        .XorMem => { return true; }
+        .Test => { return true; }
+        .TestImm => { return true; }
+        .Test32 => { return true; }
+        .Test32Imm => { return true; }
+        .Clc => { return true; }
+        .Stc => { return true; }
+        .LockXadd => { return true; }
+        .LockCmpxchg => { return true; }
+        .VUcomiSS => { return true; }
+        .VUcomiSD => { return true; }
+        .CallSym => { return true; }
+        .CallReg => { return true; }
+        .CallBarrier => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn op_src0_is_vec(op: mach_ir.MachOp) -> bool {
+    match op {
+        .VMovSSStore => { return true; }
+        .VMovSDStore => { return true; }
+        .VMovVecReg => { return true; }
+        .VAddSS => { return true; }
+        .VSubSS => { return true; }
+        .VMulSS => { return true; }
+        .VDivSS => { return true; }
+        .VMinSS => { return true; }
+        .VMaxSS => { return true; }
+        .VSqrtSS => { return true; }
+        .VFmadd231SS => { return true; }
+        .VAddSD => { return true; }
+        .VSubSD => { return true; }
+        .VMulSD => { return true; }
+        .VDivSD => { return true; }
+        .VMinSD => { return true; }
+        .VMaxSD => { return true; }
+        .VSqrtSD => { return true; }
+        .VFmadd231SD => { return true; }
+        .VUcomiSS => { return true; }
+        .VUcomiSD => { return true; }
+        .VCvtTTSS2SI => { return true; }
+        .VCvtTTSD2SI => { return true; }
+        .VCvtSS2SD => { return true; }
+        .VCvtSD2SS => { return true; }
+        .VMovDFromXmm => { return true; }
+        .VMovQFromXmm => { return true; }
+        .VMovUpsStore => { return true; }
+        .VMovApsStore => { return true; }
+        .VMovDquStore => { return true; }
+        .VBroadcastSS => { return true; }
+        .VBroadcastSD => { return true; }
+        .VAddPS => { return true; }
+        .VAddPSMem => { return true; }
+        .VSubPS => { return true; }
+        .VSubPSMem => { return true; }
+        .VMulPS => { return true; }
+        .VMulPSMem => { return true; }
+        .VDivPS => { return true; }
+        .VMinPS => { return true; }
+        .VMaxPS => { return true; }
+        .VSqrtPS => { return true; }
+        .VRsqrtPS => { return true; }
+        .VFmadd231PS => { return true; }
+        .VFmadd231PSMem => { return true; }
+        .VFnMadd231PS => { return true; }
+        .VAddPD => { return true; }
+        .VSubPD => { return true; }
+        .VMulPD => { return true; }
+        .VDivPD => { return true; }
+        .VMinPD => { return true; }
+        .VMaxPD => { return true; }
+        .VSqrtPD => { return true; }
+        .VFmadd231PD => { return true; }
+        .VFmadd231PDMem => { return true; }
+        .VXorPS => { return true; }
+        .VAndPS => { return true; }
+        .VOrPS => { return true; }
+        .VXorPD => { return true; }
+        .VAndPD => { return true; }
+        .VOrPD => { return true; }
+        .VCmpPS => { return true; }
+        .VBlendVPS => { return true; }
+        .VShufPS => { return true; }
+        .VHAddPS => { return true; }
+        .VExtractF128 => { return true; }
+        .VInsertF128 => { return true; }
+        .VPXor => { return true; }
+        .VPAnd => { return true; }
+        .VPOr => { return true; }
+        .VPAddB => { return true; }
+        .VPSubB => { return true; }
+        .VPAddD => { return true; }
+        .VPSubD => { return true; }
+        .VPMullD => { return true; }
+        .VPAddQ => { return true; }
+        .VPSubQ => { return true; }
+        .VPMinSD => { return true; }
+        .VPMaxSD => { return true; }
+        .VPCmpEqB => { return true; }
+        .VPCmpEqD => { return true; }
+        .VPCmpGtD => { return true; }
+        .VPMovMskB => { return true; }
+        .VPSllDImm => { return true; }
+        .VPSrlDImm => { return true; }
+        .VPSraDImm => { return true; }
+        .VPSllWImm => { return true; }
+        .VPBroadcastB => { return true; }
+        .VPBroadcastD => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn op_reads_mem(inst: *mach_ir.MachInst) -> bool {
+    if inst.mem.kind == .None {
+        return inst.op == .Pop || inst.op == .MemCopy;
+    }
+    match inst.op {
+        .Lea => { return false; }
+        .Store => { return false; }
+        .StoreImm => { return false; }
+        .VMovSSStore => { return false; }
+        .VMovSDStore => { return false; }
+        .VMovUpsStore => { return false; }
+        .VMovApsStore => { return false; }
+        .VMovDquStore => { return false; }
+        .Jmp => { return false; }
+        .Jcc => { return false; }
+        .JmpSym => { return false; }
+        .CallSym => { return false; }
+        .LabelDef => { return false; }
+        _ => { return true; }
+    }
+}
+
+fn op_writes_mem(op: mach_ir.MachOp) -> bool {
+    match op {
+        .Store => { return true; }
+        .StoreImm => { return true; }
+        .Push => { return true; }
+        .MemCopy => { return true; }
+        .MemZero => { return true; }
+        .LockXadd => { return true; }
+        .LockCmpxchg => { return true; }
+        .XchgMem => { return true; }
+        .VMovSSStore => { return true; }
+        .VMovSDStore => { return true; }
+        .VMovUpsStore => { return true; }
+        .VMovApsStore => { return true; }
+        .VMovDquStore => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn op_is_sched_barrier(op: mach_ir.MachOp) -> bool {
+    if mach_ir.op_is_call(op) || mach_ir.op_is_terminator(op) {
+        return true;
+    }
+    match op {
+        .LabelDef => { return true; }
+        .Push => { return true; }
+        .Pop => { return true; }
+        .MemCopy => { return true; }
+        .MemZero => { return true; }
+        .LockXadd => { return true; }
+        .LockCmpxchg => { return true; }
+        .XchgMem => { return true; }
+        .Clc => { return true; }
+        .Stc => { return true; }
+        .InlineAsmRaw => { return true; }
+        .RawBytes => { return true; }
+        .VZeroUpper => { return true; }
+        .DefFixed => { return true; }
+        .UseFixed => { return true; }
+        .ParallelCopy => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn op_latency(op: mach_ir.MachOp) -> u8 {
+    match op {
+        .Load => { return 4_u8; }
+        .LoadSX => { return 4_u8; }
+        .VMovSSLoad => { return 4_u8; }
+        .VMovSDLoad => { return 4_u8; }
+        .VMovUpsLoad => { return 5_u8; }
+        .VMovApsLoad => { return 5_u8; }
+        .VMovDquLoad => { return 5_u8; }
+        .VBroadcastSS => { return 5_u8; }
+        .VBroadcastSD => { return 5_u8; }
+        .Mul => { return 3_u8; }
+        .MulImm => { return 3_u8; }
+        .Mul32 => { return 3_u8; }
+        .Mul32Imm => { return 3_u8; }
+        .MulMem => { return 7_u8; }
+        .CmpMem => { return 4_u8; }
+        .AddMem => { return 5_u8; }
+        .SubMem => { return 5_u8; }
+        .AndMem => { return 5_u8; }
+        .OrMem => { return 5_u8; }
+        .XorMem => { return 5_u8; }
+        .Mul128 => { return 4_u8; }
+        .Imul128 => { return 4_u8; }
+        .Div => { return 20_u8; }
+        .Idiv => { return 20_u8; }
+        .Div32 => { return 12_u8; }
+        .Idiv32 => { return 12_u8; }
+        .VAddSS => { return 3_u8; }
+        .VSubSS => { return 3_u8; }
+        .VMulSS => { return 3_u8; }
+        .VAddSD => { return 3_u8; }
+        .VSubSD => { return 3_u8; }
+        .VMulSD => { return 3_u8; }
+        .VAddPS => { return 3_u8; }
+        .VAddPSMem => { return 7_u8; }
+        .VSubPS => { return 3_u8; }
+        .VSubPSMem => { return 7_u8; }
+        .VMulPS => { return 3_u8; }
+        .VMulPSMem => { return 7_u8; }
+        .VAddPD => { return 3_u8; }
+        .VSubPD => { return 3_u8; }
+        .VMulPD => { return 3_u8; }
+        .VFmadd231SS => { return 4_u8; }
+        .VFmadd231SD => { return 4_u8; }
+        .VFmadd231PS => { return 4_u8; }
+        .VFmadd231PSMem => { return 8_u8; }
+        .VFnMadd231PS => { return 4_u8; }
+        .VFmadd231PD => { return 4_u8; }
+        .VFmadd231PDMem => { return 8_u8; }
+        .VDivSS => { return 11_u8; }
+        .VDivSD => { return 14_u8; }
+        .VDivPS => { return 11_u8; }
+        .VDivPD => { return 14_u8; }
+        .VSqrtSS => { return 14_u8; }
+        .VSqrtSD => { return 18_u8; }
+        .VSqrtPS => { return 14_u8; }
+        .VSqrtPD => { return 18_u8; }
+        .VRsqrtPS => { return 4_u8; }
+        .VPMullD => { return 4_u8; }
+        .VHAddPS => { return 5_u8; }
+        .Tzcnt => { return 2_u8; }
+        .Lzcnt => { return 2_u8; }
+        .Popcnt => { return 2_u8; }
+        _ => { return 1_u8; }
+    }
+}
+
+fn analyze_inst_effects(inst: *mach_ir.MachInst) -> InstEffects {
+    var rg: u16 = 0_u16;
+    var wg: u16 = 0_u16;
+    var rx: u16 = 0_u16;
+    var wx: u16 = 0_u16;
+
+    let src0_vec = op_src0_is_vec(inst.op);
+    let dst_vec = mach_ir.op_dst_is_vec(inst.op);
+
+    if inst.src0_phys < 16_u8 {
+        if src0_vec {
+            rx = rx | mach_ir.phys_bit(inst.src0_phys);
+        } else {
+            rg = rg | mach_ir.phys_bit(inst.src0_phys);
+        }
+    }
+    if inst.src1_phys < 16_u8 {
+        if src0_vec && inst.op != .Bextr {
+            rx = rx | mach_ir.phys_bit(inst.src1_phys);
+        } else {
+            rg = rg | mach_ir.phys_bit(inst.src1_phys);
+        }
+    }
+    if inst.src2_phys < 16_u8 {
+        if src0_vec {
+            rx = rx | mach_ir.phys_bit(inst.src2_phys);
+        } else {
+            rg = rg | mach_ir.phys_bit(inst.src2_phys);
+        }
+    }
+    if inst.mem.kind == .BaseDisp || inst.mem.kind == .StackSlot || inst.mem.kind == .Sib {
+        if inst.mem.base_phys < 16_u8 {
+            rg = rg | mach_ir.phys_bit(inst.mem.base_phys);
+        }
+    }
+    if inst.mem.kind == .Sib && inst.mem.idx_phys < 16_u8 {
+        rg = rg | mach_ir.phys_bit(inst.mem.idx_phys);
+    }
+
+    if mach_ir.op_has_dst(inst.op) && inst.dst_phys < 16_u8 {
+        if dst_vec {
+            wx = wx | mach_ir.phys_bit(inst.dst_phys);
+            if inst.tied_src0 {
+                rx = rx | mach_ir.phys_bit(inst.dst_phys);
+            }
+        } else {
+            wg = wg | mach_ir.phys_bit(inst.dst_phys);
+            if inst.tied_src0 {
+                rg = rg | mach_ir.phys_bit(inst.dst_phys);
+            }
+        }
+    }
+    if inst.dst2_phys < 16_u8 {
+        wg = wg | mach_ir.phys_bit(inst.dst2_phys);
+    }
+
+    // Implicit hardware register reads/writes
+    if mach_ir.op_is_div_or_mul128(inst.op) {
+        rg = rg | mach_ir.phys_bit(mach_ir.PHYS_RAX);
+        wg = wg | mach_ir.phys_bit(mach_ir.PHYS_RAX) | mach_ir.phys_bit(mach_ir.PHYS_RDX);
+    } else if mach_ir.op_is_var_shift(inst.op) {
+        rg = rg | mach_ir.phys_bit(mach_ir.PHYS_RCX);
+    }
+    // RIP-relative vector loads/stores may use scratch R10 during x64 emission
+    if inst.mem.kind == .RipSym && (dst_vec || src0_vec || (inst.op == .Load && inst.size_bytes != 8_u8)) {
+        wg = wg | mach_ir.phys_bit(mach_ir.SCRATCH_GPR0);
+    }
+    if inst.op == .StoreImm && (inst.size_bytes < 4_u8 || inst.mem.kind == .Sib) {
+        wg = wg | mach_ir.phys_bit(mach_ir.SCRATCH_GPR0) | mach_ir.phys_bit(mach_ir.SCRATCH_GPR1);
+    }
+    wg = wg | inst.clobber_gprs;
+    wx = wx | inst.clobber_xmms;
+
+    // Any instruction modifying RSP is treated as a barrier for stack safety
+    let touches_rsp = (wg & mach_ir.phys_bit(mach_ir.PHYS_RSP)) != 0_u16;
+    return InstEffects.{
+        read_gprs: rg,
+        write_gprs: wg,
+        read_xmms: rx,
+        write_xmms: wx,
+        reads_flags: op_reads_flags(inst.op),
+        writes_flags: op_writes_flags(inst.op),
+        reads_mem: op_reads_mem(inst),
+        writes_mem: op_writes_mem(inst.op),
+        is_barrier: op_is_sched_barrier(inst.op) || touches_rsp,
+        latency: op_latency(inst.op),
+    };
+}
+
+// ============================================================================
+// Section 3: Post-RA Peephole Optimizer (Flag-Safe, Fallthrough & Branch Inv)
+// ============================================================================
+
+fn build_emit_order(
+    alloc: *mut AllocCap,
+    mf: *mach_ir.MachFunc,
+    out: *mut col.DynBuf[u32],
+) -> !OutOfMemory {
+    out.clear();
+    let n_blocks = mf.blocks.len();
+    if n_blocks == 0_usize {
+        return;
+    }
+    let rpo = mf.rpo.as_slice();
+    if rpo.len > 0_usize {
+        var seen = try col.BitSet.init(alloc, n_blocks);
+        errdefer seen.destroy(alloc);
+        let eb = mf.entry_block;
+        let eb_idx = eb.widen.[usize]();
+        if eb_idx < n_blocks {
+            seen.set(eb_idx);
+            try out.push(alloc, eb);
+        }
+        var ri: usize = 0_usize;
+        while ri < rpo.len {
+            let bb = rpo[ri];
+            let bidx = bb.widen.[usize]();
+            if bidx < n_blocks && !seen.test(bidx) {
+                seen.set(bidx);
+                try out.push(alloc, bb);
+            }
+            ri = ri +% 1_usize;
+        }
+        seen.destroy(alloc);
+        return;
+    }
+    var bi: usize = 0_usize;
+    while bi < n_blocks {
+        try out.push(alloc, bi.trunc.[u32]());
+        bi = bi +% 1_usize;
+    }
+    return;
+}
+
+fn is_self_noop_move(inst: *mach_ir.MachInst, uses_ymm: bool) -> bool {
+    if inst.op == .Mov || inst.op == .Copy {
+        return inst.dst_phys < 16_u8 && inst.dst_phys == inst.src0_phys;
+    }
+    if inst.op == .VMovVecReg {
+        // Note: 128-bit `vmovaps xmm, xmm` zeros upper 128 bits of YMM; only elide when
+        // either YMM isn't used in this function or it's already a 256-bit YMM copy.
+        if inst.dst_phys < 16_u8 && inst.dst_phys == inst.src0_phys {
+            return !uses_ymm || inst.flag0;
+        }
+    }
+    return false;
+}
+
+fn is_flag_setting_logic_gpr64(op: mach_ir.MachOp) -> bool {
+    return op == .And || op == .AndImm || op == .AndMem
+        || op == .Or || op == .OrImm || op == .OrMem
+        || op == .Xor || op == .XorImm || op == .XorMem;
+}
+
+fn is_flag_setting_addsub_gpr64(op: mach_ir.MachOp) -> bool {
+    return op == .Add || op == .AddImm || op == .AddMem
+        || op == .Sub || op == .SubImm || op == .SubMem;
+}
+
+fn is_store_reload_pair(prev: *mach_ir.MachInst, cur: *mach_ir.MachInst) -> bool {
+    if prev.op == .Store && cur.op == .Load {
+        if prev.mem.kind == .StackSlot && cur.mem.kind == .StackSlot
+            && prev.mem.disp == cur.mem.disp
+            && prev.size_bytes == cur.size_bytes
+            && prev.src0_phys < 16_u8 && prev.src0_phys == cur.dst_phys
+        {
+            // For 8-byte stores, reload gives exact same 64-bit register value!
+            return prev.size_bytes == 8_u8;
+        }
+    }
+    if prev.op == .VMovUpsStore && cur.op == .VMovUpsLoad {
+        if prev.mem.kind == .StackSlot && cur.mem.kind == .StackSlot
+            && prev.mem.disp == cur.mem.disp
+            && prev.flag0 == cur.flag0
+            && prev.src0_phys < 16_u8 && prev.src0_phys == cur.dst_phys
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn is_reverse_move_pair(prev: *mach_ir.MachInst, cur: *mach_ir.MachInst) -> bool {
+    if prev.op == .Mov && cur.op == .Mov {
+        return prev.dst_phys < 16_u8 && prev.src0_phys < 16_u8
+            && prev.dst_phys == cur.src0_phys && prev.src0_phys == cur.dst_phys;
+    }
+    if prev.op == .VMovVecReg && cur.op == .VMovVecReg && prev.flag0 == cur.flag0 {
+        return prev.dst_phys < 16_u8 && prev.src0_phys < 16_u8
+            && prev.dst_phys == cur.src0_phys && prev.src0_phys == cur.dst_phys;
+    }
+    return false;
+}
+
+struct PeepState {
+    zero32_regs: u16;
+    zero8_regs: u16;
+    spill_valid: u16;
+    spill_off: [16]i32;
+    lea_valid: u16;
+    lea_base: [16]u8;
+    lea_disp: [16]i32;
+    cmp_valid: bool;
+    cmp_a: u8;
+    cmp_b: u8;
+    jcc_valid: bool;
+    jcc_cc: x64_asm.Cond;
+}
+
+fn peep_state_empty() -> PeepState {
+    return PeepState.{
+        zero32_regs: 0_u16,
+        zero8_regs: 0_u16,
+        spill_valid: 0_u16,
+        spill_off: [0_i32; 16],
+        lea_valid: 0_u16,
+        lea_base: [0_u8; 16],
+        lea_disp: [0_i32; 16],
+        cmp_valid: false,
+        cmp_a: mach_ir.PHYS_NONE,
+        cmp_b: mach_ir.PHYS_NONE,
+        jcc_valid: false,
+        jcc_cc: .E,
+    };
+}
+
+fn peep_inval_lea_regs(st: *mut PeepState, wg: u16) {
+    if st.lea_valid == 0_u16 || wg == 0_u16 {
+        return;
+    }
+    st.lea_valid = st.lea_valid & (~wg);
+    var r: u8 = 0_u8;
+    while r < 16_u8 {
+        let b = mach_ir.phys_bit(r);
+        if (st.lea_valid & b) != 0_u16 {
+            let bp = st.lea_base[r.widen.[usize]()];
+            if bp < 16_u8 && (wg & mach_ir.phys_bit(bp)) != 0_u16 {
+                st.lea_valid = st.lea_valid & (~b);
+            }
+        }
+        r = r +% 1_u8;
+    }
+}
+
+fn peep_find_spill_reg(st: *PeepState, disp: i32) -> u8 {
+    if st.spill_valid == 0_u16 {
+        return mach_ir.PHYS_NONE;
+    }
+    var r: u8 = 0_u8;
+    while r < 16_u8 {
+        if (st.spill_valid & mach_ir.phys_bit(r)) != 0_u16 && st.spill_off[r.widen.[usize]()] == disp {
+            return r;
+        }
+        r = r +% 1_u8;
+    }
+    return mach_ir.PHYS_NONE;
+}
+
+fn peep_inval_spill_slot(st: *mut PeepState, disp: i32, span_bytes: i32) {
+    if st.spill_valid == 0_u16 {
+        return;
+    }
+    var r: u8 = 0_u8;
+    while r < 16_u8 {
+        let b = mach_ir.phys_bit(r);
+        if (st.spill_valid & b) != 0_u16 {
+            let o = st.spill_off[r.widen.[usize]()];
+            if o < disp +% span_bytes && o +% 8_i32 > disp {
+                st.spill_valid = st.spill_valid & (~b);
+            }
+        }
+        r = r +% 1_u8;
+    }
+}
+
+fn op_ends_no_fallthrough(op: mach_ir.MachOp) -> bool {
+    return op == .Jmp || op == .Ret || op == .Ud2 || op == .Iretq || op == .JmpTable;
+}
+
+fn peephole_block(
+    alloc: *mut AllocCap,
+    insts: *[mach_ir.MachInst],
+    next_lbl: u32,
+    uses_ymm: bool,
+    first_spill_off: i32,
+    st: *mut PeepState,
+    out: *mut col.DynBuf[mach_ir.MachInst],
+) -> !OutOfMemory {
+    let n = insts.len;
+    if n == 0_usize {
+        return;
+    }
+
+    // Compute backward flags_live per instruction so folding MovImm 0 -> Xor32 NEVER clobbers live flags!
+    var flags_live_after = try col.DynBuf.[u8].init(alloc, n);
+    errdefer flags_live_after.destroy(alloc);
+    var fi: usize = 0_usize;
+    while fi < n {
+        try flags_live_after.push(alloc, 0_u8);
+        fi = fi +% 1_usize;
+    }
+    var live_f = false;
+    var bi = n;
+    let fl_mut = flags_live_after.as_mut_slice();
+    while bi > 0_usize {
+        bi = bi - 1_usize;
+        if bi < fl_mut.len {
+            fl_mut[bi] = if live_f { 1_u8 } else { 0_u8 };
+        }
+        let op = insts[bi].op;
+        if op_writes_flags(op) {
+            live_f = false;
+        }
+        if op_reads_flags(op) {
+            live_f = true;
+        }
+    }
+
+    let fl_ro = flags_live_after.as_slice();
+    let blk_out_start = out.len();
+    var i: usize = 0_usize;
+    while i < insts.len {
+        var cur = insts[i];
+        let fl_after = i < fl_ro.len && fl_ro[i] != 0_u8;
+
+        // 1. Drop redundant self-moves (`Mov r, r`, `Copy r, r`, `VMovVecReg x, x`)
+        if is_self_noop_move(&cur, uses_ymm) {
+            i = i +% 1_usize;
+            continue;
+        }
+
+        // 1a. Drop duplicate `Lea dst, [base + disp]` / duplicate `Cmp a, b` / guaranteed-not-taken duplicate `Jcc`
+        if cur.op == .Lea && cur.mem.kind == .BaseDisp && cur.dst_phys < 16_u8 && cur.mem.base_phys < 16_u8 {
+            let db_lea = mach_ir.phys_bit(cur.dst_phys);
+            if (st.lea_valid & db_lea) != 0_u16
+                && st.lea_base[cur.dst_phys.widen.[usize]()] == cur.mem.base_phys
+                && st.lea_disp[cur.dst_phys.widen.[usize]()] == cur.mem.disp
+            {
+                i = i +% 1_usize;
+                continue;
+            }
+        }
+        if cur.op == .Cmp && st.cmp_valid && cur.src0_phys == st.cmp_a && cur.src1_phys == st.cmp_b {
+            i = i +% 1_usize;
+            continue;
+        }
+        if cur.op == .Jcc && st.jcc_valid && cur.cc == st.jcc_cc {
+            i = i +% 1_usize;
+            continue;
+        }
+
+        // 1b. Drop redundant zero-extend (`Extend` unsigned 4B / 1B or self `Mov32`) when `r` is already zero-extended!
+        if cur.op == .Mov32 && cur.dst_phys < 16_u8 && cur.dst_phys == cur.src0_phys
+            && (st.zero32_regs & mach_ir.phys_bit(cur.dst_phys)) != 0_u16
+        {
+            i = i +% 1_usize;
+            continue;
+        }
+        if cur.op == .Extend && !cur.flag0 && cur.dst_phys < 16_u8 && cur.dst_phys == cur.src0_phys {
+            if cur.size_bytes == 4_u8 && (st.zero32_regs & mach_ir.phys_bit(cur.dst_phys)) != 0_u16 {
+                i = i +% 1_usize;
+                continue;
+            }
+            if cur.size_bytes == 1_u8 && (st.zero8_regs & mach_ir.phys_bit(cur.dst_phys)) != 0_u16 {
+                i = i +% 1_usize;
+                continue;
+            }
+        }
+
+        // 1c. Pure regalloc spill-slot register cache (`mem.disp < first_spill_off`, never address-taken!)
+        //     Eliminates repeated `mov -0x978(%rbp), %r10` reloads inside a block and across 1-pred fallthroughs!
+        if first_spill_off <= 0_i32 && cur.mem.kind == .StackSlot && cur.mem.disp < first_spill_off {
+            if cur.op == .Load && cur.size_bytes == 8_u8 && !cur.flag0 && cur.dst_phys < 16_u8 {
+                let hit = peep_find_spill_reg(st, cur.mem.disp);
+                if hit == cur.dst_phys {
+                    i = i +% 1_usize;
+                    continue;
+                }
+                if hit < 16_u8 {
+                    var mv = mach_ir.inst_empty(.Mov, cur.span);
+                    mv.dst_phys = cur.dst_phys;
+                    mv.src0_phys = hit;
+                    cur = mv;
+                }
+            } else if cur.op == .Store && cur.size_bytes == 8_u8 && cur.src0_phys < 16_u8 {
+                let sb = mach_ir.phys_bit(cur.src0_phys);
+                if (st.spill_valid & sb) != 0_u16 && st.spill_off[cur.src0_phys.widen.[usize]()] == cur.mem.disp {
+                    i = i +% 1_usize;
+                    continue;
+                }
+            }
+        }
+
+        // 2. Fold `MovImm r, 0` -> `Xor32 r, r` (only when flags are NOT live!)
+        //    Fold `0 < imm <= 0xFFFFFFFF` -> `MovImm32 r, imm` (5 bytes, zero-extends to 64b, preserves flags!)
+        if cur.op == .MovImm && cur.dst_phys < 16_u8 {
+            let uval = cur.imm.bitcast.[u64]();
+            if uval == 0_u64 && !fl_after {
+                cur.op = .Xor32;
+                cur.src0_phys = cur.dst_phys;
+                cur.src1_phys = cur.dst_phys;
+                cur.tied_src0 = true;
+                cur.imm = 0_i64;
+            } else if uval > 0_u64 && uval <= 0xFFFFFFFF_u64 {
+                cur.op = .MovImm32;
+            }
+        }
+
+        // 3. Drop reverse redundant move & immediate store-then-reload against previous emitted inst
+        let os = out.as_slice();
+        if os.len > blk_out_start && os.len > 0_usize {
+            let prev = os[os.len - 1_usize];
+            if is_reverse_move_pair(&prev, &cur) {
+                i = i +% 1_usize;
+                continue;
+            }
+            if is_store_reload_pair(&prev, &cur) {
+                i = i +% 1_usize;
+                continue;
+            }
+            // 4. Redundant `Test r, r` right after flag-setting ALU defining `r`
+            if cur.op == .Test && cur.src0_phys < 16_u8 && cur.src0_phys == cur.src1_phys
+                && prev.dst_phys == cur.src0_phys
+            {
+                var can_elide = false;
+                if is_flag_setting_logic_gpr64(prev.op) {
+                    can_elide = true;
+                } else if is_flag_setting_addsub_gpr64(prev.op) {
+                    let ni = i +% 1_usize;
+                    if ni < insts.len {
+                        let nxt = insts[ni];
+                        if (nxt.op == .Jcc || nxt.op == .Setcc || nxt.op == .Cmov) && cond_only_zf_sf(nxt.cc) {
+                            can_elide = true;
+                        }
+                    }
+                }
+                if can_elide {
+                    i = i +% 1_usize;
+                    continue;
+                }
+            }
+        }
+
+        // 5. Branch inversion & fallthrough Jmp elimination at block tail
+        let tail_i = i +% 1_usize;
+        if cur.op == .Jcc && tail_i < insts.len && i +% 2_usize == insts.len {
+            let tail = insts[tail_i];
+            if tail.op == .Jmp && next_lbl != mach_ir.LABEL_NONE {
+                if cur.mem.label == next_lbl && tail.mem.label != next_lbl {
+                    // `Jcc L_next; Jmp L_else` -> `Jcc(invert(cc)) L_else`!
+                    cur.cc = invert_cond(cur.cc);
+                    cur.mem.label = tail.mem.label;
+                    st.jcc_valid = true;
+                    st.jcc_cc = cur.cc;
+                    try out.push(alloc, cur);
+                    i = i +% 2_usize;
+                    continue;
+                }
+                if tail.mem.label == next_lbl {
+                    // `Jcc L_then; Jmp L_next` -> `Jcc L_then`!
+                    st.jcc_valid = true;
+                    st.jcc_cc = cur.cc;
+                    try out.push(alloc, cur);
+                    i = i +% 2_usize;
+                    continue;
+                }
+            }
+        }
+        if cur.op == .Jmp && i +% 1_usize == n && next_lbl != mach_ir.LABEL_NONE && cur.mem.label == next_lbl {
+            i = i +% 1_usize;
+            continue;
+        }
+
+        // 6. Insert `VZeroUpper` before calls when function executes 256-bit YMM ops
+        if uses_ymm && (cur.op == .CallSym || cur.op == .CallReg) {
+            var already_vzu = false;
+            let os2 = out.as_slice();
+            if os2.len > blk_out_start && os2.len > 0_usize {
+                if os2[os2.len - 1_usize].op == .VZeroUpper {
+                    already_vzu = true;
+                }
+            }
+            if !already_vzu {
+                try out.push(alloc, mach_ir.inst_empty(.VZeroUpper, cur.span));
+            }
+        }
+
+        // Track known-zero-extended 32-bit / 8-bit GPRs AND pure regalloc spill-slot cache
+        let old_z32 = st.zero32_regs;
+        let old_z8 = st.zero8_regs;
+        let old_sv = st.spill_valid;
+        let old_so = st.spill_off;
+        if cur.op == .InlineAsmRaw || cur.op == .RawBytes || cur.op == .CallBarrier {
+            st.zero32_regs = 0_u16;
+            st.zero8_regs = 0_u16;
+            st.spill_valid = 0_u16;
+            st.lea_valid = 0_u16;
+            st.cmp_valid = false;
+            st.jcc_valid = false;
+        } else if mach_ir.op_is_call(cur.op) {
+            st.zero32_regs = 0_u16;
+            st.zero8_regs = 0_u16;
+            let callee_saved_keep: u16 = mach_ir.phys_bit(mach_ir.PHYS_RBX)
+                | mach_ir.phys_bit(mach_ir.PHYS_R12)
+                | mach_ir.phys_bit(mach_ir.PHYS_R13)
+                | mach_ir.phys_bit(mach_ir.PHYS_R14);
+            st.spill_valid = st.spill_valid & callee_saved_keep & (~cur.clobber_gprs);
+            peep_inval_lea_regs(st, ~(callee_saved_keep & (~cur.clobber_gprs)));
+            st.cmp_valid = false;
+            st.jcc_valid = false;
+        } else {
+            let eff = analyze_inst_effects(&cur);
+            var wg = eff.write_gprs;
+            if cur.op == .MemCopy || cur.op == .MemZero {
+                wg = wg | mach_ir.phys_bit(mach_ir.PHYS_RDI) | mach_ir.phys_bit(mach_ir.PHYS_RSI)
+                    | mach_ir.phys_bit(mach_ir.PHYS_RCX) | mach_ir.phys_bit(mach_ir.PHYS_RAX);
+            }
+            st.zero32_regs = st.zero32_regs & (~wg);
+            st.zero8_regs = st.zero8_regs & (~wg);
+            st.spill_valid = st.spill_valid & (~wg);
+            peep_inval_lea_regs(st, wg);
+            if eff.writes_flags {
+                st.cmp_valid = false;
+                st.jcc_valid = false;
+            } else if st.cmp_valid {
+                if (st.cmp_a < 16_u8 && (wg & mach_ir.phys_bit(st.cmp_a)) != 0_u16)
+                    || (st.cmp_b < 16_u8 && (wg & mach_ir.phys_bit(st.cmp_b)) != 0_u16)
+                {
+                    st.cmp_valid = false;
+                }
+            }
+            if cur.op == .Cmp && cur.src0_phys < 16_u8 && cur.src1_phys < 16_u8 {
+                st.cmp_valid = true;
+                st.cmp_a = cur.src0_phys;
+                st.cmp_b = cur.src1_phys;
+                st.jcc_valid = false;
+            } else if cur.op == .Jcc {
+                st.jcc_valid = true;
+                st.jcc_cc = cur.cc;
+            } else if cur.op == .Lea && cur.mem.kind == .BaseDisp
+                && cur.dst_phys < 16_u8 && cur.mem.base_phys < 16_u8
+                && cur.dst_phys != cur.mem.base_phys
+            {
+                let d_idx = cur.dst_phys.widen.[usize]();
+                st.lea_valid = st.lea_valid | mach_ir.phys_bit(cur.dst_phys);
+                st.lea_base[d_idx] = cur.mem.base_phys;
+                st.lea_disp[d_idx] = cur.mem.disp;
+            }
+
+            if first_spill_off <= 0_i32 && op_writes_mem(cur.op) && cur.mem.kind == .StackSlot && cur.mem.disp < first_spill_off {
+                let sbytes: i32 = if cur.size_bytes > 0_u8 { cur.size_bytes.widen.[i32]() } else { 32_i32 };
+                peep_inval_spill_slot(st, cur.mem.disp, sbytes);
+                if cur.op == .Store && cur.size_bytes == 8_u8 && cur.src0_phys < 16_u8 {
+                    st.spill_valid = st.spill_valid | mach_ir.phys_bit(cur.src0_phys);
+                    st.spill_off[cur.src0_phys.widen.[usize]()] = cur.mem.disp;
+                }
+            }
+
+            if mach_ir.op_has_dst(cur.op) && !mach_ir.op_dst_is_vec(cur.op) && cur.dst_phys < 16_u8 {
+                let db = mach_ir.phys_bit(cur.dst_phys);
+                let is_z8 = (cur.op == .Extend && !cur.flag0 && cur.size_bytes == 1_u8)
+                    || cur.op == .Setcc
+                    || (cur.op == .Xor32 && cur.dst_phys == cur.src1_phys)
+                    || (cur.op == .Load && cur.size_bytes == 1_u8 && !cur.flag0)
+                    || ((cur.op == .MovImm32 || cur.op == .MovImm) && cur.imm.bitcast.[u64]() <= 255_u64)
+                    || (cur.op == .AndImm && cur.imm >= 0_i64 && cur.imm <= 255_i64)
+                    || (cur.op == .And32Imm && cur.imm >= 0_i64 && cur.imm <= 255_i64)
+                    || (cur.op == .ShrImm && cur.imm >= 56_i64)
+                    || (cur.op == .Shr32Imm && cur.imm >= 24_i64);
+                let is_alu32 = cur.op == .Add32 || cur.op == .Add32Imm
+                    || cur.op == .Sub32 || cur.op == .Sub32Imm
+                    || cur.op == .Mul32 || cur.op == .Mul32Imm
+                    || cur.op == .And32 || cur.op == .And32Imm
+                    || cur.op == .Or32 || cur.op == .Or32Imm
+                    || cur.op == .Xor32 || cur.op == .Xor32Imm
+                    || cur.op == .Shl32 || cur.op == .Shl32Imm
+                    || cur.op == .Shr32 || cur.op == .Shr32Imm
+                    || cur.op == .Sar32 || cur.op == .Sar32Imm
+                    || cur.op == .Ror32Imm || cur.op == .Neg32 || cur.op == .Not32;
+                let is_z32 = is_z8 || is_alu32
+                    || (cur.op == .Extend && !cur.flag0 && cur.size_bytes <= 4_u8)
+                    || cur.op == .Mov32 || cur.op == .MovImm32 || cur.op == .VPMovMskB
+                    || (cur.op == .Load && cur.size_bytes <= 4_u8 && !cur.flag0)
+                    || (cur.op == .MovImm && cur.imm.bitcast.[u64]() <= 0xFFFFFFFF_u64)
+                    || (cur.op == .AndImm && cur.imm >= 0_i64 && cur.imm <= 0xFFFFFFFF_i64)
+                    || (cur.op == .ShrImm && cur.imm >= 32_i64);
+                if (cur.op == .Mov || cur.op == .Copy) && cur.src0_phys < 16_u8 {
+                    let sb = mach_ir.phys_bit(cur.src0_phys);
+                    if (old_z32 & sb) != 0_u16 { st.zero32_regs = st.zero32_regs | db; }
+                    if (old_z8 & sb) != 0_u16 { st.zero8_regs = st.zero8_regs | db; }
+                    if (old_sv & sb) != 0_u16 {
+                        st.spill_valid = st.spill_valid | db;
+                        st.spill_off[cur.dst_phys.widen.[usize]()] = old_so[cur.src0_phys.widen.[usize]()];
+                    }
+                } else {
+                    if is_z32 { st.zero32_regs = st.zero32_regs | db; }
+                    if is_z8 { st.zero8_regs = st.zero8_regs | db; }
+                    if first_spill_off <= 0_i32 && cur.op == .Load
+                        && cur.mem.kind == .StackSlot && cur.mem.disp < first_spill_off
+                        && cur.size_bytes == 8_u8 && !cur.flag0
+                    {
+                        st.spill_valid = st.spill_valid | db;
+                        st.spill_off[cur.dst_phys.widen.[usize]()] = cur.mem.disp;
+                    }
+                }
+            }
+        }
+
+        try out.push(alloc, cur);
+        i = i +% 1_usize;
+    }
+
+    flags_live_after.destroy(alloc);
+    return;
+}
+
+fn peephole_func(alloc: *mut AllocCap, mf: *mut mach_ir.MachFunc) -> !OutOfMemory {
+    let n_blocks = mf.blocks.len();
+    if n_blocks == 0_usize {
+        return;
+    }
+    var order = try col.DynBuf.[u32].init(alloc, n_blocks);
+    errdefer order.destroy(alloc);
+    try build_emit_order(alloc, mf, &mut order);
+
+    // Map each block_id -> label of next block in emission order (for fallthrough & branch inversion)
+    var next_lbl_of = try col.DynBuf.[u32].init(alloc, n_blocks);
+    errdefer next_lbl_of.destroy(alloc);
+    var pred_cnt = try col.DynBuf.[u32].init(alloc, n_blocks);
+    errdefer pred_cnt.destroy(alloc);
+    var visited = try col.DynBuf.[u8].init(alloc, n_blocks);
+    errdefer visited.destroy(alloc);
+    var max_lbl: u32 = 0_u32;
+    let bs_ro0 = mf.blocks.as_slice();
+    var bi_init: usize = 0_usize;
+    while bi_init < n_blocks {
+        try next_lbl_of.push(alloc, mach_ir.LABEL_NONE);
+        try pred_cnt.push(alloc, 0_u32);
+        try visited.push(alloc, 0_u8);
+        if bi_init < bs_ro0.len && bs_ro0[bi_init].label != mach_ir.LABEL_NONE && bs_ro0[bi_init].label > max_lbl {
+            max_lbl = bs_ro0[bi_init].label;
+        }
+        bi_init = bi_init +% 1_usize;
+    }
+    let lbl_cap = max_lbl.widen.[usize]() +% 1_usize;
+    var lbl_to_bb = try col.DynBuf.[u32].init(alloc, lbl_cap);
+    errdefer lbl_to_bb.destroy(alloc);
+    var li_init: usize = 0_usize;
+    while li_init < lbl_cap {
+        try lbl_to_bb.push(alloc, 0xFFFFFFFF_u32);
+        li_init = li_init +% 1_usize;
+    }
+    let l2b_mut = lbl_to_bb.as_mut_slice();
+    bi_init = 0_usize;
+    while bi_init < bs_ro0.len {
+        let bl = bs_ro0[bi_init].label;
+        if bl != mach_ir.LABEL_NONE && bl.widen.[usize]() < l2b_mut.len {
+            l2b_mut[bl.widen.[usize]()] = bi_init.trunc.[u32]();
+        }
+        bi_init = bi_init +% 1_usize;
+    }
+
+    let ord_s = order.as_slice();
+    let nl_mut = next_lbl_of.as_mut_slice();
+    var oi: usize = 0_usize;
+    while oi < ord_s.len {
+        let nxt_oi = oi +% 1_usize;
+        if nxt_oi >= ord_s.len {
+            break;
+        }
+        let cur_bb = ord_s[oi].widen.[usize]();
+        let nxt_bb = ord_s[nxt_oi].widen.[usize]();
+        if cur_bb < nl_mut.len && nxt_bb < bs_ro0.len {
+            nl_mut[cur_bb] = bs_ro0[nxt_bb].label;
+        }
+        oi = nxt_oi;
+    }
+
+    // Compute conservative incoming edge count per block for safe 1-pred fallthrough state propagation
+    let l2b_ro = lbl_to_bb.as_slice();
+    let pc_mut = pred_cnt.as_mut_slice();
+    let eb_idx = mf.entry_block.widen.[usize]();
+    if eb_idx < pc_mut.len {
+        pc_mut[eb_idx] = 2_u32;
+    }
+    let jts = mf.jump_tables.as_slice();
+    var ji: usize = 0_usize;
+    while ji < jts.len {
+        let dl = jts[ji].default_label;
+        if dl != mach_ir.LABEL_NONE && dl.widen.[usize]() < l2b_ro.len {
+            let tbb = l2b_ro[dl.widen.[usize]()].widen.[usize]();
+            if tbb < pc_mut.len { pc_mut[tbb] = 2_u32; }
+        }
+        let ents = mf.jtable_slice(jts[ji].entries);
+        var ei: usize = 0_usize;
+        while ei < ents.len {
+            let tl = ents[ei];
+            if tl != mach_ir.LABEL_NONE && tl.widen.[usize]() < l2b_ro.len {
+                let tbb = l2b_ro[tl.widen.[usize]()].widen.[usize]();
+                if tbb < pc_mut.len { pc_mut[tbb] = 2_u32; }
+            }
+            ei = ei +% 1_usize;
+        }
+        ji = ji +% 1_usize;
+    }
+    oi = 0_usize;
+    while oi < ord_s.len {
+        let cur_bb = ord_s[oi].widen.[usize]();
+        let b_insts = mf.block_insts(cur_bb.trunc.[u32]());
+        var ki: usize = 0_usize;
+        while ki < b_insts.len {
+            let ins = b_insts[ki];
+            if (ins.op == .Jmp || ins.op == .Jcc) && ins.mem.label != mach_ir.LABEL_NONE {
+                let lu = ins.mem.label.widen.[usize]();
+                if lu < l2b_ro.len {
+                    let tbb = l2b_ro[lu].widen.[usize]();
+                    if tbb < pc_mut.len && pc_mut[tbb] < 2_u32 {
+                        pc_mut[tbb] = pc_mut[tbb] +% 1_u32;
+                    }
+                }
+            }
+            ki = ki +% 1_usize;
+        }
+        let nxt_oi = oi +% 1_usize;
+        if nxt_oi < ord_s.len {
+            let falls = b_insts.len == 0_usize || !op_ends_no_fallthrough(b_insts[b_insts.len - 1_usize].op);
+            if falls {
+                let nxt_bb = ord_s[nxt_oi].widen.[usize]();
+                if nxt_bb < pc_mut.len && pc_mut[nxt_bb] < 2_u32 {
+                    pc_mut[nxt_bb] = pc_mut[nxt_bb] +% 1_u32;
+                }
+            }
+        }
+        oi = oi +% 1_usize;
+    }
+
+    let old_cnt = mf.insts.len();
+    var new_insts = try col.DynBuf.[mach_ir.MachInst].init(
+        alloc,
+        if old_cnt > 16_usize { old_cnt +% 8_usize } else { 32_usize },
+    );
+    errdefer new_insts.destroy(alloc);
+
+    let nl_ro = next_lbl_of.as_slice();
+    let pc_ro = pred_cnt.as_slice();
+    var st = peep_state_empty();
+    oi = 0_usize;
+    while oi < ord_s.len {
+        let cur_bb = ord_s[oi].widen.[usize]();
+        let new_start = new_insts.len().trunc.[u32]();
+        let b_insts = mf.block_insts(cur_bb.trunc.[u32]());
+        let next_lbl = if cur_bb < nl_ro.len { nl_ro[cur_bb] } else { mach_ir.LABEL_NONE };
+        try peephole_block(alloc, b_insts, next_lbl, mf.uses_ymm, mf.first_spill_off, &mut st, &mut new_insts);
+        let new_len = new_insts.len().trunc.[u32]() -% new_start;
+        let bs = mf.blocks.as_mut_slice();
+        if cur_bb < bs.len {
+            bs[cur_bb].insts = ast.range_new(new_start, new_len);
+        }
+        let vis_mut = visited.as_mut_slice();
+        if cur_bb < vis_mut.len {
+            vis_mut[cur_bb] = 1_u8;
+        }
+        var carry_next = false;
+        let nxt_oi = oi +% 1_usize;
+        if nxt_oi < ord_s.len {
+            let nxt_bb = ord_s[nxt_oi].widen.[usize]();
+            if nxt_bb < pc_ro.len && pc_ro[nxt_bb] == 1_u32 {
+                if new_len == 0_u32 {
+                    carry_next = true;
+                } else {
+                    let ni_ro = new_insts.as_slice();
+                    if ni_ro.len > 0_usize && !op_ends_no_fallthrough(ni_ro[ni_ro.len - 1_usize].op) {
+                        carry_next = true;
+                    }
+                }
+            }
+        }
+        if !carry_next {
+            st = peep_state_empty();
+        }
+        oi = oi +% 1_usize;
+    }
+
+    // Clear unreachable blocks not in emission order so their ranges never dangle
+    let vis_ro = visited.as_slice();
+    let bs_fin = mf.blocks.as_mut_slice();
+    var ubi: usize = 0_usize;
+    while ubi < n_blocks && ubi < vis_ro.len && ubi < bs_fin.len {
+        if vis_ro[ubi] == 0_u8 {
+            bs_fin[ubi].insts = ast.range_empty();
+        }
+        ubi = ubi +% 1_usize;
+    }
+
+    lbl_to_bb.destroy(alloc);
+    visited.destroy(alloc);
+    pred_cnt.destroy(alloc);
+    next_lbl_of.destroy(alloc);
+    order.destroy(alloc);
+    mf.replace_insts(alloc, new_insts);
+    return;
+}
+
+/// Dead spill-store elimination: after store-to-load forwarding in peephole_block,
+/// any pure regalloc spill slot (`mem.disp < mf.first_spill_off`, never address-taken)
+/// that is NEVER read by any reachable instruction has all its stores deleted!
+fn eliminate_dead_spill_stores(alloc: *mut AllocCap, mf: *mut mach_ir.MachFunc) -> !OutOfMemory {
+    let n_blocks = mf.blocks.len();
+    if n_blocks == 0_usize || mf.first_spill_off > 0_i32 {
+        return;
+    }
+    let fso = mf.first_spill_off;
+    var read_offs = try col.DynBuf.[i32].init(alloc, 32_usize);
+    errdefer read_offs.destroy(alloc);
+    var has_any_spill_store = false;
+    let rpo_s = mf.rpo.as_slice();
+    var ri: usize = 0_usize;
+    while ri < rpo_s.len {
+        let bb = rpo_s[ri];
+        let b_insts = mf.block_insts(bb);
+        var ki: usize = 0_usize;
+        while ki < b_insts.len {
+            let ins = b_insts[ki];
+            if ins.mem.kind == .StackSlot && ins.mem.disp < fso {
+                if ins.op == .Store || ins.op == .StoreImm || ins.op == .VMovUpsStore {
+                    has_any_spill_store = true;
+                } else {
+                    let d = ins.mem.disp;
+                    let ro_s = read_offs.as_slice();
+                    var dup = false;
+                    var di: usize = 0_usize;
+                    while di < ro_s.len {
+                        if ro_s[di] == d {
+                            dup = true;
+                            break;
+                        }
+                        di = di +% 1_usize;
+                    }
+                    if !dup {
+                        try read_offs.push(alloc, d);
+                    }
+                }
+            }
+            ki = ki +% 1_usize;
+        }
+        ri = ri +% 1_usize;
+    }
+    if has_any_spill_store {
+        var clean_insts = try col.DynBuf.[mach_ir.MachInst].init(alloc, mf.insts.len() +% 8_usize);
+        errdefer clean_insts.destroy(alloc);
+        let ro_fin = read_offs.as_slice();
+        var b2: usize = 0_usize;
+        while b2 < n_blocks {
+            let ns2 = clean_insts.len().trunc.[u32]();
+            let bi_insts = mf.block_insts(b2.trunc.[u32]());
+            var k2: usize = 0_usize;
+            while k2 < bi_insts.len {
+                let ins = bi_insts[k2];
+                var kill = false;
+                if (ins.op == .Store || ins.op == .VMovUpsStore)
+                    && ins.mem.kind == .StackSlot
+                    && ins.mem.disp < fso
+                {
+                    var is_read = false;
+                    var di: usize = 0_usize;
+                    while di < ro_fin.len {
+                        if ro_fin[di] == ins.mem.disp {
+                            is_read = true;
+                            break;
+                        }
+                        di = di +% 1_usize;
+                    }
+                    if !is_read {
+                        kill = true;
+                    }
+                }
+                if !kill {
+                    try clean_insts.push(alloc, ins);
+                }
+                k2 = k2 +% 1_usize;
+            }
+            let nl2 = clean_insts.len().trunc.[u32]() -% ns2;
+            let bs2 = mf.blocks.as_mut_slice();
+            if b2 < bs2.len {
+                bs2[b2].insts = ast.range_new(ns2, nl2);
+            }
+            b2 = b2 +% 1_usize;
+        }
+        mf.replace_insts(alloc, clean_insts);
+    }
+    read_offs.destroy(alloc);
+    return;
+}
+
+// ============================================================================
+// Section 4: Local Instruction Scheduler (Hot Loops, Critical-Path + Load Hoist)
+// ============================================================================
+
+const SCHED_MAX_REGION: usize = 96_usize;
+
+fn effects_depend(a: InstEffects, b: InstEffects) -> bool {
+    if (a.write_gprs & (b.read_gprs | b.write_gprs)) != 0_u16 {
+        return true;
+    }
+    if (a.read_gprs & b.write_gprs) != 0_u16 {
+        return true;
+    }
+    if (a.write_xmms & (b.read_xmms | b.write_xmms)) != 0_u16 {
+        return true;
+    }
+    if (a.read_xmms & b.write_xmms) != 0_u16 {
+        return true;
+    }
+    if (a.writes_flags && (b.reads_flags || b.writes_flags)) || (a.reads_flags && b.writes_flags) {
+        return true;
+    }
+    if (a.writes_mem && (b.reads_mem || b.writes_mem)) || (a.reads_mem && b.writes_mem) {
+        return true;
+    }
+    return false;
+}
+
+fn schedule_region(
+    alloc: *mut AllocCap,
+    region: *[mach_ir.MachInst],
+    out: *mut col.DynBuf[mach_ir.MachInst],
+) -> !OutOfMemory {
+    let m = region.len;
+    if m < 3_usize || m > SCHED_MAX_REGION {
+        try out.push_slice(alloc, region);
+        return;
+    }
+
+    var effs = try col.DynBuf.[InstEffects].init(alloc, m);
+    errdefer effs.destroy(alloc);
+    var i: usize = 0_usize;
+    while i < m {
+        try effs.push(alloc, analyze_inst_effects(&region[i]));
+        i = i +% 1_usize;
+    }
+    let es = effs.as_slice();
+
+    // 128-bit adjacency bitmasks per node (2 * u64 = 128 bits >= SCHED_MAX_REGION)
+    var succ_lo: [96]u64 = [0_u64; 96];
+    var succ_hi: [96]u64 = [0_u64; 96];
+    var pred_cnt: [96]u16 = [0_u16; 96];
+
+    i = 0_usize;
+    while i < m && i < es.len {
+        var j = i +% 1_usize;
+        while j < m && j < es.len {
+            if effects_depend(es[i], es[j]) {
+                if j < 64_usize {
+                    succ_lo[i] = succ_lo[i] | (1_u64 <<% j.widen.[u64]());
+                } else {
+                    succ_hi[i] = succ_hi[i] | (1_u64 <<% (j - 64_usize).widen.[u64]());
+                }
+                pred_cnt[j] = pred_cnt[j] +% 1_u16;
+            }
+            j = j +% 1_usize;
+        }
+        i = i +% 1_usize;
+    }
+
+    // Bottom-up critical-path heights
+    var cp: [96]u32 = [0_u32; 96];
+    var bi = m;
+    while bi > 0_usize {
+        bi = bi - 1_usize;
+        var max_child: u32 = 0_u32;
+        var j = bi +% 1_usize;
+        while j < m {
+            let has_edge = if j < 64_usize {
+                (succ_lo[bi] & (1_u64 <<% j.widen.[u64]())) != 0_u64
+            } else {
+                (succ_hi[bi] & (1_u64 <<% (j - 64_usize).widen.[u64]())) != 0_u64
+            };
+            if has_edge && cp[j] > max_child {
+                max_child = cp[j];
+            }
+            j = j +% 1_usize;
+        }
+        if bi < es.len {
+            cp[bi] = es[bi].latency.widen.[u32]() +% max_child;
+        }
+    }
+
+    // List scheduling: pick ready node with earliest readiness, highest critical path, load-hoist tiebreak
+    var scheduled: [96]u8 = [0_u8; 96];
+    var ready_cyc: [96]u32 = [0_u32; 96];
+    var cur_cyc: u32 = 0_u32;
+    var emitted: usize = 0_usize;
+
+    while emitted < m {
+        var best: usize = m;
+        var best_ready_now = false;
+        var best_prio: u32 = 0_u32;
+        var k: usize = 0_usize;
+        while k < m && k < es.len {
+            if scheduled[k] == 0_u8 && pred_cnt[k] == 0_u16 {
+                let is_now = ready_cyc[k] <= cur_cyc;
+                let load_bonus: u32 = if es[k].reads_mem && !es[k].writes_mem { 2_u32 } else { 0_u32 };
+                let prio = (cp[k] *% 4_u32) +% load_bonus;
+                let better = if best == m {
+                    true
+                } else if is_now && !best_ready_now {
+                    true
+                } else if is_now == best_ready_now && prio > best_prio {
+                    true
+                } else {
+                    false
+                };
+                if better {
+                    best = k;
+                    best_ready_now = is_now;
+                    best_prio = prio;
+                }
+            }
+            k = k +% 1_usize;
+        }
+        if best >= m || best >= region.len || best >= es.len {
+            // Fallback safety: emit any remaining unscheduled in original order
+            var rem: usize = 0_usize;
+            while rem < m && rem < region.len {
+                if scheduled[rem] == 0_u8 {
+                    try out.push(alloc, region[rem]);
+                    scheduled[rem] = 1_u8;
+                }
+                rem = rem +% 1_usize;
+            }
+            break;
+        }
+
+        scheduled[best] = 1_u8;
+        if ready_cyc[best] > cur_cyc {
+            cur_cyc = ready_cyc[best];
+        }
+        try out.push(alloc, region[best]);
+        let done_cyc = cur_cyc +% es[best].latency.widen.[u32]();
+
+        var j = best +% 1_usize;
+        while j < m {
+            let has_edge = if j < 64_usize {
+                (succ_lo[best] & (1_u64 <<% j.widen.[u64]())) != 0_u64
+            } else {
+                (succ_hi[best] & (1_u64 <<% (j - 64_usize).widen.[u64]())) != 0_u64
+            };
+            if has_edge {
+                if pred_cnt[j] > 0_u16 {
+                    pred_cnt[j] = pred_cnt[j] -% 1_u16;
+                }
+                if done_cyc > ready_cyc[j] {
+                    ready_cyc[j] = done_cyc;
+                }
+            }
+            j = j +% 1_usize;
+        }
+        cur_cyc = cur_cyc +% 1_u32;
+        emitted = emitted +% 1_usize;
+    }
+
+    effs.destroy(alloc);
+    return;
+}
+
+fn schedule_func(alloc: *mut AllocCap, mf: *mut mach_ir.MachFunc) -> !OutOfMemory {
+    let n_blocks = mf.blocks.len();
+    if n_blocks == 0_usize {
+        return;
+    }
+    var any_hot = false;
+    let bs_chk = mf.blocks.as_slice();
+    var bi_chk: usize = 0_usize;
+    while bi_chk < bs_chk.len {
+        let len_u = bs_chk[bi_chk].insts.len.widen.[usize]();
+        if bs_chk[bi_chk].loop_depth > 0_u8 && len_u >= 4_usize && len_u <= SCHED_MAX_REGION {
+            any_hot = true;
+            break;
+        }
+        bi_chk = bi_chk +% 1_usize;
+    }
+    if !any_hot {
+        return;
+    }
+
+    let old_cnt = mf.insts.len();
+    var new_insts = try col.DynBuf.[mach_ir.MachInst].init(
+        alloc,
+        if old_cnt > 16_usize { old_cnt } else { 32_usize },
+    );
+    errdefer new_insts.destroy(alloc);
+
+    var bi: usize = 0_usize;
+    while bi < n_blocks {
+        let new_start = new_insts.len().trunc.[u32]();
+        let bs_cur = mf.blocks.as_slice();
+        let depth = if bi < bs_cur.len { bs_cur[bi].loop_depth } else { 0_u8 };
+        let b_insts = mf.block_insts(bi.trunc.[u32]());
+        if depth == 0_u8 || b_insts.len < 4_usize || b_insts.len > SCHED_MAX_REGION {
+            try new_insts.push_slice(alloc, b_insts);
+        } else {
+            var pos: usize = 0_usize;
+            while pos < b_insts.len {
+                let eff0 = analyze_inst_effects(&b_insts[pos]);
+                if eff0.is_barrier {
+                    try new_insts.push(alloc, b_insts[pos]);
+                    pos = pos +% 1_usize;
+                    continue;
+                }
+                var end = pos +% 1_usize;
+                while end < b_insts.len && (end - pos) < SCHED_MAX_REGION {
+                    let eff_e = analyze_inst_effects(&b_insts[end]);
+                    if eff_e.is_barrier {
+                        break;
+                    }
+                    end = end +% 1_usize;
+                }
+                let sub = b_insts.sub(pos, end) catch {
+                    try new_insts.push(alloc, b_insts[pos]);
+                    pos = pos +% 1_usize;
+                    continue;
+                };
+                try schedule_region(alloc, sub, &mut new_insts);
+                pos = end;
+            }
+        }
+        let new_len = new_insts.len().trunc.[u32]() -% new_start;
+        let bs = mf.blocks.as_mut_slice();
+        if bi < bs.len {
+            bs[bi].insts = ast.range_new(new_start, new_len);
+        }
+        bi = bi +% 1_usize;
+    }
+
+    mf.replace_insts(alloc, new_insts);
+    return;
+}
+
+pub fn run_post_ra_passes(
+    alloc: *mut AllocCap,
+    mf: *mut mach_ir.MachFunc,
+    cfg: eir.EirOptConfig,
+) -> !OutOfMemory {
+    try peephole_func(alloc, mf);
+    try eliminate_dead_spill_stores(alloc, mf);
+    if cfg.opt_level >= 2_u8 {
+        try schedule_func(alloc, mf);
+        try peephole_func(alloc, mf);
+        try eliminate_dead_spill_stores(alloc, mf);
+    }
+    return;
+}
+
+// ============================================================================
+// Section 5: Prologue, Flag-Preserving Epilogue & X64Buf Instruction Emitter
+// ============================================================================
+
+struct FrameLayout {
+    needs_frame: bool;
+    local_bytes: usize;
+    total_sub: usize;
+    n_saved: usize;
+    saved_regs: [5]u8;
+}
+
+fn func_references_rbp(mf: *mach_ir.MachFunc) -> bool {
+    let insts = mf.insts.as_slice();
+    var i: usize = 0_usize;
+    while i < insts.len {
+        let inst = insts[i];
+        if inst.mem.kind == .StackSlot {
+            return true;
+        }
+        if (inst.mem.kind == .BaseDisp || inst.mem.kind == .Sib) && inst.mem.base_phys == mach_ir.PHYS_RBP {
+            return true;
+        }
+        if inst.mem.kind == .Sib && inst.mem.idx_phys == mach_ir.PHYS_RBP {
+            return true;
+        }
+        if inst.src0_phys == mach_ir.PHYS_RBP || inst.src1_phys == mach_ir.PHYS_RBP {
+            return true;
+        }
+        i = i +% 1_usize;
+    }
+    return false;
+}
+
+fn plan_frame_layout(mf: *mach_ir.MachFunc) -> FrameLayout {
+    var saved: [5]u8 = [0_u8; 5];
+    var n_saved: usize = 0_usize;
+    let cands: [5]u8 = [
+        mach_ir.PHYS_RBX,
+        mach_ir.PHYS_R12,
+        mach_ir.PHYS_R13,
+        mach_ir.PHYS_R14,
+        mach_ir.PHYS_R15,
+    ];
+    var ci: usize = 0_usize;
+    while ci < 5_usize {
+        if (mf.used_callee_gprs & mach_ir.phys_bit(cands[ci])) != 0_u16 && n_saved < 5_usize {
+            saved[n_saved] = cands[ci];
+            n_saved = n_saved +% 1_usize;
+        }
+        ci = ci +% 1_usize;
+    }
+    let uses_rbp = func_references_rbp(mf);
+    let local_bytes = align_up_usize(mf.frame_cursor, 8_usize);
+    let needs_frame = mf.has_calls || !mf.is_leaf || local_bytes > 0_usize || n_saved > 0_usize || uses_rbp;
+    let saved_bytes = n_saved *% 8_usize;
+    let total_sub = if local_bytes > 0_usize {
+        align_up_usize(local_bytes +% saved_bytes, 16_usize)
+    } else if mf.has_calls && (n_saved & 1_usize) == 1_usize {
+        8_usize
+    } else {
+        0_usize
+    };
+    return FrameLayout.{
+        needs_frame: needs_frame,
+        local_bytes: local_bytes,
+        total_sub: total_sub,
+        n_saved: n_saved,
+        saved_regs: saved,
+    };
+}
+
+fn emit_prologue(
+    alloc: *mut AllocCap,
+    buf: *mut x64_asm.X64Buf,
+    fl: *FrameLayout,
+) -> !OutOfMemory {
+    if !fl.needs_frame {
+        return;
+    }
+    try buf.push(alloc, .Rbp);
+    try buf.mov_rr(alloc, .Rbp, .Rsp);
+    if fl.local_bytes == 0_usize {
+        var si: usize = 0_usize;
+        while si < fl.n_saved && si < 5_usize {
+            try buf.push(alloc, mach_ir.phys_to_reg(fl.saved_regs[si]));
+            si = si +% 1_usize;
+        }
+        if fl.total_sub > 0_usize {
+            try buf.sub_ri32(alloc, .Rsp, fl.total_sub.trunc.[i32]());
+        }
+        return;
+    }
+    if fl.total_sub > 0_usize {
+        try buf.sub_ri32(alloc, .Rsp, fl.total_sub.trunc.[i32]());
+    }
+    var si: usize = 0_usize;
+    while si < fl.n_saved && si < 5_usize {
+        let off = 0_i32 -% (fl.local_bytes +% ((si +% 1_usize) *% 8_usize)).trunc.[i32]();
+        try buf.store_mem(alloc, .Rbp, off, mach_ir.phys_to_reg(fl.saved_regs[si]), 8_usize);
+        si = si +% 1_usize;
+    }
+    return;
+}
+
+/// Emits epilogue WITHOUT modifying RFLAGS (preserving CF for ErrorUnion returns!).
+fn emit_epilogue_preserving_flags(
+    alloc: *mut AllocCap,
+    buf: *mut x64_asm.X64Buf,
+    fl: *FrameLayout,
+) -> !OutOfMemory {
+    if !fl.needs_frame {
+        return;
+    }
+    if fl.local_bytes == 0_usize {
+        if fl.total_sub > 0_usize {
+            let saved_bytes = (fl.n_saved *% 8_usize).trunc.[i32]();
+            try buf.lea_mem(alloc, .Rsp, .Rbp, 0_i32 -% saved_bytes);
+        }
+        var si = if fl.n_saved <= 5_usize { fl.n_saved } else { 5_usize };
+        while si > 0_usize {
+            si = si - 1_usize;
+            try buf.pop(alloc, mach_ir.phys_to_reg(fl.saved_regs[si]));
+        }
+        try buf.pop(alloc, .Rbp);
+        return;
+    }
+    var si: usize = 0_usize;
+    while si < fl.n_saved && si < 5_usize {
+        let off = 0_i32 -% (fl.local_bytes +% ((si +% 1_usize) *% 8_usize)).trunc.[i32]();
+        try buf.load_mem(alloc, mach_ir.phys_to_reg(fl.saved_regs[si]), .Rbp, off, 8_usize, false);
+        si = si +% 1_usize;
+    }
+    try buf.mov_rr(alloc, .Rsp, .Rbp);
+    try buf.pop(alloc, .Rbp);
+    return;
+}
+
+fn map_label(lbl_map: *[u32], lbl: u32) -> u32 {
+    let idx = lbl.widen.[usize]();
+    if idx < lbl_map.len {
+        return lbl_map[idx];
+    }
+    return lbl;
+}
+
+fn mem_base_reg(mem: *mach_ir.MemAddr) -> x64_asm.Reg {
+    if mem.kind == .StackSlot {
+        return .Rbp;
+    }
+    return mach_ir.phys_to_reg(mem.base_phys);
+}
+
+fn emit_vec_load_mem(
+    alloc: *mut AllocCap,
+    buf: *mut x64_asm.X64Buf,
+    op: mach_ir.MachOp,
+    dst: x64_asm.Xmm,
+    mem: *mach_ir.MemAddr,
+    l256: bool,
+) -> !OutOfMemory {
+    if mem.kind == .RipSym {
+        try buf.lea_rip_sym(alloc, .R10, mem.sym, mem.disp.widen.[i64]());
+        match op {
+            .VMovSSLoad => { try buf.vmovss_load(alloc, dst, .R10, 0_i32); }
+            .VMovSDLoad => { try buf.vmovsd_load(alloc, dst, .R10, 0_i32); }
+            .VMovUpsLoad => { try buf.vmovups_load(alloc, dst, .R10, 0_i32, l256); }
+            .VMovApsLoad => { try buf.vmovaps_load(alloc, dst, .R10, 0_i32, l256); }
+            .VMovDquLoad => { try buf.vmovdqu_load(alloc, dst, .R10, 0_i32, l256); }
+            _ => {}
+        }
+        return;
+    }
+    let base = mem_base_reg(mem);
+    if mem.kind == .Sib {
+        let idx = mach_ir.phys_to_reg(mem.idx_phys);
+        match op {
+            .VMovSSLoad => { try buf.vmovss_load_sib(alloc, dst, base, idx, mem.scale, mem.disp); }
+            .VMovSDLoad => { try buf.vmovsd_load_sib(alloc, dst, base, idx, mem.scale, mem.disp); }
+            .VMovUpsLoad => { try buf.vmovups_load_sib(alloc, dst, base, idx, mem.scale, mem.disp, l256); }
+            .VMovApsLoad => { try buf.vmovaps_load_sib(alloc, dst, base, idx, mem.scale, mem.disp, l256); }
+            .VMovDquLoad => { try buf.vmovdqu_load_sib(alloc, dst, base, idx, mem.scale, mem.disp, l256); }
+            _ => {}
+        }
+        return;
+    }
+    match op {
+        .VMovSSLoad => { try buf.vmovss_load(alloc, dst, base, mem.disp); }
+        .VMovSDLoad => { try buf.vmovsd_load(alloc, dst, base, mem.disp); }
+        .VMovUpsLoad => { try buf.vmovups_load(alloc, dst, base, mem.disp, l256); }
+        .VMovApsLoad => { try buf.vmovaps_load(alloc, dst, base, mem.disp, l256); }
+        .VMovDquLoad => { try buf.vmovdqu_load(alloc, dst, base, mem.disp, l256); }
+        _ => {}
+    }
+    return;
+}
+
+fn emit_vec_store_mem(
+    alloc: *mut AllocCap,
+    buf: *mut x64_asm.X64Buf,
+    op: mach_ir.MachOp,
+    mem: *mach_ir.MemAddr,
+    src: x64_asm.Xmm,
+    l256: bool,
+) -> !OutOfMemory {
+    let base = mem_base_reg(mem);
+    if mem.kind == .Sib {
+        let idx = mach_ir.phys_to_reg(mem.idx_phys);
+        match op {
+            .VMovSSStore => { try buf.vmovss_store_sib(alloc, base, idx, mem.scale, mem.disp, src); }
+            .VMovSDStore => { try buf.vmovsd_store_sib(alloc, base, idx, mem.scale, mem.disp, src); }
+            .VMovUpsStore => { try buf.vmovups_store_sib(alloc, base, idx, mem.scale, mem.disp, src, l256); }
+            .VMovApsStore => { try buf.vmovaps_store_sib(alloc, base, idx, mem.scale, mem.disp, src, l256); }
+            .VMovDquStore => { try buf.vmovdqu_store_sib(alloc, base, idx, mem.scale, mem.disp, src, l256); }
+            _ => {}
+        }
+        return;
+    }
+    match op {
+        .VMovSSStore => { try buf.vmovss_store(alloc, base, mem.disp, src); }
+        .VMovSDStore => { try buf.vmovsd_store(alloc, base, mem.disp, src); }
+        .VMovUpsStore => { try buf.vmovups_store(alloc, base, mem.disp, src, l256); }
+        .VMovApsStore => { try buf.vmovaps_store(alloc, base, mem.disp, src, l256); }
+        .VMovDquStore => { try buf.vmovdqu_store(alloc, base, mem.disp, src, l256); }
+        _ => {}
+    }
+    return;
+}
+
+fn emit_gpr_inst(
+    alloc: *mut AllocCap,
+    buf: *mut x64_asm.X64Buf,
+    mf: *mach_ir.MachFunc,
+    fl: *FrameLayout,
+    lbl_map: *[u32],
+    jt_labels: *[u32],
+    inst: *mach_ir.MachInst,
+) -> !OutOfMemory {
+    let d = mach_ir.phys_to_reg(inst.dst_phys);
+    let s0 = mach_ir.phys_to_reg(inst.src0_phys);
+    let s1 = mach_ir.phys_to_reg(inst.src1_phys);
+    let sz = if inst.size_bytes == 0_u8 { 8_usize } else { inst.size_bytes.widen.[usize]() };
+    let imm32 = inst.imm.trunc.[i32]();
+    let imm8 = (inst.imm & 0xFF_i64).trunc.[u8]();
+
+    match inst.op {
+        .Mov => { try buf.mov_rr(alloc, d, s0); }
+        .Copy => { try buf.mov_rr(alloc, d, s0); }
+        .Mov32 => { try buf.mov_rr32(alloc, d, s0); }
+        .MovImm => {
+            // Note: mov_ri64(0) emits xor_rr32 which clobbers RFLAGS! Keep MovImm 0 flag-safe!
+            if inst.imm == 0_i64 {
+                try buf.mov_ri32(alloc, d, 0_u32);
+            } else {
+                try buf.mov_ri64(alloc, d, inst.imm.bitcast.[u64]());
+            }
+            _ = 0_u8;
+        }
+        .MovImm32 => { try buf.mov_ri32(alloc, d, inst.imm.bitcast.[u64]().trunc.[u32]()); }
+        .Lea => {
+            match inst.mem.kind {
+                .RipSym => { try buf.lea_rip_sym(alloc, d, inst.mem.sym, inst.mem.disp.widen.[i64]()); }
+                .RipLabel => { try buf.lea_rip_label(alloc, d, map_label(lbl_map, inst.mem.label)); }
+                .Sib => {
+                    if inst.mem.base_phys == mach_ir.PHYS_NONE {
+                        try buf.lea_scale_disp(alloc, d, mach_ir.phys_to_reg(inst.mem.idx_phys), inst.mem.scale, inst.mem.disp);
+                    } else {
+                        try buf.lea_sib(
+                            alloc,
+                            d,
+                            mem_base_reg(&inst.mem),
+                            mach_ir.phys_to_reg(inst.mem.idx_phys),
+                            inst.mem.scale,
+                            inst.mem.disp,
+                        );
+                    }
+                    _ = 0_u8;
+                }
+                _ => { try buf.lea_mem(alloc, d, mem_base_reg(&inst.mem), inst.mem.disp); }
+            }
+            _ = 0_u8;
+        }
+        .Load => {
+            if inst.mem.kind == .RipSym {
+                if sz == 8_usize {
+                    try buf.mov_rip_load(alloc, d, inst.mem.sym, inst.mem.disp.widen.[i64]());
+                } else {
+                    try buf.lea_rip_sym(alloc, .R10, inst.mem.sym, inst.mem.disp.widen.[i64]());
+                    try buf.load_mem(alloc, d, .R10, 0_i32, sz, false);
+                }
+                _ = 0_u8;
+            } else if inst.mem.kind == .Sib {
+                try buf.load_mem_sib(alloc, d, mem_base_reg(&inst.mem), mach_ir.phys_to_reg(inst.mem.idx_phys), inst.mem.scale, inst.mem.disp, sz, false);
+            } else {
+                try buf.load_mem(alloc, d, mem_base_reg(&inst.mem), inst.mem.disp, sz, false);
+            }
+            _ = 0_u8;
+        }
+        .LoadSX => {
+            if inst.mem.kind == .RipSym {
+                try buf.lea_rip_sym(alloc, .R10, inst.mem.sym, inst.mem.disp.widen.[i64]());
+                try buf.load_mem(alloc, d, .R10, 0_i32, sz, true);
+            } else if inst.mem.kind == .Sib {
+                try buf.load_mem_sib(alloc, d, mem_base_reg(&inst.mem), mach_ir.phys_to_reg(inst.mem.idx_phys), inst.mem.scale, inst.mem.disp, sz, true);
+            } else {
+                try buf.load_mem(alloc, d, mem_base_reg(&inst.mem), inst.mem.disp, sz, true);
+            }
+            _ = 0_u8;
+        }
+        .Store => {
+            if inst.mem.kind == .RipSym {
+                try buf.mov_rip_store(alloc, inst.mem.sym, inst.mem.disp.widen.[i64](), s0);
+            } else if inst.mem.kind == .Sib {
+                try buf.store_mem_sib(alloc, mem_base_reg(&inst.mem), mach_ir.phys_to_reg(inst.mem.idx_phys), inst.mem.scale, inst.mem.disp, s0, sz);
+            } else {
+                try buf.store_mem(alloc, mem_base_reg(&inst.mem), inst.mem.disp, s0, sz);
+            }
+            _ = 0_u8;
+        }
+        .StoreImm => {
+            if inst.mem.kind == .Sib {
+                let b = mem_base_reg(&inst.mem);
+                let ix = mach_ir.phys_to_reg(inst.mem.idx_phys);
+                let tmp: x64_asm.Reg = if b != .R10 && ix != .R10 { .R10 } else { .R11 };
+                try buf.mov_ri64(alloc, tmp, inst.imm.bitcast.[u64]());
+                try buf.store_mem_sib(alloc, b, ix, inst.mem.scale, inst.mem.disp, tmp, sz);
+            } else if sz == 4_usize {
+                try buf.store_imm32_mem(alloc, mem_base_reg(&inst.mem), inst.mem.disp, imm32);
+            } else if sz == 8_usize {
+                try buf.store_imm64_sext_mem(alloc, mem_base_reg(&inst.mem), inst.mem.disp, imm32);
+            } else {
+                let b = mem_base_reg(&inst.mem);
+                let tmp: x64_asm.Reg = if b != .R10 { .R10 } else { .R11 };
+                try buf.mov_ri32(alloc, tmp, inst.imm.bitcast.[u64]().trunc.[u32]());
+                try buf.store_mem(alloc, b, inst.mem.disp, tmp, sz);
+            }
+            _ = 0_u8;
+        }
+        .Extend => { try buf.extend_reg(alloc, d, s0, (sz *% 8_usize).trunc.[u8](), inst.flag0); }
+        .Push => { try buf.push(alloc, s0); }
+        .Pop => { try buf.pop(alloc, d); }
+        .MemCopy => {
+            if inst.flag0 {
+                // Branchless overlapping AVX2 memcpy using reserved scratch YMM14/YMM15:
+                // - < 32B: rep movsb
+                // - 32..64B: 32B front + 32B overlapping tail (zero loop, zero tail branch)
+                // - 65..128B: 64B front + 64B overlapping tail (zero loop, zero tail branch)
+                // - > 128B: 128B loop + unconditional 128B overlapping tail (zero tail branch!)
+                let l_lt32 = try buf.new_label(alloc);
+                let l_gt64 = try buf.new_label(alloc);
+                let l_loop128 = try buf.new_label(alloc);
+                let l_done = try buf.new_label(alloc);
+
+                try buf.cmp_ri32(alloc, .Rcx, 32_i32);
+                try buf.jcc_label(alloc, .B, l_lt32);
+                try buf.cmp_ri32(alloc, .Rcx, 64_i32);
+                try buf.jcc_label(alloc, .A, l_gt64);
+                // 32..64 bytes
+                try buf.vmovdqu_load(alloc, .Xmm14, .Rsi, 0_i32, true);
+                try buf.add_rr(alloc, .Rsi, .Rcx);
+                try buf.vmovdqu_load(alloc, .Xmm15, .Rsi, -32_i32, true);
+                try buf.vmovdqu_store(alloc, .Rdi, 0_i32, .Xmm14, true);
+                try buf.add_rr(alloc, .Rdi, .Rcx);
+                try buf.vmovdqu_store(alloc, .Rdi, -32_i32, .Xmm15, true);
+                try buf.jmp_label(alloc, l_done);
+
+                buf.bind_label(l_gt64);
+                try buf.cmp_ri32(alloc, .Rcx, 128_i32);
+                try buf.jcc_label(alloc, .A, l_loop128);
+                // 65..128 bytes
+                try buf.vmovdqu_load(alloc, .Xmm14, .Rsi, 0_i32, true);
+                try buf.vmovdqu_load(alloc, .Xmm15, .Rsi, 32_i32, true);
+                try buf.vmovdqu_store(alloc, .Rdi, 0_i32, .Xmm14, true);
+                try buf.vmovdqu_store(alloc, .Rdi, 32_i32, .Xmm15, true);
+                try buf.add_rr(alloc, .Rsi, .Rcx);
+                try buf.add_rr(alloc, .Rdi, .Rcx);
+                try buf.vmovdqu_load(alloc, .Xmm14, .Rsi, -64_i32, true);
+                try buf.vmovdqu_load(alloc, .Xmm15, .Rsi, -32_i32, true);
+                try buf.vmovdqu_store(alloc, .Rdi, -64_i32, .Xmm14, true);
+                try buf.vmovdqu_store(alloc, .Rdi, -32_i32, .Xmm15, true);
+                try buf.jmp_label(alloc, l_done);
+
+                // > 128 bytes: 128B chunks while rcx > 128, then overlapping 128B tail
+                buf.bind_label(l_loop128);
+                try buf.vmovdqu_load(alloc, .Xmm14, .Rsi, 0_i32, true);
+                try buf.vmovdqu_load(alloc, .Xmm15, .Rsi, 32_i32, true);
+                try buf.vmovdqu_store(alloc, .Rdi, 0_i32, .Xmm14, true);
+                try buf.vmovdqu_store(alloc, .Rdi, 32_i32, .Xmm15, true);
+                try buf.vmovdqu_load(alloc, .Xmm14, .Rsi, 64_i32, true);
+                try buf.vmovdqu_load(alloc, .Xmm15, .Rsi, 96_i32, true);
+                try buf.vmovdqu_store(alloc, .Rdi, 64_i32, .Xmm14, true);
+                try buf.vmovdqu_store(alloc, .Rdi, 96_i32, .Xmm15, true);
+                try buf.add_ri32(alloc, .Rsi, 128_i32);
+                try buf.add_ri32(alloc, .Rdi, 128_i32);
+                try buf.sub_ri32(alloc, .Rcx, 128_i32);
+                try buf.cmp_ri32(alloc, .Rcx, 128_i32);
+                try buf.jcc_label(alloc, .A, l_loop128);
+                try buf.add_rr(alloc, .Rsi, .Rcx);
+                try buf.add_rr(alloc, .Rdi, .Rcx);
+                try buf.vmovdqu_load(alloc, .Xmm14, .Rsi, -128_i32, true);
+                try buf.vmovdqu_load(alloc, .Xmm15, .Rsi, -96_i32, true);
+                try buf.vmovdqu_store(alloc, .Rdi, -128_i32, .Xmm14, true);
+                try buf.vmovdqu_store(alloc, .Rdi, -96_i32, .Xmm15, true);
+                try buf.vmovdqu_load(alloc, .Xmm14, .Rsi, -64_i32, true);
+                try buf.vmovdqu_load(alloc, .Xmm15, .Rsi, -32_i32, true);
+                try buf.vmovdqu_store(alloc, .Rdi, -64_i32, .Xmm14, true);
+                try buf.vmovdqu_store(alloc, .Rdi, -32_i32, .Xmm15, true);
+                try buf.jmp_label(alloc, l_done);
+
+                buf.bind_label(l_lt32);
+                try buf.test_rr(alloc, .Rcx, .Rcx);
+                try buf.jcc_label(alloc, .E, l_done);
+                try buf.rep_movsb(alloc);
+                buf.bind_label(l_done);
+            } else {
+                try buf.rep_movsb(alloc);
+            }
+            _ = 0_u8;
+        }
+        .MemZero => { try buf.rep_stosb(alloc); }
+
+        .Add => { try buf.add_rr(alloc, d, s1); }
+        .AddMem => { try buf.add_rm(alloc, d, mem_base_reg(&inst.mem), inst.mem.disp); }
+        .AddImm => { try buf.add_ri32(alloc, d, imm32); }
+        .Sub => { try buf.sub_rr(alloc, d, s1); }
+        .SubMem => { try buf.sub_rm(alloc, d, mem_base_reg(&inst.mem), inst.mem.disp); }
+        .SubImm => { try buf.sub_ri32(alloc, d, imm32); }
+        .Mul => { try buf.imul_rr(alloc, d, s1); }
+        .MulMem => { try buf.imul_rm(alloc, d, mem_base_reg(&inst.mem), inst.mem.disp); }
+        .MulImm => { try buf.imul_rri32(alloc, d, s0, imm32); }
+        .Imul128 => { try buf.imul_r(alloc, s1); }
+        .Mul128 => { try buf.mul_r(alloc, s1); }
+        .Div => {
+            try buf.xor_rr32(alloc, .Rdx, .Rdx);
+            try buf.div_r(alloc, s1);
+        }
+        .Idiv => {
+            try buf.cqo(alloc);
+            try buf.idiv_r(alloc, s1);
+        }
+        .Div32 => {
+            try buf.xor_rr32(alloc, .Rdx, .Rdx);
+            try buf.div_r32(alloc, s1);
+        }
+        .Idiv32 => {
+            try buf.cdq(alloc);
+            try buf.idiv_r32(alloc, s1);
+        }
+        .Add32 => { try buf.add_rr32(alloc, d, s1); }
+        .Add32Imm => { try buf.add_ri32_32(alloc, d, imm32); }
+        .Sub32 => { try buf.sub_rr32(alloc, d, s1); }
+        .Sub32Imm => { try buf.sub_ri32_32(alloc, d, imm32); }
+        .Mul32 => { try buf.imul_rr32(alloc, d, s1); }
+        .Mul32Imm => { try buf.imul_rri32_32(alloc, d, s0, imm32); }
+        .And => { try buf.and_rr(alloc, d, s1); }
+        .AndMem => { try buf.and_rm(alloc, d, mem_base_reg(&inst.mem), inst.mem.disp); }
+        .AndImm => { try buf.and_ri32(alloc, d, imm32); }
+        .And32 => { try buf.and_rr32(alloc, d, s1); }
+        .And32Imm => { try buf.and_ri32_32(alloc, d, imm32); }
+        .Or => { try buf.or_rr(alloc, d, s1); }
+        .OrMem => { try buf.or_rm(alloc, d, mem_base_reg(&inst.mem), inst.mem.disp); }
+        .OrImm => { try buf.or_ri32(alloc, d, imm32); }
+        .Or32 => { try buf.or_rr32(alloc, d, s1); }
+        .Or32Imm => { try buf.or_ri32_32(alloc, d, imm32); }
+        .Xor => { try buf.xor_rr(alloc, d, s1); }
+        .XorMem => { try buf.xor_rm(alloc, d, mem_base_reg(&inst.mem), inst.mem.disp); }
+        .XorImm => { try buf.xor_ri32(alloc, d, imm32); }
+        .Xor32 => { try buf.xor_rr32(alloc, d, s1); }
+        .Xor32Imm => { try buf.xor_ri32_32(alloc, d, imm32); }
+        .Shl => { try buf.shl_cl(alloc, d); }
+        .ShlImm => { try buf.shl_imm(alloc, d, imm8); }
+        .Shr => { try buf.shr_cl(alloc, d); }
+        .ShrImm => { try buf.shr_imm(alloc, d, imm8); }
+        .Sar => { try buf.sar_cl(alloc, d); }
+        .SarImm => { try buf.sar_imm(alloc, d, imm8); }
+        .Shl32 => { try buf.shl_cl32(alloc, d); }
+        .Shl32Imm => { try buf.shl_imm32(alloc, d, imm8); }
+        .Shr32 => { try buf.shr_cl32(alloc, d); }
+        .Shr32Imm => { try buf.shr_imm32(alloc, d, imm8); }
+        .Sar32 => { try buf.sar_cl32(alloc, d); }
+        .Sar32Imm => { try buf.sar_imm32(alloc, d, imm8); }
+        .RorImm => { try buf.ror_imm(alloc, d, imm8); }
+        .Ror32Imm => { try buf.ror_imm32(alloc, d, imm8); }
+        .Neg => { try buf.neg_r(alloc, d); }
+        .Neg32 => { try buf.neg_r32(alloc, d); }
+        .Not => { try buf.not_r(alloc, d); }
+        .Not32 => { try buf.not_r32(alloc, d); }
+
+        .Tzcnt => { try buf.tzcnt(alloc, sz == 8_usize, d, s0); }
+        .Lzcnt => { try buf.lzcnt(alloc, sz == 8_usize, d, s0); }
+        .Popcnt => { try buf.popcnt(alloc, sz == 8_usize, d, s0); }
+        .Bswap => { try buf.bswap(alloc, sz, d); }
+        .Bextr => { try buf.bextr(alloc, sz == 8_usize, d, s0, s1); }
+        .Cmov => {
+            if sz == 4_usize {
+                try buf.cmovcc32(alloc, inst.cc, d, s1);
+            } else {
+                try buf.cmovcc(alloc, inst.cc, d, s1);
+            }
+            _ = 0_u8;
+        }
+        .Setcc => { try buf.setcc(alloc, inst.cc, d); }
+
+        .Cmp => { try buf.cmp_rr(alloc, s0, s1); }
+        .CmpMem => {
+            if inst.flag0 {
+                try buf.cmp_mr(alloc, mem_base_reg(&inst.mem), inst.mem.disp, s1);
+            } else {
+                try buf.cmp_rm(alloc, s0, mem_base_reg(&inst.mem), inst.mem.disp);
+            }
+            _ = 0_u8;
+        }
+        .CmpImm => { try buf.cmp_ri32(alloc, s0, imm32); }
+        .Cmp32 => { try buf.cmp_rr32(alloc, s0, s1); }
+        .Cmp32Imm => { try buf.cmp_ri32_32(alloc, s0, imm32); }
+        .Test => { try buf.test_rr(alloc, s0, s1); }
+        .TestImm => { try buf.test_ri32(alloc, s0, imm32); }
+        .Test32 => { try buf.test_rr32(alloc, s0, s1); }
+        .Test32Imm => { try buf.test_ri32_32(alloc, s0, imm32); }
+
+        .Jmp => { try buf.jmp_label(alloc, map_label(lbl_map, inst.mem.label)); }
+        .Jcc => { try buf.jcc_label(alloc, inst.cc, map_label(lbl_map, inst.mem.label)); }
+        .JmpReg => { try buf.jmp_reg(alloc, s0); }
+        .JmpTable => {
+            let jt_idx = inst.imm.bitcast.[u64]().trunc.[usize]();
+            if jt_idx < jt_labels.len {
+                let base_lbl = jt_labels[jt_idx];
+                // 100% PIE-safe PC-relative 32-bit signed offset table (handles idx in R10 or R11 too!)
+                if s0 == .R10 {
+                    try buf.lea_rip_label(alloc, .R11, base_lbl);
+                    try buf.load_mem_sib(alloc, .R10, .R11, .R10, 4_u8, 0_i32, 4_usize, true);
+                    try buf.add_rr(alloc, .R11, .R10);
+                    try buf.jmp_reg(alloc, .R11);
+                } else {
+                    try buf.lea_rip_label(alloc, .R10, base_lbl);
+                    try buf.load_mem_sib(alloc, .R11, .R10, s0, 4_u8, 0_i32, 4_usize, true);
+                    try buf.add_rr(alloc, .R10, .R11);
+                    try buf.jmp_reg(alloc, .R10);
+                }
+                _ = 0_u8;
+            } else {
+                try buf.ud2(alloc);
+            }
+            _ = 0_u8;
+        }
+        .JmpSym => {
+            if inst.imm == 3_i64 {
+                try buf.jmp_plt_sym(alloc, inst.mem.sym);
+            } else {
+                try buf.jmp_sym(alloc, inst.mem.sym);
+            }
+            _ = 0_u8;
+        }
+        .CallSym => {
+            if inst.imm == 3_i64 {
+                try buf.call_plt_sym(alloc, inst.mem.sym);
+            } else {
+                try buf.call_sym(alloc, inst.mem.sym);
+            }
+            _ = 0_u8;
+        }
+        .CallReg => { try buf.call_reg(alloc, s0); }
+        .Ret => {
+            if mf.uses_ymm {
+                try buf.vzeroupper(alloc);
+            }
+            try emit_epilogue_preserving_flags(alloc, buf, fl);
+            try buf.ret(alloc);
+        }
+        .Iretq => {
+            if mf.uses_ymm {
+                try buf.vzeroupper(alloc);
+            }
+            try emit_epilogue_preserving_flags(alloc, buf, fl);
+            try buf.iretq(alloc);
+        }
+        .Ud2 => { try buf.ud2(alloc); }
+        .Clc => { try buf.clc(alloc); }
+        .Stc => { try buf.stc(alloc); }
+        .Nop => { try buf.nop(alloc); }
+        .RawBytes => {
+            let bs = mf.raw_bytes_slice(inst.extra_range);
+            try buf.emit_bytes(alloc, bs);
+        }
+        .LockXadd => { try buf.lock_xadd_disp(alloc, mem_base_reg(&inst.mem), inst.mem.disp, d, sz); }
+        .LockCmpxchg => { try buf.lock_cmpxchg_disp(alloc, mem_base_reg(&inst.mem), inst.mem.disp, s1, sz); }
+        .XchgMem => { try buf.xchg_mem_disp(alloc, mem_base_reg(&inst.mem), inst.mem.disp, d, sz); }
+        .LabelDef => { buf.bind_label(map_label(lbl_map, inst.mem.label)); }
+        .VZeroUpper => { try buf.vzeroupper(alloc); }
+        _ => {}
+    }
+    return;
+}
+
+fn emit_vec_inst(
+    alloc: *mut AllocCap,
+    buf: *mut x64_asm.X64Buf,
+    inst: *mach_ir.MachInst,
+) -> !OutOfMemory {
+    let xd = mach_ir.phys_to_xmm(inst.dst_phys);
+    let xs0 = mach_ir.phys_to_xmm(inst.src0_phys);
+    let xs1 = mach_ir.phys_to_xmm(inst.src1_phys);
+    let xs2 = mach_ir.phys_to_xmm(inst.src2_phys);
+    let gd = mach_ir.phys_to_reg(inst.dst_phys);
+    let gs0 = mach_ir.phys_to_reg(inst.src0_phys);
+    let l256 = inst.flag0;
+    let imm8 = (inst.imm & 0xFF_i64).trunc.[u8]();
+    let is_64 = inst.size_bytes == 8_u8;
+
+    match inst.op {
+        .VMovSSLoad => { try emit_vec_load_mem(alloc, buf, .VMovSSLoad, xd, &inst.mem, false); }
+        .VMovSDLoad => { try emit_vec_load_mem(alloc, buf, .VMovSDLoad, xd, &inst.mem, false); }
+        .VMovSSStore => { try emit_vec_store_mem(alloc, buf, .VMovSSStore, &inst.mem, xs0, false); }
+        .VMovSDStore => { try emit_vec_store_mem(alloc, buf, .VMovSDStore, &inst.mem, xs0, false); }
+        .VMovVecReg => { try buf.vmovaps_rr(alloc, xd, xs0, l256); }
+        .VAddSS => { try buf.vaddss(alloc, xd, xs0, xs1); }
+        .VSubSS => { try buf.vsubss(alloc, xd, xs0, xs1); }
+        .VMulSS => { try buf.vmulss(alloc, xd, xs0, xs1); }
+        .VDivSS => { try buf.vdivss(alloc, xd, xs0, xs1); }
+        .VMinSS => { try buf.vminss(alloc, xd, xs0, xs1); }
+        .VMaxSS => { try buf.vmaxss(alloc, xd, xs0, xs1); }
+        .VSqrtSS => { try buf.vsqrtss(alloc, xd, xs0, xs0); }
+        .VFmadd231SS => { try buf.vfmadd231ss(alloc, xd, xs1, xs2); }
+        .VAddSD => { try buf.vaddsd(alloc, xd, xs0, xs1); }
+        .VSubSD => { try buf.vsubsd(alloc, xd, xs0, xs1); }
+        .VMulSD => { try buf.vmulsd(alloc, xd, xs0, xs1); }
+        .VDivSD => { try buf.vdivsd(alloc, xd, xs0, xs1); }
+        .VMinSD => { try buf.vminsd(alloc, xd, xs0, xs1); }
+        .VMaxSD => { try buf.vmaxsd(alloc, xd, xs0, xs1); }
+        .VSqrtSD => { try buf.vsqrtsd(alloc, xd, xs0, xs0); }
+        .VFmadd231SD => { try buf.vfmadd231sd(alloc, xd, xs1, xs2); }
+        .VUcomiSS => { try buf.vucomiss(alloc, xs0, xs1); }
+        .VUcomiSD => { try buf.vucomisd(alloc, xs0, xs1); }
+        .VCvtSI2SS => {
+            try buf.vpxor(alloc, xd, xd, xd, false);
+            try buf.vcvtsi2ss(alloc, xd, xd, gs0, is_64);
+        }
+        .VCvtSI2SD => {
+            try buf.vpxor(alloc, xd, xd, xd, false);
+            try buf.vcvtsi2sd(alloc, xd, xd, gs0, is_64);
+        }
+        .VCvtTTSS2SI => { try buf.vcvttss2si(alloc, gd, xs0, is_64); }
+        .VCvtTTSD2SI => { try buf.vcvttsd2si(alloc, gd, xs0, is_64); }
+        .VCvtSS2SD => { try buf.vcvtss2sd(alloc, xd, xs0, xs0); }
+        .VCvtSD2SS => { try buf.vcvtsd2ss(alloc, xd, xs0, xs0); }
+        .VMovDToXmm => { try buf.vmovd_xmm_r32(alloc, xd, gs0); }
+        .VMovDFromXmm => { try buf.vmovd_r32_xmm(alloc, gd, xs0); }
+        .VMovQToXmm => { try buf.vmovq_xmm_r64(alloc, xd, gs0); }
+        .VMovQFromXmm => { try buf.vmovq_r64_xmm(alloc, gd, xs0); }
+
+        .VMovUpsLoad => { try emit_vec_load_mem(alloc, buf, .VMovUpsLoad, xd, &inst.mem, l256); }
+        .VMovUpsStore => { try emit_vec_store_mem(alloc, buf, .VMovUpsStore, &inst.mem, xs0, l256); }
+        .VMovApsLoad => { try emit_vec_load_mem(alloc, buf, .VMovApsLoad, xd, &inst.mem, l256); }
+        .VMovApsStore => { try emit_vec_store_mem(alloc, buf, .VMovApsStore, &inst.mem, xs0, l256); }
+        .VMovDquLoad => { try emit_vec_load_mem(alloc, buf, .VMovDquLoad, xd, &inst.mem, l256); }
+        .VMovDquStore => { try emit_vec_store_mem(alloc, buf, .VMovDquStore, &inst.mem, xs0, l256); }
+
+        .VBroadcastSS => {
+            if inst.mem.kind == .None {
+                try buf.vbroadcastss_xmm(alloc, xd, xs0, l256);
+            } else if inst.mem.kind == .RipSym {
+                try buf.lea_rip_sym(alloc, .R10, inst.mem.sym, inst.mem.disp.widen.[i64]());
+                try buf.vbroadcastss_mem(alloc, xd, .R10, 0_i32, l256);
+            } else if inst.mem.kind == .Sib {
+                try buf.vbroadcastss_sib(alloc, xd, mem_base_reg(&inst.mem), mach_ir.phys_to_reg(inst.mem.idx_phys), inst.mem.scale, inst.mem.disp, l256);
+            } else {
+                try buf.vbroadcastss_mem(alloc, xd, mem_base_reg(&inst.mem), inst.mem.disp, l256);
+            }
+            _ = 0_u8;
+        }
+        .VBroadcastSD => {
+            if !l256 {
+                // 128-bit f64x2 broadcast: load scalar double (if mem) then duplicate low 64 bits via vshufps 0x44!
+                if inst.mem.kind == .None {
+                    try buf.vshufps(alloc, xd, xs0, xs0, 0x44_u8, false);
+                } else {
+                    try emit_vec_load_mem(alloc, buf, .VMovSDLoad, xd, &inst.mem, false);
+                    try buf.vshufps(alloc, xd, xd, xd, 0x44_u8, false);
+                }
+                _ = 0_u8;
+            } else if inst.mem.kind == .None {
+                try buf.vbroadcastsd_xmm(alloc, xd, xs0);
+            } else if inst.mem.kind == .RipSym {
+                try buf.lea_rip_sym(alloc, .R10, inst.mem.sym, inst.mem.disp.widen.[i64]());
+                try buf.vbroadcastsd_mem(alloc, xd, .R10, 0_i32);
+            } else if inst.mem.kind == .Sib {
+                try buf.vbroadcastsd_sib(alloc, xd, mem_base_reg(&inst.mem), mach_ir.phys_to_reg(inst.mem.idx_phys), inst.mem.scale, inst.mem.disp);
+            } else {
+                try buf.vbroadcastsd_mem(alloc, xd, mem_base_reg(&inst.mem), inst.mem.disp);
+            }
+            _ = 0_u8;
+        }
+
+        .VAddPS => { try buf.vaddps(alloc, xd, xs0, xs1, l256); }
+        .VAddPSMem => {
+            if inst.mem.kind == .Sib {
+                try buf.vaddps_sib(alloc, xd, xs0, mem_base_reg(&inst.mem), mach_ir.phys_to_reg(inst.mem.idx_phys), inst.mem.scale, inst.mem.disp, l256);
+            } else {
+                try buf.vaddps_mem(alloc, xd, xs0, mem_base_reg(&inst.mem), inst.mem.disp, l256);
+            }
+            _ = 0_u8;
+        }
+        .VSubPS => { try buf.vsubps(alloc, xd, xs0, xs1, l256); }
+        .VSubPSMem => {
+            if inst.mem.kind == .Sib {
+                try buf.vsubps_sib(alloc, xd, xs0, mem_base_reg(&inst.mem), mach_ir.phys_to_reg(inst.mem.idx_phys), inst.mem.scale, inst.mem.disp, l256);
+            } else {
+                try buf.vsubps_mem(alloc, xd, xs0, mem_base_reg(&inst.mem), inst.mem.disp, l256);
+            }
+            _ = 0_u8;
+        }
+        .VMulPS => { try buf.vmulps(alloc, xd, xs0, xs1, l256); }
+        .VMulPSMem => {
+            if inst.mem.kind == .Sib {
+                try buf.vmulps_sib(alloc, xd, xs0, mem_base_reg(&inst.mem), mach_ir.phys_to_reg(inst.mem.idx_phys), inst.mem.scale, inst.mem.disp, l256);
+            } else {
+                try buf.vmulps_mem(alloc, xd, xs0, mem_base_reg(&inst.mem), inst.mem.disp, l256);
+            }
+            _ = 0_u8;
+        }
+        .VDivPS => { try buf.vdivps(alloc, xd, xs0, xs1, l256); }
+        .VMinPS => { try buf.vminps(alloc, xd, xs0, xs1, l256); }
+        .VMaxPS => { try buf.vmaxps(alloc, xd, xs0, xs1, l256); }
+        .VSqrtPS => { try buf.vsqrtps(alloc, xd, xs0, l256); }
+        .VRsqrtPS => { try buf.vrsqrtps(alloc, xd, xs0, l256); }
+        .VFmadd231PS => { try buf.vfmadd231ps(alloc, xd, xs1, xs2, l256); }
+        .VFmadd231PSMem => {
+            if inst.mem.kind == .Sib {
+                try buf.vfmadd231ps_sib(alloc, xd, xs1, mem_base_reg(&inst.mem), mach_ir.phys_to_reg(inst.mem.idx_phys), inst.mem.scale, inst.mem.disp, l256);
+            } else {
+                try buf.vfmadd231ps_mem(alloc, xd, xs1, mem_base_reg(&inst.mem), inst.mem.disp, l256);
+            }
+            _ = 0_u8;
+        }
+        .VFnMadd231PS => { try buf.vfnmadd231ps(alloc, xd, xs1, xs2, l256); }
+        .VAddPD => { try buf.vaddpd(alloc, xd, xs0, xs1, l256); }
+        .VSubPD => { try buf.vsubpd(alloc, xd, xs0, xs1, l256); }
+        .VMulPD => { try buf.vmulpd(alloc, xd, xs0, xs1, l256); }
+        .VDivPD => { try buf.vdivpd(alloc, xd, xs0, xs1, l256); }
+        .VMinPD => { try buf.vminpd(alloc, xd, xs0, xs1, l256); }
+        .VMaxPD => { try buf.vmaxpd(alloc, xd, xs0, xs1, l256); }
+        .VSqrtPD => { try buf.vsqrtpd(alloc, xd, xs0, l256); }
+        .VFmadd231PD => { try buf.vfmadd231pd(alloc, xd, xs1, xs2, l256); }
+        .VFmadd231PDMem => {
+            if inst.mem.kind == .Sib {
+                try buf.vfmadd231pd_sib(alloc, xd, xs1, mem_base_reg(&inst.mem), mach_ir.phys_to_reg(inst.mem.idx_phys), inst.mem.scale, inst.mem.disp, l256);
+            } else {
+                try buf.vfmadd231pd_mem(alloc, xd, xs1, mem_base_reg(&inst.mem), inst.mem.disp, l256);
+            }
+            _ = 0_u8;
+        }
+        .VXorPS => { try buf.vxorps(alloc, xd, xs0, xs1, l256); }
+        .VAndPS => { try buf.vandps(alloc, xd, xs0, xs1, l256); }
+        .VOrPS => { try buf.vorps(alloc, xd, xs0, xs1, l256); }
+        .VXorPD => { try buf.vxorpd(alloc, xd, xs0, xs1, l256); }
+        .VAndPD => { try buf.vandpd(alloc, xd, xs0, xs1, l256); }
+        .VOrPD => { try buf.vorpd(alloc, xd, xs0, xs1, l256); }
+        .VCmpPS => { try buf.vcmpps(alloc, xd, xs0, xs1, imm8, l256); }
+        .VBlendVPS => { try buf.vblendvps(alloc, xd, xs0, xs1, xs2, l256); }
+        .VShufPS => { try buf.vshufps(alloc, xd, xs0, xs1, imm8, l256); }
+        .VHAddPS => { try buf.vhaddps(alloc, xd, xs0, xs1, l256); }
+        .VExtractF128 => { try buf.vextractf128(alloc, xd, xs0, imm8); }
+        .VInsertF128 => { try buf.vinsertf128(alloc, xd, xs0, xs1, imm8); }
+        .VPXor => { try buf.vpxor(alloc, xd, xs0, xs1, l256); }
+        .VPAnd => { try buf.vpand(alloc, xd, xs0, xs1, l256); }
+        .VPOr => { try buf.vpor(alloc, xd, xs0, xs1, l256); }
+        .VPAddB => { try buf.vpaddb(alloc, xd, xs0, xs1, l256); }
+        .VPSubB => { try buf.vpsubb(alloc, xd, xs0, xs1, l256); }
+        .VPAddD => { try buf.vpaddd(alloc, xd, xs0, xs1, l256); }
+        .VPSubD => { try buf.vpsubd(alloc, xd, xs0, xs1, l256); }
+        .VPMullD => { try buf.vpmulld(alloc, xd, xs0, xs1, l256); }
+        .VPAddQ => { try buf.vpaddq(alloc, xd, xs0, xs1, l256); }
+        .VPSubQ => { try buf.vpsubq(alloc, xd, xs0, xs1, l256); }
+        .VPMinSD => { try buf.vpminsd(alloc, xd, xs0, xs1, l256); }
+        .VPMaxSD => { try buf.vpmaxsd(alloc, xd, xs0, xs1, l256); }
+        .VPCmpEqB => { try buf.vpcmpeqb(alloc, xd, xs0, xs1, l256); }
+        .VPCmpEqD => { try buf.vpcmpeqd(alloc, xd, xs0, xs1, l256); }
+        .VPCmpGtD => { try buf.vpcmpgtd(alloc, xd, xs0, xs1, l256); }
+        .VPMovMskB => { try buf.vpmovmskb(alloc, gd, xs0, l256); }
+        .VPSllDImm => { try buf.vpslld_imm(alloc, xd, xs0, imm8, l256); }
+        .VPSrlDImm => { try buf.vpsrld_imm(alloc, xd, xs0, imm8, l256); }
+        .VPSraDImm => { try buf.vpsrad_imm(alloc, xd, xs0, imm8, l256); }
+        .VPSllWImm => { try buf.vpsllw_imm(alloc, xd, xs0, imm8, l256); }
+        .VPBroadcastB => { try buf.vpbroadcastb_xmm(alloc, xd, xs0, l256); }
+        .VPBroadcastD => { try buf.vpbroadcastd_xmm(alloc, xd, xs0, l256); }
+        _ => {}
+    }
+    return;
+}
+
+fn op_is_vec_family(op: mach_ir.MachOp) -> bool {
+    return mach_ir.op_dst_is_vec(op) || op_src0_is_vec(op);
+}
+
+fn find_max_label(mf: *mach_ir.MachFunc) -> usize {
+    var max_lbl: usize = mf.blocks.len();
+    let bs = mf.blocks.as_slice();
+    var bi: usize = 0_usize;
+    while bi < bs.len {
+        let l = bs[bi].label.widen.[usize]();
+        if l < 65536_usize && l +% 1_usize > max_lbl {
+            max_lbl = l +% 1_usize;
+        }
+        bi = bi +% 1_usize;
+    }
+    let insts = mf.insts.as_slice();
+    var ii: usize = 0_usize;
+    while ii < insts.len {
+        let op = insts[ii].op;
+        if op == .Jmp || op == .Jcc || op == .LabelDef || (op == .Lea && insts[ii].mem.kind == .RipLabel) {
+            let l = insts[ii].mem.label.widen.[usize]();
+            if l < 65536_usize && l +% 1_usize > max_lbl {
+                max_lbl = l +% 1_usize;
+            }
+        }
+        ii = ii +% 1_usize;
+    }
+    return max_lbl;
+}
+
+struct LineTracker {
+    last_file: u32;
+    last_line: u32;
+}
+
+fn record_debug_line(
+    alloc: *mut AllocCap,
+    sm: *span.SourceMap,
+    buf: *x64_asm.X64Buf,
+    sp: span.Span,
+    tr: *mut LineTracker,
+    out: *mut col.DynBuf[elf64.LineEntry],
+) -> !OutOfMemory {
+    if sp.file == span.FILE_DUMMY {
+        return;
+    }
+    let lc = sm.line_col(sp.file, sp.start);
+    if lc.line == 0_u32 {
+        return;
+    }
+    if sp.file == tr.last_file && lc.line == tr.last_line {
+        return;
+    }
+    tr.last_file = sp.file;
+    tr.last_line = lc.line;
+    try out.push(alloc, elf64.LineEntry.{
+        code_offset: buf.pos(),
+        file_idx: sp.file +% 1_u32,
+        line: lc.line,
+        col: lc.col,
+    });
+    return;
+}
+
+fn is_loop_header_block(
+    mf: *mach_ir.MachFunc,
+    bb: u32,
+    emit_pos: *[u32],
+) -> bool {
+    let bidx = bb.widen.[usize]();
+    let bs = mf.blocks.as_slice();
+    if bidx >= bs.len || bidx >= emit_pos.len {
+        return false;
+    }
+    if bs[bidx].loop_depth == 0_u8 {
+        return false;
+    }
+    let my_pos = emit_pos[bidx];
+    let preds = mf.block_preds(bb);
+    var pi: usize = 0_usize;
+    while pi < preds.len {
+        let pidx = preds[pi].widen.[usize]();
+        if pidx < emit_pos.len && emit_pos[pidx] >= my_pos {
+            return true;
+        }
+        pi = pi +% 1_usize;
+    }
+    return false;
+}
+
+fn lookup_buf_label_pos(buf: *x64_asm.X64Buf, lbl_idx: usize) -> u32 {
+    let labels_ro = buf.labels.as_slice();
+    if lbl_idx < labels_ro.len {
+        return labels_ro[lbl_idx];
+    }
+    return x64_asm.LABEL_UNBOUND;
+}
+
+fn emit_jump_tables_tail(
+    alloc: *mut AllocCap,
+    mf: *mach_ir.MachFunc,
+    buf: *mut x64_asm.X64Buf,
+    lbl_map: *[u32],
+    jt_labels: *[u32],
+) -> !OutOfMemory {
+    let jts = mf.jump_tables.as_slice();
+    var ji: usize = 0_usize;
+    while ji < jts.len && ji < jt_labels.len {
+        try buf.align_nop(alloc, 4_usize);
+        let base_lbl = jt_labels[ji];
+        buf.bind_label(base_lbl);
+        let base_pos = buf.pos().widen.[u64]().bitcast.[i64]();
+        let targs = mf.jtable_slice(jts[ji].entries);
+        let def_x64 = map_label(lbl_map, jts[ji].default_label);
+        var ti: usize = 0_usize;
+        while ti < targs.len {
+            let t_x64 = map_label(lbl_map, targs[ti]);
+            var tpos = lookup_buf_label_pos(buf, t_x64.widen.[usize]());
+            if tpos == x64_asm.LABEL_UNBOUND {
+                tpos = lookup_buf_label_pos(buf, def_x64.widen.[usize]());
+            }
+            let rel: i32 = if tpos != x64_asm.LABEL_UNBOUND {
+                (tpos.widen.[u64]().bitcast.[i64]() -% base_pos).trunc.[i32]()
+            } else {
+                0_i32
+            };
+            try buf.emit_i32(alloc, rel);
+            ti = ti +% 1_usize;
+        }
+        ji = ji +% 1_usize;
+    }
+    return;
+}
+
+pub fn emit_mach_func_x64(
+    alloc: *mut AllocCap,
+    mf: *mach_ir.MachFunc,
+    sm: *span.SourceMap,
+    emit_debug_line: bool,
+) -> MachEmitOut ! OutOfMemory {
+    var out = try MachEmitOut.init(alloc);
+    errdefer out.destroy(alloc);
+
+    var buf = try x64_asm.X64Buf.init(alloc);
+    errdefer buf.destroy(alloc);
+
+    let n_blocks = mf.blocks.len();
+    var order = try col.DynBuf.[u32].init(alloc, if n_blocks > 4_usize { n_blocks } else { 4_usize });
+    errdefer order.destroy(alloc);
+    try build_emit_order(alloc, mf, &mut order);
+
+    // Map block_id -> emission index for back-edge / loop-header detection
+    var emit_pos = try col.DynBuf.[u32].init(alloc, if n_blocks > 4_usize { n_blocks } else { 4_usize });
+    errdefer emit_pos.destroy(alloc);
+    var bi_ep: usize = 0_usize;
+    while bi_ep < n_blocks {
+        try emit_pos.push(alloc, 0_u32);
+        bi_ep = bi_ep +% 1_usize;
+    }
+    let ord_s = order.as_slice();
+    let ep_mut = emit_pos.as_mut_slice();
+    var oi: usize = 0_usize;
+    while oi < ord_s.len {
+        let bidx = ord_s[oi].widen.[usize]();
+        if bidx < ep_mut.len {
+            ep_mut[bidx] = oi.trunc.[u32]();
+        }
+        oi = oi +% 1_usize;
+    }
+
+    // Allocate X64Buf labels for every MachIR label ID and jump table
+    let max_lbl = find_max_label(mf);
+    var lbl_map = try col.DynBuf.[u32].init(alloc, if max_lbl > 4_usize { max_lbl } else { 4_usize });
+    errdefer lbl_map.destroy(alloc);
+    var li: usize = 0_usize;
+    while li < max_lbl {
+        let xl = try buf.new_label(alloc);
+        try lbl_map.push(alloc, xl);
+        li = li +% 1_usize;
+    }
+    let njt = mf.jump_tables.len();
+    var jt_labels = try col.DynBuf.[u32].init(alloc, if njt > 2_usize { njt } else { 2_usize });
+    errdefer jt_labels.destroy(alloc);
+    var ji: usize = 0_usize;
+    while ji < njt {
+        let jxl = try buf.new_label(alloc);
+        try jt_labels.push(alloc, jxl);
+        ji = ji +% 1_usize;
+    }
+
+    let fl = plan_frame_layout(mf);
+    // Exact final own machine stack footprint:
+    //   8 B caller return address + optional 8 B saved rbp + saved regs + locals/spills + alignment + max outgoing call args
+    var max_out_call_sub: u64 = 0_u64;
+    let all_ins = mf.insts.as_slice();
+    var msi: usize = 0_usize;
+    while msi < all_ins.len {
+        let mi = all_ins[msi];
+        if mi.op == .SubImm && mi.dst_phys == mach_ir.PHYS_RSP && mi.imm > 0_i64 {
+            let sub_u = mi.imm.bitcast.[u64]();
+            if sub_u > max_out_call_sub {
+                max_out_call_sub = sub_u;
+            }
+        }
+        msi = msi +% 1_usize;
+    }
+    var prolog_bytes: u64 = 8_u64; // return address pushed by CALL
+    if fl.needs_frame {
+        prolog_bytes = prolog_bytes +% 8_u64; // push rbp
+        if fl.local_bytes == 0_usize {
+            prolog_bytes = prolog_bytes +% (fl.n_saved *% 8_usize).widen.[u64]() +% fl.total_sub.widen.[u64]();
+        } else {
+            prolog_bytes = prolog_bytes +% fl.total_sub.widen.[u64]();
+        }
+    }
+    out.own_stack_bytes = prolog_bytes +% max_out_call_sub;
+    try emit_prologue(alloc, &mut buf, &fl);
+
+    var line_tr = LineTracker.{ last_file: span.FILE_DUMMY, last_line: 0_u32 };
+    let loop_align: usize = if mf.uses_ymm { 32_usize } else { 16_usize };
+    let lm_ro = lbl_map.as_slice();
+    let jtl_ro = jt_labels.as_slice();
+    let ep_ro = emit_pos.as_slice();
+
+    oi = 0_usize;
+    while oi < ord_s.len {
+        let bb = ord_s[oi];
+        let bidx = bb.widen.[usize]();
+        let bs = mf.blocks.as_slice();
+        if bidx >= bs.len {
+            oi = oi +% 1_usize;
+            continue;
+        }
+        // Align hot loop headers to 16 bytes (or 32 bytes for AVX2 YMM loops)
+        if oi > 0_usize && is_loop_header_block(mf, bb, ep_ro) {
+            try buf.align_nop(alloc, loop_align);
+        }
+        buf.bind_label(map_label(lm_ro, bs[bidx].label));
+
+        let insts = mf.block_insts(bb);
+        var ki: usize = 0_usize;
+        while ki < insts.len {
+            let inst = insts[ki];
+            if emit_debug_line {
+                try record_debug_line(alloc, sm, &buf, inst.span, &mut line_tr, &mut out.line_entries);
+            }
+            if op_is_vec_family(inst.op) {
+                try emit_vec_inst(alloc, &mut buf, &inst);
+            } else {
+                try emit_gpr_inst(alloc, &mut buf, mf, &fl, lm_ro, jtl_ro, &inst);
+            }
+            ki = ki +% 1_usize;
+        }
+        oi = oi +% 1_usize;
+    }
+
+    // Emit PC-relative jump tables after all blocks so every target label offset is already bound
+    if njt > 0_usize {
+        try emit_jump_tables_tail(alloc, mf, &mut buf, lm_ro, jtl_ro);
+    }
+
+    let fin_ok = buf.finish();
+    out.ok = fin_ok;
+    if fin_ok {
+        try out.code.push_slice(alloc, buf.code.as_slice());
+        try out.relocs.push_slice(alloc, buf.relocs.as_slice());
+        try out.rodata_items.push_slice(alloc, mf.rodata_items.as_slice());
+        try out.rodata_bytes.push_slice(alloc, mf.rodata_bytes.as_slice());
+        try out.rodata_relocs.push_slice(alloc, mf.rodata_relocs.as_slice());
+        try out.used_helpers.push_slice(alloc, mf.used_helpers.as_slice());
+    }
+
+    jt_labels.destroy(alloc);
+    lbl_map.destroy(alloc);
+    emit_pos.destroy(alloc);
+    order.destroy(alloc);
+    buf.destroy(alloc);
+    return out;
+}

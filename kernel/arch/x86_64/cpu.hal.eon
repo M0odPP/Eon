@@ -1,0 +1,455 @@
+module kernel.arch.x86_64.cpu @hal;
+
+/// Fixed identity-mapped shared kernel state region (`0x00200000`, well above kernel ELF at `0x00100000`).
+/// Layout (all 64-bit aligned, zero-initialized on BSP boot):
+///   +0x00: timer_ticks  (Atomic[u64])
+///   +0x08: cpus_online  (Atomic[u32])
+///   +0x10: ap_lapic_id  (Atomic[u32])
+///   +0x18: ap_ready     (Atomic[u32])
+///   +0x20: irq_errors   (Atomic[u32])
+pub struct KernelShared {
+    pub timer_ticks: Atomic[u64];
+    pub cpus_online: Atomic[u32];
+    pub ap_lapic_id: Atomic[u32];
+    pub ap_ready: Atomic[u32];
+    pub irq_errors: Atomic[u32];
+}
+
+const SHARED_ADDR: usize = 0x00200000_usize;
+const GDT_ADDR: usize    = 0x00201000_usize;
+const TSS_ADDR: usize    = 0x00201080_usize;
+const GDTR_ADDR: usize   = 0x00201100_usize;
+const IDT_ADDR: usize    = 0x00202000_usize;
+const IDTR_ADDR: usize   = 0x00203000_usize;
+const IST1_TOP: u64      = 0x00210000_u64;
+const RSP0_TOP: u64      = 0x0020F000_u64;
+
+// ---------------------------------------------------------------------------
+// Low-level x86_64 CPU & Port I/O Primitives (EonCall: rdi, rsi, rdx -> rax)
+// ---------------------------------------------------------------------------
+
+@naked
+pub fn outb(_port: u16, _val: u8) @noalloc @noblock {
+    raw {
+        asm("mov rdx, rdi; mov rax, rsi; outb; ret", options(noreturn));
+    }
+}
+
+@naked
+pub fn inb(_port: u16) -> u8 @noalloc @noblock {
+    raw {
+        asm("mov rdx, rdi; xor rax, rax; inb; ret", options(noreturn));
+    }
+    return 0_u8;
+}
+
+@naked
+pub fn outw(_port: u16, _val: u16) @noalloc @noblock {
+    raw {
+        asm("mov rdx, rdi; mov rax, rsi; outw; ret", options(noreturn));
+    }
+}
+
+@naked
+pub fn inw(_port: u16) -> u16 @noalloc @noblock {
+    raw {
+        asm("mov rdx, rdi; xor rax, rax; inw; ret", options(noreturn));
+    }
+    return 0_u16;
+}
+
+@naked
+pub fn outl(_port: u16, _val: u32) @noalloc @noblock {
+    raw {
+        asm("mov rdx, rdi; mov rax, rsi; outl; ret", options(noreturn));
+    }
+}
+
+@naked
+pub fn inl(_port: u16) -> u32 @noalloc @noblock {
+    raw {
+        asm("mov rdx, rdi; xor rax, rax; inl; ret", options(noreturn));
+    }
+    return 0_u32;
+}
+
+@naked
+pub fn rdmsr(_msr: u32) -> u64 @noalloc @noblock {
+    raw {
+        asm("mov rcx, rdi; rdmsr; shl rdx, 32; or rax, rdx; ret", options(noreturn));
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn wrmsr(_msr: u32, _val: u64) @noalloc @noblock {
+    raw {
+        asm("mov rcx, rdi; mov rax, rsi; mov rdx, rsi; shr rdx, 32; wrmsr; ret", options(noreturn));
+    }
+}
+
+@naked
+pub fn read_cr0() -> u64 @noalloc @noblock {
+    raw {
+        asm("mov rax, cr0; ret", options(noreturn));
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn read_cr2() -> u64 @noalloc @noblock {
+    raw {
+        asm("mov rax, cr2; ret", options(noreturn));
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn read_cr3() -> u64 @noalloc @noblock {
+    raw {
+        asm("mov rax, cr3; ret", options(noreturn));
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn write_cr3(_val: u64) @noalloc @noblock {
+    raw {
+        asm("mov cr3, rdi; ret", options(noreturn));
+    }
+}
+
+@naked
+pub fn invlpg_raw(_vaddr: u64) @noalloc @noblock {
+    raw {
+        asm("invlpg [rdi]; ret", options(noreturn));
+    }
+}
+
+@naked
+pub fn lgdt_raw(_gdtr_addr: u64) @noalloc @noblock {
+    raw {
+        asm("lgdt [rdi]; ret", options(noreturn));
+    }
+}
+
+@naked
+pub fn lidt_raw(_idtr_addr: u64) @noalloc @noblock {
+    raw {
+        asm("lidt [rdi]; ret", options(noreturn));
+    }
+}
+
+@naked
+pub fn ltr_raw(_sel: u16) @noalloc @noblock {
+    raw {
+        asm("ltr rdi; ret", options(noreturn));
+    }
+}
+
+@naked
+pub fn reload_segments(_cs_sel: u64, _ds_sel: u64) @noalloc @noblock {
+    raw {
+        asm("pop rax; push rdi; push rax; mov ds, rsi; mov es, rsi; mov ss, rsi; mov fs, rsi; mov gs, rsi; retfq", options(noreturn));
+    }
+}
+
+pub fn cli() @noalloc @noblock {
+    raw {
+        asm("cli");
+    }
+}
+
+pub fn sti() @noalloc @noblock {
+    raw {
+        asm("sti");
+    }
+}
+
+pub fn hlt() @noalloc @noblock {
+    raw {
+        asm("hlt");
+    }
+}
+
+pub fn pause() @noalloc @noblock {
+    raw {
+        asm("pause");
+    }
+}
+
+pub fn mfence() @noalloc @noblock {
+    raw {
+        asm("mfence");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Direct Physical Memory Access Helpers (Identity-Mapped Low 4 GiB)
+// ---------------------------------------------------------------------------
+
+pub fn mem_write_u8(addr: usize, val: u8) @noalloc @noblock {
+    raw {
+        let p = rawptr_mut.[u8].from_usize(addr);
+        p.* = val;
+    }
+}
+
+pub fn mem_read_u8(addr: usize) -> u8 @noalloc @noblock {
+    var out: u8 = 0_u8;
+    raw {
+        let p = rawptr_mut.[u8].from_usize(addr);
+        out = p.*;
+    }
+    return out;
+}
+
+pub fn mem_write_u16(addr: usize, val: u16) @noalloc @noblock {
+    raw {
+        let p = rawptr_mut.[u16].from_usize(addr);
+        p.* = val;
+    }
+}
+
+pub fn mem_write_u32(addr: usize, val: u32) @noalloc @noblock {
+    raw {
+        let p = rawptr_mut.[u32].from_usize(addr);
+        p.* = val;
+    }
+}
+
+pub fn mem_read_u32(addr: usize) -> u32 @noalloc @noblock {
+    var out: u32 = 0_u32;
+    raw {
+        let p = rawptr_mut.[u32].from_usize(addr);
+        out = p.*;
+    }
+    return out;
+}
+
+pub fn mem_write_u64(addr: usize, val: u64) @noalloc @noblock {
+    raw {
+        let p = rawptr_mut.[u64].from_usize(addr);
+        p.* = val;
+    }
+}
+
+pub fn mem_read_u64(addr: usize) -> u64 @noalloc @noblock {
+    var out: u64 = 0_u64;
+    raw {
+        let p = rawptr_mut.[u64].from_usize(addr);
+        out = p.*;
+    }
+    return out;
+}
+
+pub fn mem_zero(addr: usize, len: usize) @noalloc @noblock {
+    var i: usize = 0_usize;
+    while i < len {
+        mem_write_u8(addr +% i, 0_u8);
+        i = i +% 1_usize;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Function Address Extraction (Follows Eon FnRef Thunk to Direct Symbol)
+// ---------------------------------------------------------------------------
+
+@naked
+fn closure0_code_ptr(_f: fn()) -> u64 @noalloc @noblock {
+    raw {
+        asm("mov rax, rdi; ret", options(noreturn));
+    }
+    return 0_u64;
+}
+
+@naked
+fn closure1_code_ptr(_f: fn(u64)) -> u64 @noalloc @noblock {
+    raw {
+        asm("mov rax, rdi; ret", options(noreturn));
+    }
+    return 0_u64;
+}
+
+fn unwrap_fnref_thunk(thunk_addr: u64) -> u64 @noalloc @noblock {
+    // Eon FnRef thunk: 7x 3-byte `mov r_i, r_{i+1}` (21 bytes) + `E9 rel32` (5 bytes).
+    let op = mem_read_u8((thunk_addr +% 21_u64).trunc.[usize]());
+    if op == 0xE9_u8 {
+        let rel_u = mem_read_u32((thunk_addr +% 22_u64).trunc.[usize]()).widen.[u64]();
+        let rel_sext = if (rel_u & 0x80000000_u64) != 0_u64 {
+            rel_u | 0xFFFFFFFF00000000_u64
+        } else {
+            rel_u
+        };
+        return thunk_addr +% 26_u64 +% rel_sext;
+    }
+    return thunk_addr;
+}
+
+pub fn direct_fn0_addr(f: fn()) -> u64 @noalloc @noblock {
+    return unwrap_fnref_thunk(closure0_code_ptr(f));
+}
+
+pub fn direct_fn1_addr(f: fn(u64)) -> u64 @noalloc @noblock {
+    return unwrap_fnref_thunk(closure1_code_ptr(f));
+}
+
+// ---------------------------------------------------------------------------
+// Shared Atomic Kernel State (`0x00200000`)
+// ---------------------------------------------------------------------------
+
+pub fn init_shared_state() @noalloc @noblock {
+    mem_zero(SHARED_ADDR, 64_usize);
+    raw {
+        let p = rawptr_mut.[KernelShared].from_usize(SHARED_ADDR);
+        p.*.timer_ticks.store(0_u64, .SeqCst);
+        p.*.cpus_online.store(1_u32, .SeqCst);
+        p.*.ap_lapic_id.store(0_u32, .SeqCst);
+        p.*.ap_ready.store(0_u32, .SeqCst);
+        p.*.irq_errors.store(0_u32, .SeqCst);
+    }
+}
+
+pub fn inc_timer_ticks() -> u64 @noalloc @noblock {
+    var prev: u64 = 0_u64;
+    raw {
+        let p = rawptr_mut.[KernelShared].from_usize(SHARED_ADDR);
+        prev = p.*.timer_ticks.fetch_add(1_u64, .SeqCst);
+    }
+    return prev +% 1_u64;
+}
+
+pub fn get_timer_ticks() -> u64 @noalloc @noblock {
+    var v: u64 = 0_u64;
+    raw {
+        let p = rawptr_mut.[KernelShared].from_usize(SHARED_ADDR);
+        v = p.*.timer_ticks.load(.SeqCst);
+    }
+    return v;
+}
+
+pub fn mark_ap_online(lapic_id: u32) @noalloc @noblock {
+    raw {
+        let p = rawptr_mut.[KernelShared].from_usize(SHARED_ADDR);
+        p.*.ap_lapic_id.store(lapic_id, .SeqCst);
+        _ = p.*.cpus_online.fetch_add(1_u32, .SeqCst);
+        p.*.ap_ready.store(1_u32, .SeqCst);
+    }
+}
+
+pub fn get_cpus_online() -> u32 @noalloc @noblock {
+    var v: u32 = 0_u32;
+    raw {
+        let p = rawptr_mut.[KernelShared].from_usize(SHARED_ADDR);
+        v = p.*.cpus_online.load(.SeqCst);
+    }
+    return v;
+}
+
+pub fn get_ap_lapic_id() -> u32 @noalloc @noblock {
+    var v: u32 = 0_u32;
+    raw {
+        let p = rawptr_mut.[KernelShared].from_usize(SHARED_ADDR);
+        v = p.*.ap_lapic_id.load(.SeqCst);
+    }
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// GDT + 64-bit TSS Setup (Selectors: 0x08 Code64, 0x10 Data64, 0x28 TSS)
+// ---------------------------------------------------------------------------
+
+pub fn init_gdt_tss() @noalloc @noblock {
+    mem_zero(GDT_ADDR, 64_usize);
+    mem_zero(TSS_ADDR, 104_usize);
+
+    // Populate 64-bit TSS (rsp0 @ +4, ist1 @ +36, iomap_base @ +102 = 104)
+    mem_write_u64(TSS_ADDR +% 4_usize, RSP0_TOP);
+    mem_write_u64(TSS_ADDR +% 36_usize, IST1_TOP);
+    mem_write_u16(TSS_ADDR +% 102_usize, 104_u16);
+
+    // GDT entries:
+    //   0x00: Null
+    //   0x08: Kernel 64-bit Code (0x00AF9A000000FFFF)
+    //   0x10: Kernel 64-bit Data (0x00CF92000000FFFF)
+    //   0x18: User Data          (0x00CFF2000000FFFF)
+    //   0x20: User 64-bit Code   (0x00AFFA000000FFFF)
+    //   0x28: 16-byte 64-bit Available TSS descriptor
+    mem_write_u64(GDT_ADDR +% 0_usize, 0_u64);
+    mem_write_u64(GDT_ADDR +% 8_usize, 0x00AF9A000000FFFF_u64);
+    mem_write_u64(GDT_ADDR +% 16_usize, 0x00CF92000000FFFF_u64);
+    mem_write_u64(GDT_ADDR +% 24_usize, 0x00CFF2000000FFFF_u64);
+    mem_write_u64(GDT_ADDR +% 32_usize, 0x00AFFA000000FFFF_u64);
+
+    let tss_base: u64 = TSS_ADDR.widen.[u64]();
+    let tss_lim: u64 = 103_u64;
+    let tss_lo: u64 = (tss_lim & 0xFFFF_u64)
+        | ((tss_base & 0xFFFFFF_u64) <<% 16_u64)
+        | (0x89_u64 <<% 40_u64)
+        | (((tss_base >> 24_u64) & 0xFF_u64) <<% 56_u64);
+    let tss_hi: u64 = (tss_base >> 32_u64) & 0xFFFFFFFF_u64;
+    mem_write_u64(GDT_ADDR +% 40_usize, tss_lo);
+    mem_write_u64(GDT_ADDR +% 48_usize, tss_hi);
+
+    // GDTR: limit = 55 (7 * 8 - 1), base = GDT_ADDR
+    mem_write_u16(GDTR_ADDR, 55_u16);
+    mem_write_u64(GDTR_ADDR +% 2_usize, GDT_ADDR.widen.[u64]());
+
+    lgdt_raw(GDTR_ADDR.widen.[u64]());
+    reload_segments(0x08_u64, 0x10_u64);
+    ltr_raw(0x28_u16);
+}
+
+// ---------------------------------------------------------------------------
+// 256-Entry 64-bit IDT Setup
+// ---------------------------------------------------------------------------
+
+@naked
+fn default_iret_stub() @noalloc @noblock {
+    raw {
+        asm("iretq", options(noreturn));
+    }
+}
+
+pub fn idt_set_gate(vec: u8, handler_addr: u64, ist: u8) @noalloc @noblock {
+    let off = IDT_ADDR +% (vec.widen.[usize]() *% 16_usize);
+    let lo16 = (handler_addr & 0xFFFF_u64).trunc.[u16]();
+    let mid16 = ((handler_addr >> 16_u64) & 0xFFFF_u64).trunc.[u16]();
+    let hi32 = ((handler_addr >> 32_u64) & 0xFFFFFFFF_u64).trunc.[u32]();
+    mem_write_u16(off +% 0_usize, lo16);
+    mem_write_u16(off +% 2_usize, 0x0008_u16); // Kernel CS
+    mem_write_u8(off +% 4_usize, ist & 7_u8);
+    mem_write_u8(off +% 5_usize, 0x8E_u8);     // Present | DPL=0 | 64-bit Interrupt Gate
+    mem_write_u16(off +% 6_usize, mid16);
+    mem_write_u32(off +% 8_usize, hi32);
+    mem_write_u32(off +% 12_usize, 0_u32);
+}
+
+pub fn init_idt(timer_handler: fn()) @noalloc @noblock {
+    mem_zero(IDT_ADDR, 4096_usize);
+    let def_addr = direct_fn0_addr(default_iret_stub);
+    var v: u32 = 0_u32;
+    while v < 256_u32 {
+        idt_set_gate(v.trunc.[u8](), def_addr, 0_u8);
+        v = v +% 1_u32;
+    }
+    let timer_addr = direct_fn0_addr(timer_handler);
+    // Vector 0x20 (32): LAPIC Periodic Timer -> Safe Eon `@interrupt @noalloc @stack(512)` handler
+    idt_set_gate(32_u8, timer_addr, 1_u8);
+
+    mem_write_u16(IDTR_ADDR, 4095_u16);
+    mem_write_u64(IDTR_ADDR +% 2_usize, IDT_ADDR.widen.[u64]());
+    lidt_raw(IDTR_ADDR.widen.[u64]());
+}
+
+// ---------------------------------------------------------------------------
+// QEMU `isa-debug-exit` Clean Shutdown (port 0xF4 -> exit status `(code << 1) | 1`)
+// ---------------------------------------------------------------------------
+
+pub fn qemu_debug_exit(code: u8) @noalloc @noblock {
+    outb(0x00F4_u16, code);
+    loop {
+        cli();
+        hlt();
+    }
+}

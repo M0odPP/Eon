@@ -1,0 +1,27 @@
+module fail.zm06;
+
+pub linear struct Token {
+    pub id: u32;
+}
+
+pub struct Wrapper { //~ ERROR E0322
+    pub tok: Token;
+}
+
+pub struct Big {
+    pub buf: [32]u8;
+}
+
+fn sink(b: Big) -> u8 {
+    return b.buf[0_usize];
+}
+
+pub fn bad_moves(tok: Token) -> u8 {
+    let dup = copy tok; //~ ERROR E0320
+    let b = Big.{ buf: [1_u8; 32] };
+    let r1 = sink(b);
+    let r2 = sink(b); //~ ERROR E0301
+    let Token.{ id: _ } = tok;
+    let Token.{ id: _ } = dup;
+    return r1 +% r2;
+}

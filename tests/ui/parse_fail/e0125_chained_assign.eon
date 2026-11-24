@@ -1,0 +1,6 @@
+module fail.chain_assign;
+pub fn f() {
+    var a: u32 = 0_u32;
+    var b: u32 = 0_u32;
+    a = b = 1_u32; //~ ERROR E0125
+}

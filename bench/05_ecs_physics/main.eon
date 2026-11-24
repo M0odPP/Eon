@@ -1,0 +1,194 @@
+module bench.ecs_physics;
+
+import core.math;
+import std.rt;
+
+pub pool Body {
+    pub pos_x: f32;
+    pub pos_y: f32;
+    pub pos_z: f32;
+    pub vel_x: f32;
+    pub vel_y: f32;
+    pub vel_z: f32;
+    pub inv_mass: f32;
+    pub drag: f32;
+}
+
+pub sys sys_apply_forces(
+    r: read ArenaPool[Body].{pos_x, pos_y, pos_z, inv_mass, drag},
+    w: write ArenaPool[Body].{vel_x, vel_y, vel_z},
+) {
+    let dt: f32 = 0.016_f32;
+    let grav: f32 = -9.81_f32;
+    let n = r.len();
+    for i in 0_usize..n {
+        let rid = r.id_at(i) catch { continue; };
+        let wid = w.id_at(i) catch { continue; };
+
+        let px = r.pos_x[rid];
+        let py = r.pos_y[rid];
+        let pz = r.pos_z[rid];
+        let im = r.inv_mass[rid];
+        let dr = r.drag[rid];
+
+        let dx = 0.0_f32 - px;
+        let dy = 25.0_f32 - py;
+        let dz = 0.0_f32 - pz;
+        let dist_sq = ((dx * dx) + (dy * dy)) + ((dz * dz) + 4.0_f32);
+        let inv_d = 1.0_f32 / @sqrt(dist_sq);
+        let pull = 12.0_f32 * inv_d;
+        let swirl = 6.0_f32 * inv_d;
+
+        let ax = ((dx * pull) - (dz * swirl)) * im;
+        let ay = grav + ((dy * pull) * im);
+        let az = ((dz * pull) + (dx * swirl)) * im;
+
+        let damp = 1.0_f32 - (dr * dt);
+        w.vel_x[wid] = (w.vel_x[wid] + (ax * dt)) * damp;
+        w.vel_y[wid] = (w.vel_y[wid] + (ay * dt)) * damp;
+        w.vel_z[wid] = (w.vel_z[wid] + (az * dt)) * damp;
+    }
+}
+
+pub sys sys_integrate_pos(
+    rv: read ArenaPool[Body].{vel_x, vel_y, vel_z},
+    wp: write ArenaPool[Body].{pos_x, pos_y, pos_z},
+) {
+    let dt: f32 = 0.016_f32;
+    let n = rv.len();
+    for i in 0_usize..n {
+        let vid = rv.id_at(i) catch { continue; };
+        let pid = wp.id_at(i) catch { continue; };
+
+        wp.pos_x[pid] = wp.pos_x[pid] + (rv.vel_x[vid] * dt);
+        wp.pos_y[pid] = wp.pos_y[pid] + (rv.vel_y[vid] * dt);
+        wp.pos_z[pid] = wp.pos_z[pid] + (rv.vel_z[vid] * dt);
+    }
+}
+
+pub sys sys_collide_bounds(
+    p: write ArenaPool[Body].{pos_x, pos_y, pos_z, vel_x, vel_y, vel_z},
+) {
+    let min_xz: f32 = -50.0_f32;
+    let max_xz: f32 = 50.0_f32;
+    let min_y: f32 = 0.0_f32;
+    let max_y: f32 = 100.0_f32;
+    let rest: f32 = -0.75_f32;
+    let n = p.len();
+    for i in 0_usize..n {
+        let id = p.id_at(i) catch { continue; };
+
+        let px = p.pos_x[id];
+        if px < min_xz {
+            p.pos_x[id] = min_xz;
+            p.vel_x[id] = p.vel_x[id] * rest;
+        } else if px > max_xz {
+            p.pos_x[id] = max_xz;
+            p.vel_x[id] = p.vel_x[id] * rest;
+        }
+
+        let py = p.pos_y[id];
+        if py < min_y {
+            p.pos_y[id] = min_y;
+            p.vel_y[id] = p.vel_y[id] * rest;
+        } else if py > max_y {
+            p.pos_y[id] = max_y;
+            p.vel_y[id] = p.vel_y[id] * rest;
+        }
+
+        let pz = p.pos_z[id];
+        if pz < min_xz {
+            p.pos_z[id] = min_xz;
+            p.vel_z[id] = p.vel_z[id] * rest;
+        } else if pz > max_xz {
+            p.pos_z[id] = max_xz;
+            p.vel_z[id] = p.vel_z[id] * rest;
+        }
+    }
+}
+
+fn rng_next(state: *mut u64) -> u64 {
+    var x = state.*;
+    x = x ^ (x <<% 13_u64);
+    x = x ^ (x >> 7_u64);
+    x = x ^ (x <<% 17_u64);
+    state.* = x;
+    return x;
+}
+
+fn rng_unit_f32(state: *mut u64) -> f32 {
+    let r = (rng_next(state) >> 40_u64).trunc.[u32]();
+    return r.to_float.[f32]() * (1.0_f32 / 16777216.0_f32);
+}
+
+pub fn main(env: *mut Env) -> i32 ! OutOfMemory | MemError | BoundsError {
+    let alloc = &mut env.alloc;
+    let num_bodies: usize = 200000_usize;
+    let num_ticks: usize = 60_usize;
+
+    // 8 columns * 4 bytes * 200,000 = 6.4 MB; allocate 8 MiB arena.
+    var arena = try Arena.init(alloc, 8388608_usize);
+    errdefer arena.destroy(alloc);
+    var bodies = try ArenaPool.[Body].init(&mut arena, num_bodies);
+
+    // Deterministic body initialization (excluded from timed section).
+    var rng: u64 = 0xA5A5F0F012345678_u64;
+    for _i in 0_usize..num_bodies {
+        let px = (rng_unit_f32(&mut rng) * 96.0_f32) - 48.0_f32;
+        let py = (rng_unit_f32(&mut rng) * 90.0_f32) + 5.0_f32;
+        let pz = (rng_unit_f32(&mut rng) * 96.0_f32) - 48.0_f32;
+        let vx = (rng_unit_f32(&mut rng) * 20.0_f32) - 10.0_f32;
+        let vy = (rng_unit_f32(&mut rng) * 20.0_f32) - 10.0_f32;
+        let vz = (rng_unit_f32(&mut rng) * 20.0_f32) - 10.0_f32;
+        let inv_mass = 0.25_f32 + (rng_unit_f32(&mut rng) * 1.75_f32);
+        let drag = 0.05_f32 + (rng_unit_f32(&mut rng) * 0.25_f32);
+
+        let _ = try bodies.push(.{
+            pos_x: px,
+            pos_y: py,
+            pos_z: pz,
+            vel_x: vx,
+            vel_y: vy,
+            vel_z: vz,
+            inv_mass: inv_mass,
+            drag: drag,
+        });
+    }
+
+    let sim_sched = comptime Schedule.build(.{
+        sys_apply_forces.before(sys_integrate_pos),
+        sys_integrate_pos.before(sys_collide_bounds),
+    });
+
+    // Timed physics simulation loop.
+    let t0 = rt.now_ns(&env.clock);
+    for _tick in 0_usize..num_ticks {
+        sim_sched.run(&mut bodies);
+    }
+    let elapsed_ns = rt.elapsed_since(&env.clock, t0);
+
+    // Bit-exact IEEE-754 checksum over all body positions and velocities.
+    var checksum: u64 = 0xCBF29CE484222325_u64;
+    for i in 0_usize..bodies.len() {
+        let id = try bodies.id_at(i);
+        let b0 = (math.f32_to_bits(bodies.pos_x[id]).widen.[u64]() <<% 32_u64) | math.f32_to_bits(bodies.pos_y[id]).widen.[u64]();
+        let b1 = (math.f32_to_bits(bodies.pos_z[id]).widen.[u64]() <<% 32_u64) | math.f32_to_bits(bodies.vel_x[id]).widen.[u64]();
+        let b2 = (math.f32_to_bits(bodies.vel_y[id]).widen.[u64]() <<% 32_u64) | math.f32_to_bits(bodies.vel_z[id]).widen.[u64]();
+        checksum = (checksum ^ b0) *% 0x100000001B3_u64;
+        checksum = (checksum ^ b1) *% 0x100000001B3_u64;
+        checksum = (checksum ^ b2) *% 0x100000001B3_u64;
+    }
+
+    arena.destroy(alloc);
+    if alloc.live_allocs() != 0_usize {
+        return 1_i32;
+    }
+
+    rt.print_str("RESULT ecs_physics checksum=");
+    rt.print_u64(checksum);
+    rt.print_str(" elapsed_ns=");
+    rt.print_u64(elapsed_ns);
+    rt.print_nl();
+
+    return 0_i32;
+}

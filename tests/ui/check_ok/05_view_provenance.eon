@@ -1,0 +1,52 @@
+module ok.view_provenance;
+
+pub struct Pair {
+    pub first: u32;
+    pub second: u32;
+}
+
+impl Pair {
+    pub view fn pick(self: *Self, from other: *u32) -> *u32 {
+        let _ = other.*;
+        return &self.first;
+    }
+}
+
+pub view fn branch(from src: *Pair, other: *u32, first: bool) -> *u32 {
+    let alias = src;
+    return if first { alias.pick(other) } else { &alias.second };
+}
+
+pub view fn optional(src: *u32, present: bool) -> ?*u32 {
+    if present {
+        return src;
+    }
+    return null;
+}
+
+pub view fn checked(src: *u32, fail: bool) -> *u32 ! MemError {
+    if fail {
+        return .OutOfMemory;
+    }
+    return src;
+}
+
+pub view fn forward(src: *u32, fail: bool) -> *u32 ! MemError {
+    let alias = try checked(src, fail);
+    return alias;
+}
+
+pub view fn loop_result(src: *u32) -> *u32 {
+    return 'outer: loop {
+        let alias = loop { break src; };
+        loop { break 'outer alias; }
+    };
+}
+
+view fn string_view(src: *str) -> *str {
+    return src;
+}
+
+pub view fn as_slice(src: *str) -> *[u8] {
+    return string_view(src).as_bytes();
+}

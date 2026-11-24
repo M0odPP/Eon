@@ -1,0 +1,29 @@
+module tests.view_and_try;
+
+pub view fn pick_first(from a: *mut [u32], b: *[u32]) -> *mut u32 {
+    _ = b;
+    return &mut a[0_usize];
+}
+
+pub fn checked_sum(a: u64, b: u64) -> u64 ! ArithError {
+    let total = try a +? b;
+    let half = try total /? 2_u64;
+    return half;
+}
+
+pub fn all_expr_forms(x: ?u32, r: u32 ! ParseError) -> u32 {
+    let v1 = x orelse 10_u32;
+    let v2 = r catch 20_u32;
+    let v3 = r catch |e| {
+        _ = e;
+        30_u32
+    };
+    let arr = [1_u32, 2_u32, 3_u32,];
+    let s1 = arr[..2_usize];
+    let s2 = arr[1_usize..];
+    let s3 = arr[..];
+    _ = s1;
+    _ = s2;
+    _ = s3;
+    return v1 +% v2 +% v3;
+}

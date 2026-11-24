@@ -1,0 +1,54 @@
+module example.concurrency_ok;
+
+pub pool Particle {
+    pos: f32x2;
+    vel: f32x2;
+}
+
+pub pool Widget {
+    pos:    f32x2;
+    size:   f32x2;
+    color:  u8x4;
+    flags:  u32;
+    parent: ?Link[Self];
+}
+
+pub sys calc_layout(
+    parents: read  ArenaPool[Widget].parent,
+    bounds:  write ArenaPool[Widget].{pos, size},
+) {
+    par for row in bounds.each_mut() {
+        row.pos = row.pos + f32x2.{ 1.0, 0.0 };
+    }
+    _ = parents;
+}
+
+pub sys animate_colors(
+    styles: read  ArenaPool[Widget].flags,
+    colors: write ArenaPool[Widget].color,
+    dt:     f32,
+) {
+    _ = styles;
+    _ = colors;
+    _ = dt;
+}
+
+pub sys integrate(
+    vel: read  ArenaPool[Particle].vel,
+    pos: write ArenaPool[Particle].pos,
+    dt:  f32,
+) {
+    let dt_vec = f32x2.splat(dt);
+    par for (p, v) in pos.each_mut_with(vel) {
+        p.* = p.* + (v.* * dt_vec);
+    }
+}
+
+pub fn schedule_demo(xs: *[f32]) -> f32 {
+    let frame_graph = comptime Schedule.build(.{
+        calc_layout,
+        animate_colors,
+    });
+    _ = frame_graph;
+    return xs.each().par_reduce(.AddTree, 0.0_f32);
+}

@@ -1,0 +1,284 @@
+module bench.nbody_simd;
+
+import std.rt;
+
+struct Rng {
+    state: u64;
+}
+
+impl Rng {
+    fn next(self: *mut Self) -> u64 {
+        var x = self.state;
+        x = x ^ (x >> 12_u64);
+        x = x ^ (x <<% 25_u64);
+        x = x ^ (x >> 27_u64);
+        self.state = x;
+        return x *% 0x2545F4914F6CDD1D_u64;
+    }
+
+    fn next_f32_sym(self: *mut Self, scale: f32) -> f32 {
+        let u = (self.next() & 4095_u64).trunc.[i32]() -% 2048_i32;
+        return u.to_float.[f32]() * scale;
+    }
+}
+
+fn body_force_8(
+    pxi: f32x8,
+    pyi: f32x8,
+    pzi: f32x8,
+    px_s: *[f32],
+    py_s: *[f32],
+    pz_s: *[f32],
+    mass_s: *[f32],
+    vxi: f32x8,
+    vyi: f32x8,
+    vzi: f32x8,
+    out_vx: *mut [f32x8],
+    out_vy: *mut [f32x8],
+    out_vz: *mut [f32x8],
+    iv: usize,
+) {
+    if px_s.len > py_s.len || px_s.len > pz_s.len || px_s.len > mass_s.len {
+        return;
+    }
+    let eps_v = f32x8.splat(0.0625_f32);
+    let ones_v = f32x8.splat(1.0_f32);
+    let dt_v = f32x8.splat(0.0078125_f32);
+
+    var ax = f32x8.splat(0.0_f32);
+    var ay = f32x8.splat(0.0_f32);
+    var az = f32x8.splat(0.0_f32);
+
+    var j: usize = 0_usize;
+    while j < px_s.len {
+        let dx = f32x8.splat(px_s[j]) - pxi;
+        let dy = f32x8.splat(py_s[j]) - pyi;
+        let dz = f32x8.splat(pz_s[j]) - pzi;
+        let dist2 = (((dx * dx) + (dy * dy)) + (dz * dz)) + eps_v;
+        let sq: f32x8 = .{
+            @sqrt(dist2[0_usize]), @sqrt(dist2[1_usize]), @sqrt(dist2[2_usize]), @sqrt(dist2[3_usize]),
+            @sqrt(dist2[4_usize]), @sqrt(dist2[5_usize]), @sqrt(dist2[6_usize]), @sqrt(dist2[7_usize]),
+        };
+        let inv_d = ones_v / sq;
+        let inv_d3 = (inv_d * inv_d) * inv_d;
+        let s = f32x8.splat(mass_s[j]) * inv_d3;
+        ax = ax + (dx * s);
+        ay = ay + (dy * s);
+        az = az + (dz * s);
+        j = j + 1_usize;
+    }
+
+    if iv < out_vx.len && iv < out_vy.len && iv < out_vz.len {
+        out_vx[iv] = vxi + (ax * dt_v);
+        out_vy[iv] = vyi + (ay * dt_v);
+        out_vz[iv] = vzi + (az * dt_v);
+    }
+}
+
+fn nbody_step(
+    px_v: *mut [f32x8],
+    py_v: *mut [f32x8],
+    pz_v: *mut [f32x8],
+    vx_v: *mut [f32x8],
+    vy_v: *mut [f32x8],
+    vz_v: *mut [f32x8],
+    px_s: *mut [f32],
+    py_s: *mut [f32],
+    pz_s: *mut [f32],
+    mass_s: *[f32],
+) {
+    let dt_v = f32x8.splat(0.0078125_f32);
+    var iv: usize = 0_usize;
+    while iv < px_v.len {
+        if iv < py_v.len && iv < pz_v.len && iv < vx_v.len && iv < vy_v.len && iv < vz_v.len {
+            body_force_8(
+                px_v[iv],
+                py_v[iv],
+                pz_v[iv],
+                px_s,
+                py_s,
+                pz_s,
+                mass_s,
+                vx_v[iv],
+                vy_v[iv],
+                vz_v[iv],
+                vx_v,
+                vy_v,
+                vz_v,
+                iv,
+            );
+        }
+        iv = iv + 1_usize;
+    }
+
+    iv = 0_usize;
+    while iv < px_v.len {
+        if iv < py_v.len && iv < pz_v.len && iv < vx_v.len && iv < vy_v.len && iv < vz_v.len {
+            let nx = vx_v[iv].fma(dt_v, px_v[iv]);
+            let ny = vy_v[iv].fma(dt_v, py_v[iv]);
+            let nz = vz_v[iv].fma(dt_v, pz_v[iv]);
+            px_v[iv] = nx;
+            py_v[iv] = ny;
+            pz_v[iv] = nz;
+
+            let base = iv *% 8_usize;
+            if base +% 7_usize < px_s.len && base +% 7_usize < py_s.len && base +% 7_usize < pz_s.len {
+                var lane: usize = 0_usize;
+                while lane < 8_usize {
+                    let bi = base +% lane;
+                    if bi < px_s.len && bi < py_s.len && bi < pz_s.len {
+                        px_s[bi] = nx[lane];
+                        py_s[bi] = ny[lane];
+                        pz_s[bi] = nz[lane];
+                    }
+                    lane = lane + 1_usize;
+                }
+            }
+        }
+        iv = iv + 1_usize;
+    }
+}
+
+fn mix_q(h: u64, v: f32) -> u64 {
+    let q = (v * 1024.0_f32).trunc_to_int.[i64]().bitcast.[u64]();
+    return (h ^ q) *% 0x100000001B3_u64;
+}
+
+pub fn main(env: *mut Env) -> i32 ! OutOfMemory | BoundsError {
+    let n: usize = 1536_usize;
+    let n_vec: usize = 192_usize;
+    let steps: usize = 40_usize;
+
+    var rng = Rng.{ state: 0xD1B54A32D192ED03_u64 };
+
+    var px_s_buf = try Buf.[f32].init(&mut env.alloc, n);
+    errdefer px_s_buf.destroy(&mut env.alloc);
+    var py_s_buf = try Buf.[f32].init(&mut env.alloc, n);
+    errdefer py_s_buf.destroy(&mut env.alloc);
+    var pz_s_buf = try Buf.[f32].init(&mut env.alloc, n);
+    errdefer pz_s_buf.destroy(&mut env.alloc);
+    var mass_buf = try Buf.[f32].init(&mut env.alloc, n);
+    errdefer mass_buf.destroy(&mut env.alloc);
+
+    var px_v_buf = try Buf.[f32x8].init(&mut env.alloc, n_vec);
+    errdefer px_v_buf.destroy(&mut env.alloc);
+    var py_v_buf = try Buf.[f32x8].init(&mut env.alloc, n_vec);
+    errdefer py_v_buf.destroy(&mut env.alloc);
+    var pz_v_buf = try Buf.[f32x8].init(&mut env.alloc, n_vec);
+    errdefer pz_v_buf.destroy(&mut env.alloc);
+    var vx_v_buf = try Buf.[f32x8].init(&mut env.alloc, n_vec);
+    errdefer vx_v_buf.destroy(&mut env.alloc);
+    var vy_v_buf = try Buf.[f32x8].init(&mut env.alloc, n_vec);
+    errdefer vy_v_buf.destroy(&mut env.alloc);
+    var vz_v_buf = try Buf.[f32x8].init(&mut env.alloc, n_vec);
+    errdefer vz_v_buf.destroy(&mut env.alloc);
+
+    let pos_scale = 1.0_f32 / 256.0_f32;
+    let vel_scale = 1.0_f32 / 8192.0_f32;
+    let mass_scale = 1.0_f32 / 1024.0_f32;
+
+    var iv: usize = 0_usize;
+    while iv < n_vec {
+        var px_a: [8]f32 = [0.0_f32; 8];
+        var py_a: [8]f32 = [0.0_f32; 8];
+        var pz_a: [8]f32 = [0.0_f32; 8];
+        var vx_a: [8]f32 = [0.0_f32; 8];
+        var vy_a: [8]f32 = [0.0_f32; 8];
+        var vz_a: [8]f32 = [0.0_f32; 8];
+        var k: usize = 0_usize;
+        while k < 8_usize {
+            let px = rng.next_f32_sym(pos_scale);
+            let py = rng.next_f32_sym(pos_scale);
+            let pz = rng.next_f32_sym(pos_scale);
+            let vx = rng.next_f32_sym(vel_scale);
+            let vy = rng.next_f32_sym(vel_scale);
+            let vz = rng.next_f32_sym(vel_scale);
+            let m = 0.5_f32 + (rng.next() & 1023_u64).trunc.[i32]().to_float.[f32]() * mass_scale;
+            px_a[k] = px;
+            py_a[k] = py;
+            pz_a[k] = pz;
+            vx_a[k] = vx;
+            vy_a[k] = vy;
+            vz_a[k] = vz;
+            try px_s_buf.push(px);
+            try py_s_buf.push(py);
+            try pz_s_buf.push(pz);
+            try mass_buf.push(m);
+            k = k + 1_usize;
+        }
+        let pxv: f32x8 = .{ px_a[0_usize], px_a[1_usize], px_a[2_usize], px_a[3_usize], px_a[4_usize], px_a[5_usize], px_a[6_usize], px_a[7_usize] };
+        let pyv: f32x8 = .{ py_a[0_usize], py_a[1_usize], py_a[2_usize], py_a[3_usize], py_a[4_usize], py_a[5_usize], py_a[6_usize], py_a[7_usize] };
+        let pzv: f32x8 = .{ pz_a[0_usize], pz_a[1_usize], pz_a[2_usize], pz_a[3_usize], pz_a[4_usize], pz_a[5_usize], pz_a[6_usize], pz_a[7_usize] };
+        let vxv: f32x8 = .{ vx_a[0_usize], vx_a[1_usize], vx_a[2_usize], vx_a[3_usize], vx_a[4_usize], vx_a[5_usize], vx_a[6_usize], vx_a[7_usize] };
+        let vyv: f32x8 = .{ vy_a[0_usize], vy_a[1_usize], vy_a[2_usize], vy_a[3_usize], vy_a[4_usize], vy_a[5_usize], vy_a[6_usize], vy_a[7_usize] };
+        let vzv: f32x8 = .{ vz_a[0_usize], vz_a[1_usize], vz_a[2_usize], vz_a[3_usize], vz_a[4_usize], vz_a[5_usize], vz_a[6_usize], vz_a[7_usize] };
+        try px_v_buf.push(pxv);
+        try py_v_buf.push(pyv);
+        try pz_v_buf.push(pzv);
+        try vx_v_buf.push(vxv);
+        try vy_v_buf.push(vyv);
+        try vz_v_buf.push(vzv);
+        iv = iv + 1_usize;
+    }
+
+    let px_v = px_v_buf.as_mut_slice();
+    let py_v = py_v_buf.as_mut_slice();
+    let pz_v = pz_v_buf.as_mut_slice();
+    let vx_v = vx_v_buf.as_mut_slice();
+    let vy_v = vy_v_buf.as_mut_slice();
+    let vz_v = vz_v_buf.as_mut_slice();
+    let px_s = px_s_buf.as_mut_slice();
+    let py_s = py_s_buf.as_mut_slice();
+    let pz_s = pz_s_buf.as_mut_slice();
+    let mass_s = mass_buf.as_slice();
+
+    let t0 = rt.now_ns(&env.clock);
+    var s: usize = 0_usize;
+    while s < steps {
+        nbody_step(px_v, py_v, pz_v, vx_v, vy_v, vz_v, px_s, py_s, pz_s, mass_s);
+        s = s + 1_usize;
+    }
+    let elapsed_ns = rt.elapsed_since(&env.clock, t0);
+
+    var h: u64 = 0xCBF29CE484222325_u64;
+    iv = 0_usize;
+    while iv < px_v.len {
+        if iv < py_v.len && iv < pz_v.len && iv < vx_v.len && iv < vy_v.len && iv < vz_v.len {
+            let px8 = px_v[iv];
+            let py8 = py_v[iv];
+            let pz8 = pz_v[iv];
+            let vx8 = vx_v[iv];
+            let vy8 = vy_v[iv];
+            let vz8 = vz_v[iv];
+            var lane: usize = 0_usize;
+            while lane < 8_usize {
+                h = mix_q(h, px8[lane]);
+                h = mix_q(h, py8[lane]);
+                h = mix_q(h, pz8[lane]);
+                h = mix_q(h, vx8[lane]);
+                h = mix_q(h, vy8[lane]);
+                h = mix_q(h, vz8[lane]);
+                lane = lane + 1_usize;
+            }
+        }
+        iv = iv + 1_usize;
+    }
+
+    px_v_buf.destroy(&mut env.alloc);
+    py_v_buf.destroy(&mut env.alloc);
+    pz_v_buf.destroy(&mut env.alloc);
+    vx_v_buf.destroy(&mut env.alloc);
+    vy_v_buf.destroy(&mut env.alloc);
+    vz_v_buf.destroy(&mut env.alloc);
+    px_s_buf.destroy(&mut env.alloc);
+    py_s_buf.destroy(&mut env.alloc);
+    pz_s_buf.destroy(&mut env.alloc);
+    mass_buf.destroy(&mut env.alloc);
+
+    rt.print_str("RESULT nbody_simd checksum=");
+    rt.print_u64(h);
+    rt.print_str(" elapsed_ns=");
+    rt.print_u64(elapsed_ns);
+    rt.print_nl();
+    return 0_i32;
+}

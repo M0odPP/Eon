@@ -1,0 +1,4 @@
+module fail.braceless_while;
+pub fn f(a: bool) {
+    while a break; //~ ERROR E0117
+}

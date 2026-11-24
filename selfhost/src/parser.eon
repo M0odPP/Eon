@@ -1,0 +1,4694 @@
+module eonc.parser;
+
+import core.col;
+import core.str;
+import eonc.span;
+import eonc.diag;
+import eonc.tok;
+import eonc.lexer;
+import eonc.ast;
+
+// ---------------------------------------------------------------------------
+// Constants, Precedence Categories, and Small Value Results
+// ---------------------------------------------------------------------------
+
+const MAX_RECURSION_DEPTH: u32 = 128_u32;
+
+enum PrecCat : u8 {
+    Other = 0,
+    Bitwise = 1,
+    Arith = 2,
+    Cmp = 3,
+    LogAnd = 4,
+    LogOr = 5,
+}
+
+struct InfixInfo {
+    op: ast.BinaryOp;
+    l_bp: u8;
+    r_bp: u8;
+    cat: PrecCat;
+}
+
+struct ExprPrec {
+    id: u32;
+    cat: PrecCat;
+}
+
+struct ModuleHeader {
+    path: ast.IdRange;
+    is_hal: bool;
+    has_hal_span: bool;
+    hal_span: span.Span;
+}
+
+struct ParamName {
+    ident: ast.IdentSpan;
+    is_self: bool;
+}
+
+struct BorrowTargetRes {
+    kind: ast.BorrowTargetKind;
+    inner: u32;
+}
+
+struct CatchRhs {
+    kind: ast.BodyKind;
+    id: u32;
+    span: span.Span;
+}
+
+struct MatchParts {
+    scrutinee: u32;
+    arms: ast.IdRange;
+    end_span: span.Span;
+}
+
+struct ExternKindRes {
+    ok: bool;
+    kind: ast.DeclKind;
+    payload: u32;
+}
+
+struct RangeEndRes {
+    has_range: bool;
+    range_kind: ast.RangeKind;
+    end_expr: u32;
+}
+
+fn truncate_buf[T](buf: *mut col.DynBuf[T], mark: usize) {
+    while buf.len() > mark {
+        _ = buf.pop();
+    }
+}
+
+view fn slice_from[T](all: *[T], mark: usize) -> *[T] {
+    let s = all.sub(mark, all.len) catch {
+        return all.sub(0_usize, 0_usize) catch {
+            return all;
+        };
+    };
+    return s;
+}
+
+view fn slice_span_bytes(src: *[u8], sp: span.Span) -> *[u8] {
+    let empty: *str = "";
+    let s = src.sub(sp.start.widen.[usize](), sp.end.widen.[usize]()) catch {
+        return empty.as_bytes();
+    };
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// Reusable LIFO Scratch Stacks (zero per-node heap allocations during parse)
+// ---------------------------------------------------------------------------
+
+linear struct ScratchMeta {
+    imports: col.DynBuf[ast.ImportNode];
+    import_items: col.DynBuf[ast.ImportItemNode];
+    attrs: col.DynBuf[ast.AttrNode];
+    attr_args: col.DynBuf[ast.AttrArgNode];
+    idents: col.DynBuf[ast.IdentSpan];
+    generic_params: col.DynBuf[ast.GenericParamNode];
+    generic_args: col.DynBuf[ast.GenericArgNode];
+    decl_ids: col.DynBuf[u32];
+}
+
+impl ScratchMeta {
+    fn init(alloc: *mut AllocCap) -> ScratchMeta ! OutOfMemory {
+        let imports = try col.DynBuf.[ast.ImportNode].init(alloc, 16_usize);
+        errdefer imports.destroy(alloc);
+        let import_items = try col.DynBuf.[ast.ImportItemNode].init(alloc, 16_usize);
+        errdefer import_items.destroy(alloc);
+        let attrs = try col.DynBuf.[ast.AttrNode].init(alloc, 16_usize);
+        errdefer attrs.destroy(alloc);
+        let attr_args = try col.DynBuf.[ast.AttrArgNode].init(alloc, 16_usize);
+        errdefer attr_args.destroy(alloc);
+        let idents = try col.DynBuf.[ast.IdentSpan].init(alloc, 32_usize);
+        errdefer idents.destroy(alloc);
+        let generic_params = try col.DynBuf.[ast.GenericParamNode].init(alloc, 16_usize);
+        errdefer generic_params.destroy(alloc);
+        let generic_args = try col.DynBuf.[ast.GenericArgNode].init(alloc, 16_usize);
+        errdefer generic_args.destroy(alloc);
+        let decl_ids = try col.DynBuf.[u32].init(alloc, 64_usize);
+        errdefer decl_ids.destroy(alloc);
+        return ScratchMeta.{
+            imports: imports,
+            import_items: import_items,
+            attrs: attrs,
+            attr_args: attr_args,
+            idents: idents,
+            generic_params: generic_params,
+            generic_args: generic_args,
+            decl_ids: decl_ids,
+        };
+    }
+
+    fn destroy(self: ScratchMeta, alloc: *mut AllocCap) {
+        let ScratchMeta.{
+            imports,
+            import_items,
+            attrs,
+            attr_args,
+            idents,
+            generic_params,
+            generic_args,
+            decl_ids,
+        } = self;
+        imports.destroy(alloc);
+        import_items.destroy(alloc);
+        attrs.destroy(alloc);
+        attr_args.destroy(alloc);
+        idents.destroy(alloc);
+        generic_params.destroy(alloc);
+        generic_args.destroy(alloc);
+        decl_ids.destroy(alloc);
+    }
+}
+
+linear struct ScratchDecl {
+    params: col.DynBuf[ast.ParamNode];
+    sys_params: col.DynBuf[ast.SysParamNode];
+    fields: col.DynBuf[ast.FieldNode];
+    enum_variants: col.DynBuf[ast.EnumVariantNode];
+    union_variants: col.DynBuf[ast.UnionVariantNode];
+    bitfield_members: col.DynBuf[ast.BitfieldMemberNode];
+    iface_methods: col.DynBuf[ast.IfaceMethodNode];
+    asm_ops: col.DynBuf[ast.AsmOperandNode];
+}
+
+impl ScratchDecl {
+    fn init(alloc: *mut AllocCap) -> ScratchDecl ! OutOfMemory {
+        let params = try col.DynBuf.[ast.ParamNode].init(alloc, 16_usize);
+        errdefer params.destroy(alloc);
+        let sys_params = try col.DynBuf.[ast.SysParamNode].init(alloc, 8_usize);
+        errdefer sys_params.destroy(alloc);
+        let fields = try col.DynBuf.[ast.FieldNode].init(alloc, 32_usize);
+        errdefer fields.destroy(alloc);
+        let enum_variants = try col.DynBuf.[ast.EnumVariantNode].init(alloc, 32_usize);
+        errdefer enum_variants.destroy(alloc);
+        let union_variants = try col.DynBuf.[ast.UnionVariantNode].init(alloc, 16_usize);
+        errdefer union_variants.destroy(alloc);
+        let bitfield_members = try col.DynBuf.[ast.BitfieldMemberNode].init(alloc, 8_usize);
+        errdefer bitfield_members.destroy(alloc);
+        let iface_methods = try col.DynBuf.[ast.IfaceMethodNode].init(alloc, 16_usize);
+        errdefer iface_methods.destroy(alloc);
+        let asm_ops = try col.DynBuf.[ast.AsmOperandNode].init(alloc, 8_usize);
+        errdefer asm_ops.destroy(alloc);
+        return ScratchDecl.{
+            params: params,
+            sys_params: sys_params,
+            fields: fields,
+            enum_variants: enum_variants,
+            union_variants: union_variants,
+            bitfield_members: bitfield_members,
+            iface_methods: iface_methods,
+            asm_ops: asm_ops,
+        };
+    }
+
+    fn destroy(self: ScratchDecl, alloc: *mut AllocCap) {
+        let ScratchDecl.{
+            params,
+            sys_params,
+            fields,
+            enum_variants,
+            union_variants,
+            bitfield_members,
+            iface_methods,
+            asm_ops,
+        } = self;
+        params.destroy(alloc);
+        sys_params.destroy(alloc);
+        fields.destroy(alloc);
+        enum_variants.destroy(alloc);
+        union_variants.destroy(alloc);
+        bitfield_members.destroy(alloc);
+        iface_methods.destroy(alloc);
+        asm_ops.destroy(alloc);
+    }
+}
+
+linear struct ScratchTree {
+    type_ids: col.DynBuf[u32];
+    pat_ids: col.DynBuf[u32];
+    pat_fields: col.DynBuf[ast.PatFieldNode];
+    stmt_ids: col.DynBuf[u32];
+    match_arms: col.DynBuf[ast.MatchArmNode];
+    expr_ids: col.DynBuf[u32];
+    field_inits: col.DynBuf[ast.FieldInitNode];
+}
+
+impl ScratchTree {
+    fn init(alloc: *mut AllocCap) -> ScratchTree ! OutOfMemory {
+        let type_ids = try col.DynBuf.[u32].init(alloc, 16_usize);
+        errdefer type_ids.destroy(alloc);
+        let pat_ids = try col.DynBuf.[u32].init(alloc, 16_usize);
+        errdefer pat_ids.destroy(alloc);
+        let pat_fields = try col.DynBuf.[ast.PatFieldNode].init(alloc, 16_usize);
+        errdefer pat_fields.destroy(alloc);
+        let stmt_ids = try col.DynBuf.[u32].init(alloc, 64_usize);
+        errdefer stmt_ids.destroy(alloc);
+        let match_arms = try col.DynBuf.[ast.MatchArmNode].init(alloc, 16_usize);
+        errdefer match_arms.destroy(alloc);
+        let expr_ids = try col.DynBuf.[u32].init(alloc, 32_usize);
+        errdefer expr_ids.destroy(alloc);
+        let field_inits = try col.DynBuf.[ast.FieldInitNode].init(alloc, 16_usize);
+        errdefer field_inits.destroy(alloc);
+        return ScratchTree.{
+            type_ids: type_ids,
+            pat_ids: pat_ids,
+            pat_fields: pat_fields,
+            stmt_ids: stmt_ids,
+            match_arms: match_arms,
+            expr_ids: expr_ids,
+            field_inits: field_inits,
+        };
+    }
+
+    fn destroy(self: ScratchTree, alloc: *mut AllocCap) {
+        let ScratchTree.{
+            type_ids,
+            pat_ids,
+            pat_fields,
+            stmt_ids,
+            match_arms,
+            expr_ids,
+            field_inits,
+        } = self;
+        type_ids.destroy(alloc);
+        pat_ids.destroy(alloc);
+        pat_fields.destroy(alloc);
+        stmt_ids.destroy(alloc);
+        match_arms.destroy(alloc);
+        expr_ids.destroy(alloc);
+        field_inits.destroy(alloc);
+    }
+}
+
+linear struct ParseScratch {
+    meta: ScratchMeta;
+    decl: ScratchDecl;
+    tree: ScratchTree;
+}
+
+impl ParseScratch {
+    fn init(alloc: *mut AllocCap) -> ParseScratch ! OutOfMemory {
+        let meta = try ScratchMeta.init(alloc);
+        errdefer meta.destroy(alloc);
+        let decl = try ScratchDecl.init(alloc);
+        errdefer decl.destroy(alloc);
+        let tree = try ScratchTree.init(alloc);
+        errdefer tree.destroy(alloc);
+        return ParseScratch.{ meta: meta, decl: decl, tree: tree };
+    }
+
+    fn destroy(self: ParseScratch, alloc: *mut AllocCap) {
+        let ParseScratch.{ meta, decl, tree } = self;
+        meta.destroy(alloc);
+        decl.destroy(alloc);
+        tree.destroy(alloc);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Token Classification & Operator Precedence Tables
+// ---------------------------------------------------------------------------
+
+fn is_base_type_start(kind: tok.TokenKind) -> bool {
+    match kind {
+        .Question => { return true; }
+        .Star => { return true; }
+        .LBracket => { return true; }
+        .KwDyn => { return true; }
+        .KwFn => { return true; }
+        .KwStruct => { return true; }
+        .LParen => { return true; }
+        .KwVoid => { return true; }
+        .KwNever => { return true; }
+        .KwType => { return true; }
+        .KwSelfType => { return true; }
+        .Ident => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn is_stmt_sync_stop(kind: tok.TokenKind) -> bool {
+    match kind {
+        .RBrace => { return true; }
+        .KwFn => { return true; }
+        .KwSys => { return true; }
+        .KwStruct => { return true; }
+        .KwPool => { return true; }
+        .KwEnum => { return true; }
+        .KwUnion => { return true; }
+        .KwBitfield => { return true; }
+        .KwIface => { return true; }
+        .KwImpl => { return true; }
+        .KwError => { return true; }
+        .KwType => { return true; }
+        .KwConst => { return true; }
+        .KwPub => { return true; }
+        .KwLet => { return true; }
+        .KwVar => { return true; }
+        .KwReturn => { return true; }
+        .KwIf => { return true; }
+        .KwMatch => { return true; }
+        .KwWhile => { return true; }
+        .KwFor => { return true; }
+        .KwPar => { return true; }
+        .KwLoop => { return true; }
+        .KwDefer => { return true; }
+        .KwErrdefer => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn is_decl_sync_stop(kind: tok.TokenKind) -> bool {
+    match kind {
+        .At => { return true; }
+        .KwPub => { return true; }
+        .KwFn => { return true; }
+        .KwSys => { return true; }
+        .KwStruct => { return true; }
+        .KwLinear => { return true; }
+        .KwPool => { return true; }
+        .KwEnum => { return true; }
+        .KwUnion => { return true; }
+        .KwBitfield => { return true; }
+        .KwIface => { return true; }
+        .KwImpl => { return true; }
+        .KwError => { return true; }
+        .KwType => { return true; }
+        .KwConst => { return true; }
+        .KwExtern => { return true; }
+        .KwComptime => { return true; }
+        .KwView => { return true; }
+        .RBrace => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn is_value_builtin_name(bytes: *[u8]) -> bool {
+    return str.bytes_eq(bytes, "sqrt".as_bytes())
+        || str.bytes_eq(bytes, "fma".as_bytes())
+        || str.bytes_eq(bytes, "lzcnt".as_bytes())
+        || str.bytes_eq(bytes, "tzcnt".as_bytes())
+        || str.bytes_eq(bytes, "popcnt".as_bytes())
+        || str.bytes_eq(bytes, "bswap".as_bytes());
+}
+
+fn is_tuple_type_disqualifying_op(kind: tok.TokenKind) -> bool {
+    match kind {
+        .Plus => { return true; }
+        .Minus => { return true; }
+        .Slash => { return true; }
+        .Percent => { return true; }
+        .EqEq => { return true; }
+        .NotEq => { return true; }
+        .Lt => { return true; }
+        .Gt => { return true; }
+        .AndAnd => { return true; }
+        .OrOr => { return true; }
+        .Amp => { return true; }
+        .Pipe => { return true; }
+        .Caret => { return true; }
+        .Shl => { return true; }
+        .Shr => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn infix_binding_power(kind: tok.TokenKind) -> ?InfixInfo {
+    match kind {
+        .Star => { return InfixInfo.{ op: .Mul, l_bp: 21_u8, r_bp: 22_u8, cat: .Arith }; }
+        .Slash => { return InfixInfo.{ op: .Div, l_bp: 21_u8, r_bp: 22_u8, cat: .Arith }; }
+        .Percent => { return InfixInfo.{ op: .Mod, l_bp: 21_u8, r_bp: 22_u8, cat: .Arith }; }
+        .StarWrap => { return InfixInfo.{ op: .MulWrap, l_bp: 21_u8, r_bp: 22_u8, cat: .Arith }; }
+        .StarSat => { return InfixInfo.{ op: .MulSat, l_bp: 21_u8, r_bp: 22_u8, cat: .Arith }; }
+        .StarCheck => { return InfixInfo.{ op: .MulCheck, l_bp: 21_u8, r_bp: 22_u8, cat: .Arith }; }
+        .SlashCheck => { return InfixInfo.{ op: .DivCheck, l_bp: 21_u8, r_bp: 22_u8, cat: .Arith }; }
+        .PercentCheck => { return InfixInfo.{ op: .ModCheck, l_bp: 21_u8, r_bp: 22_u8, cat: .Arith }; }
+
+        .Plus => { return InfixInfo.{ op: .Add, l_bp: 19_u8, r_bp: 20_u8, cat: .Arith }; }
+        .Minus => { return InfixInfo.{ op: .Sub, l_bp: 19_u8, r_bp: 20_u8, cat: .Arith }; }
+        .PlusWrap => { return InfixInfo.{ op: .AddWrap, l_bp: 19_u8, r_bp: 20_u8, cat: .Arith }; }
+        .MinusWrap => { return InfixInfo.{ op: .SubWrap, l_bp: 19_u8, r_bp: 20_u8, cat: .Arith }; }
+        .PlusSat => { return InfixInfo.{ op: .AddSat, l_bp: 19_u8, r_bp: 20_u8, cat: .Arith }; }
+        .MinusSat => { return InfixInfo.{ op: .SubSat, l_bp: 19_u8, r_bp: 20_u8, cat: .Arith }; }
+        .PlusCheck => { return InfixInfo.{ op: .AddCheck, l_bp: 19_u8, r_bp: 20_u8, cat: .Arith }; }
+        .MinusCheck => { return InfixInfo.{ op: .SubCheck, l_bp: 19_u8, r_bp: 20_u8, cat: .Arith }; }
+
+        .Shl => { return InfixInfo.{ op: .Shl, l_bp: 17_u8, r_bp: 18_u8, cat: .Bitwise }; }
+        .Shr => { return InfixInfo.{ op: .Shr, l_bp: 17_u8, r_bp: 18_u8, cat: .Bitwise }; }
+        .ShlWrap => { return InfixInfo.{ op: .ShlWrap, l_bp: 17_u8, r_bp: 18_u8, cat: .Bitwise }; }
+
+        .Amp => { return InfixInfo.{ op: .BitAnd, l_bp: 15_u8, r_bp: 16_u8, cat: .Bitwise }; }
+        .Caret => { return InfixInfo.{ op: .BitXor, l_bp: 13_u8, r_bp: 14_u8, cat: .Bitwise }; }
+        .Pipe => { return InfixInfo.{ op: .BitOr, l_bp: 11_u8, r_bp: 12_u8, cat: .Bitwise }; }
+
+        .EqEq => { return InfixInfo.{ op: .Eq, l_bp: 9_u8, r_bp: 10_u8, cat: .Cmp }; }
+        .NotEq => { return InfixInfo.{ op: .NotEq, l_bp: 9_u8, r_bp: 10_u8, cat: .Cmp }; }
+        .Lt => { return InfixInfo.{ op: .Lt, l_bp: 9_u8, r_bp: 10_u8, cat: .Cmp }; }
+        .LtEq => { return InfixInfo.{ op: .LtEq, l_bp: 9_u8, r_bp: 10_u8, cat: .Cmp }; }
+        .Gt => { return InfixInfo.{ op: .Gt, l_bp: 9_u8, r_bp: 10_u8, cat: .Cmp }; }
+        .GtEq => { return InfixInfo.{ op: .GtEq, l_bp: 9_u8, r_bp: 10_u8, cat: .Cmp }; }
+
+        .AndAnd => { return InfixInfo.{ op: .And, l_bp: 7_u8, r_bp: 8_u8, cat: .LogAnd }; }
+        .OrOr => { return InfixInfo.{ op: .Or, l_bp: 5_u8, r_bp: 6_u8, cat: .LogOr }; }
+
+        _ => { return null; }
+    }
+}
+
+fn token_assign_op(kind: tok.TokenKind) -> ?ast.AssignOp {
+    match kind {
+        .Eq => { return .Assign; }
+        .PlusEq => { return .AddAssign; }
+        .MinusEq => { return .SubAssign; }
+        .StarEq => { return .MulAssign; }
+        .PlusWrapEq => { return .AddWrapAssign; }
+        .MinusWrapEq => { return .SubWrapAssign; }
+        .StarWrapEq => { return .MulWrapAssign; }
+        .PlusSatEq => { return .AddSatAssign; }
+        .MinusSatEq => { return .SubSatAssign; }
+        .StarSatEq => { return .MulSatAssign; }
+        .AmpEq => { return .BitAndAssign; }
+        .PipeEq => { return .BitOrAssign; }
+        .CaretEq => { return .BitXorAssign; }
+        .ShlEq => { return .ShlAssign; }
+        .ShrEq => { return .ShrAssign; }
+        _ => { return null; }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parser State (second-class `view struct`, passed by `*mut Parser`)
+// ---------------------------------------------------------------------------
+
+view struct Parser {
+    alloc: *mut AllocCap;
+    fid: u32;
+    profile: span.FileProfile;
+    src: *[u8];
+    lexed: *lexer.LexOutput;
+    tokens: *[tok.Token];
+    pos: usize;
+    interner: *mut span.SymInterner;
+    diags: *mut diag.DiagBag;
+    arena: *mut ast.AstArena;
+    scratch: *mut ParseScratch;
+    msg_buf: *mut str.StrBuf;
+    depth: u32;
+    allow_return_as_expr: bool;
+    in_ensures_or_where: bool;
+}
+
+impl Parser {
+    // --- Token navigation & spans ---
+
+    fn cur(self: *Self) -> tok.Token {
+        if self.pos < self.tokens.len {
+            return self.tokens[self.pos];
+        }
+        if self.tokens.len > 0_usize {
+            return self.tokens[self.tokens.len - 1_usize];
+        }
+        return tok.Token.simple(.Eof, 0_u32, 0_u32);
+    }
+
+    fn kind(self: *Self) -> tok.TokenKind {
+        return self.cur().kind;
+    }
+
+    fn peek_kind(self: *Self, offset: usize) -> tok.TokenKind {
+        if offset < self.tokens.len && self.pos < self.tokens.len - offset {
+            return self.tokens[self.pos + offset].kind;
+        }
+        return .Eof;
+    }
+
+    fn tok_span(self: *Self, t: tok.Token) -> span.Span {
+        return span.span_new(self.fid, t.start, t.end);
+    }
+
+    fn span(self: *Self) -> span.Span {
+        return self.tok_span(self.cur());
+    }
+
+    view fn slice(self: *Self, sp: span.Span) -> *[u8] {
+        let empty: *str = "";
+        let s = self.src.sub(sp.start.widen.[usize](), sp.end.widen.[usize]()) catch {
+            return empty.as_bytes();
+        };
+        return s;
+    }
+
+    fn at(self: *Self, k: tok.TokenKind) -> bool {
+        return self.kind() == k;
+    }
+
+    fn at_eof(self: *Self) -> bool {
+        return self.kind() == .Eof;
+    }
+
+    fn bump(self: *mut Self) -> tok.Token {
+        let t = self.cur();
+        if self.tokens.len > 1_usize && self.pos < self.tokens.len - 1_usize {
+            self.pos = self.pos +% 1_usize;
+        }
+        return t;
+    }
+
+    fn eat(self: *mut Self, k: tok.TokenKind) -> bool {
+        if self.at(k) {
+            _ = self.bump();
+            return true;
+        }
+        return false;
+    }
+
+    fn prev_end_span(self: *Self) -> span.Span {
+        if self.pos > 0_usize && self.pos <= self.tokens.len {
+            return self.tok_span(self.tokens[self.pos - 1_usize]);
+        }
+        return self.span();
+    }
+
+    fn enter_depth(self: *mut Self) -> bool ! OutOfMemory {
+        if self.depth >= MAX_RECURSION_DEPTH {
+            _ = try self.diags.emit_error(
+                self.alloc,
+                diag.E0005,
+                self.span(),
+                "maximum syntactic nesting depth exceeded",
+            );
+            return false;
+        }
+        self.depth = self.depth +% 1_u32;
+        return true;
+    }
+
+    fn leave_depth(self: *mut Self) {
+        if self.depth > 0_u32 {
+            self.depth = self.depth - 1_u32;
+        }
+    }
+
+    // --- Arena span accessors ---
+
+    fn expr_span(self: *Self, id: u32) -> span.Span {
+        if let e = self.arena.get_expr(id) {
+            return e.span;
+        }
+        return self.span();
+    }
+
+    fn type_span(self: *Self, id: u32) -> span.Span {
+        if let t = self.arena.get_type(id) {
+            return t.span;
+        }
+        return self.span();
+    }
+
+    fn pat_span(self: *Self, id: u32) -> span.Span {
+        if let p = self.arena.get_pat(id) {
+            return p.span;
+        }
+        return self.span();
+    }
+
+    fn block_span(self: *Self, id: u32) -> span.Span {
+        if let b = self.arena.get_block(id) {
+            return b.span;
+        }
+        return self.span();
+    }
+
+    fn if_span(self: *Self, id: u32) -> span.Span {
+        if let n = self.arena.get_if(id) {
+            return n.span;
+        }
+        return self.span();
+    }
+
+    fn if_has_else(self: *Self, id: u32) -> bool {
+        if let n = self.arena.get_if(id) {
+            return n.else_kind != .None;
+        }
+        return false;
+    }
+
+    // --- Scratch stack committers ---
+
+    fn commit_imports(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.meta.imports.len() > mark {
+            let sub = slice_from.[ast.ImportNode](self.scratch.meta.imports.as_slice(), mark);
+            r = try self.arena.push_imports(self.alloc, sub);
+        }
+        truncate_buf.[ast.ImportNode](&mut self.scratch.meta.imports, mark);
+        return r;
+    }
+
+    fn commit_import_items(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.meta.import_items.len() > mark {
+            let sub = slice_from.[ast.ImportItemNode](self.scratch.meta.import_items.as_slice(), mark);
+            r = try self.arena.push_import_items(self.alloc, sub);
+        }
+        truncate_buf.[ast.ImportItemNode](&mut self.scratch.meta.import_items, mark);
+        return r;
+    }
+
+    fn commit_attrs(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.meta.attrs.len() > mark {
+            let sub = slice_from.[ast.AttrNode](self.scratch.meta.attrs.as_slice(), mark);
+            r = try self.arena.push_attrs(self.alloc, sub);
+        }
+        truncate_buf.[ast.AttrNode](&mut self.scratch.meta.attrs, mark);
+        return r;
+    }
+
+    fn commit_attr_args(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.meta.attr_args.len() > mark {
+            let sub = slice_from.[ast.AttrArgNode](self.scratch.meta.attr_args.as_slice(), mark);
+            r = try self.arena.push_attr_args(self.alloc, sub);
+        }
+        truncate_buf.[ast.AttrArgNode](&mut self.scratch.meta.attr_args, mark);
+        return r;
+    }
+
+    fn commit_idents(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.meta.idents.len() > mark {
+            let sub = slice_from.[ast.IdentSpan](self.scratch.meta.idents.as_slice(), mark);
+            r = try self.arena.push_idents(self.alloc, sub);
+        }
+        truncate_buf.[ast.IdentSpan](&mut self.scratch.meta.idents, mark);
+        return r;
+    }
+
+    fn commit_generic_params(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.meta.generic_params.len() > mark {
+            let sub = slice_from.[ast.GenericParamNode](self.scratch.meta.generic_params.as_slice(), mark);
+            r = try self.arena.push_generic_params(self.alloc, sub);
+        }
+        truncate_buf.[ast.GenericParamNode](&mut self.scratch.meta.generic_params, mark);
+        return r;
+    }
+
+    fn commit_generic_args(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.meta.generic_args.len() > mark {
+            let sub = slice_from.[ast.GenericArgNode](self.scratch.meta.generic_args.as_slice(), mark);
+            r = try self.arena.push_generic_args(self.alloc, sub);
+        }
+        truncate_buf.[ast.GenericArgNode](&mut self.scratch.meta.generic_args, mark);
+        return r;
+    }
+
+    fn commit_decl_ids(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.meta.decl_ids.len() > mark {
+            let sub = slice_from.[u32](self.scratch.meta.decl_ids.as_slice(), mark);
+            r = try self.arena.push_decl_list(self.alloc, sub);
+        }
+        truncate_buf.[u32](&mut self.scratch.meta.decl_ids, mark);
+        return r;
+    }
+
+    fn commit_params(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.decl.params.len() > mark {
+            let sub = slice_from.[ast.ParamNode](self.scratch.decl.params.as_slice(), mark);
+            r = try self.arena.push_params(self.alloc, sub);
+        }
+        truncate_buf.[ast.ParamNode](&mut self.scratch.decl.params, mark);
+        return r;
+    }
+
+    fn commit_sys_params(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.decl.sys_params.len() > mark {
+            let sub = slice_from.[ast.SysParamNode](self.scratch.decl.sys_params.as_slice(), mark);
+            r = try self.arena.push_sys_params(self.alloc, sub);
+        }
+        truncate_buf.[ast.SysParamNode](&mut self.scratch.decl.sys_params, mark);
+        return r;
+    }
+
+    fn commit_fields(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.decl.fields.len() > mark {
+            let sub = slice_from.[ast.FieldNode](self.scratch.decl.fields.as_slice(), mark);
+            r = try self.arena.push_fields(self.alloc, sub);
+        }
+        truncate_buf.[ast.FieldNode](&mut self.scratch.decl.fields, mark);
+        return r;
+    }
+
+    fn commit_enum_variants(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.decl.enum_variants.len() > mark {
+            let sub = slice_from.[ast.EnumVariantNode](self.scratch.decl.enum_variants.as_slice(), mark);
+            r = try self.arena.push_enum_variants(self.alloc, sub);
+        }
+        truncate_buf.[ast.EnumVariantNode](&mut self.scratch.decl.enum_variants, mark);
+        return r;
+    }
+
+    fn commit_union_variants(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.decl.union_variants.len() > mark {
+            let sub = slice_from.[ast.UnionVariantNode](self.scratch.decl.union_variants.as_slice(), mark);
+            r = try self.arena.push_union_variants(self.alloc, sub);
+        }
+        truncate_buf.[ast.UnionVariantNode](&mut self.scratch.decl.union_variants, mark);
+        return r;
+    }
+
+    fn commit_bitfield_members(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.decl.bitfield_members.len() > mark {
+            let sub = slice_from.[ast.BitfieldMemberNode](self.scratch.decl.bitfield_members.as_slice(), mark);
+            r = try self.arena.push_bitfield_members(self.alloc, sub);
+        }
+        truncate_buf.[ast.BitfieldMemberNode](&mut self.scratch.decl.bitfield_members, mark);
+        return r;
+    }
+
+    fn commit_iface_methods(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.decl.iface_methods.len() > mark {
+            let sub = slice_from.[ast.IfaceMethodNode](self.scratch.decl.iface_methods.as_slice(), mark);
+            r = try self.arena.push_iface_methods(self.alloc, sub);
+        }
+        truncate_buf.[ast.IfaceMethodNode](&mut self.scratch.decl.iface_methods, mark);
+        return r;
+    }
+
+    fn commit_asm_ops(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.decl.asm_ops.len() > mark {
+            let sub = slice_from.[ast.AsmOperandNode](self.scratch.decl.asm_ops.as_slice(), mark);
+            r = try self.arena.push_asm_ops(self.alloc, sub);
+        }
+        truncate_buf.[ast.AsmOperandNode](&mut self.scratch.decl.asm_ops, mark);
+        return r;
+    }
+
+    fn commit_type_ids(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.tree.type_ids.len() > mark {
+            let sub = slice_from.[u32](self.scratch.tree.type_ids.as_slice(), mark);
+            r = try self.arena.push_type_list(self.alloc, sub);
+        }
+        truncate_buf.[u32](&mut self.scratch.tree.type_ids, mark);
+        return r;
+    }
+
+    fn commit_pat_ids(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.tree.pat_ids.len() > mark {
+            let sub = slice_from.[u32](self.scratch.tree.pat_ids.as_slice(), mark);
+            r = try self.arena.push_pat_list(self.alloc, sub);
+        }
+        truncate_buf.[u32](&mut self.scratch.tree.pat_ids, mark);
+        return r;
+    }
+
+    fn commit_pat_fields(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.tree.pat_fields.len() > mark {
+            let sub = slice_from.[ast.PatFieldNode](self.scratch.tree.pat_fields.as_slice(), mark);
+            r = try self.arena.push_pat_fields(self.alloc, sub);
+        }
+        truncate_buf.[ast.PatFieldNode](&mut self.scratch.tree.pat_fields, mark);
+        return r;
+    }
+
+    fn commit_stmt_ids(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.tree.stmt_ids.len() > mark {
+            let sub = slice_from.[u32](self.scratch.tree.stmt_ids.as_slice(), mark);
+            r = try self.arena.push_stmt_list(self.alloc, sub);
+        }
+        truncate_buf.[u32](&mut self.scratch.tree.stmt_ids, mark);
+        return r;
+    }
+
+    fn commit_match_arms(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.tree.match_arms.len() > mark {
+            let sub = slice_from.[ast.MatchArmNode](self.scratch.tree.match_arms.as_slice(), mark);
+            r = try self.arena.push_match_arms(self.alloc, sub);
+        }
+        truncate_buf.[ast.MatchArmNode](&mut self.scratch.tree.match_arms, mark);
+        return r;
+    }
+
+    fn commit_expr_ids(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.tree.expr_ids.len() > mark {
+            let sub = slice_from.[u32](self.scratch.tree.expr_ids.as_slice(), mark);
+            r = try self.arena.push_expr_list(self.alloc, sub);
+        }
+        truncate_buf.[u32](&mut self.scratch.tree.expr_ids, mark);
+        return r;
+    }
+
+    fn commit_field_inits(self: *mut Self, mark: usize) -> ast.IdRange ! OutOfMemory {
+        var r = ast.range_empty();
+        if self.scratch.tree.field_inits.len() > mark {
+            let sub = slice_from.[ast.FieldInitNode](self.scratch.tree.field_inits.as_slice(), mark);
+            r = try self.arena.push_field_inits(self.alloc, sub);
+        }
+        truncate_buf.[ast.FieldInitNode](&mut self.scratch.tree.field_inits, mark);
+        return r;
+    }
+
+    // --- Diagnostic & expectation helpers ---
+
+    fn emit_err(self: *mut Self, code: u32, sp: span.Span, msg: *str) -> !OutOfMemory {
+        _ = try self.diags.emit_error(self.alloc, code, sp, msg);
+        return;
+    }
+
+    fn emit_msg_buf(self: *mut Self, code: u32, sp: span.Span) -> !OutOfMemory {
+        _ = try self.diags.emit_error_bytes(self.alloc, code, sp, self.msg_buf.as_bytes());
+        return;
+    }
+
+    fn emit_expected_what(self: *mut Self, sp: span.Span, what: *str, found: tok.TokenKind) -> !OutOfMemory {
+        self.msg_buf.clear();
+        try self.msg_buf.push_str_grow(self.alloc, "expected ");
+        try self.msg_buf.push_str_grow(self.alloc, what);
+        try self.msg_buf.push_str_grow(self.alloc, ", found ");
+        try tok.write_token_kind_description(self.alloc, found, self.msg_buf);
+        try self.emit_msg_buf(diag.E0005, sp);
+        return;
+    }
+
+    fn expect(self: *mut Self, expected: tok.TokenKind) -> ?tok.Token ! OutOfMemory {
+        if self.at(expected) {
+            return self.bump();
+        }
+        let sp = self.span();
+        let found = self.kind();
+        self.msg_buf.clear();
+        try self.msg_buf.push_str_grow(self.alloc, "expected ");
+        try tok.write_token_kind_description(self.alloc, expected, self.msg_buf);
+        try self.msg_buf.push_str_grow(self.alloc, ", found ");
+        try tok.write_token_kind_description(self.alloc, found, self.msg_buf);
+        try self.emit_msg_buf(diag.E0005, sp);
+        return null;
+    }
+
+    fn expect_semi(self: *mut Self) -> !OutOfMemory {
+        if !self.eat(.Semi) {
+            let err_span = self.prev_end_span();
+            let found = self.kind();
+            self.msg_buf.clear();
+            try self.msg_buf.push_str_grow(self.alloc, "expected `;`, found ");
+            try tok.write_token_kind_description(self.alloc, found, self.msg_buf);
+            try self.emit_msg_buf(diag.E0005, err_span);
+        }
+        return;
+    }
+
+    fn expect_ident(self: *mut Self, what: *str) -> ?ast.IdentSpan ! OutOfMemory {
+        let t = self.cur();
+        let sp = self.tok_span(t);
+        match t.kind {
+            .Ident => {
+                _ = self.bump();
+                return ast.ident_new(t.payload, sp);
+            }
+            .KwRaw => {
+                _ = self.bump();
+                try self.emit_hal_reserved_ident_err(sp, what);
+                return null;
+            }
+            .KwAsm => {
+                _ = self.bump();
+                try self.emit_hal_reserved_ident_err(sp, what);
+                return null;
+            }
+            .KwVolatile => {
+                _ = self.bump();
+                try self.emit_hal_reserved_ident_err(sp, what);
+                return null;
+            }
+            .Error => {
+                _ = self.bump();
+                return null;
+            }
+            _ => {
+                try self.emit_expected_what(sp, what, t.kind);
+                return null;
+            }
+        }
+    }
+
+    fn emit_hal_reserved_ident_err(self: *mut Self, sp: span.Span, what: *str) -> !OutOfMemory {
+        let text = slice_span_bytes(self.src, sp);
+        self.msg_buf.clear();
+        if self.profile == .Safe {
+            try self.msg_buf.push_byte_grow(self.alloc, b'`');
+            try self.msg_buf.push_bytes_grow(self.alloc, text);
+            try self.msg_buf.push_str_grow(self.alloc, "` is reserved for `.hal.eon` modules");
+            try self.emit_msg_buf(diag.E0111, sp);
+        } else {
+            try self.msg_buf.push_str_grow(self.alloc, "expected ");
+            try self.msg_buf.push_str_grow(self.alloc, what);
+            try self.msg_buf.push_str_grow(self.alloc, ", found reserved keyword `");
+            try self.msg_buf.push_bytes_grow(self.alloc, text);
+            try self.msg_buf.push_byte_grow(self.alloc, b'`');
+            try self.emit_msg_buf(diag.E0005, sp);
+        }
+        return;
+    }
+
+    fn dummy_ident(self: *mut Self, sp: span.Span) -> ast.IdentSpan ! OutOfMemory {
+        let sym = try self.interner.intern_str(self.alloc, "<error>");
+        return ast.ident_new(sym, sp);
+    }
+
+    fn expect_ident_or_dummy(self: *mut Self, what: *str) -> ast.IdentSpan ! OutOfMemory {
+        let sp = self.span();
+        if let id = try self.expect_ident(what) {
+            return id;
+        }
+        return try self.dummy_ident(sp);
+    }
+
+    fn sync_to_stmt(self: *mut Self) {
+        while !self.at_eof() {
+            let k = self.kind();
+            if k == .Semi {
+                _ = self.bump();
+                return;
+            }
+            if is_stmt_sync_stop(k) {
+                return;
+            }
+            _ = self.bump();
+        }
+    }
+
+    fn sync_to_decl(self: *mut Self) {
+        while !self.at_eof() {
+            let k = self.kind();
+            if is_decl_sync_stop(k) {
+                return;
+            }
+            if k == .Semi {
+                _ = self.bump();
+                return;
+            }
+            _ = self.bump();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Compilation Unit & Declarations (mirroring `compiler/src/parser/decl.rs`)
+    // -----------------------------------------------------------------------
+
+    fn parse_compilation_unit(self: *mut Self) -> u32 ! OutOfMemory {
+        let hdr = try self.parse_module_header();
+        let imark = self.scratch.meta.imports.len();
+        while self.at(.KwImport) {
+            let imp = try self.parse_import_decl();
+            try self.scratch.meta.imports.push(self.alloc, imp);
+        }
+
+        let dmark = self.scratch.meta.decl_ids.len();
+        while !self.at_eof() {
+            if self.at(.KwImport) {
+                try self.emit_err(
+                    diag.E0005,
+                    self.span(),
+                    "`import` declarations must appear immediately after the `module` header",
+                );
+                let imp = try self.parse_import_decl();
+                try self.scratch.meta.imports.push(self.alloc, imp);
+                continue;
+            }
+            let prev_pos = self.pos;
+            let did = try self.parse_top_level_decl();
+            if did != ast.NONE_ID {
+                try self.scratch.meta.decl_ids.push(self.alloc, did);
+            }
+            if self.pos == prev_pos {
+                _ = self.bump();
+            }
+        }
+
+        let imports = try self.commit_imports(imark);
+        let decls = try self.commit_decl_ids(dmark);
+        return try self.arena.add_unit(
+            self.alloc,
+            ast.UnitNode.{
+                file: self.fid,
+                profile: self.profile,
+                module_path: hdr.path,
+                is_hal: hdr.is_hal,
+                has_hal_span: hdr.has_hal_span,
+                hal_span: hdr.hal_span,
+                imports: imports,
+                decls: decls,
+                is_emi_stub: false,
+            },
+        );
+    }
+
+    fn parse_module_header(self: *mut Self) -> ModuleHeader ! OutOfMemory {
+        if !self.eat(.KwModule) {
+            try self.emit_err(
+                diag.E0005,
+                self.span(),
+                "expected `module` header at start of file",
+            );
+            if self.profile == .Hal {
+                try self.emit_err(
+                    diag.E0111,
+                    self.span(),
+                    "`.hal.eon` files must declare `module ... @hal;`",
+                );
+            }
+            return ModuleHeader.{
+                path: ast.range_empty(),
+                is_hal: false,
+                has_hal_span: false,
+                hal_span: span.span_dummy(),
+            };
+        }
+
+        let path = try self.parse_module_path();
+        var is_hal = false;
+        var has_hal_span = false;
+        var hal_span = span.span_dummy();
+
+        if self.eat(.At) {
+            let at_span = self.prev_end_span();
+            if let id = try self.expect_ident("`hal`") {
+                let s = span.span_merge(at_span, id.span);
+                let id_bytes = self.interner.get(id.sym);
+                if str.bytes_eq(id_bytes, "hal".as_bytes()) {
+                    is_hal = true;
+                    has_hal_span = true;
+                    hal_span = s;
+                    if self.profile == .Safe {
+                        try self.emit_err(
+                            diag.E0111,
+                            s,
+                            "`@hal` module header is only allowed in `.hal.eon` files",
+                        );
+                    }
+                } else {
+                    self.msg_buf.clear();
+                    try self.msg_buf.push_str_grow(self.alloc, "expected `@hal` in module header, found `@");
+                    try self.msg_buf.push_bytes_grow(self.alloc, self.interner.get(id.sym));
+                    try self.msg_buf.push_byte_grow(self.alloc, b'`');
+                    try self.emit_msg_buf(diag.E0005, s);
+                }
+            }
+        } else if self.profile == .Hal {
+            try self.emit_err(
+                diag.E0111,
+                self.span(),
+                "`.hal.eon` files must declare `module ... @hal;`",
+            );
+        }
+
+        try self.expect_semi();
+        return ModuleHeader.{
+            path: path,
+            is_hal: is_hal,
+            has_hal_span: has_hal_span,
+            hal_span: hal_span,
+        };
+    }
+
+    fn parse_module_path(self: *mut Self) -> ast.IdRange ! OutOfMemory {
+        let mark = self.scratch.meta.idents.len();
+        let first = try self.expect_ident_or_dummy("module identifier");
+        try self.scratch.meta.idents.push(self.alloc, first);
+        while self.eat(.Dot) {
+            let seg = try self.expect_ident_or_dummy("module segment");
+            try self.scratch.meta.idents.push(self.alloc, seg);
+        }
+        return try self.commit_idents(mark);
+    }
+
+    fn parse_import_items(self: *mut Self) -> ast.IdRange ! OutOfMemory {
+        let mark = self.scratch.meta.import_items.len();
+        while !self.at(.RBrace) && !self.at_eof() {
+            let name = try self.expect_ident_or_dummy("imported symbol");
+            var sp = name.span;
+            var alias = ast.ident_none();
+            if self.eat(.KwAs) {
+                let a = try self.expect_ident_or_dummy("alias identifier");
+                sp = span.span_merge(sp, a.span);
+                alias = a;
+            }
+            try self.scratch.meta.import_items.push(
+                self.alloc,
+                ast.ImportItemNode.{ span: sp, name: name, alias: alias },
+            );
+            if !self.eat(.Comma) {
+                break;
+            }
+        }
+        _ = try self.expect(.RBrace);
+        return try self.commit_import_items(mark);
+    }
+
+    fn parse_import_decl(self: *mut Self) -> ast.ImportNode ! OutOfMemory {
+        let start = self.tok_span(self.bump());
+        let pmark = self.scratch.meta.idents.len();
+        let first = try self.expect_ident_or_dummy("module path");
+        try self.scratch.meta.idents.push(self.alloc, first);
+
+        var tail_kind: ast.ImportTailKind = .None;
+        var alias = ast.ident_none();
+        var items = ast.range_empty();
+
+        while self.eat(.Dot) {
+            if self.eat(.LBrace) {
+                items = try self.parse_import_items();
+                tail_kind = .Items;
+                break;
+            } else {
+                let seg = try self.expect_ident_or_dummy("module segment");
+                try self.scratch.meta.idents.push(self.alloc, seg);
+            }
+        }
+
+        if tail_kind == .None && self.eat(.KwAs) {
+            alias = try self.expect_ident_or_dummy("alias identifier");
+            tail_kind = .Alias;
+        }
+
+        try self.expect_semi();
+        let path = try self.commit_idents(pmark);
+        return ast.ImportNode.{
+            span: span.span_merge(start, self.prev_end_span()),
+            path: path,
+            tail_kind: tail_kind,
+            alias: alias,
+            items: items,
+        };
+    }
+
+    @recursive
+    fn parse_attributes(self: *mut Self) -> ast.IdRange ! OutOfMemory {
+        if !self.at(.At) {
+            return ast.range_empty();
+        }
+        let mark = self.scratch.meta.attrs.len();
+        try self.parse_attributes_into_scratch();
+        return try self.commit_attrs(mark);
+    }
+
+    @recursive
+    fn parse_attributes_into_scratch(self: *mut Self) -> !OutOfMemory {
+        while self.at(.At) {
+            let a = try self.parse_one_attribute();
+            try self.scratch.meta.attrs.push(self.alloc, a);
+        }
+        return;
+    }
+
+    fn parse_attr_name(self: *mut Self) -> ast.IdentSpan ! OutOfMemory {
+        let t = self.cur();
+        let sp = self.tok_span(t);
+        if t.kind == .Ident {
+            _ = self.bump();
+            return ast.ident_new(t.payload, sp);
+        }
+        if t.kind == .KwExtern {
+            _ = self.bump();
+            let sym = try self.interner.intern_str(self.alloc, "extern");
+            return ast.ident_new(sym, sp);
+        }
+        return try self.expect_ident_or_dummy("attribute name");
+    }
+
+    @recursive
+    fn parse_one_attribute(self: *mut Self) -> ast.AttrNode ! OutOfMemory {
+        let at_span = self.tok_span(self.bump());
+        let name = try self.parse_attr_name();
+        var sp = span.span_merge(at_span, name.span);
+        var has_parens = false;
+        var args = ast.range_empty();
+
+        if self.eat(.LParen) {
+            has_parens = true;
+            let amark = self.scratch.meta.attr_args.len();
+            while !self.at(.RParen) && !self.at_eof() {
+                let arg_start = self.span();
+                var arg_name = ast.ident_none();
+                if self.at(.Ident) && self.peek_kind(1_usize) == .Eq {
+                    arg_name = try self.expect_ident_or_dummy("attribute argument name");
+                    _ = self.bump();
+                }
+                let value = try self.parse_expr();
+                let vspan = self.expr_span(value);
+                try self.scratch.meta.attr_args.push(
+                    self.alloc,
+                    ast.AttrArgNode.{
+                        span: span.span_merge(arg_start, vspan),
+                        name: arg_name,
+                        value: value,
+                    },
+                );
+                if !self.eat(.Comma) {
+                    break;
+                }
+            }
+            if let rp = try self.expect(.RParen) {
+                sp = span.span_merge(sp, self.tok_span(rp));
+            }
+            args = try self.commit_attr_args(amark);
+        }
+
+        return ast.AttrNode.{
+            span: sp,
+            name: name,
+            args: args,
+            has_parens: has_parens,
+        };
+    }
+
+    fn has_gpu_attr(self: *Self, decl_attrs: ast.IdRange, effects: ast.IdRange) -> bool {
+        let da = self.arena.attrs_range(decl_attrs);
+        var i: usize = 0_usize;
+        while i < da.len {
+            if str.bytes_eq(self.interner.get(da[i].name.sym), "gpu".as_bytes()) {
+                return true;
+            }
+            i = i +% 1_usize;
+        }
+        let ea = self.arena.attrs_range(effects);
+        var j: usize = 0_usize;
+        while j < ea.len {
+            if str.bytes_eq(self.interner.get(ea[j].name.sym), "gpu".as_bytes()) {
+                return true;
+            }
+            j = j +% 1_usize;
+        }
+        return false;
+    }
+
+    fn validate_param_access_modes(self: *mut Self, params: ast.IdRange, has_gpu: bool) -> !OutOfMemory {
+        if has_gpu {
+            return;
+        }
+        let count = params.len.widen.[usize]();
+        var i: usize = 0_usize;
+        while i < count {
+            var bad = false;
+            var psp = span.span_dummy();
+            let ps = self.arena.params_range(params);
+            if i < ps.len && ps[i].access != .None {
+                bad = true;
+                psp = ps[i].span;
+            }
+            if bad {
+                try self.emit_err(
+                    diag.E0823,
+                    psp,
+                    "`read`/`write` parameter access qualifiers are only allowed on `sys` and `@gpu` functions",
+                );
+            }
+            i = i +% 1_usize;
+        }
+        return;
+    }
+
+    @recursive
+    fn parse_top_level_decl(self: *mut Self) -> u32 ! OutOfMemory {
+        let start_span = self.span();
+        let attrs = try self.parse_attributes();
+        let is_pub = self.eat(.KwPub);
+
+        let res = try self.parse_top_level_decl_kind(attrs);
+        if !res.ok {
+            return ast.NONE_ID;
+        }
+        return try self.arena.add_decl(
+            self.alloc,
+            ast.DeclNode.{
+                span: span.span_merge(start_span, self.prev_end_span()),
+                attrs: attrs,
+                is_pub: is_pub,
+                kind: res.kind,
+                payload: res.payload,
+            },
+        );
+    }
+
+    @recursive
+    fn parse_linear_decl(self: *mut Self) -> ExternKindRes ! OutOfMemory {
+        let lin_span = self.tok_span(self.bump());
+        match self.kind() {
+            .KwStruct => {
+                let id = try self.parse_struct_decl(true, false);
+                return ExternKindRes.{ ok: true, kind: .Struct, payload: id };
+            }
+            .KwView => {
+                if self.peek_kind(1_usize) == .KwStruct {
+                    _ = self.bump();
+                    let id = try self.parse_struct_decl(true, true);
+                    return ExternKindRes.{ ok: true, kind: .Struct, payload: id };
+                }
+            }
+            .KwUnion => {
+                let id = try self.parse_union_decl(true);
+                return ExternKindRes.{ ok: true, kind: .Union, payload: id };
+            }
+            _ => {}
+        }
+        try self.emit_err(
+            diag.E0005,
+            lin_span,
+            "expected `struct`, `view struct`, or `union` after `linear`",
+        );
+        self.sync_to_decl();
+        return ExternKindRes.{ ok: false, kind: .Fn, payload: ast.NONE_ID };
+    }
+
+    @recursive
+    fn parse_top_level_decl_kind(self: *mut Self, attrs: ast.IdRange) -> ExternKindRes ! OutOfMemory {
+        match self.kind() {
+            .KwFn => {
+                let id = try self.parse_fn_decl(attrs);
+                return ExternKindRes.{ ok: true, kind: .Fn, payload: id };
+            }
+            .KwComptime => {
+                let id = try self.parse_fn_decl(attrs);
+                return ExternKindRes.{ ok: true, kind: .Fn, payload: id };
+            }
+            .KwView => {
+                if self.peek_kind(1_usize) == .KwStruct {
+                    _ = self.bump();
+                    let id = try self.parse_struct_decl(false, true);
+                    return ExternKindRes.{ ok: true, kind: .Struct, payload: id };
+                }
+                let id = try self.parse_fn_decl(attrs);
+                return ExternKindRes.{ ok: true, kind: .Fn, payload: id };
+            }
+            .KwSys => {
+                let id = try self.parse_sys_decl();
+                return ExternKindRes.{ ok: true, kind: .Sys, payload: id };
+            }
+            .KwStruct => {
+                let id = try self.parse_struct_decl(false, false);
+                return ExternKindRes.{ ok: true, kind: .Struct, payload: id };
+            }
+            .KwLinear => {
+                return try self.parse_linear_decl();
+            }
+            .KwPool => {
+                let id = try self.parse_pool_decl();
+                return ExternKindRes.{ ok: true, kind: .Pool, payload: id };
+            }
+            .KwEnum => {
+                let id = try self.parse_enum_decl();
+                return ExternKindRes.{ ok: true, kind: .Enum, payload: id };
+            }
+            .KwUnion => {
+                let id = try self.parse_union_decl(false);
+                return ExternKindRes.{ ok: true, kind: .Union, payload: id };
+            }
+            .KwBitfield => {
+                let id = try self.parse_bitfield_decl();
+                return ExternKindRes.{ ok: true, kind: .Bitfield, payload: id };
+            }
+            .KwIface => {
+                let id = try self.parse_iface_decl();
+                return ExternKindRes.{ ok: true, kind: .Iface, payload: id };
+            }
+            .KwImpl => {
+                let id = try self.parse_impl_decl();
+                return ExternKindRes.{ ok: true, kind: .Impl, payload: id };
+            }
+            .KwError => {
+                let id = try self.parse_error_decl();
+                return ExternKindRes.{ ok: true, kind: .Error, payload: id };
+            }
+            .KwType => {
+                let id = try self.parse_type_alias_decl();
+                return ExternKindRes.{ ok: true, kind: .TypeAlias, payload: id };
+            }
+            .KwConst => {
+                let id = try self.parse_const_decl();
+                return ExternKindRes.{ ok: true, kind: .Const, payload: id };
+            }
+            .KwExtern => {
+                return try self.parse_extern_decl();
+            }
+            .KwVar => {
+                let var_sp = self.tok_span(self.bump());
+                try self.emit_err(
+                    diag.E0110,
+                    var_sp,
+                    "ZM-10: module-level mutable `var` declarations are forbidden in Eon (even in `.hal.eon`)",
+                );
+                self.sync_to_stmt();
+                return ExternKindRes.{ ok: false, kind: .Fn, payload: ast.NONE_ID };
+            }
+            _ => {
+                try self.emit_expected_what(self.span(), "declaration", self.kind());
+                self.sync_to_decl();
+                return ExternKindRes.{ ok: false, kind: .Fn, payload: ast.NONE_ID };
+            }
+        }
+    }
+
+    @recursive
+    fn parse_fn_decl(self: *mut Self, decl_attrs: ast.IdRange) -> u32 ! OutOfMemory {
+        var is_comptime = false;
+        var is_view = false;
+        if self.eat(.KwComptime) {
+            is_comptime = true;
+        } else if self.eat(.KwView) {
+            is_view = true;
+        }
+        _ = try self.expect(.KwFn);
+        let name = try self.expect_ident_or_dummy("function name");
+        let generics = try self.parse_optional_generic_params();
+        let params = try self.parse_param_list();
+        var ret_type = ast.NONE_ID;
+        if self.eat(.Arrow) || self.at(.Bang) {
+            ret_type = try self.parse_type_expr();
+        }
+        let effects = try self.parse_attributes();
+        let has_gpu = self.has_gpu_attr(decl_attrs, effects);
+        try self.validate_param_access_modes(params, has_gpu);
+        let where_clauses = try self.parse_optional_where_clause();
+        let ensures_clauses = try self.parse_optional_ensures_clause();
+        let body = try self.parse_block(false);
+        return try self.arena.add_fn_decl(
+            self.alloc,
+            ast.FnDeclNode.{
+                is_comptime: is_comptime,
+                is_view: is_view,
+                name: name,
+                generics: generics,
+                params: params,
+                ret_type: ret_type,
+                effects: effects,
+                where_clauses: where_clauses,
+                ensures_clauses: ensures_clauses,
+                body: body,
+                is_emi_stub_body: false,
+            },
+        );
+    }
+
+    @recursive
+    fn parse_sys_decl(self: *mut Self) -> u32 ! OutOfMemory {
+        _ = self.bump();
+        let name = try self.expect_ident_or_dummy("system name");
+        let generics = try self.parse_optional_generic_params();
+        let params = try self.parse_sys_param_list();
+        var ret_type = ast.NONE_ID;
+        if self.eat(.Arrow) || self.at(.Bang) {
+            ret_type = try self.parse_type_expr();
+        }
+        let effects = try self.parse_attributes();
+        let where_clauses = try self.parse_optional_where_clause();
+        let ensures_clauses = try self.parse_optional_ensures_clause();
+        let body = try self.parse_block(false);
+        return try self.arena.add_sys_decl(
+            self.alloc,
+            ast.SysDeclNode.{
+                name: name,
+                generics: generics,
+                params: params,
+                ret_type: ret_type,
+                effects: effects,
+                where_clauses: where_clauses,
+                ensures_clauses: ensures_clauses,
+                body: body,
+                is_emi_stub_body: false,
+            },
+        );
+    }
+
+    @recursive
+    fn parse_param_list(self: *mut Self) -> ast.IdRange ! OutOfMemory {
+        _ = try self.expect(.LParen);
+        let mark = self.scratch.decl.params.len();
+        while !self.at(.RParen) && !self.at_eof() {
+            let p = try self.parse_param();
+            try self.scratch.decl.params.push(self.alloc, p);
+            if !self.eat(.Comma) {
+                break;
+            }
+        }
+        _ = try self.expect(.RParen);
+        return try self.commit_params(mark);
+    }
+
+    @recursive
+    fn parse_param(self: *mut Self) -> ast.ParamNode ! OutOfMemory {
+        let start = self.span();
+        let attrs = try self.parse_attributes();
+        let is_comptime = self.eat(.KwComptime);
+        var modifier: ast.ParamModifier = .None;
+        if self.eat(.KwMut) {
+            modifier = .Mut;
+        } else if self.eat(.KwFrom) {
+            modifier = .From;
+        }
+        let pn = try self.parse_param_name();
+        _ = try self.expect(.Colon);
+        let access = self.parse_contextual_access_mode();
+        let ty = try self.parse_type_expr();
+        let end = self.type_span(ty);
+        return ast.ParamNode.{
+            span: span.span_merge(start, end),
+            attrs: attrs,
+            is_comptime: is_comptime,
+            modifier: modifier,
+            name: pn.ident,
+            is_self: pn.is_self,
+            access: access,
+            ty: ty,
+        };
+    }
+
+    fn parse_param_name(self: *mut Self) -> ParamName ! OutOfMemory {
+        if self.at(.KwSelf) {
+            let sp = self.tok_span(self.bump());
+            let sym = try self.interner.intern_str(self.alloc, "self");
+            return ParamName.{ ident: ast.ident_new(sym, sp), is_self: true };
+        }
+        let id = try self.expect_ident_or_dummy("parameter name");
+        return ParamName.{ ident: id, is_self: false };
+    }
+
+    @recursive
+    fn parse_sys_param_list(self: *mut Self) -> ast.IdRange ! OutOfMemory {
+        _ = try self.expect(.LParen);
+        let mark = self.scratch.decl.sys_params.len();
+        while !self.at(.RParen) && !self.at_eof() {
+            let p = try self.parse_sys_param();
+            try self.scratch.decl.sys_params.push(self.alloc, p);
+            if !self.eat(.Comma) {
+                break;
+            }
+        }
+        _ = try self.expect(.RParen);
+        return try self.commit_sys_params(mark);
+    }
+
+    @recursive
+    fn parse_sys_param(self: *mut Self) -> ast.SysParamNode ! OutOfMemory {
+        let start = self.span();
+        let attrs = try self.parse_attributes();
+        let is_comptime = self.eat(.KwComptime);
+        var modifier: ast.ParamModifier = .None;
+        if self.eat(.KwMut) {
+            modifier = .Mut;
+        } else if self.eat(.KwFrom) {
+            modifier = .From;
+        }
+        let pn = try self.parse_param_name();
+        _ = try self.expect(.Colon);
+        let access = self.parse_contextual_access_mode();
+        let ty = try self.parse_type_expr();
+
+        var columns = ast.range_empty();
+        if access != .None && self.eat(.Dot) {
+            let cmark = self.scratch.meta.idents.len();
+            if self.eat(.LBrace) {
+                while !self.at(.RBrace) && !self.at_eof() {
+                    let col = try self.expect_ident_or_dummy("pool column name");
+                    try self.scratch.meta.idents.push(self.alloc, col);
+                    if !self.eat(.Comma) {
+                        break;
+                    }
+                }
+                _ = try self.expect(.RBrace);
+            } else {
+                let col = try self.expect_ident_or_dummy("pool column name");
+                try self.scratch.meta.idents.push(self.alloc, col);
+            }
+            columns = try self.commit_idents(cmark);
+        }
+
+        return ast.SysParamNode.{
+            span: span.span_merge(start, self.prev_end_span()),
+            attrs: attrs,
+            is_comptime: is_comptime,
+            modifier: modifier,
+            name: pn.ident,
+            is_self: pn.is_self,
+            access: access,
+            ty: ty,
+            columns: columns,
+        };
+    }
+
+    fn parse_contextual_access_mode(self: *mut Self) -> ast.AccessMode {
+        if self.at(.Ident) {
+            let next = self.peek_kind(1_usize);
+            if next != .Comma && next != .RParen {
+                let text = self.slice(self.span());
+                if str.bytes_eq(text, "read".as_bytes()) {
+                    _ = self.bump();
+                    return .Read;
+                }
+                if str.bytes_eq(text, "write".as_bytes()) {
+                    _ = self.bump();
+                    return .Write;
+                }
+            }
+        }
+        return .None;
+    }
+
+    @recursive
+    fn parse_optional_where_clause(self: *mut Self) -> ast.IdRange ! OutOfMemory {
+        if !self.eat(.KwWhere) {
+            return ast.range_empty();
+        }
+        return try self.parse_constraint_conjunction(false);
+    }
+
+    @recursive
+    fn parse_optional_ensures_clause(self: *mut Self) -> ast.IdRange ! OutOfMemory {
+        if !self.eat(.KwEnsures) {
+            return ast.range_empty();
+        }
+        return try self.parse_constraint_conjunction(true);
+    }
+
+    @recursive
+    fn parse_constraint_conjunction(self: *mut Self, allow_return: bool) -> ast.IdRange ! OutOfMemory {
+        let old_ret = self.allow_return_as_expr;
+        let old_in = self.in_ensures_or_where;
+        self.allow_return_as_expr = allow_return;
+        self.in_ensures_or_where = true;
+
+        let mark = self.scratch.tree.expr_ids.len();
+        loop {
+            let res = try self.parse_binary_expr_bp(8_u8);
+            try self.scratch.tree.expr_ids.push(self.alloc, res.id);
+            if !self.eat(.AndAnd) {
+                break;
+            }
+        }
+
+        self.allow_return_as_expr = old_ret;
+        self.in_ensures_or_where = old_in;
+        return try self.commit_expr_ids(mark);
+    }
+
+    @recursive
+    fn parse_struct_decl(self: *mut Self, is_linear: bool, is_view: bool) -> u32 ! OutOfMemory {
+        _ = self.bump();
+        let name = try self.expect_ident_or_dummy("struct name");
+        let generics = try self.parse_optional_generic_params();
+        let where_clauses = try self.parse_optional_where_clause();
+        let fields = try self.parse_field_block();
+        return try self.arena.add_struct_decl(
+            self.alloc,
+            ast.StructDeclNode.{
+                is_linear: is_linear,
+                is_view: is_view,
+                name: name,
+                generics: generics,
+                where_clauses: where_clauses,
+                fields: fields,
+            },
+        );
+    }
+
+    @recursive
+    fn parse_pool_decl(self: *mut Self) -> u32 ! OutOfMemory {
+        _ = self.bump();
+        let name = try self.expect_ident_or_dummy("pool name");
+        let generics = try self.parse_optional_generic_params();
+        let where_clauses = try self.parse_optional_where_clause();
+        let fields = try self.parse_field_block();
+        return try self.arena.add_struct_decl(
+            self.alloc,
+            ast.StructDeclNode.{
+                is_linear: false,
+                is_view: false,
+                name: name,
+                generics: generics,
+                where_clauses: where_clauses,
+                fields: fields,
+            },
+        );
+    }
+
+    @recursive
+    fn parse_field_block(self: *mut Self) -> ast.IdRange ! OutOfMemory {
+        _ = try self.expect(.LBrace);
+        let mark = self.scratch.decl.fields.len();
+        while !self.at(.RBrace) && !self.at_eof() {
+            let prev = self.pos;
+            let f = try self.parse_field_decl();
+            try self.scratch.decl.fields.push(self.alloc, f);
+            if self.pos == prev {
+                _ = self.bump();
+            }
+        }
+        _ = try self.expect(.RBrace);
+        return try self.commit_fields(mark);
+    }
+
+    @recursive
+    fn parse_field_decl(self: *mut Self) -> ast.FieldNode ! OutOfMemory {
+        let start = self.span();
+        let amark = self.scratch.meta.attrs.len();
+        try self.parse_attributes_into_scratch();
+        let is_pub = self.eat(.KwPub);
+        let name = try self.expect_ident_or_dummy("field name");
+        _ = try self.expect(.Colon);
+        let ty = try self.parse_type_expr();
+        try self.parse_attributes_into_scratch();
+        let attrs = try self.commit_attrs(amark);
+        var default = ast.NONE_ID;
+        if self.eat(.Eq) {
+            default = try self.parse_expr();
+        }
+        try self.expect_semi();
+        return ast.FieldNode.{
+            span: span.span_merge(start, self.prev_end_span()),
+            attrs: attrs,
+            is_pub: is_pub,
+            name: name,
+            ty: ty,
+            default: default,
+        };
+    }
+
+    @recursive
+    fn parse_enum_decl(self: *mut Self) -> u32 ! OutOfMemory {
+        _ = self.bump();
+        let name = try self.expect_ident_or_dummy("enum name");
+        var repr_int = ast.ident_none();
+        if self.eat(.Colon) {
+            repr_int = try self.expect_ident_or_dummy("integer representation type");
+        }
+        _ = try self.expect(.LBrace);
+        let mark = self.scratch.decl.enum_variants.len();
+        while !self.at(.RBrace) && !self.at_eof() {
+            let vname = try self.expect_ident_or_dummy("enum variant");
+            var vspan = vname.span;
+            var value = ast.NONE_ID;
+            if self.eat(.Eq) {
+                value = try self.parse_expr();
+                vspan = span.span_merge(vspan, self.expr_span(value));
+            }
+            try self.scratch.decl.enum_variants.push(
+                self.alloc,
+                ast.EnumVariantNode.{ span: vspan, name: vname, value: value },
+            );
+            if !self.eat(.Comma) {
+                break;
+            }
+        }
+        _ = try self.expect(.RBrace);
+        let variants = try self.commit_enum_variants(mark);
+        return try self.arena.add_enum_decl(
+            self.alloc,
+            ast.EnumDeclNode.{ name: name, repr_int: repr_int, variants: variants },
+        );
+    }
+
+    @recursive
+    fn parse_union_decl(self: *mut Self, is_linear: bool) -> u32 ! OutOfMemory {
+        _ = self.bump();
+        let name = try self.expect_ident_or_dummy("union name");
+        let generics = try self.parse_optional_generic_params();
+        let where_clauses = try self.parse_optional_where_clause();
+        _ = try self.expect(.LBrace);
+        let mark = self.scratch.decl.union_variants.len();
+        while !self.at(.RBrace) && !self.at_eof() {
+            let vname = try self.expect_ident_or_dummy("union variant");
+            var vspan = vname.span;
+            var ty = ast.NONE_ID;
+            if self.eat(.Colon) {
+                ty = try self.parse_type_expr();
+                vspan = span.span_merge(vspan, self.type_span(ty));
+            }
+            try self.scratch.decl.union_variants.push(
+                self.alloc,
+                ast.UnionVariantNode.{ span: vspan, name: vname, ty: ty },
+            );
+            if !self.eat(.Comma) {
+                break;
+            }
+        }
+        _ = try self.expect(.RBrace);
+        let variants = try self.commit_union_variants(mark);
+        return try self.arena.add_union_decl(
+            self.alloc,
+            ast.UnionDeclNode.{
+                is_linear: is_linear,
+                name: name,
+                generics: generics,
+                where_clauses: where_clauses,
+                variants: variants,
+            },
+        );
+    }
+
+    @recursive
+    fn parse_bitfield_decl(self: *mut Self) -> u32 ! OutOfMemory {
+        _ = self.bump();
+        let name = try self.expect_ident_or_dummy("bitfield name");
+        _ = try self.expect(.Colon);
+        let base_int = try self.expect_ident_or_dummy("unsigned integer backing type");
+        _ = try self.expect(.LBrace);
+        let mark = self.scratch.decl.bitfield_members.len();
+        while !self.at(.RBrace) && !self.at_eof() {
+            let prev = self.pos;
+            let mname = try self.expect_ident_or_dummy("bitfield member name");
+            _ = try self.expect(.Colon);
+            let mty = try self.expect_ident_or_dummy("bitfield member type");
+            var has_bits = false;
+            var bits_lo = ast.NONE_ID;
+            var bits_hi = ast.NONE_ID;
+            if self.eat(.At) {
+                let attr_name = try self.expect_ident_or_dummy("`bits`");
+                if !str.bytes_eq(self.interner.get(attr_name.sym), "bits".as_bytes()) {
+                    try self.emit_err(
+                        diag.E0005,
+                        attr_name.span,
+                        "expected `@bits(lo..hi)` on bitfield member",
+                    );
+                }
+                _ = try self.expect(.LParen);
+                bits_lo = try self.parse_expr();
+                _ = try self.expect(.DotDot);
+                bits_hi = try self.parse_expr();
+                _ = try self.expect(.RParen);
+                has_bits = true;
+            }
+            try self.expect_semi();
+            let end_sp = self.prev_end_span();
+            try self.scratch.decl.bitfield_members.push(
+                self.alloc,
+                ast.BitfieldMemberNode.{
+                    span: span.span_merge(mname.span, end_sp),
+                    name: mname,
+                    ty: mty,
+                    has_bits: has_bits,
+                    bits_lo: bits_lo,
+                    bits_hi: bits_hi,
+                },
+            );
+            if self.pos == prev {
+                _ = self.bump();
+            }
+        }
+        _ = try self.expect(.RBrace);
+        let members = try self.commit_bitfield_members(mark);
+        return try self.arena.add_bitfield_decl(
+            self.alloc,
+            ast.BitfieldDeclNode.{ name: name, base_int: base_int, members: members },
+        );
+    }
+
+    @recursive
+    fn parse_iface_decl(self: *mut Self) -> u32 ! OutOfMemory {
+        _ = self.bump();
+        let name = try self.expect_ident_or_dummy("interface name");
+        let generics = try self.parse_optional_generic_params();
+        _ = try self.expect(.LBrace);
+        let mark = self.scratch.decl.iface_methods.len();
+        while !self.at(.RBrace) && !self.at_eof() {
+            let prev = self.pos;
+            let start = self.span();
+            let attrs = try self.parse_attributes();
+            let is_view = self.eat(.KwView);
+            _ = try self.expect(.KwFn);
+            let mname = try self.expect_ident_or_dummy("method name");
+            let mgen = try self.parse_optional_generic_params();
+            let params = try self.parse_param_list();
+            var ret_type = ast.NONE_ID;
+            if self.eat(.Arrow) || self.at(.Bang) {
+                ret_type = try self.parse_type_expr();
+            }
+            let effects = try self.parse_attributes();
+            let has_gpu = self.has_gpu_attr(attrs, effects);
+            try self.validate_param_access_modes(params, has_gpu);
+            let where_clauses = try self.parse_optional_where_clause();
+            let ensures_clauses = try self.parse_optional_ensures_clause();
+            try self.expect_semi();
+            let end_sp = self.prev_end_span();
+            try self.scratch.decl.iface_methods.push(
+                self.alloc,
+                ast.IfaceMethodNode.{
+                    span: span.span_merge(start, end_sp),
+                    attrs: attrs,
+                    is_view: is_view,
+                    name: mname,
+                    generics: mgen,
+                    params: params,
+                    ret_type: ret_type,
+                    effects: effects,
+                    where_clauses: where_clauses,
+                    ensures_clauses: ensures_clauses,
+                },
+            );
+            if self.pos == prev {
+                _ = self.bump();
+            }
+        }
+        _ = try self.expect(.RBrace);
+        let methods = try self.commit_iface_methods(mark);
+        return try self.arena.add_iface_decl(
+            self.alloc,
+            ast.IfaceDeclNode.{ name: name, generics: generics, methods: methods },
+        );
+    }
+
+    @recursive
+    fn parse_impl_decl(self: *mut Self) -> u32 ! OutOfMemory {
+        _ = self.bump();
+        let generics = try self.parse_optional_generic_params();
+        let first_ty = try self.parse_type_expr();
+        var iface_type = ast.NONE_ID;
+        var target_type = first_ty;
+        if self.eat(.KwFor) {
+            iface_type = first_ty;
+            target_type = try self.parse_type_expr();
+        }
+        let where_clauses = try self.parse_optional_where_clause();
+        _ = try self.expect(.LBrace);
+        let mark = self.scratch.meta.decl_ids.len();
+        while !self.at(.RBrace) && !self.at_eof() {
+            let prev = self.pos;
+            let did = try self.parse_top_level_decl();
+            if did != ast.NONE_ID {
+                try self.scratch.meta.decl_ids.push(self.alloc, did);
+            }
+            if self.pos == prev {
+                _ = self.bump();
+            }
+        }
+        _ = try self.expect(.RBrace);
+        let decls = try self.commit_decl_ids(mark);
+        return try self.arena.add_impl_decl(
+            self.alloc,
+            ast.ImplDeclNode.{
+                generics: generics,
+                iface_type: iface_type,
+                target_type: target_type,
+                where_clauses: where_clauses,
+                decls: decls,
+            },
+        );
+    }
+
+    fn parse_error_decl(self: *mut Self) -> u32 ! OutOfMemory {
+        _ = self.bump();
+        let name = try self.expect_ident_or_dummy("error set name");
+        _ = try self.expect(.LBrace);
+        let mark = self.scratch.meta.idents.len();
+        while !self.at(.RBrace) && !self.at_eof() {
+            let v = try self.expect_ident_or_dummy("error variant");
+            try self.scratch.meta.idents.push(self.alloc, v);
+            if !self.eat(.Comma) {
+                break;
+            }
+        }
+        _ = try self.expect(.RBrace);
+        let variants = try self.commit_idents(mark);
+        return try self.arena.add_error_decl(
+            self.alloc,
+            ast.ErrorDeclNode.{ name: name, variants: variants },
+        );
+    }
+
+    @recursive
+    fn parse_type_alias_decl(self: *mut Self) -> u32 ! OutOfMemory {
+        _ = self.bump();
+        let name = try self.expect_ident_or_dummy("type alias name");
+        let generics = try self.parse_optional_generic_params();
+        let where_clauses = try self.parse_optional_where_clause();
+        _ = try self.expect(.Eq);
+        let ty = try self.parse_type_expr();
+        try self.expect_semi();
+        return try self.arena.add_type_decl(
+            self.alloc,
+            ast.TypeAliasDeclNode.{
+                name: name,
+                generics: generics,
+                where_clauses: where_clauses,
+                ty: ty,
+            },
+        );
+    }
+
+    @recursive
+    fn parse_const_decl(self: *mut Self) -> u32 ! OutOfMemory {
+        _ = self.bump();
+        let name = try self.expect_ident_or_dummy("constant name");
+        _ = try self.expect(.Colon);
+        let ty = try self.parse_type_expr();
+        _ = try self.expect(.Eq);
+        let value = try self.parse_expr();
+        try self.expect_semi();
+        return try self.arena.add_const_decl(
+            self.alloc,
+            ast.ConstDeclNode.{ name: name, ty: ty, value: value },
+        );
+    }
+
+    @recursive
+    fn parse_extern_decl(self: *mut Self) -> ExternKindRes ! OutOfMemory {
+        let ext_sp = self.tok_span(self.bump());
+        if self.profile == .Safe {
+            try self.emit_err(
+                diag.E0111,
+                ext_sp,
+                "ZM-11: `extern` declarations are only allowed inside `.hal.eon` modules",
+            );
+        }
+        var abi: u32 = 0_u32;
+        if self.at(.StringLit) {
+            let st = self.bump();
+            abi = try self.interner.intern(self.alloc, self.lexed.str_lit(st.payload));
+        } else {
+            try self.emit_err(
+                diag.E0005,
+                self.span(),
+                "expected ABI string literal (e.g. `\"C\"`) after `extern`",
+            );
+            abi = try self.interner.intern_str(self.alloc, "C");
+        }
+
+        match self.kind() {
+            .KwFn => {
+                _ = self.bump();
+                let name = try self.expect_ident_or_dummy("extern function name");
+                let params = try self.parse_param_list();
+                var ret_type = ast.NONE_ID;
+                if self.eat(.Arrow) {
+                    ret_type = try self.parse_type_expr();
+                }
+                try self.expect_semi();
+                try self.validate_param_access_modes(params, false);
+                let id = try self.arena.add_extern_decl(
+                    self.alloc,
+                    ast.ExternDeclNode.{
+                        abi: abi,
+                        name: name,
+                        params: params,
+                        fields: ast.range_empty(),
+                        ret_type: ret_type,
+                    },
+                );
+                return ExternKindRes.{ ok: true, kind: .ExternFn, payload: id };
+            }
+            .KwStruct => {
+                _ = self.bump();
+                let name = try self.expect_ident_or_dummy("extern struct name");
+                let fields = try self.parse_field_block();
+                let id = try self.arena.add_extern_decl(
+                    self.alloc,
+                    ast.ExternDeclNode.{
+                        abi: abi,
+                        name: name,
+                        params: ast.range_empty(),
+                        fields: fields,
+                        ret_type: ast.NONE_ID,
+                    },
+                );
+                return ExternKindRes.{ ok: true, kind: .ExternStruct, payload: id };
+            }
+            .KwUnion => {
+                _ = self.bump();
+                let name = try self.expect_ident_or_dummy("extern union name");
+                let fields = try self.parse_field_block();
+                let id = try self.arena.add_extern_decl(
+                    self.alloc,
+                    ast.ExternDeclNode.{
+                        abi: abi,
+                        name: name,
+                        params: ast.range_empty(),
+                        fields: fields,
+                        ret_type: ast.NONE_ID,
+                    },
+                );
+                return ExternKindRes.{ ok: true, kind: .ExternUnion, payload: id };
+            }
+            _ => {
+                try self.emit_err(
+                    diag.E0005,
+                    self.span(),
+                    "expected `fn`, `struct`, or `union` after `extern \"...\"`",
+                );
+                self.sync_to_decl();
+                return ExternKindRes.{ ok: false, kind: .Fn, payload: ast.NONE_ID };
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Types & Generic Arguments (mirroring `compiler/src/parser/ty.rs`)
+    // -----------------------------------------------------------------------
+
+    @recursive
+    fn parse_optional_generic_params(self: *mut Self) -> ast.IdRange ! OutOfMemory {
+        if !self.eat(.LBracket) {
+            return ast.range_empty();
+        }
+        let mark = self.scratch.meta.generic_params.len();
+        while !self.at(.RBracket) && !self.at_eof() {
+            let start = self.span();
+            let is_comptime = self.eat(.KwComptime);
+            let name = try self.expect_ident_or_dummy("generic parameter name");
+            var end = name.span;
+            var comptime_ty = ast.NONE_ID;
+            var bounds = ast.range_empty();
+
+            if is_comptime {
+                _ = try self.expect(.Colon);
+                comptime_ty = try self.parse_type_expr();
+                end = self.type_span(comptime_ty);
+            } else if self.eat(.Colon) {
+                let bmark = self.scratch.tree.type_ids.len();
+                loop {
+                    let b = try self.parse_type_expr();
+                    end = self.type_span(b);
+                    try self.scratch.tree.type_ids.push(self.alloc, b);
+                    if !self.eat(.Plus) {
+                        break;
+                    }
+                }
+                bounds = try self.commit_type_ids(bmark);
+            }
+
+            try self.scratch.meta.generic_params.push(
+                self.alloc,
+                ast.GenericParamNode.{
+                    span: span.span_merge(start, end),
+                    is_comptime: is_comptime,
+                    name: name,
+                    comptime_ty: comptime_ty,
+                    bounds: bounds,
+                },
+            );
+            if !self.eat(.Comma) {
+                break;
+            }
+        }
+        _ = try self.expect(.RBracket);
+        return try self.commit_generic_params(mark);
+    }
+
+    @recursive
+    fn parse_type_expr(self: *mut Self) -> u32 ! OutOfMemory {
+        if !(try self.enter_depth()) {
+            return try self.arena.add_type(self.alloc, ast.type_zero(self.span(), .Error));
+        }
+
+        var res = ast.NONE_ID;
+        if self.at(.Bang) {
+            let bang = self.tok_span(self.bump());
+            let errors = try self.parse_error_set_expr();
+            var tn = ast.type_zero(span.span_merge(bang, self.prev_end_span()), .ErrorUnion);
+            tn.primary = ast.NONE_ID;
+            tn.list = errors;
+            res = try self.arena.add_type(self.alloc, tn);
+        } else {
+            let base = try self.parse_base_type();
+            if self.eat(.Bang) {
+                let start = self.type_span(base);
+                let errors = try self.parse_error_set_expr();
+                var tn = ast.type_zero(span.span_merge(start, self.prev_end_span()), .ErrorUnion);
+                tn.primary = base;
+                tn.list = errors;
+                res = try self.arena.add_type(self.alloc, tn);
+            } else {
+                res = base;
+            }
+        }
+
+        self.leave_depth();
+        return res;
+    }
+
+    @recursive
+    fn parse_error_set_expr(self: *mut Self) -> ast.IdRange ! OutOfMemory {
+        let mark = self.scratch.tree.type_ids.len();
+        loop {
+            let start = self.span();
+            let path = try self.parse_type_path();
+            var tn = ast.type_zero(span.span_merge(start, self.prev_end_span()), .Path);
+            tn.list = path.segments;
+            tn.list2 = path.generics;
+            let tid = try self.arena.add_type(self.alloc, tn);
+            try self.scratch.tree.type_ids.push(self.alloc, tid);
+            if !self.eat(.Pipe) {
+                break;
+            }
+        }
+        return try self.commit_type_ids(mark);
+    }
+
+    @recursive
+    fn parse_fn_ptr_type(self: *mut Self, start: span.Span) -> ast.TypeNode ! OutOfMemory {
+        _ = self.bump();
+        _ = try self.expect(.LParen);
+        let pmark = self.scratch.tree.type_ids.len();
+        while !self.at(.RParen) && !self.at_eof() {
+            let p = try self.parse_type_expr();
+            try self.scratch.tree.type_ids.push(self.alloc, p);
+            if !self.eat(.Comma) {
+                break;
+            }
+        }
+        _ = try self.expect(.RParen);
+        let params = try self.commit_type_ids(pmark);
+        var ret = ast.NONE_ID;
+        if self.eat(.Arrow) {
+            ret = try self.parse_type_expr();
+        }
+        let effects = try self.parse_attributes();
+        var tn = ast.type_zero(span.span_merge(start, self.prev_end_span()), .FnPtr);
+        tn.list = params;
+        tn.primary = ret;
+        tn.list2 = effects;
+        return tn;
+    }
+
+    @recursive
+    fn parse_tuple_type(self: *mut Self, start: span.Span) -> ast.TypeNode ! OutOfMemory {
+        _ = self.bump();
+        let mark = self.scratch.tree.type_ids.len();
+        while !self.at(.RParen) && !self.at_eof() {
+            let e = try self.parse_type_expr();
+            try self.scratch.tree.type_ids.push(self.alloc, e);
+            if !self.eat(.Comma) {
+                break;
+            }
+        }
+        _ = try self.expect(.RParen);
+        let elems = try self.commit_type_ids(mark);
+        var tn = ast.type_zero(span.span_merge(start, self.prev_end_span()), .Tuple);
+        tn.list = elems;
+        return tn;
+    }
+
+    @recursive
+    fn parse_base_type(self: *mut Self) -> u32 ! OutOfMemory {
+        if !(try self.enter_depth()) {
+            return try self.arena.add_type(self.alloc, ast.type_zero(self.span(), .Error));
+        }
+        let start = self.span();
+        var tn = ast.type_zero(start, .Error);
+        match self.kind() {
+            .Question => {
+                _ = self.bump();
+                let inner = try self.parse_base_type();
+                tn = ast.type_zero(span.span_merge(start, self.prev_end_span()), .Optional);
+                tn.primary = inner;
+            }
+            .Star => {
+                _ = self.bump();
+                let is_mut = self.eat(.KwMut);
+                let bt = try self.parse_borrow_target();
+                tn = ast.type_zero(span.span_merge(start, self.prev_end_span()), .Borrow);
+                tn.is_mut = is_mut;
+                tn.borrow_target = bt.kind;
+                tn.primary = bt.inner;
+            }
+            .LBracket => {
+                let arr = try self.parse_array_type();
+                self.leave_depth();
+                return arr;
+            }
+            .KwDyn => {
+                _ = self.bump();
+                let tp = try self.parse_type_path();
+                tn = ast.type_zero(span.span_merge(start, self.prev_end_span()), .Dyn);
+                tn.list = tp.segments;
+                tn.list2 = tp.generics;
+            }
+            .KwFn => {
+                tn = try self.parse_fn_ptr_type(start);
+            }
+            .KwStruct => {
+                _ = self.bump();
+                let fields = try self.parse_field_block();
+                tn = ast.type_zero(span.span_merge(start, self.prev_end_span()), .InlineStruct);
+                tn.list = fields;
+            }
+            .LParen => {
+                tn = try self.parse_tuple_type(start);
+            }
+            .KwVoid => {
+                _ = self.bump();
+                tn = ast.type_zero(span.span_merge(start, self.prev_end_span()), .Void);
+            }
+            .KwNever => {
+                _ = self.bump();
+                tn = ast.type_zero(span.span_merge(start, self.prev_end_span()), .Never);
+            }
+            .KwType => {
+                _ = self.bump();
+                tn = ast.type_zero(span.span_merge(start, self.prev_end_span()), .TypeType);
+            }
+            .KwSelfType => {
+                _ = self.bump();
+                tn = ast.type_zero(span.span_merge(start, self.prev_end_span()), .SelfType);
+            }
+            .Ident => {
+                let tp = try self.parse_type_path();
+                tn = ast.type_zero(span.span_merge(start, self.prev_end_span()), .Path);
+                tn.list = tp.segments;
+                tn.list2 = tp.generics;
+            }
+            .Error => {
+                _ = self.bump();
+                tn = ast.type_zero(span.span_merge(start, self.prev_end_span()), .Error);
+            }
+            _ => {
+                try self.emit_expected_what(self.span(), "type", self.kind());
+                tn = ast.type_zero(span.span_merge(start, self.prev_end_span()), .Error);
+            }
+        }
+        self.leave_depth();
+        return try self.arena.add_type(self.alloc, tn);
+    }
+
+    @recursive
+    fn parse_array_type(self: *mut Self) -> u32 ! OutOfMemory {
+        let start = self.tok_span(self.bump());
+        let len_expr = try self.parse_expr();
+        _ = try self.expect(.RBracket);
+        let elem = try self.parse_base_type();
+        var tn = ast.type_zero(span.span_merge(start, self.type_span(elem)), .Array);
+        tn.aux = len_expr;
+        tn.primary = elem;
+        return try self.arena.add_type(self.alloc, tn);
+    }
+
+    @recursive
+    fn parse_borrow_target(self: *mut Self) -> BorrowTargetRes ! OutOfMemory {
+        if self.at(.Ident) && str.bytes_eq(self.slice(self.span()), "str".as_bytes()) {
+            let next = self.peek_kind(1_usize);
+            if next != .Dot && next != .LBracket {
+                _ = self.bump();
+                return BorrowTargetRes.{ kind: .Str, inner: ast.NONE_ID };
+            }
+        }
+        if self.at(.LBracket) {
+            if self.is_bracketed_followed_by_base_type() {
+                let inner = try self.parse_base_type();
+                return BorrowTargetRes.{ kind: .Single, inner: inner };
+            }
+            _ = self.bump();
+            let elem = try self.parse_type_expr();
+            _ = try self.expect(.RBracket);
+            return BorrowTargetRes.{ kind: .Slice, inner: elem };
+        }
+        let inner = try self.parse_base_type();
+        return BorrowTargetRes.{ kind: .Single, inner: inner };
+    }
+
+    fn is_bracketed_followed_by_base_type(self: *Self) -> bool {
+        if !self.at(.LBracket) {
+            return false;
+        }
+        var i = self.pos +% 1_usize;
+        var depth_sq: usize = 1_usize;
+        while i < self.tokens.len && depth_sq > 0_usize {
+            let k = self.tokens[i].kind;
+            if k == .LBracket {
+                depth_sq = depth_sq +% 1_usize;
+            } else if k == .RBracket {
+                depth_sq = depth_sq - 1_usize;
+            } else if k == .Eof {
+                return false;
+            }
+            i = i +% 1_usize;
+        }
+        if depth_sq != 0_usize {
+            return false;
+        }
+        let after: tok.TokenKind = if i < self.tokens.len {
+            self.tokens[i].kind
+        } else {
+            .Eof
+        };
+        return is_base_type_start(after);
+    }
+
+    @recursive
+    fn parse_type_path(self: *mut Self) -> ast.TypePath ! OutOfMemory {
+        let mark = self.scratch.meta.idents.len();
+        let first = try self.expect_ident_or_dummy("type name");
+        try self.scratch.meta.idents.push(self.alloc, first);
+        while self.at(.Dot) && self.peek_kind(1_usize) == .Ident {
+            _ = self.bump();
+            let seg = try self.expect_ident_or_dummy("type segment");
+            try self.scratch.meta.idents.push(self.alloc, seg);
+        }
+        let segs = try self.commit_idents(mark);
+        var gens = ast.range_empty();
+        if self.at(.LBracket) {
+            gens = try self.parse_generic_args();
+        }
+        return ast.type_path_new(segs, gens);
+    }
+
+    @recursive
+    fn parse_generic_args(self: *mut Self) -> ast.IdRange ! OutOfMemory {
+        _ = try self.expect(.LBracket);
+        let mark = self.scratch.meta.generic_args.len();
+        while !self.at(.RBracket) && !self.at_eof() {
+            let a = try self.parse_generic_arg();
+            try self.scratch.meta.generic_args.push(self.alloc, a);
+            if !self.eat(.Comma) {
+                break;
+            }
+        }
+        _ = try self.expect(.RBracket);
+        return try self.commit_generic_args(mark);
+    }
+
+    @recursive
+    fn parse_ident_generic_arg(self: *mut Self, start: span.Span) -> ast.GenericArgNode ! OutOfMemory {
+        var look = self.pos +% 1_usize;
+        while look < self.tokens.len && self.tokens[look].kind == .Dot {
+            let next_i = look +% 1_usize;
+            if next_i < self.tokens.len && self.tokens[next_i].kind == .Ident {
+                look = next_i +% 1_usize;
+            } else {
+                break;
+            }
+        }
+        let next_k: tok.TokenKind = if look < self.tokens.len {
+            self.tokens[look].kind
+        } else {
+            .Eof
+        };
+        if next_k == .LBracket || next_k == .Bang {
+            let ty = try self.parse_type_expr();
+            return ast.GenericArgNode.{
+                span: self.type_span(ty),
+                kind: .Type,
+                node_id: ty,
+                segs: ast.range_empty(),
+            };
+        }
+        if next_k == .Comma || next_k == .RBracket || next_k == .RParen {
+            let mark = self.scratch.meta.idents.len();
+            let first = try self.expect_ident_or_dummy("generic argument");
+            var end = first.span;
+            try self.scratch.meta.idents.push(self.alloc, first);
+            while self.at(.Dot) && self.peek_kind(1_usize) == .Ident {
+                _ = self.bump();
+                let seg = try self.expect_ident_or_dummy("path segment");
+                end = seg.span;
+                try self.scratch.meta.idents.push(self.alloc, seg);
+            }
+            let segs = try self.commit_idents(mark);
+            return ast.GenericArgNode.{
+                span: span.span_merge(start, end),
+                kind: .TypeOrConst,
+                node_id: ast.NONE_ID,
+                segs: segs,
+            };
+        }
+        let e = try self.parse_expr();
+        return ast.GenericArgNode.{
+            span: self.expr_span(e),
+            kind: .Expr,
+            node_id: e,
+            segs: ast.range_empty(),
+        };
+    }
+
+    @recursive
+    fn parse_generic_arg(self: *mut Self) -> ast.GenericArgNode ! OutOfMemory {
+        let start = self.span();
+        match self.kind() {
+            .Question => {
+                let ty = try self.parse_type_expr();
+                return ast.GenericArgNode.{ span: self.type_span(ty), kind: .Type, node_id: ty, segs: ast.range_empty() };
+            }
+            .Star => {
+                let ty = try self.parse_type_expr();
+                return ast.GenericArgNode.{ span: self.type_span(ty), kind: .Type, node_id: ty, segs: ast.range_empty() };
+            }
+            .KwDyn => {
+                let ty = try self.parse_type_expr();
+                return ast.GenericArgNode.{ span: self.type_span(ty), kind: .Type, node_id: ty, segs: ast.range_empty() };
+            }
+            .KwFn => {
+                let ty = try self.parse_type_expr();
+                return ast.GenericArgNode.{ span: self.type_span(ty), kind: .Type, node_id: ty, segs: ast.range_empty() };
+            }
+            .KwStruct => {
+                let ty = try self.parse_type_expr();
+                return ast.GenericArgNode.{ span: self.type_span(ty), kind: .Type, node_id: ty, segs: ast.range_empty() };
+            }
+            .KwVoid => {
+                let ty = try self.parse_type_expr();
+                return ast.GenericArgNode.{ span: self.type_span(ty), kind: .Type, node_id: ty, segs: ast.range_empty() };
+            }
+            .KwNever => {
+                let ty = try self.parse_type_expr();
+                return ast.GenericArgNode.{ span: self.type_span(ty), kind: .Type, node_id: ty, segs: ast.range_empty() };
+            }
+            .KwType => {
+                let ty = try self.parse_type_expr();
+                return ast.GenericArgNode.{ span: self.type_span(ty), kind: .Type, node_id: ty, segs: ast.range_empty() };
+            }
+            .KwSelfType => {
+                let ty = try self.parse_type_expr();
+                return ast.GenericArgNode.{ span: self.type_span(ty), kind: .Type, node_id: ty, segs: ast.range_empty() };
+            }
+            .Bang => {
+                let ty = try self.parse_type_expr();
+                return ast.GenericArgNode.{ span: self.type_span(ty), kind: .Type, node_id: ty, segs: ast.range_empty() };
+            }
+            .LBracket => {
+                if self.is_bracketed_followed_by_base_type() {
+                    let ty = try self.parse_type_expr();
+                    return ast.GenericArgNode.{ span: self.type_span(ty), kind: .Type, node_id: ty, segs: ast.range_empty() };
+                }
+                let e = try self.parse_expr();
+                return ast.GenericArgNode.{ span: self.expr_span(e), kind: .Expr, node_id: e, segs: ast.range_empty() };
+            }
+            .LParen => {
+                if self.looks_like_tuple_type_in_generic() {
+                    let ty = try self.parse_type_expr();
+                    return ast.GenericArgNode.{ span: self.type_span(ty), kind: .Type, node_id: ty, segs: ast.range_empty() };
+                }
+                let e = try self.parse_expr();
+                return ast.GenericArgNode.{ span: self.expr_span(e), kind: .Expr, node_id: e, segs: ast.range_empty() };
+            }
+            .Ident => {
+                return try self.parse_ident_generic_arg(start);
+            }
+            _ => {
+                let e = try self.parse_expr();
+                return ast.GenericArgNode.{ span: self.expr_span(e), kind: .Expr, node_id: e, segs: ast.range_empty() };
+            }
+        }
+    }
+
+    fn looks_like_tuple_type_in_generic(self: *Self) -> bool {
+        if self.peek_kind(1_usize) == .RParen {
+            return true;
+        }
+        var i = self.pos +% 1_usize;
+        var depth: usize = 1_usize;
+        var has_comma_top = false;
+        while i < self.tokens.len && depth > 0_usize {
+            let k = self.tokens[i].kind;
+            if k == .LParen || k == .LBracket || k == .LBrace {
+                depth = depth +% 1_usize;
+            } else if k == .RParen || k == .RBracket || k == .RBrace {
+                depth = depth - 1_usize;
+            } else if k == .Comma && depth == 1_usize {
+                has_comma_top = true;
+            } else if depth == 1_usize && is_tuple_type_disqualifying_op(k) {
+                return false;
+            } else if k == .Eof {
+                return false;
+            }
+            i = i +% 1_usize;
+        }
+        return has_comma_top;
+    }
+
+    // -----------------------------------------------------------------------
+    // Blocks, Statements & Patterns (mirroring `compiler/src/parser/stmt.rs`)
+    // -----------------------------------------------------------------------
+
+    @recursive
+    fn parse_block(self: *mut Self, allow_tail_expr: bool) -> u32 ! OutOfMemory {
+        if !(try self.enter_depth()) {
+            return try self.arena.add_block(
+                self.alloc,
+                ast.BlockNode.{ span: self.span(), stmts: ast.range_empty(), tail_expr: ast.NONE_ID },
+            );
+        }
+        let start = self.span();
+        if !self.eat(.LBrace) {
+            try self.emit_expected_what(start, "`{`", self.kind());
+            self.leave_depth();
+            return try self.arena.add_block(
+                self.alloc,
+                ast.BlockNode.{ span: start, stmts: ast.range_empty(), tail_expr: ast.NONE_ID },
+            );
+        }
+        let blk = try self.parse_block_body_after_lbrace(start, allow_tail_expr);
+        self.leave_depth();
+        return blk;
+    }
+
+    @recursive
+    fn parse_control_flow_block(self: *mut Self, construct: *str, allow_tail_expr: bool) -> u32 ! OutOfMemory {
+        if !(try self.enter_depth()) {
+            return try self.arena.add_block(
+                self.alloc,
+                ast.BlockNode.{ span: self.span(), stmts: ast.range_empty(), tail_expr: ast.NONE_ID },
+            );
+        }
+        if !self.at(.LBrace) {
+            let err_span = self.span();
+            self.msg_buf.clear();
+            try self.msg_buf.push_str_grow(self.alloc, "ZM-17: missing braces `{}` around `");
+            try self.msg_buf.push_str_grow(self.alloc, construct);
+            try self.msg_buf.push_str_grow(self.alloc, "` body");
+            try self.emit_msg_buf(diag.E0117, err_span);
+
+            let smark = self.scratch.tree.stmt_ids.len();
+            if !self.at(.RBrace) && !self.at_eof() {
+                let s = try self.parse_stmt_in_recovery();
+                if s != ast.NONE_ID {
+                    try self.scratch.tree.stmt_ids.push(self.alloc, s);
+                }
+            }
+            let stmts = try self.commit_stmt_ids(smark);
+            self.leave_depth();
+            return try self.arena.add_block(
+                self.alloc,
+                ast.BlockNode.{
+                    span: span.span_merge(err_span, self.prev_end_span()),
+                    stmts: stmts,
+                    tail_expr: ast.NONE_ID,
+                },
+            );
+        }
+        let start = self.tok_span(self.bump());
+        let blk = try self.parse_block_body_after_lbrace(start, allow_tail_expr);
+        self.leave_depth();
+        return blk;
+    }
+
+    @recursive
+    fn parse_block_stmt_dispatch(
+        self: *mut Self,
+        allow_tail_expr: bool,
+        tail_out: *mut u32,
+    ) -> bool ! OutOfMemory {
+        match self.kind() {
+            .At => {
+                if self.starts_stmt_attrs() {
+                    let attrs = try self.parse_attributes();
+                    if self.at(.KwLet) {
+                        let s = try self.parse_let_stmt(attrs);
+                        try self.scratch.tree.stmt_ids.push(self.alloc, s);
+                    } else if self.at(.KwVar) {
+                        let s = try self.parse_var_stmt(attrs);
+                        try self.scratch.tree.stmt_ids.push(self.alloc, s);
+                    }
+                    return false;
+                }
+                let lhs = try self.parse_expr();
+                return try self.finish_expr_stmt_or_tail(lhs, allow_tail_expr, tail_out);
+            }
+            .Underscore => {
+                let u_span = self.tok_span(self.bump());
+                _ = try self.expect(.Eq);
+                let rhs = try self.parse_expr();
+                try self.expect_semi();
+                var sn = ast.stmt_zero(span.span_merge(u_span, self.prev_end_span()), .Discard);
+                sn.a = rhs;
+                let sid = try self.arena.add_stmt(self.alloc, sn);
+                try self.scratch.tree.stmt_ids.push(self.alloc, sid);
+                return false;
+            }
+            .KwLet => {
+                let s = try self.parse_let_stmt(ast.range_empty());
+                try self.scratch.tree.stmt_ids.push(self.alloc, s);
+                return false;
+            }
+            .KwVar => {
+                let s = try self.parse_var_stmt(ast.range_empty());
+                try self.scratch.tree.stmt_ids.push(self.alloc, s);
+                return false;
+            }
+            .KwConst => {
+                let c_span = self.span();
+                let cid = try self.parse_const_decl();
+                var sn = ast.stmt_zero(span.span_merge(c_span, self.prev_end_span()), .Const);
+                sn.a = cid;
+                let sid = try self.arena.add_stmt(self.alloc, sn);
+                try self.scratch.tree.stmt_ids.push(self.alloc, sid);
+                return false;
+            }
+            .KwDefer => {
+                let s = try self.parse_defer_stmt();
+                try self.scratch.tree.stmt_ids.push(self.alloc, s);
+                return false;
+            }
+            .KwErrdefer => {
+                let s = try self.parse_errdefer_stmt();
+                try self.scratch.tree.stmt_ids.push(self.alloc, s);
+                return false;
+            }
+            .KwReturn => {
+                try self.parse_jump_stmt_push(.Return);
+                return false;
+            }
+            .KwBreak => {
+                try self.parse_jump_stmt_push(.Break);
+                return false;
+            }
+            .KwContinue => {
+                try self.parse_jump_stmt_push(.Continue);
+                return false;
+            }
+            .KwUnreachable => {
+                try self.parse_jump_stmt_push(.Unreachable);
+                return false;
+            }
+            .Label => {
+                try self.parse_labeled_stmt();
+                return false;
+            }
+            .KwWhile => {
+                let s = try self.parse_while_stmt(ast.ident_none());
+                try self.scratch.tree.stmt_ids.push(self.alloc, s);
+                return false;
+            }
+            .KwFor => {
+                let s = try self.parse_for_stmt(ast.ident_none());
+                try self.scratch.tree.stmt_ids.push(self.alloc, s);
+                return false;
+            }
+            .KwPar => {
+                let s = try self.parse_par_for_stmt();
+                try self.scratch.tree.stmt_ids.push(self.alloc, s);
+                return false;
+            }
+            .KwLoop => {
+                let s = try self.parse_loop_stmt(ast.ident_none());
+                try self.scratch.tree.stmt_ids.push(self.alloc, s);
+                return false;
+            }
+            .KwRaw => {
+                let s = try self.parse_raw_stmt();
+                try self.scratch.tree.stmt_ids.push(self.alloc, s);
+                return false;
+            }
+            .KwIf => {
+                let sp = self.span();
+                return try self.parse_if_stmt_or_tail(sp, false, allow_tail_expr, tail_out);
+            }
+            .KwMatch => {
+                return try self.parse_match_stmt_or_tail(allow_tail_expr, tail_out);
+            }
+            .KwComptime => {
+                return try self.parse_comptime_stmt_or_tail(allow_tail_expr, tail_out);
+            }
+            _ => {
+                let lhs = try self.parse_expr();
+                return try self.finish_expr_stmt_or_tail(lhs, allow_tail_expr, tail_out);
+            }
+        }
+    }
+
+    @recursive
+    fn parse_jump_stmt_push(self: *mut Self, jkind: ast.JumpKind) -> !OutOfMemory {
+        let sp = self.span();
+        var jid = ast.NONE_ID;
+        match jkind {
+            .Return => { jid = try self.parse_return_action(); }
+            .Break => { jid = try self.parse_break_action(); }
+            .Continue => { jid = try self.parse_continue_action(); }
+            .Unreachable => {
+                _ = self.bump();
+                jid = try self.arena.add_jump(
+                    self.alloc,
+                    ast.JumpNode.{ kind: .Unreachable, label: ast.ident_none(), value: ast.NONE_ID },
+                );
+            }
+        }
+        try self.expect_semi();
+        var sn = ast.stmt_zero(span.span_merge(sp, self.prev_end_span()), .Jump);
+        sn.a = jid;
+        let sid = try self.arena.add_stmt(self.alloc, sn);
+        try self.scratch.tree.stmt_ids.push(self.alloc, sid);
+        return;
+    }
+
+    @recursive
+    fn parse_labeled_stmt(self: *mut Self) -> !OutOfMemory {
+        let label_tok = self.bump();
+        let label = ast.ident_new(label_tok.payload, self.tok_span(label_tok));
+        _ = try self.expect(.Colon);
+        match self.kind() {
+            .KwWhile => {
+                let s = try self.parse_while_stmt(label);
+                try self.scratch.tree.stmt_ids.push(self.alloc, s);
+            }
+            .KwFor => {
+                let s = try self.parse_for_stmt(label);
+                try self.scratch.tree.stmt_ids.push(self.alloc, s);
+            }
+            .KwLoop => {
+                let s = try self.parse_loop_stmt(label);
+                try self.scratch.tree.stmt_ids.push(self.alloc, s);
+            }
+            _ => {
+                try self.emit_err(
+                    diag.E0005,
+                    self.span(),
+                    "loop label must precede `while`, `for`, or `loop`",
+                );
+                self.sync_to_stmt();
+            }
+        }
+        return;
+    }
+
+    @recursive
+    fn parse_if_stmt_or_tail(
+        self: *mut Self,
+        sp: span.Span,
+        is_comptime: bool,
+        allow_tail_expr: bool,
+        tail_out: *mut u32,
+    ) -> bool ! OutOfMemory {
+        let if_id = try self.parse_if_data(is_comptime, allow_tail_expr);
+        let end = self.if_span(if_id);
+        let full_sp = span.span_merge(sp, end);
+        if allow_tail_expr && self.at(.RBrace) && self.if_has_else(if_id) {
+            var en = ast.expr_zero(full_sp, .If);
+            en.a = if_id;
+            tail_out.* = try self.arena.add_expr(self.alloc, en);
+            return true;
+        }
+        var sn = ast.stmt_zero(full_sp, .If);
+        sn.a = if_id;
+        let sid = try self.arena.add_stmt(self.alloc, sn);
+        try self.scratch.tree.stmt_ids.push(self.alloc, sid);
+        return false;
+    }
+
+    @recursive
+    fn parse_match_stmt_or_tail(
+        self: *mut Self,
+        allow_tail_expr: bool,
+        tail_out: *mut u32,
+    ) -> bool ! OutOfMemory {
+        let sp = self.span();
+        let mp = try self.parse_match_parts();
+        let full_sp = span.span_merge(sp, mp.end_span);
+        if allow_tail_expr && self.at(.RBrace) {
+            var en = ast.expr_zero(full_sp, .Match);
+            en.a = mp.scrutinee;
+            en.list = mp.arms;
+            tail_out.* = try self.arena.add_expr(self.alloc, en);
+            return true;
+        }
+        var sn = ast.stmt_zero(full_sp, .Match);
+        sn.a = mp.scrutinee;
+        sn.list = mp.arms;
+        let sid = try self.arena.add_stmt(self.alloc, sn);
+        try self.scratch.tree.stmt_ids.push(self.alloc, sid);
+        return false;
+    }
+
+    @recursive
+    fn parse_comptime_stmt_or_tail(
+        self: *mut Self,
+        allow_tail_expr: bool,
+        tail_out: *mut u32,
+    ) -> bool ! OutOfMemory {
+        let sp = self.tok_span(self.bump());
+        if self.at(.KwIf) {
+            return try self.parse_if_stmt_or_tail(sp, true, allow_tail_expr, tail_out);
+        }
+        if self.at(.LBrace) {
+            let blk = try self.parse_block(true);
+            let full_sp = span.span_merge(sp, self.block_span(blk));
+            if allow_tail_expr && self.at(.RBrace) {
+                var en = ast.expr_zero(full_sp, .ComptimeBlock);
+                en.a = blk;
+                tail_out.* = try self.arena.add_expr(self.alloc, en);
+                return true;
+            }
+            var sn = ast.stmt_zero(full_sp, .ComptimeBlock);
+            sn.a = blk;
+            let sid = try self.arena.add_stmt(self.alloc, sn);
+            try self.scratch.tree.stmt_ids.push(self.alloc, sid);
+            return false;
+        }
+        let inner = try self.parse_expr();
+        var ce_node = ast.expr_zero(span.span_merge(sp, self.expr_span(inner)), .ComptimeExpr);
+        ce_node.a = inner;
+        let ce = try self.arena.add_expr(self.alloc, ce_node);
+        return try self.finish_expr_stmt_or_tail(ce, allow_tail_expr, tail_out);
+    }
+
+    @recursive
+    fn parse_block_body_after_lbrace(
+        self: *mut Self,
+        start: span.Span,
+        allow_tail_expr: bool,
+    ) -> u32 ! OutOfMemory {
+        let smark = self.scratch.tree.stmt_ids.len();
+        var tail_expr = ast.NONE_ID;
+
+        while !self.at(.RBrace) && !self.at_eof() {
+            let prev = self.pos;
+            let is_tail = try self.parse_block_stmt_dispatch(allow_tail_expr, &mut tail_expr);
+            if is_tail {
+                break;
+            }
+            if self.pos == prev {
+                _ = self.bump();
+            }
+        }
+
+        let end = if let rb = try self.expect(.RBrace) {
+            self.tok_span(rb)
+        } else {
+            self.prev_end_span()
+        };
+        let stmts = try self.commit_stmt_ids(smark);
+        return try self.arena.add_block(
+            self.alloc,
+            ast.BlockNode.{
+                span: span.span_merge(start, end),
+                stmts: stmts,
+                tail_expr: tail_expr,
+            },
+        );
+    }
+
+    fn starts_stmt_attrs(self: *Self) -> bool {
+        var i = self.pos;
+        while i < self.tokens.len && self.tokens[i].kind == .At {
+            i = i +% 1_usize;
+            if i >= self.tokens.len {
+                return false;
+            }
+            i = i +% 1_usize;
+            if i < self.tokens.len && self.tokens[i].kind == .LParen {
+                i = i +% 1_usize;
+                var depth: usize = 1_usize;
+                while i < self.tokens.len && depth > 0_usize {
+                    let k = self.tokens[i].kind;
+                    if k == .LParen {
+                        depth = depth +% 1_usize;
+                    } else if k == .RParen {
+                        depth = depth - 1_usize;
+                    } else if k == .Eof {
+                        return false;
+                    }
+                    i = i +% 1_usize;
+                }
+            }
+        }
+        if i < self.tokens.len {
+            let k = self.tokens[i].kind;
+            return k == .KwLet || k == .KwVar;
+        }
+        return false;
+    }
+
+    @recursive
+    fn finish_expr_stmt_or_tail(
+        self: *mut Self,
+        lhs: u32,
+        allow_tail_expr: bool,
+        tail_out: *mut u32,
+    ) -> bool ! OutOfMemory {
+        let lhs_span = self.expr_span(lhs);
+        if let op = token_assign_op(self.kind()) {
+            _ = self.bump();
+            let rhs = try self.parse_expr();
+            var end = self.expr_span(rhs);
+            if let _ = token_assign_op(self.kind()) {
+                try self.emit_err(
+                    diag.E0125,
+                    self.span(),
+                    "assignment is a statement, not an expression; chained assignments are forbidden",
+                );
+                loop {
+                    if let _ = token_assign_op(self.kind()) {
+                        _ = self.bump();
+                        let extra = try self.parse_expr();
+                        end = self.expr_span(extra);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            try self.expect_semi();
+            var sn = ast.stmt_zero(span.span_merge(lhs_span, end), .Assign);
+            sn.assign_op = op;
+            sn.a = lhs;
+            sn.b = rhs;
+            let sid = try self.arena.add_stmt(self.alloc, sn);
+            try self.scratch.tree.stmt_ids.push(self.alloc, sid);
+            return false;
+        }
+
+        if self.eat(.Semi) {
+            var sn = ast.stmt_zero(span.span_merge(lhs_span, self.prev_end_span()), .Expr);
+            sn.a = lhs;
+            let sid = try self.arena.add_stmt(self.alloc, sn);
+            try self.scratch.tree.stmt_ids.push(self.alloc, sid);
+            return false;
+        }
+
+        if self.at(.RBrace) {
+            if allow_tail_expr {
+                tail_out.* = lhs;
+                return true;
+            }
+            try self.emit_err(
+                diag.E0124,
+                lhs_span,
+                "trailing expression without `;` is not allowed in function body; use explicit `return ...;` or add `;`",
+            );
+            var sn = ast.stmt_zero(lhs_span, .Expr);
+            sn.a = lhs;
+            let sid = try self.arena.add_stmt(self.alloc, sn);
+            try self.scratch.tree.stmt_ids.push(self.alloc, sid);
+            return false;
+        }
+
+        try self.expect_semi();
+        var sn = ast.stmt_zero(lhs_span, .Expr);
+        sn.a = lhs;
+        let sid = try self.arena.add_stmt(self.alloc, sn);
+        try self.scratch.tree.stmt_ids.push(self.alloc, sid);
+        return false;
+    }
+
+    @recursive
+    fn parse_stmt_in_recovery(self: *mut Self) -> u32 ! OutOfMemory {
+        let sp = self.span();
+        match self.kind() {
+            .KwReturn => {
+                let j = try self.parse_return_action();
+                try self.expect_semi();
+                var sn = ast.stmt_zero(span.span_merge(sp, self.prev_end_span()), .Jump);
+                sn.a = j;
+                return try self.arena.add_stmt(self.alloc, sn);
+            }
+            .KwBreak => {
+                let j = try self.parse_break_action();
+                try self.expect_semi();
+                var sn = ast.stmt_zero(span.span_merge(sp, self.prev_end_span()), .Jump);
+                sn.a = j;
+                return try self.arena.add_stmt(self.alloc, sn);
+            }
+            .KwContinue => {
+                let j = try self.parse_continue_action();
+                try self.expect_semi();
+                var sn = ast.stmt_zero(span.span_merge(sp, self.prev_end_span()), .Jump);
+                sn.a = j;
+                return try self.arena.add_stmt(self.alloc, sn);
+            }
+            .Underscore => {
+                _ = self.bump();
+                _ = try self.expect(.Eq);
+                let rhs = try self.parse_expr();
+                try self.expect_semi();
+                var sn = ast.stmt_zero(span.span_merge(sp, self.prev_end_span()), .Discard);
+                sn.a = rhs;
+                return try self.arena.add_stmt(self.alloc, sn);
+            }
+            _ => {
+                let e = try self.parse_expr();
+                _ = self.eat(.Semi);
+                var sn = ast.stmt_zero(span.span_merge(sp, self.prev_end_span()), .Expr);
+                sn.a = e;
+                return try self.arena.add_stmt(self.alloc, sn);
+            }
+        }
+    }
+
+    @recursive
+    fn parse_let_stmt(self: *mut Self, attrs: ast.IdRange) -> u32 ! OutOfMemory {
+        let start = self.tok_span(self.bump());
+        let pat = try self.parse_pattern();
+        var ty = ast.NONE_ID;
+        if self.eat(.Colon) {
+            ty = try self.parse_type_expr();
+        }
+        _ = try self.expect(.Eq);
+        let init = try self.parse_expr();
+        try self.expect_semi();
+        var sn = ast.stmt_zero(span.span_merge(start, self.prev_end_span()), .Let);
+        sn.list = attrs;
+        sn.a = pat;
+        sn.b = ty;
+        sn.c = init;
+        return try self.arena.add_stmt(self.alloc, sn);
+    }
+
+    @recursive
+    fn parse_var_stmt(self: *mut Self, attrs: ast.IdRange) -> u32 ! OutOfMemory {
+        let start = self.tok_span(self.bump());
+        let name = try self.expect_ident_or_dummy("variable name");
+        var ty = ast.NONE_ID;
+        if self.eat(.Colon) {
+            ty = try self.parse_type_expr();
+        }
+        _ = try self.expect(.Eq);
+        let init = try self.parse_expr();
+        try self.expect_semi();
+        var sn = ast.stmt_zero(span.span_merge(start, self.prev_end_span()), .Var);
+        sn.list = attrs;
+        sn.ident = name;
+        sn.b = ty;
+        sn.c = init;
+        return try self.arena.add_stmt(self.alloc, sn);
+    }
+
+    @recursive
+    fn parse_defer_stmt(self: *mut Self) -> u32 ! OutOfMemory {
+        let start = self.tok_span(self.bump());
+        var bkind: ast.BodyKind = .Expr;
+        var bid = ast.NONE_ID;
+        if self.at(.LBrace) {
+            bkind = .Block;
+            bid = try self.parse_block(false);
+        } else {
+            bid = try self.parse_expr();
+            try self.expect_semi();
+        }
+        var sn = ast.stmt_zero(span.span_merge(start, self.prev_end_span()), .Defer);
+        sn.body_kind = bkind;
+        sn.a = bid;
+        return try self.arena.add_stmt(self.alloc, sn);
+    }
+
+    @recursive
+    fn parse_errdefer_stmt(self: *mut Self) -> u32 ! OutOfMemory {
+        let start = self.tok_span(self.bump());
+        var err_bind = ast.ident_none();
+        if self.eat(.Pipe) {
+            err_bind = try self.expect_ident_or_dummy("error binding");
+            _ = try self.expect(.Pipe);
+        }
+        var bkind: ast.BodyKind = .Expr;
+        var bid = ast.NONE_ID;
+        if self.at(.LBrace) {
+            bkind = .Block;
+            bid = try self.parse_block(false);
+        } else {
+            bid = try self.parse_expr();
+            try self.expect_semi();
+        }
+        var sn = ast.stmt_zero(span.span_merge(start, self.prev_end_span()), .Errdefer);
+        sn.ident = err_bind;
+        sn.body_kind = bkind;
+        sn.a = bid;
+        return try self.arena.add_stmt(self.alloc, sn);
+    }
+
+    fn is_jump_val_stop(k: tok.TokenKind) -> bool {
+        return k == .Semi || k == .Comma || k == .RBrace || k == .Eof;
+    }
+
+    @recursive
+    fn parse_return_action(self: *mut Self) -> u32 ! OutOfMemory {
+        _ = self.bump();
+        var val = ast.NONE_ID;
+        if !Parser.is_jump_val_stop(self.kind()) {
+            val = try self.parse_expr();
+        }
+        return try self.arena.add_jump(
+            self.alloc,
+            ast.JumpNode.{ kind: .Return, label: ast.ident_none(), value: val },
+        );
+    }
+
+    @recursive
+    fn parse_break_action(self: *mut Self) -> u32 ! OutOfMemory {
+        _ = self.bump();
+        var label = ast.ident_none();
+        if self.at(.Label) {
+            let t = self.bump();
+            label = ast.ident_new(t.payload, self.tok_span(t));
+        }
+        var val = ast.NONE_ID;
+        if !Parser.is_jump_val_stop(self.kind()) {
+            val = try self.parse_expr();
+        }
+        return try self.arena.add_jump(
+            self.alloc,
+            ast.JumpNode.{ kind: .Break, label: label, value: val },
+        );
+    }
+
+    fn parse_continue_action(self: *mut Self) -> u32 ! OutOfMemory {
+        _ = self.bump();
+        var label = ast.ident_none();
+        if self.at(.Label) {
+            let t = self.bump();
+            label = ast.ident_new(t.payload, self.tok_span(t));
+        }
+        return try self.arena.add_jump(
+            self.alloc,
+            ast.JumpNode.{ kind: .Continue, label: label, value: ast.NONE_ID },
+        );
+    }
+
+    @recursive
+    fn parse_if_data(self: *mut Self, is_comptime: bool, allow_tail_expr: bool) -> u32 ! OutOfMemory {
+        if !(try self.enter_depth()) {
+            let sp = self.span();
+            let ce = try self.arena.add_expr(self.alloc, ast.expr_zero(sp, .Error));
+            let tb = try self.arena.add_block(
+                self.alloc,
+                ast.BlockNode.{ span: sp, stmts: ast.range_empty(), tail_expr: ast.NONE_ID },
+            );
+            return try self.arena.add_if(
+                self.alloc,
+                ast.IfNode.{
+                    span: sp,
+                    is_comptime: is_comptime,
+                    cond_kind: .Expr,
+                    cond_pat: ast.NONE_ID,
+                    cond_expr: ce,
+                    then_block: tb,
+                    else_kind: .None,
+                    else_id: ast.NONE_ID,
+                },
+            );
+        }
+
+        let start = self.tok_span(self.bump());
+        var cond_kind: ast.IfCondKind = .Expr;
+        var cond_pat = ast.NONE_ID;
+        var cond_expr = ast.NONE_ID;
+        if self.eat(.KwLet) {
+            cond_kind = .Let;
+            cond_pat = try self.parse_pattern();
+            _ = try self.expect(.Eq);
+            cond_expr = try self.parse_expr();
+        } else {
+            cond_expr = try self.parse_expr();
+        }
+
+        let then_block = try self.parse_control_flow_block("if", allow_tail_expr);
+        var end = self.block_span(then_block);
+
+        var else_kind: ast.ElseKind = .None;
+        var else_id = ast.NONE_ID;
+        if self.eat(.KwElse) {
+            if self.at(.KwIf) {
+                let nested = try self.parse_if_data(false, allow_tail_expr);
+                end = self.if_span(nested);
+                else_kind = .If;
+                else_id = nested;
+            } else if self.at(.KwComptime) && self.peek_kind(1_usize) == .KwIf {
+                _ = self.bump();
+                let nested = try self.parse_if_data(true, allow_tail_expr);
+                end = self.if_span(nested);
+                else_kind = .If;
+                else_id = nested;
+            } else {
+                let blk = try self.parse_control_flow_block("else", allow_tail_expr);
+                end = self.block_span(blk);
+                else_kind = .Block;
+                else_id = blk;
+            }
+        }
+
+        self.leave_depth();
+        return try self.arena.add_if(
+            self.alloc,
+            ast.IfNode.{
+                span: span.span_merge(start, end),
+                is_comptime: is_comptime,
+                cond_kind: cond_kind,
+                cond_pat: cond_pat,
+                cond_expr: cond_expr,
+                then_block: then_block,
+                else_kind: else_kind,
+                else_id: else_id,
+            },
+        );
+    }
+
+    @recursive
+    fn parse_match_arm(self: *mut Self) -> ast.MatchArmNode ! OutOfMemory {
+        let a_start = self.span();
+        let pat = try self.parse_pattern();
+        var guard = ast.NONE_ID;
+        if self.eat(.KwIf) {
+            guard = try self.parse_expr();
+        }
+        _ = try self.expect(.FatArrow);
+        var body_kind: ast.BodyKind = .Expr;
+        var body_id = ast.NONE_ID;
+        if self.at(.LBrace) {
+            body_kind = .Block;
+            body_id = try self.parse_block(true);
+            _ = self.eat(.Comma);
+        } else {
+            match self.kind() {
+                .KwReturn => {
+                    body_kind = .Jump;
+                    body_id = try self.parse_return_action();
+                }
+                .KwBreak => {
+                    body_kind = .Jump;
+                    body_id = try self.parse_break_action();
+                }
+                .KwContinue => {
+                    body_kind = .Jump;
+                    body_id = try self.parse_continue_action();
+                }
+                .KwUnreachable => {
+                    _ = self.bump();
+                    body_kind = .Jump;
+                    body_id = try self.arena.add_jump(
+                        self.alloc,
+                        ast.JumpNode.{ kind: .Unreachable, label: ast.ident_none(), value: ast.NONE_ID },
+                    );
+                }
+                _ => {
+                    body_kind = .Expr;
+                    body_id = try self.parse_expr();
+                }
+            }
+            if !self.eat(.Comma) && !self.at(.RBrace) {
+                let sp = self.span();
+                let found = self.kind();
+                self.msg_buf.clear();
+                try self.msg_buf.push_str_grow(self.alloc, "expected `,` after match arm, found ");
+                try tok.write_token_kind_description(self.alloc, found, self.msg_buf);
+                try self.emit_msg_buf(diag.E0005, sp);
+            }
+        }
+        return ast.MatchArmNode.{
+            span: span.span_merge(a_start, self.prev_end_span()),
+            pat: pat,
+            guard: guard,
+            body_kind: body_kind,
+            body_id: body_id,
+        };
+    }
+
+    @recursive
+    fn parse_match_parts(self: *mut Self) -> MatchParts ! OutOfMemory {
+        _ = self.bump();
+        let scrutinee = try self.parse_expr();
+        _ = try self.expect(.LBrace);
+        let mark = self.scratch.tree.match_arms.len();
+        while !self.at(.RBrace) && !self.at_eof() {
+            let prev = self.pos;
+            let arm = try self.parse_match_arm();
+            try self.scratch.tree.match_arms.push(self.alloc, arm);
+            if self.pos == prev {
+                _ = self.bump();
+            }
+        }
+        let end = if let rb = try self.expect(.RBrace) {
+            self.tok_span(rb)
+        } else {
+            self.prev_end_span()
+        };
+        let arms = try self.commit_match_arms(mark);
+        return MatchParts.{ scrutinee: scrutinee, arms: arms, end_span: end };
+    }
+
+    @recursive
+    fn parse_while_stmt(self: *mut Self, label: ast.IdentSpan) -> u32 ! OutOfMemory {
+        let start = if ast.ident_is_some(label) { label.span } else { self.span() };
+        _ = self.bump();
+        let cond = try self.parse_expr();
+        let where_clauses = try self.parse_optional_where_clause();
+        let body = try self.parse_control_flow_block("while", false);
+        var sn = ast.stmt_zero(span.span_merge(start, self.block_span(body)), .While);
+        sn.ident = label;
+        sn.a = cond;
+        sn.list = where_clauses;
+        sn.b = body;
+        return try self.arena.add_stmt(self.alloc, sn);
+    }
+
+    @recursive
+    fn parse_optional_range_end(self: *mut Self) -> RangeEndRes ! OutOfMemory {
+        if self.eat(.DotDotEq) {
+            let e = try self.parse_expr();
+            return RangeEndRes.{ has_range: true, range_kind: .Inclusive, end_expr: e };
+        }
+        if self.eat(.DotDot) {
+            let e = try self.parse_expr();
+            return RangeEndRes.{ has_range: true, range_kind: .Exclusive, end_expr: e };
+        }
+        return RangeEndRes.{ has_range: false, range_kind: .Exclusive, end_expr: ast.NONE_ID };
+    }
+
+    @recursive
+    fn parse_for_stmt(self: *mut Self, label: ast.IdentSpan) -> u32 ! OutOfMemory {
+        let start = if ast.ident_is_some(label) { label.span } else { self.span() };
+        _ = self.bump();
+        let pat = try self.parse_pattern();
+        _ = try self.expect(.KwIn);
+        let iter_start = try self.parse_expr();
+        let re = try self.parse_optional_range_end();
+        let body = try self.parse_control_flow_block("for", false);
+        var sn = ast.stmt_zero(span.span_merge(start, self.block_span(body)), .For);
+        sn.ident = label;
+        sn.a = pat;
+        sn.c = iter_start;
+        sn.has_range = re.has_range;
+        sn.range_kind = re.range_kind;
+        sn.d = re.end_expr;
+        sn.b = body;
+        return try self.arena.add_stmt(self.alloc, sn);
+    }
+
+    @recursive
+    fn parse_par_for_stmt(self: *mut Self) -> u32 ! OutOfMemory {
+        let start = self.tok_span(self.bump());
+        _ = try self.expect(.KwFor);
+        let pat = try self.parse_pattern();
+        _ = try self.expect(.KwIn);
+        let iter_start = try self.parse_expr();
+        let re = try self.parse_optional_range_end();
+        let body = try self.parse_control_flow_block("par for", false);
+        var sn = ast.stmt_zero(span.span_merge(start, self.block_span(body)), .ParFor);
+        sn.a = pat;
+        sn.c = iter_start;
+        sn.has_range = re.has_range;
+        sn.range_kind = re.range_kind;
+        sn.d = re.end_expr;
+        sn.b = body;
+        return try self.arena.add_stmt(self.alloc, sn);
+    }
+
+    @recursive
+    fn parse_loop_stmt(self: *mut Self, label: ast.IdentSpan) -> u32 ! OutOfMemory {
+        let start = if ast.ident_is_some(label) { label.span } else { self.span() };
+        _ = self.bump();
+        let body = try self.parse_control_flow_block("loop", false);
+        var sn = ast.stmt_zero(span.span_merge(start, self.block_span(body)), .Loop);
+        sn.ident = label;
+        sn.a = body;
+        return try self.arena.add_stmt(self.alloc, sn);
+    }
+
+    @recursive
+    fn parse_raw_stmt(self: *mut Self) -> u32 ! OutOfMemory {
+        let raw_sp = self.tok_span(self.bump());
+        if self.profile == .Safe {
+            try self.emit_err(
+                diag.E0111,
+                raw_sp,
+                "ZM-11: `raw { ... }` blocks are forbidden outside `.hal.eon` modules",
+            );
+        }
+        let body = try self.parse_control_flow_block("raw", false);
+        var sn = ast.stmt_zero(span.span_merge(raw_sp, self.block_span(body)), .RawBlock);
+        sn.a = body;
+        return try self.arena.add_stmt(self.alloc, sn);
+    }
+
+    fn emit_hal_reserved_pat_err(self: *mut Self, sp: span.Span) -> !OutOfMemory {
+        let text = slice_span_bytes(self.src, sp);
+        self.msg_buf.clear();
+        if self.profile == .Safe {
+            try self.msg_buf.push_byte_grow(self.alloc, b'`');
+            try self.msg_buf.push_bytes_grow(self.alloc, text);
+            try self.msg_buf.push_str_grow(self.alloc, "` is reserved for `.hal.eon` modules");
+            try self.emit_msg_buf(diag.E0111, sp);
+        } else {
+            try self.msg_buf.push_str_grow(self.alloc, "expected pattern, found `");
+            try self.msg_buf.push_bytes_grow(self.alloc, text);
+            try self.msg_buf.push_byte_grow(self.alloc, b'`');
+            try self.emit_msg_buf(diag.E0005, sp);
+        }
+        return;
+    }
+
+    @recursive
+    fn parse_dot_pattern(self: *mut Self, start: span.Span) -> ast.PatNode ! OutOfMemory {
+        _ = self.bump();
+        if self.eat(.LBrace) {
+            let fields = try self.parse_field_pat_list();
+            _ = try self.expect(.RBrace);
+            var pn = ast.pat_zero(span.span_merge(start, self.prev_end_span()), .Struct);
+            pn.flag = false;
+            pn.list = fields;
+            return pn;
+        }
+        let name = try self.expect_ident_or_dummy("variant name");
+        var args = ast.range_empty();
+        if self.eat(.LParen) {
+            let mark = self.scratch.tree.pat_ids.len();
+            while !self.at(.RParen) && !self.at_eof() {
+                let p = try self.parse_pattern();
+                try self.scratch.tree.pat_ids.push(self.alloc, p);
+                if !self.eat(.Comma) {
+                    break;
+                }
+            }
+            _ = try self.expect(.RParen);
+            args = try self.commit_pat_ids(mark);
+        }
+        var pn = ast.pat_zero(span.span_merge(start, self.prev_end_span()), .Variant);
+        pn.ident = name;
+        pn.list = args;
+        return pn;
+    }
+
+    @recursive
+    fn parse_pattern(self: *mut Self) -> u32 ! OutOfMemory {
+        if !(try self.enter_depth()) {
+            return try self.arena.add_pat(self.alloc, ast.pat_zero(self.span(), .Error));
+        }
+        let start = self.span();
+        var pn = ast.pat_zero(start, .Error);
+        match self.kind() {
+            .Underscore => {
+                _ = self.bump();
+                pn = ast.pat_zero(start, .Wildcard);
+            }
+            .KwTrue => {
+                _ = self.bump();
+                pn = ast.pat_zero(start, .BoolLit);
+                pn.flag = true;
+            }
+            .KwFalse => {
+                _ = self.bump();
+                pn = ast.pat_zero(start, .BoolLit);
+                pn.flag = false;
+            }
+            .KwNull => {
+                _ = self.bump();
+                pn = ast.pat_zero(start, .Null);
+            }
+            .Minus => {
+                pn = try self.parse_int_pattern(start);
+            }
+            .IntLit => {
+                pn = try self.parse_int_pattern(start);
+            }
+            .CharLit => {
+                let ch = self.bump().payload;
+                pn = ast.pat_zero(start, .CharLit);
+                pn.data0 = ch;
+                if self.eat(.DotDotEq) {
+                    if let c2 = try self.parse_pattern_char() {
+                        pn.has_range = true;
+                        pn.range_kind = .Inclusive;
+                        pn.data1 = c2;
+                    }
+                } else if self.eat(.DotDot) {
+                    if let c2 = try self.parse_pattern_char() {
+                        pn.has_range = true;
+                        pn.range_kind = .Exclusive;
+                        pn.data1 = c2;
+                    }
+                }
+            }
+            .Dot => {
+                pn = try self.parse_dot_pattern(start);
+            }
+            .LParen => {
+                _ = self.bump();
+                let mark = self.scratch.tree.pat_ids.len();
+                while !self.at(.RParen) && !self.at_eof() {
+                    let p = try self.parse_pattern();
+                    try self.scratch.tree.pat_ids.push(self.alloc, p);
+                    if !self.eat(.Comma) {
+                        break;
+                    }
+                }
+                _ = try self.expect(.RParen);
+                let ps = try self.commit_pat_ids(mark);
+                pn = ast.pat_zero(start, .Tuple);
+                pn.list = ps;
+            }
+            .Ident => {
+                let next = self.peek_kind(1_usize);
+                if next == .Dot || next == .LBracket {
+                    let path = try self.parse_type_path();
+                    _ = try self.expect(.Dot);
+                    _ = try self.expect(.LBrace);
+                    let fields = try self.parse_field_pat_list();
+                    _ = try self.expect(.RBrace);
+                    pn = ast.pat_zero(start, .Struct);
+                    pn.flag = true;
+                    pn.path_segs = path.segments;
+                    pn.path_gens = path.generics;
+                    pn.list = fields;
+                } else {
+                    let t = self.bump();
+                    pn = ast.pat_zero(start, .Ident);
+                    pn.data0 = t.payload;
+                }
+            }
+            .KwRaw => {
+                let sp = self.tok_span(self.bump());
+                try self.emit_hal_reserved_pat_err(sp);
+                pn = ast.pat_zero(start, .Error);
+            }
+            .KwAsm => {
+                let sp = self.tok_span(self.bump());
+                try self.emit_hal_reserved_pat_err(sp);
+                pn = ast.pat_zero(start, .Error);
+            }
+            .KwVolatile => {
+                let sp = self.tok_span(self.bump());
+                try self.emit_hal_reserved_pat_err(sp);
+                pn = ast.pat_zero(start, .Error);
+            }
+            .Error => {
+                _ = self.bump();
+                pn = ast.pat_zero(start, .Error);
+            }
+            _ => {
+                try self.emit_expected_what(self.span(), "pattern", self.kind());
+                pn = ast.pat_zero(start, .Error);
+            }
+        }
+        pn.span = span.span_merge(start, self.prev_end_span());
+        self.leave_depth();
+        return try self.arena.add_pat(self.alloc, pn);
+    }
+
+    fn parse_int_pattern(self: *mut Self, start: span.Span) -> ast.PatNode ! OutOfMemory {
+        let neg = self.eat(.Minus);
+        let raw_sym = try self.expect_pattern_int_raw();
+        var pn = ast.pat_zero(start, .IntLit);
+        pn.flag = neg;
+        pn.data0 = raw_sym;
+        if self.eat(.DotDotEq) {
+            pn.has_range = true;
+            pn.range_kind = .Inclusive;
+            pn.range_neg = self.eat(.Minus);
+            pn.data1 = try self.expect_pattern_int_raw();
+        } else if self.eat(.DotDot) {
+            pn.has_range = true;
+            pn.range_kind = .Exclusive;
+            pn.range_neg = self.eat(.Minus);
+            pn.data1 = try self.expect_pattern_int_raw();
+        }
+        return pn;
+    }
+
+    fn expect_pattern_int_raw(self: *mut Self) -> u32 ! OutOfMemory {
+        if self.at(.IntLit) {
+            let t = self.bump();
+            if let nd = self.lexed.num_lit(t.payload) {
+                let raw_bytes = lexer.num_raw_slice(self.src, nd);
+                return try self.interner.intern(self.alloc, raw_bytes);
+            }
+            return try self.interner.intern_str(self.alloc, "0");
+        }
+        if self.at(.Error) {
+            _ = self.bump();
+            return try self.interner.intern_str(self.alloc, "0");
+        }
+        try self.emit_expected_what(self.span(), "integer literal in pattern", self.kind());
+        return try self.interner.intern_str(self.alloc, "0");
+    }
+
+    fn parse_pattern_char(self: *mut Self) -> ?u32 ! OutOfMemory {
+        if self.at(.CharLit) {
+            return self.bump().payload;
+        }
+        if self.at(.Error) {
+            _ = self.bump();
+            return null;
+        }
+        try self.emit_expected_what(self.span(), "character literal in range pattern", self.kind());
+        return null;
+    }
+
+    @recursive
+    fn parse_field_pat_list(self: *mut Self) -> ast.IdRange ! OutOfMemory {
+        let mark = self.scratch.tree.pat_fields.len();
+        while !self.at(.RBrace) && !self.at_eof() {
+            let name = try self.expect_ident_or_dummy("field pattern name");
+            var sp = name.span;
+            var pat = ast.NONE_ID;
+            if self.eat(.Colon) {
+                pat = try self.parse_pattern();
+                sp = span.span_merge(sp, self.pat_span(pat));
+            }
+            try self.scratch.tree.pat_fields.push(
+                self.alloc,
+                ast.PatFieldNode.{ span: sp, name: name, pat: pat },
+            );
+            if !self.eat(.Comma) {
+                break;
+            }
+        }
+        return try self.commit_pat_fields(mark);
+    }
+
+    // -----------------------------------------------------------------------
+    // Expressions & Pratt Parser (mirroring `compiler/src/parser/expr.rs`)
+    // -----------------------------------------------------------------------
+
+    @recursive
+    fn parse_expr(self: *mut Self) -> u32 ! OutOfMemory {
+        if !(try self.enter_depth()) {
+            return try self.arena.add_expr(self.alloc, ast.expr_zero(self.span(), .Error));
+        }
+        let res = try self.parse_catch_orelse_expr();
+        self.leave_depth();
+        return res;
+    }
+
+    @recursive
+    fn parse_catch_orelse_expr(self: *mut Self) -> u32 ! OutOfMemory {
+        var lhs = ast.NONE_ID;
+        if self.at(.KwTry) {
+            let try_sp = self.tok_span(self.bump());
+            let inner = try self.parse_binary_expr_bp(0_u8);
+            var en = ast.expr_zero(span.span_merge(try_sp, self.expr_span(inner.id)), .Unary);
+            en.unary_op = .Try;
+            en.a = inner.id;
+            lhs = try self.arena.add_expr(self.alloc, en);
+        } else {
+            let first = try self.parse_binary_expr_bp(0_u8);
+            lhs = first.id;
+        }
+
+        loop {
+            let lhs_span = self.expr_span(lhs);
+            if self.eat(.KwOrelse) {
+                let rhs = try self.parse_catch_or_orelse_rhs(true);
+                var en = ast.expr_zero(span.span_merge(lhs_span, rhs.span), .Orelse);
+                en.a = lhs;
+                en.body_kind = rhs.kind;
+                en.b = rhs.id;
+                lhs = try self.arena.add_expr(self.alloc, en);
+            } else if self.eat(.KwCatch) {
+                var err_bind = ast.ident_none();
+                if self.eat(.Pipe) {
+                    err_bind = try self.expect_ident_or_dummy("error binding");
+                    _ = try self.expect(.Pipe);
+                }
+                let rhs = try self.parse_catch_or_orelse_rhs(true);
+                var en = ast.expr_zero(span.span_merge(lhs_span, rhs.span), .Catch);
+                en.a = lhs;
+                en.ident = err_bind;
+                en.body_kind = rhs.kind;
+                en.b = rhs.id;
+                lhs = try self.arena.add_expr(self.alloc, en);
+            } else {
+                break;
+            }
+        }
+        return lhs;
+    }
+
+    @recursive
+    fn parse_catch_or_orelse_rhs(self: *mut Self, allow_block: bool) -> CatchRhs ! OutOfMemory {
+        if allow_block && self.at(.LBrace) {
+            let blk = try self.parse_block(true);
+            return CatchRhs.{ kind: .Block, id: blk, span: self.block_span(blk) };
+        }
+        let sp = self.span();
+        match self.kind() {
+            .KwReturn => {
+                let j = try self.parse_return_action();
+                return CatchRhs.{ kind: .Jump, id: j, span: span.span_merge(sp, self.prev_end_span()) };
+            }
+            .KwBreak => {
+                let j = try self.parse_break_action();
+                return CatchRhs.{ kind: .Jump, id: j, span: span.span_merge(sp, self.prev_end_span()) };
+            }
+            .KwContinue => {
+                let j = try self.parse_continue_action();
+                return CatchRhs.{ kind: .Jump, id: j, span: span.span_merge(sp, self.prev_end_span()) };
+            }
+            .KwUnreachable => {
+                _ = self.bump();
+                let j = try self.arena.add_jump(
+                    self.alloc,
+                    ast.JumpNode.{ kind: .Unreachable, label: ast.ident_none(), value: ast.NONE_ID },
+                );
+                return CatchRhs.{ kind: .Jump, id: j, span: sp };
+            }
+            _ => {
+                let e = try self.parse_binary_expr_bp(0_u8);
+                return CatchRhs.{ kind: .Expr, id: e.id, span: self.expr_span(e.id) };
+            }
+        }
+    }
+
+    @recursive
+    fn parse_binary_expr_bp(self: *mut Self, min_bp: u8) -> ExprPrec ! OutOfMemory {
+        if !(try self.enter_depth()) {
+            let err_id = try self.arena.add_expr(self.alloc, ast.expr_zero(self.span(), .Error));
+            return ExprPrec.{ id: err_id, cat: .Other };
+        }
+
+        let first = try self.parse_unary_expr();
+        var lhs = first.id;
+        var lhs_cat = first.cat;
+
+        loop {
+            if self.at(.KwIs) {
+                if 9_u8 < min_bp {
+                    break;
+                }
+                let op_sp = self.tok_span(self.bump());
+                if lhs_cat == .Bitwise {
+                    try self.emit_err(
+                        diag.E0120,
+                        op_sp,
+                        "mixing bitwise operators with comparisons without parentheses is forbidden",
+                    );
+                } else if lhs_cat == .Cmp {
+                    try self.emit_err(
+                        diag.E0125,
+                        op_sp,
+                        "chained comparison operators are forbidden; use `&&` with explicit comparisons",
+                    );
+                }
+                let pat = try self.parse_pattern();
+                let sp = span.span_merge(self.expr_span(lhs), self.pat_span(pat));
+                var en = ast.expr_zero(sp, .Is);
+                en.a = lhs;
+                en.b = pat;
+                lhs = try self.arena.add_expr(self.alloc, en);
+                lhs_cat = .Cmp;
+                continue;
+            }
+
+            let info = infix_binding_power(self.kind()) orelse {
+                break;
+            };
+            if info.l_bp < min_bp {
+                break;
+            }
+
+            let op_sp = self.tok_span(self.bump());
+            let rhs = try self.parse_binary_expr_bp(info.r_bp);
+            try self.check_operator_mixing(op_sp, info.cat, lhs_cat, rhs.cat);
+
+            let sp = span.span_merge(self.expr_span(lhs), self.expr_span(rhs.id));
+            var en = ast.expr_zero(sp, .Binary);
+            en.bin_op = info.op;
+            en.a = lhs;
+            en.b = rhs.id;
+            lhs = try self.arena.add_expr(self.alloc, en);
+            lhs_cat = info.cat;
+        }
+
+        self.leave_depth();
+        return ExprPrec.{ id: lhs, cat: lhs_cat };
+    }
+
+    fn check_operator_mixing(
+        self: *mut Self,
+        op_span: span.Span,
+        op_cat: PrecCat,
+        lhs_cat: PrecCat,
+        rhs_cat: PrecCat,
+    ) -> !OutOfMemory {
+        let lhs_arith_cmp = lhs_cat == .Arith || lhs_cat == .Cmp;
+        let rhs_arith_cmp = rhs_cat == .Arith || rhs_cat == .Cmp;
+        let op_arith_cmp = op_cat == .Arith || op_cat == .Cmp;
+        let mix_bitwise = (op_cat == .Bitwise && (lhs_arith_cmp || rhs_arith_cmp))
+            || (op_arith_cmp && (lhs_cat == .Bitwise || rhs_cat == .Bitwise));
+        if mix_bitwise {
+            try self.emit_err(
+                diag.E0120,
+                op_span,
+                "mixing bitwise operators (`&`, `|`, `^`, `<<`, `>>`) with arithmetic or comparisons without parentheses is forbidden",
+            );
+        }
+
+        let mix_logic = (op_cat == .LogAnd && (lhs_cat == .LogOr || rhs_cat == .LogOr))
+            || (op_cat == .LogOr && (lhs_cat == .LogAnd || rhs_cat == .LogAnd));
+        if mix_logic {
+            try self.emit_err(
+                diag.E0121,
+                op_span,
+                "mixing `&&` and `||` without parentheses is forbidden",
+            );
+        }
+
+        if op_cat == .Cmp && (lhs_cat == .Cmp || rhs_cat == .Cmp) {
+            try self.emit_err(
+                diag.E0125,
+                op_span,
+                "chained comparison operators are forbidden; add explicit `&&`",
+            );
+        }
+        return;
+    }
+
+    @recursive
+    fn parse_unary_expr(self: *mut Self) -> ExprPrec ! OutOfMemory {
+        let start = self.span();
+        var has_op = false;
+        var uop: ast.UnaryOp = .Neg;
+        match self.kind() {
+            .Minus => {
+                _ = self.bump();
+                has_op = true;
+                uop = .Neg;
+            }
+            .Bang => {
+                _ = self.bump();
+                has_op = true;
+                uop = .Not;
+            }
+            .Tilde => {
+                _ = self.bump();
+                has_op = true;
+                uop = .BitNot;
+            }
+            .Amp => {
+                _ = self.bump();
+                has_op = true;
+                uop = if self.eat(.KwMut) { .BorrowMut } else { .Borrow };
+            }
+            .KwMove => {
+                _ = self.bump();
+                has_op = true;
+                uop = .Move;
+            }
+            .KwCopy => {
+                _ = self.bump();
+                has_op = true;
+                uop = .Copy;
+            }
+            .KwTry => {
+                let try_sp = self.tok_span(self.bump());
+                try self.emit_err(
+                    diag.E0005,
+                    try_sp,
+                    "`try` is only allowed at the beginning of an expression; bind it with `let` first",
+                );
+                has_op = true;
+                uop = .Try;
+            }
+            _ => {}
+        }
+
+        if has_op {
+            let inner = try self.parse_unary_expr();
+            var en = ast.expr_zero(span.span_merge(start, self.expr_span(inner.id)), .Unary);
+            en.unary_op = uop;
+            en.a = inner.id;
+            let id = try self.arena.add_expr(self.alloc, en);
+            return ExprPrec.{ id: id, cat: .Other };
+        }
+        return try self.parse_postfix_expr();
+    }
+
+    @recursive
+    fn parse_postfix_dot(self: *mut Self, base: u32, base_span: span.Span) -> u32 ! OutOfMemory {
+        _ = self.bump();
+        if self.at(.LBracket) {
+            let args = try self.parse_generic_args();
+            var en = ast.expr_zero(span.span_merge(base_span, self.prev_end_span()), .GenericApply);
+            en.a = base;
+            en.list = args;
+            return try self.arena.add_expr(self.alloc, en);
+        }
+        if self.at(.LBrace) {
+            let fields = try self.parse_field_init_block();
+            var en = ast.expr_zero(span.span_merge(base_span, self.prev_end_span()), .NamedStructLit);
+            en.a = base;
+            en.list = fields;
+            return try self.arena.add_expr(self.alloc, en);
+        }
+        let field = try self.expect_ident_or_dummy("field or method name");
+        var en = ast.expr_zero(span.span_merge(base_span, field.span), .Field);
+        en.a = base;
+        en.ident = field;
+        return try self.arena.add_expr(self.alloc, en);
+    }
+
+    @recursive
+    fn parse_postfix_call(self: *mut Self, base: u32, base_span: span.Span) -> u32 ! OutOfMemory {
+        _ = self.bump();
+        let mark = self.scratch.tree.expr_ids.len();
+        while !self.at(.RParen) && !self.at_eof() {
+            let a = try self.parse_expr();
+            try self.scratch.tree.expr_ids.push(self.alloc, a);
+            if !self.eat(.Comma) {
+                break;
+            }
+        }
+        let end = if let rp = try self.expect(.RParen) {
+            self.tok_span(rp)
+        } else {
+            self.prev_end_span()
+        };
+        let args = try self.commit_expr_ids(mark);
+        var en = ast.expr_zero(span.span_merge(base_span, end), .Call);
+        en.a = base;
+        en.list = args;
+        return try self.arena.add_expr(self.alloc, en);
+    }
+
+    @recursive
+    fn parse_postfix_index_or_slice(self: *mut Self, base: u32, base_span: span.Span) -> u32 ! OutOfMemory {
+        _ = self.bump();
+        if self.eat(.DotDot) {
+            var hi = ast.NONE_ID;
+            if !self.at(.RBracket) {
+                hi = try self.parse_expr();
+            }
+            let end = if let rb = try self.expect(.RBracket) {
+                self.tok_span(rb)
+            } else {
+                self.prev_end_span()
+            };
+            var en = ast.expr_zero(span.span_merge(base_span, end), .Slice);
+            en.a = base;
+            en.b = ast.NONE_ID;
+            en.c = hi;
+            return try self.arena.add_expr(self.alloc, en);
+        }
+
+        let first = try self.parse_expr();
+        if self.eat(.DotDot) {
+            var hi = ast.NONE_ID;
+            if !self.at(.RBracket) {
+                hi = try self.parse_expr();
+            }
+            let end = if let rb = try self.expect(.RBracket) {
+                self.tok_span(rb)
+            } else {
+                self.prev_end_span()
+            };
+            var en = ast.expr_zero(span.span_merge(base_span, end), .Slice);
+            en.a = base;
+            en.b = first;
+            en.c = hi;
+            return try self.arena.add_expr(self.alloc, en);
+        }
+
+        let end = if let rb = try self.expect(.RBracket) {
+            self.tok_span(rb)
+        } else {
+            self.prev_end_span()
+        };
+        var en = ast.expr_zero(span.span_merge(base_span, end), .Index);
+        en.a = base;
+        en.b = first;
+        return try self.arena.add_expr(self.alloc, en);
+    }
+
+    @recursive
+    fn parse_postfix_expr(self: *mut Self) -> ExprPrec ! OutOfMemory {
+        var expr = try self.parse_primary_expr();
+        loop {
+            let base_span = self.expr_span(expr);
+            match self.kind() {
+                .DotStar => {
+                    let sp = self.tok_span(self.bump());
+                    var en = ast.expr_zero(span.span_merge(base_span, sp), .Deref);
+                    en.a = expr;
+                    expr = try self.arena.add_expr(self.alloc, en);
+                }
+                .Dot => {
+                    expr = try self.parse_postfix_dot(expr, base_span);
+                }
+                .LParen => {
+                    expr = try self.parse_postfix_call(expr, base_span);
+                }
+                .LBracket => {
+                    expr = try self.parse_postfix_index_or_slice(expr, base_span);
+                }
+                _ => {
+                    break;
+                }
+            }
+        }
+        return ExprPrec.{ id: expr, cat: .Other };
+    }
+
+    fn parse_num_lit_expr(self: *mut Self, num_id: u32, start: span.Span, kind: ast.ExprKind) -> ast.ExprNode ! OutOfMemory {
+        var en = ast.expr_zero(start, kind);
+        if let nd = self.lexed.num_lit(num_id) {
+            en.a = try self.interner.intern(self.alloc, lexer.num_raw_slice(self.src, copy nd));
+            if let suf = lexer.num_suffix_slice(self.src, nd) {
+                en.b = try self.interner.intern(self.alloc, suf);
+            }
+        } else {
+            en.a = try self.interner.intern_str(self.alloc, "0");
+        }
+        return en;
+    }
+
+    fn parse_primary_lit(self: *mut Self, t: tok.Token, start: span.Span) -> ?ast.ExprNode ! OutOfMemory {
+        match t.kind {
+            .IntLit => {
+                _ = self.bump();
+                return try self.parse_num_lit_expr(t.payload, start, .IntLit);
+            }
+            .FloatLit => {
+                _ = self.bump();
+                return try self.parse_num_lit_expr(t.payload, start, .FloatLit);
+            }
+            .StringLit => {
+                _ = self.bump();
+                var en = ast.expr_zero(start, .StringLit);
+                en.list = try self.arena.push_str_bytes(self.alloc, self.lexed.str_lit(t.payload));
+                return en;
+            }
+            .RawStringLit => {
+                _ = self.bump();
+                var en = ast.expr_zero(start, .RawStringLit);
+                en.list = try self.arena.push_str_bytes(self.alloc, self.lexed.str_lit(t.payload));
+                return en;
+            }
+            .ByteStringLit => {
+                _ = self.bump();
+                var en = ast.expr_zero(start, .ByteStringLit);
+                en.list = try self.arena.push_byte_bytes(self.alloc, self.lexed.byte_lit(t.payload));
+                return en;
+            }
+            .CharLit => {
+                _ = self.bump();
+                var en = ast.expr_zero(start, .CharLit);
+                en.a = t.payload;
+                return en;
+            }
+            .ByteCharLit => {
+                _ = self.bump();
+                var en = ast.expr_zero(start, .ByteCharLit);
+                en.a = t.payload;
+                return en;
+            }
+            .KwTrue => {
+                _ = self.bump();
+                var en = ast.expr_zero(start, .BoolLit);
+                en.flag = true;
+                return en;
+            }
+            .KwFalse => {
+                _ = self.bump();
+                var en = ast.expr_zero(start, .BoolLit);
+                en.flag = false;
+                return en;
+            }
+            .KwNull => {
+                _ = self.bump();
+                return ast.expr_zero(start, .Null);
+            }
+            .KwSelf => {
+                _ = self.bump();
+                return ast.expr_zero(start, .SelfVal);
+            }
+            .KwReturn => {
+                if self.in_ensures_or_where {
+                    _ = self.bump();
+                    if !self.allow_return_as_expr {
+                        try self.emit_err(
+                            diag.E0126,
+                            start,
+                            "`return` in a constraint is only allowed inside `ensures`, not `where`",
+                        );
+                    }
+                    return ast.expr_zero(start, .ReturnVal);
+                }
+                return null;
+            }
+            .Ident => {
+                _ = self.bump();
+                var en = ast.expr_zero(start, .Ident);
+                en.a = t.payload;
+                return en;
+            }
+            _ => { return null; }
+        }
+    }
+
+    @recursive
+    fn parse_closure_expr(self: *mut Self, start: span.Span, empty_params: bool) -> ast.ExprNode ! OutOfMemory {
+        _ = self.bump();
+        var params = ast.range_empty();
+        if !empty_params {
+            let pmark = self.scratch.decl.params.len();
+            while !self.at(.Pipe) && !self.at_eof() {
+                let p_start = self.span();
+                let name = try self.expect_ident_or_dummy("closure parameter");
+                var ty = ast.NONE_ID;
+                if self.eat(.Colon) {
+                    ty = try self.parse_type_expr();
+                } else {
+                    ty = try self.arena.add_type(self.alloc, ast.type_zero(name.span, .Inferred));
+                }
+                let end_sp = self.prev_end_span();
+                try self.scratch.decl.params.push(
+                    self.alloc,
+                    ast.ParamNode.{
+                        span: span.span_merge(p_start, end_sp),
+                        attrs: ast.range_empty(),
+                        is_comptime: false,
+                        modifier: .None,
+                        name: name,
+                        is_self: false,
+                        access: .None,
+                        ty: ty,
+                    },
+                );
+                if !self.eat(.Comma) {
+                    break;
+                }
+            }
+            _ = try self.expect(.Pipe);
+            params = try self.commit_params(pmark);
+        }
+        let body = try self.parse_control_flow_block("closure", true);
+        var en = ast.expr_zero(start, .Closure);
+        en.list = params;
+        en.a = body;
+        return en;
+    }
+
+    @recursive
+    fn parse_primary_compound(self: *mut Self, t: tok.Token, start: span.Span) -> ?ast.ExprNode ! OutOfMemory {
+        match t.kind {
+            .Dot => {
+                _ = self.bump();
+                if self.at(.LBrace) {
+                    var en = ast.expr_zero(start, .AnonStructLit);
+                    en.list = try self.parse_field_init_block();
+                    return en;
+                }
+                var en = ast.expr_zero(start, .EnumLit);
+                en.ident = try self.expect_ident_or_dummy("variant name or `{`");
+                return en;
+            }
+            .LBracket => {
+                _ = self.bump();
+                if self.eat(.RBracket) {
+                    return ast.expr_zero(start, .ArrayLit);
+                }
+                let first = try self.parse_expr();
+                if self.eat(.Semi) {
+                    let count = try self.parse_expr();
+                    _ = try self.expect(.RBracket);
+                    var en = ast.expr_zero(start, .ArrayRepeat);
+                    en.a = first;
+                    en.b = count;
+                    return en;
+                }
+                let mark = self.scratch.tree.expr_ids.len();
+                try self.scratch.tree.expr_ids.push(self.alloc, first);
+                while self.eat(.Comma) {
+                    if self.at(.RBracket) {
+                        break;
+                    }
+                    let e = try self.parse_expr();
+                    try self.scratch.tree.expr_ids.push(self.alloc, e);
+                }
+                _ = try self.expect(.RBracket);
+                var en = ast.expr_zero(start, .ArrayLit);
+                en.list = try self.commit_expr_ids(mark);
+                return en;
+            }
+            .LParen => {
+                _ = self.bump();
+                if self.eat(.RParen) {
+                    return ast.expr_zero(start, .Tuple);
+                }
+                let first = try self.parse_expr();
+                if self.eat(.Comma) {
+                    let mark = self.scratch.tree.expr_ids.len();
+                    try self.scratch.tree.expr_ids.push(self.alloc, first);
+                    while !self.at(.RParen) && !self.at_eof() {
+                        let e = try self.parse_expr();
+                        try self.scratch.tree.expr_ids.push(self.alloc, e);
+                        if !self.eat(.Comma) {
+                            break;
+                        }
+                    }
+                    _ = try self.expect(.RParen);
+                    var en = ast.expr_zero(start, .Tuple);
+                    en.list = try self.commit_expr_ids(mark);
+                    return en;
+                }
+                _ = try self.expect(.RParen);
+                var en = ast.expr_zero(start, .Paren);
+                en.a = first;
+                return en;
+            }
+            .Pipe => {
+                return try self.parse_closure_expr(start, false);
+            }
+            .OrOr => {
+                return try self.parse_closure_expr(start, true);
+            }
+            _ => { return null; }
+        }
+    }
+
+    @recursive
+    fn parse_builtin_expr(self: *mut Self, start: span.Span) -> ast.ExprNode ! OutOfMemory {
+        _ = self.bump();
+        let name = try self.expect_ident_or_dummy("builtin name");
+        let is_val = is_value_builtin_name(self.interner.get(name.sym));
+        var args = ast.range_empty();
+        if self.eat(.LParen) {
+            let mark = self.scratch.meta.generic_args.len();
+            while !self.at(.RParen) && !self.at_eof() {
+                if is_val {
+                    let e = try self.parse_expr();
+                    let esp = self.expr_span(e);
+                    try self.scratch.meta.generic_args.push(
+                        self.alloc,
+                        ast.GenericArgNode.{
+                            span: esp,
+                            kind: .Expr,
+                            node_id: e,
+                            segs: ast.range_empty(),
+                        },
+                    );
+                } else {
+                    let a = try self.parse_generic_arg();
+                    try self.scratch.meta.generic_args.push(self.alloc, a);
+                }
+                if !self.eat(.Comma) {
+                    break;
+                }
+            }
+            _ = try self.expect(.RParen);
+            args = try self.commit_generic_args(mark);
+        }
+        var en = ast.expr_zero(start, .Builtin);
+        en.ident = name;
+        en.list = args;
+        return en;
+    }
+
+    @recursive
+    fn parse_asm_expr(self: *mut Self, start: span.Span) -> ast.ExprNode ! OutOfMemory {
+        _ = self.bump();
+        if self.profile == .Safe {
+            try self.emit_err(
+                diag.E0111,
+                start,
+                "ZM-11: `asm(...)` is forbidden outside `.hal.eon` modules",
+            );
+        }
+        _ = try self.expect(.LParen);
+        var template = ast.range_empty();
+        if self.at(.StringLit) {
+            let st = self.bump();
+            template = try self.arena.push_str_bytes(self.alloc, self.lexed.str_lit(st.payload));
+        } else {
+            try self.emit_err(
+                diag.E0005,
+                self.span(),
+                "expected assembly template string literal after `asm(`",
+            );
+        }
+
+        let mark = self.scratch.decl.asm_ops.len();
+        while self.eat(.Comma) {
+            if self.at(.RParen) {
+                break;
+            }
+            let op_start = self.span();
+            if self.at(.Ident) && self.peek_kind(1_usize) == .LParen {
+                let dir = try self.expect_ident_or_dummy("asm operand direction");
+                _ = self.bump();
+                let constraint = try self.parse_expr();
+                _ = try self.expect(.RParen);
+                var arg = ast.NONE_ID;
+                let nk = self.kind();
+                if nk != .Comma && nk != .RParen && nk != .Eof {
+                    arg = try self.parse_expr();
+                }
+                let end_sp = self.prev_end_span();
+                try self.scratch.decl.asm_ops.push(
+                    self.alloc,
+                    ast.AsmOperandNode.{
+                        span: span.span_merge(op_start, end_sp),
+                        kind: .Named,
+                        dir: dir,
+                        expr: constraint,
+                        arg: arg,
+                    },
+                );
+            } else {
+                let e = try self.parse_expr();
+                let end_sp = self.prev_end_span();
+                try self.scratch.decl.asm_ops.push(
+                    self.alloc,
+                    ast.AsmOperandNode.{
+                        span: span.span_merge(op_start, end_sp),
+                        kind: .Expr,
+                        dir: ast.ident_none(),
+                        expr: e,
+                        arg: ast.NONE_ID,
+                    },
+                );
+            }
+        }
+        _ = try self.expect(.RParen);
+        let ops = try self.commit_asm_ops(mark);
+        var en = ast.expr_zero(start, .Asm);
+        en.list = template;
+        en.list2 = ops;
+        return en;
+    }
+
+    fn emit_hal_reserved_expr_err(self: *mut Self, sp: span.Span) -> !OutOfMemory {
+        let text = slice_span_bytes(self.src, sp);
+        self.msg_buf.clear();
+        if self.profile == .Safe {
+            try self.msg_buf.push_str_grow(self.alloc, "ZM-11: `");
+            try self.msg_buf.push_bytes_grow(self.alloc, text);
+            try self.msg_buf.push_str_grow(self.alloc, "` is reserved for `.hal.eon` modules");
+            try self.emit_msg_buf(diag.E0111, sp);
+        } else {
+            try self.msg_buf.push_str_grow(self.alloc, "unexpected `");
+            try self.msg_buf.push_bytes_grow(self.alloc, text);
+            try self.msg_buf.push_str_grow(self.alloc, "` in expression");
+            try self.emit_msg_buf(diag.E0005, sp);
+        }
+        return;
+    }
+
+    @recursive
+    fn parse_primary_ctrl(self: *mut Self, t: tok.Token, start: span.Span) -> ?ast.ExprNode ! OutOfMemory {
+        match t.kind {
+            .KwIf => {
+                let if_id = try self.parse_if_data(false, true);
+                if !self.if_has_else(if_id) {
+                    try self.emit_err(
+                        diag.E0005,
+                        self.if_span(if_id),
+                        "`if` expression must have an `else` branch",
+                    );
+                }
+                var en = ast.expr_zero(start, .If);
+                en.a = if_id;
+                return en;
+            }
+            .KwMatch => {
+                let mp = try self.parse_match_parts();
+                var en = ast.expr_zero(start, .Match);
+                en.a = mp.scrutinee;
+                en.list = mp.arms;
+                return en;
+            }
+            .KwLoop => {
+                _ = self.bump();
+                let body = try self.parse_control_flow_block("loop", false);
+                var en = ast.expr_zero(start, .Loop);
+                en.a = body;
+                return en;
+            }
+            .Label => {
+                let lt = self.bump();
+                let label = ast.ident_new(lt.payload, self.tok_span(lt));
+                _ = try self.expect(.Colon);
+                _ = try self.expect(.KwLoop);
+                let body = try self.parse_control_flow_block("loop", false);
+                var en = ast.expr_zero(start, .Loop);
+                en.ident = label;
+                en.a = body;
+                return en;
+            }
+            .KwComptime => {
+                _ = self.bump();
+                if self.at(.KwIf) {
+                    let if_id = try self.parse_if_data(true, true);
+                    if !self.if_has_else(if_id) {
+                        try self.emit_err(
+                            diag.E0005,
+                            self.if_span(if_id),
+                            "`comptime if` expression must have an `else` branch",
+                        );
+                    }
+                    var en = ast.expr_zero(start, .If);
+                    en.a = if_id;
+                    return en;
+                }
+                if self.at(.LBrace) {
+                    let blk = try self.parse_block(true);
+                    var en = ast.expr_zero(start, .ComptimeBlock);
+                    en.a = blk;
+                    return en;
+                }
+                let inner = try self.parse_expr();
+                var en = ast.expr_zero(start, .ComptimeExpr);
+                en.a = inner;
+                return en;
+            }
+            .At => {
+                return try self.parse_builtin_expr(start);
+            }
+            .KwAsm => {
+                return try self.parse_asm_expr(start);
+            }
+            .KwRaw => {
+                _ = self.bump();
+                try self.emit_hal_reserved_expr_err(start);
+                return ast.expr_zero(start, .Error);
+            }
+            .KwVolatile => {
+                _ = self.bump();
+                try self.emit_hal_reserved_expr_err(start);
+                return ast.expr_zero(start, .Error);
+            }
+            .Error => {
+                _ = self.bump();
+                return ast.expr_zero(start, .Error);
+            }
+            _ => { return null; }
+        }
+    }
+
+    @recursive
+    fn parse_primary_expr(self: *mut Self) -> u32 ! OutOfMemory {
+        let t = self.cur();
+        let start = self.tok_span(t);
+        var en = ast.expr_zero(start, .Error);
+        var matched = false;
+
+        if let lit = try self.parse_primary_lit(t, start) {
+            en = lit;
+            matched = true;
+        } else if let comp = try self.parse_primary_compound(t, start) {
+            en = comp;
+            matched = true;
+        } else if let ctrl = try self.parse_primary_ctrl(t, start) {
+            en = ctrl;
+            matched = true;
+        }
+
+        if !matched {
+            try self.emit_expected_what(start, "expression", t.kind);
+            if !self.at_eof()
+                && t.kind != .Semi
+                && t.kind != .Comma
+                && t.kind != .RParen
+                && t.kind != .RBracket
+                && t.kind != .RBrace
+            {
+                _ = self.bump();
+            }
+        }
+
+        en.span = span.span_merge(start, self.prev_end_span());
+        return try self.arena.add_expr(self.alloc, en);
+    }
+
+    @recursive
+    fn parse_field_init_block(self: *mut Self) -> ast.IdRange ! OutOfMemory {
+        _ = try self.expect(.LBrace);
+        let mark = self.scratch.tree.field_inits.len();
+        while !self.at(.RBrace) && !self.at_eof() {
+            let f_start = self.span();
+            var name = ast.ident_none();
+            var value = ast.NONE_ID;
+            if self.at(.Ident) && self.peek_kind(1_usize) == .Colon {
+                name = try self.expect_ident_or_dummy("field name");
+                _ = self.bump();
+                value = try self.parse_expr();
+            } else {
+                value = try self.parse_expr();
+            }
+            let vspan = self.expr_span(value);
+            try self.scratch.tree.field_inits.push(
+                self.alloc,
+                ast.FieldInitNode.{
+                    span: span.span_merge(f_start, vspan),
+                    name: name,
+                    value: value,
+                },
+            );
+            if !self.eat(.Comma) {
+                break;
+            }
+        }
+        _ = try self.expect(.RBrace);
+        return try self.commit_field_inits(mark);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public Entrypoint
+// ---------------------------------------------------------------------------
+
+/// Lexes and parses source file `fid` in `sm`, allocating its AST into `arena`,
+/// destroying transient lexer/scratch storage, and returning the `UnitNode` id.
+pub fn parse_file(
+    alloc: *mut AllocCap,
+    sm: *span.SourceMap,
+    fid: u32,
+    interner: *mut span.SymInterner,
+    diags: *mut diag.DiagBag,
+    arena: *mut ast.AstArena,
+) -> u32 ! OutOfMemory {
+    let lexed = try lexer.lex_file(alloc, sm, fid, interner, diags);
+    errdefer lexed.destroy(alloc);
+    var scratch = try ParseScratch.init(alloc);
+    errdefer scratch.destroy(alloc);
+    var msg_buf = try str.StrBuf.init(alloc, 128_usize);
+    errdefer msg_buf.destroy(alloc);
+
+    let src = sm.file_text(fid);
+    let profile = sm.file_profile(fid);
+    var p = Parser.{
+        alloc: alloc,
+        fid: fid,
+        profile: profile,
+        src: src,
+        lexed: &lexed,
+        tokens: lexed.tokens.as_slice(),
+        pos: 0_usize,
+        interner: interner,
+        diags: diags,
+        arena: arena,
+        scratch: &mut scratch,
+        msg_buf: &mut msg_buf,
+        depth: 0_u32,
+        allow_return_as_expr: false,
+        in_ensures_or_where: false,
+    };
+    let unit_id = try p.parse_compilation_unit();
+
+    msg_buf.destroy(alloc);
+    scratch.destroy(alloc);
+    lexed.destroy(alloc);
+    return unit_id;
+}

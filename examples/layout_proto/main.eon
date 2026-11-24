@@ -1,0 +1,318 @@
+module app.layout_proto;
+
+import core.mem;
+import rt.hal;
+
+pub pool TreeNode {
+    pub tag: u32;
+    pub width: u32;
+    pub height: u32;
+    pub pad: u32;
+    pub is_row: u8;
+    pub parent: ?Link[Self];
+    pub first_child: ?Link[Self];
+    pub next_sibling: ?Link[Self];
+}
+
+pub pool LayoutBox {
+    pub tag: u32;
+    pub x: u32;
+    pub y: u32;
+    pub w: u32;
+    pub h: u32;
+    pub parent: ?Link[Self];
+}
+
+fn may_fail(should_fail: bool) -> !MemError {
+    if should_fail {
+        return .AllocFailed;
+    }
+    return;
+}
+
+fn errdefer_probe_step(alloc: *mut AllocCap, fail: bool) -> !MemError {
+    var scratch = try mem.FrameArena.init(alloc, 256_usize);
+    errdefer scratch.destroy(alloc);
+    let _slice = try scratch.alloc_bytes(64_usize);
+    try may_fail(fail);
+    scratch.destroy(alloc);
+    return;
+}
+
+fn fill_rect(
+    grid: *mut [u8],
+    stride: u32,
+    gx0: u32,
+    gy0: u32,
+    gw: u32,
+    gh: u32,
+    ch: u8,
+) -> !ArithError | BoundsError {
+    let gx1 = try (gx0 +? gw);
+    let gy1 = try (gy0 +? gh);
+    var py = gy0;
+    while py < gy1 {
+        var px = gx0;
+        while px < gx1 {
+            let off_y = try (py *? stride);
+            let cell_u = try (off_y +? px);
+            let idx = cell_u.widen.[usize]();
+            let cell = try grid.at_mut(idx);
+            cell.* = ch;
+            px = px + 1_u32;
+        }
+        py = py + 1_u32;
+    }
+    return;
+}
+
+fn draw_box_char(tag: u32) -> u8 {
+    if tag == 1_u32 { return b'.'; }
+    if tag == 2_u32 { return b'#'; }
+    if tag == 3_u32 { return b'='; }
+    if tag == 4_u32 { return b'*'; }
+    if tag == 5_u32 { return b'+'; }
+    return b'?';
+}
+
+pub fn main(alloc: *mut AllocCap) -> i32 ! MemError | OutOfMemory | BoundsError | ArithError | StaleId {
+    // 1. Error-path errdefer leak probe before building scene tree
+    let pre_live = alloc.live_allocs();
+    let probe_res = errdefer_probe_step(alloc, true);
+    probe_res catch {};
+    let post_live = alloc.live_allocs();
+    let err_leaks = try (post_live -? pre_live);
+
+    // 2. Persistent SlotPool[TreeNode] via `core.mem` library + ABA GenId check + Link[Self] tree links
+    var tree = try mem.init_slot_pool.[TreeNode](alloc, 8_usize);
+    errdefer tree.destroy(alloc);
+
+    let root = try tree.insert(alloc, .{
+        tag: 1_u32,
+        width: 24_u32,
+        height: 8_u32,
+        pad: 1_u32,
+        is_row: 0_u8,
+        parent: null,
+        first_child: null,
+        next_sibling: null,
+    });
+    let stale_id = try tree.insert(alloc, .{
+        tag: 99_u32,
+        width: 1_u32,
+        height: 1_u32,
+        pad: 0_u32,
+        is_row: 0_u8,
+        parent: root,
+        first_child: null,
+        next_sibling: null,
+    });
+    let _removed = try tree.remove(stale_id);
+    let aba_rejected: u64 = if let _row = tree.get(stale_id) { 0_u64 } else { 1_u64 };
+
+    let header = try tree.insert(alloc, .{
+        tag: 2_u32,
+        width: 22_u32,
+        height: 2_u32,
+        pad: 0_u32,
+        is_row: 0_u8,
+        parent: root,
+        first_child: null,
+        next_sibling: null,
+    });
+    let body_row = try tree.insert(alloc, .{
+        tag: 3_u32,
+        width: 22_u32,
+        height: 4_u32,
+        pad: 1_u32,
+        is_row: 1_u8,
+        parent: root,
+        first_child: null,
+        next_sibling: null,
+    });
+    let left_pane = try tree.insert(alloc, .{
+        tag: 4_u32,
+        width: 9_u32,
+        height: 2_u32,
+        pad: 0_u32,
+        is_row: 0_u8,
+        parent: body_row,
+        first_child: null,
+        next_sibling: null,
+    });
+    let right_pane = try tree.insert(alloc, .{
+        tag: 5_u32,
+        width: 10_u32,
+        height: 2_u32,
+        pad: 0_u32,
+        is_row: 0_u8,
+        parent: body_row,
+        first_child: null,
+        next_sibling: null,
+    });
+
+    tree.first_child[root] = header;
+    tree.next_sibling[header] = body_row;
+    tree.first_child[body_row] = left_pane;
+    tree.next_sibling[left_pane] = right_pane;
+
+    // 3. Frame Arena + ArenaPool[LayoutBox] via `core.mem` library over 100 reset iterations
+    var frame_arena = try mem.FrameArena.init(alloc, 4096_usize);
+    errdefer frame_arena.destroy(alloc);
+    var boxes = try mem.init_frame_pool.[LayoutBox](&mut frame_arena, 16_usize);
+
+    var grid: [192]u8 = [32_u8; 192];
+    let stride: u32 = 24_u32;
+
+    let t0 = hal.now_ns();
+    var last_box_count: usize = 0_usize;
+
+    for frame in 0_usize..100_usize {
+        // Mutate the persistent tree across frames and settle to canonical size on final frame.
+        if (frame & 1_usize) == 0_usize {
+            tree.width[right_pane] = 8_u32;
+        } else {
+            tree.width[right_pane] = 10_u32;
+        }
+
+        boxes = boxes.reset();
+
+        let rx: u32 = 0_u32;
+        let ry: u32 = 0_u32;
+        let rw = tree.width[root];
+        let rh = tree.height[root];
+        let rpad = tree.pad[root];
+
+        let root_box = try boxes.push(.{
+            tag: tree.tag[root],
+            x: rx,
+            y: ry,
+            w: rw,
+            h: rh,
+            parent: null,
+        });
+
+        let cur_x = try (rx +? rpad);
+        var cur_y = try (ry +? rpad);
+
+        var child_opt = tree.first_child[root];
+        loop {
+            let cid = child_opt orelse break;
+            let cw = tree.width[cid];
+            let ch = tree.height[cid];
+            let cpad = tree.pad[cid];
+            let crow = tree.is_row[cid];
+
+            let cbox = try boxes.push(.{
+                tag: tree.tag[cid],
+                x: cur_x,
+                y: cur_y,
+                w: cw,
+                h: ch,
+                parent: root_box,
+            });
+
+            if crow == 1_u8 {
+                var sub_x = try (cur_x +? cpad);
+                let sub_y = try (cur_y +? cpad);
+                var sub_opt = tree.first_child[cid];
+                loop {
+                    let sid = sub_opt orelse break;
+                    let sw = tree.width[sid];
+                    let sh = tree.height[sid];
+                    let _ = try boxes.push(.{
+                        tag: tree.tag[sid],
+                        x: sub_x,
+                        y: sub_y,
+                        w: sw,
+                        h: sh,
+                        parent: cbox,
+                    });
+                    sub_x = try (sub_x +? sw);
+                    sub_x = try (sub_x +? 1_u32);
+                    sub_opt = tree.next_sibling[sid];
+                }
+            }
+
+            cur_y = try (cur_y +? ch);
+            child_opt = tree.next_sibling[cid];
+        }
+
+        last_box_count = boxes.len();
+
+        if frame == 99_usize {
+            for bi in 0_usize..boxes.len() {
+                let bid = try boxes.id_at(bi);
+                let btag = boxes.tag[bid];
+                let bx = boxes.x[bid];
+                let by = boxes.y[bid];
+                let bw = boxes.w[bid];
+                let bh = boxes.h[bid];
+                try fill_rect(&mut grid, stride, bx, by, bw, bh, draw_box_char(btag));
+
+                hal.print_str("box tag=");
+                hal.print_u64(btag.widen.[u64]());
+                hal.print_str(" pos=(");
+                hal.print_u64(bx.widen.[u64]());
+                hal.print_str(",");
+                hal.print_u64(by.widen.[u64]());
+                hal.print_str(") size=");
+                hal.print_u64(bw.widen.[u64]());
+                hal.print_str("x");
+                hal.print_u64(bh.widen.[u64]());
+                hal.print_nl();
+            }
+        }
+    }
+
+    let t1 = hal.now_ns();
+    let elapsed_ns = t1 -% t0;
+
+    // 4. Print ASCII raster grid using proven zero-check `gy * stride + gx` and `grid[idx]`
+    for gy in 0_u32..8_u32 {
+        for gx in 0_u32..24_u32 {
+            let off_y = gy * stride;
+            let cell_u = off_y + gx;
+            let ch = grid[cell_u.widen.[usize]()];
+            if ch == b'.' { hal.print_str("."); }
+            else if ch == b'#' { hal.print_str("#"); }
+            else if ch == b'=' { hal.print_str("="); }
+            else if ch == b'*' { hal.print_str("*"); }
+            else if ch == b'+' { hal.print_str("+"); }
+            else { hal.print_str(" "); }
+        }
+        hal.print_nl();
+    }
+
+    let arena_used = frame_arena.used_bytes();
+    let arena_cap = frame_arena.capacity();
+    frame_arena.reset();
+    let arena_after_reset = frame_arena.used_bytes();
+    frame_arena.destroy(alloc);
+    tree.destroy(alloc);
+
+    let peak_bytes = alloc.peak_bytes();
+    let final_live = alloc.live_allocs();
+
+    hal.print_str("metrics: frames=100 boxes=");
+    hal.print_u64(last_box_count.widen.[u64]());
+    hal.print_str(" aba_rejected=");
+    hal.print_u64(aba_rejected);
+    hal.print_str(" arena_used=");
+    hal.print_u64(arena_used.widen.[u64]());
+    hal.print_str(" arena_cap=");
+    hal.print_u64(arena_cap.widen.[u64]());
+    hal.print_str(" arena_after_reset=");
+    hal.print_u64(arena_after_reset.widen.[u64]());
+    hal.print_str(" peak_bytes=");
+    hal.print_u64(peak_bytes.widen.[u64]());
+    hal.print_str(" err_cleanup_leaks=");
+    hal.print_u64(err_leaks.widen.[u64]());
+    hal.print_str(" final_live_allocs=");
+    hal.print_u64(final_live.widen.[u64]());
+    hal.print_str(" elapsed_ns=");
+    hal.print_u64(elapsed_ns);
+    hal.print_nl();
+
+    return 0_i32;
+}

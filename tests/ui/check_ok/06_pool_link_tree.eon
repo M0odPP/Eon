@@ -1,0 +1,47 @@
+module ok.pool_link_tree;
+
+pub pool TreeNode {
+    pub val: u32;
+    pub parent: ?Link[Self];
+}
+
+pub fn check_arena_tree(arena: *mut Arena, slice: *[u32], text: *str) -> usize ! MemError | BoundsError {
+    var ap = try ArenaPool.[TreeNode].init(arena, 8_usize);
+    let root = try ap.push(.{ val: 10_u32, parent: null });
+    let child = try ap.push(.{ val: 20_u32, parent: root });
+    let p_opt: ?Id[ap] = ap.parent[child];
+    let _p = p_opt orelse root;
+    ap.parent[child] = root;
+
+    let _used = arena.used_bytes();
+    let _cap = arena.capacity();
+    let _slen = slice.len();
+    let _tlen = text.len();
+    let arr: [4]u32 = [ 1_u32, 2_u32, 3_u32, 4_u32 ];
+    let _alen = arr.len();
+    let elem = try arr.at(0_usize);
+    let selem = try slice.at(0_usize);
+    return elem.* .widen.[usize]() +% selem.* .widen.[usize]();
+}
+
+pub fn check_slot_tree(alloc: *mut AllocCap) -> ?GenId[TreeNode] ! OutOfMemory | StaleId {
+    var sp = try SlotPool.[TreeNode].init(alloc, 8_usize);
+    errdefer sp.destroy(alloc);
+
+    let root = try sp.insert(alloc, .{ val: 1_u32, parent: null });
+    let child = try sp.insert(alloc, .{ val: 2_u32, parent: root });
+    let parent_col: ?GenId[TreeNode] = sp.parent[child];
+    sp.parent[child] = root;
+
+    var from_row: ?GenId[TreeNode] = parent_col;
+    if let row = sp.get(child) {
+        from_row = row.parent;
+    }
+
+    let _live = alloc.live_allocs();
+    let _used = alloc.used_bytes();
+    let _peak = alloc.peak_bytes();
+    let _ = try sp.remove(child);
+    sp.destroy(alloc);
+    return from_row;
+}

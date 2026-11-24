@@ -1,0 +1,5 @@
+module fail.try_nested;
+pub fn f(a: u32) -> u32 ! Err {
+    let x = a + try g(); //~ ERROR E0005
+    return x;
+}

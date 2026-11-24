@@ -1,0 +1,5 @@
+module fail.read_discard;
+pub fn f() {
+    let x = _; //~ ERROR E0005
+    _ = x;
+}

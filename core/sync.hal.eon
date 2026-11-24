@@ -1,0 +1,151 @@
+module core.sync @hal;
+
+/// Emit a CPU spin-wait hint (`pause` on x86_64) inside spin loops.
+pub fn cpu_relax() {
+    raw {
+        asm("pause");
+    }
+}
+
+/// Atomic lock-free 64-bit counter with explicit memory orderings.
+pub struct AtomicCounter {
+    inner: Atomic[u64];
+}
+
+impl AtomicCounter {
+    pub fn init(v: u64) -> AtomicCounter {
+        return AtomicCounter.{ inner: Atomic.[u64].new(v) };
+    }
+
+    pub fn load(self: *Self, ord: Ordering) -> u64 {
+        return self.inner.load(ord);
+    }
+
+    pub fn store(self: *mut Self, val: u64, ord: Ordering) {
+        self.inner.store(val, ord);
+    }
+
+    pub fn fetch_add(self: *mut Self, delta: u64, ord: Ordering) -> u64 {
+        return self.inner.fetch_add(delta, ord);
+    }
+
+    pub fn compare_exchange(self: *mut Self, expected: u64, desired: u64) -> bool {
+        return self.inner.compare_exchange(expected, desired, .AcqRel, .Acquire);
+    }
+}
+
+/// Linear guard token returned by `SpinLock[T].lock()`: forgetting `.unlock()` is `E0109`!
+pub linear struct SpinGuard[T] {
+    lock_ptr: rawptr_mut[SpinLock[T]];
+}
+
+/// Hardware-atomic spinlock protecting a value `T` with linear RAII-free guard token.
+pub struct SpinLock[T] {
+    locked: Atomic[u32];
+    value: T;
+}
+
+impl[T] SpinLock[T] {
+    pub fn init(val: T) -> SpinLock[T] {
+        return .{
+            locked: Atomic.[u32].new(0_u32),
+            value: val,
+        };
+    }
+
+    pub fn lock(self: *mut Self) -> SpinGuard[T] {
+        loop {
+            if self.locked.compare_exchange(0_u32, 1_u32, .Acquire, .Relaxed) {
+                break;
+            }
+            while self.locked.load(.Relaxed) != 0_u32 {
+                cpu_relax();
+            }
+        }
+        return .{
+            lock_ptr: rawptr_mut.[SpinLock[T]].from_usize(0_usize),
+        };
+    }
+
+    pub fn unlock_raw(self: *mut Self) {
+        self.locked.store(0_u32, .Release);
+    }
+
+    pub fn get_val(self: *Self) -> T {
+        return self.value;
+    }
+
+    pub fn set_val(self: *mut Self, v: T) {
+        self.value = v;
+    }
+}
+
+impl[T] SpinGuard[T] {
+    pub fn unlock(self: SpinGuard[T], lock: *mut SpinLock[T]) {
+        let SpinGuard.{ lock_ptr } = self;
+        let _p = lock_ptr;
+        lock.locked.store(0_u32, .Release);
+    }
+}
+
+/// Fixed-capacity lock-free Chase-Lev work-stealing deque (64 slots, power-of-two mask).
+pub struct WorkDeque {
+    top: Atomic[isize];
+    bottom: Atomic[isize];
+    slots: [64]u64;
+}
+
+impl WorkDeque {
+    pub fn init() -> WorkDeque {
+        return WorkDeque.{
+            top: Atomic.[isize].new(0_isize),
+            bottom: Atomic.[isize].new(0_isize),
+            slots: [0_u64; 64],
+        };
+    }
+
+    pub fn push_bottom(self: *mut Self, task_id: u64) -> bool {
+        let b = self.bottom.load(.Relaxed);
+        let t = self.top.load(.Acquire);
+        if b -% t >= 64_isize {
+            return false;
+        }
+        let idx = (b.bitcast.[usize]() & 63_usize);
+        self.slots[idx] = task_id;
+        self.bottom.store(b +% 1_isize, .Release);
+        return true;
+    }
+
+    pub fn pop_bottom(self: *mut Self) -> ?u64 {
+        let b = self.bottom.load(.Relaxed) -% 1_isize;
+        self.bottom.store(b, .SeqCst);
+        let t = self.top.load(.SeqCst);
+        if t <= b {
+            let idx = (b.bitcast.[usize]() & 63_usize);
+            let item = self.slots[idx];
+            if t == b {
+                if !self.top.compare_exchange(t, t +% 1_isize, .SeqCst, .Relaxed) {
+                    self.bottom.store(t +% 1_isize, .Relaxed);
+                    return null;
+                }
+                self.bottom.store(t +% 1_isize, .Relaxed);
+            }
+            return item;
+        }
+        self.bottom.store(t, .Relaxed);
+        return null;
+    }
+
+    pub fn steal_top(self: *mut Self) -> ?u64 {
+        let t = self.top.load(.Acquire);
+        let b = self.bottom.load(.Acquire);
+        if t < b {
+            let idx = (t.bitcast.[usize]() & 63_usize);
+            let item = self.slots[idx];
+            if self.top.compare_exchange(t, t +% 1_isize, .SeqCst, .Relaxed) {
+                return item;
+            }
+        }
+        return null;
+    }
+}

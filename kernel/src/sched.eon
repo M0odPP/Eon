@@ -1,0 +1,76 @@
+module kernel.sched;
+
+import kernel.arch.x86_64.apic;
+import kernel.arch.x86_64.cpu;
+import kernel.arch.x86_64.fiber;
+
+/// Hardware LAPIC timer Interrupt Service Routine (100% Safe Eon!).
+/// Statically verified by Eon: `@interrupt @noalloc @stack(512)` guarantees no recursion,
+/// zero dynamic allocation, and bounded kernel stack usage <= 512 bytes.
+pub fn timer_isr() @interrupt @noalloc @stack(512) {
+    _ = cpu.inc_timer_ticks();
+    apic.lapic_eoi();
+}
+
+/// SMP Application Processor entry point (runs on AP core 1 in 64-bit long mode).
+pub fn ap_main() @noalloc @noblock {
+    let my_id = apic.lapic_id();
+    cpu.mark_ap_online(my_id);
+    loop {
+        cpu.hlt();
+    }
+}
+
+/// Worker body for cooperative kernel fibers (runs on isolated 8 KiB stacks).
+fn fiber_worker(id: u64) @noalloc @noblock {
+    var step: u64 = 0_u64;
+    var local_acc: u64 = (id +% 1_u64) *% 100_u64;
+    while step < 5_u64 {
+        local_acc = local_acc +% (step *% 7_u64) +% id;
+        let is_last = step == 4_u64;
+        fiber.yield_to_main(local_acc, is_last);
+        step = step +% 1_u64;
+    }
+}
+
+/// Runs 3 cooperative kernel fibers across 15 yields (30 context switches) while
+/// hardware timer interrupts fire concurrently on IDT vector 0x20.
+pub fn run_fiber_demo() -> u64 @noalloc @noblock {
+    fiber.reset_fiber_table();
+    // Isolated 8 KiB fiber stacks in safe identity-mapped RAM (0x00310000 .. 0x00316000)
+    fiber.register_fiber(0_usize, 0x00312000_u64, fiber_worker, 1_u64);
+    fiber.register_fiber(1_usize, 0x00314000_u64, fiber_worker, 2_u64);
+    fiber.register_fiber(2_usize, 0x00316000_u64, fiber_worker, 3_u64);
+
+    var round: u32 = 0_u32;
+    while fiber.fiber_done_mask() != 7_u32 && round < 32_u32 {
+        var idx: usize = 0_usize;
+        while idx < 3_usize {
+            let bit = 1_u32 <<% idx.trunc.[u32]();
+            if (fiber.fiber_done_mask() & bit) == 0_u32 {
+                fiber.switch_main_to_fiber(idx);
+            }
+            idx = idx +% 1_usize;
+        }
+        round = round +% 1_u32;
+    }
+    return fiber.fiber_checksum();
+}
+
+/// Computes the exact expected checksum of `run_fiber_demo()` purely mathematically.
+pub fn expected_fiber_checksum() -> u64 @noalloc @noblock {
+    var acc: [3]u64 = [200_u64, 300_u64, 400_u64];
+    var h: u64 = 0_u64;
+    var step: u64 = 0_u64;
+    while step < 5_u64 {
+        var idx: usize = 0_usize;
+        while idx < 3_usize {
+            let id = idx.widen.[u64]() +% 1_u64;
+            acc[idx] = acc[idx] +% (step *% 7_u64) +% id;
+            h = (h *% 31_u64) +% acc[idx];
+            idx = idx +% 1_usize;
+        }
+        step = step +% 1_u64;
+    }
+    return h;
+}

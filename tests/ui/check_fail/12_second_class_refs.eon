@@ -1,0 +1,23 @@
+module fail.second_class;
+
+pub pool Node {
+    pub bad_ref: *u32; //~ ERROR E0310
+}
+
+pub struct BadStruct {
+    pub ptr: *u32; //~ ERROR E0310
+    pub pool_holder: ArenaPool[Node]; //~ ERROR E0311
+}
+
+pub fn return_ref(x: *u32) -> *u32 { //~ ERROR E0310
+    return x;
+}
+
+pub fn return_pool(a: *mut Arena) -> ArenaPool[Node] ! MemError { //~ ERROR E0311
+    return try ArenaPool.[Node].init(a, 16_usize);
+}
+
+pub view fn dangling_local(_a: *u32) -> *u32 {
+    let local: u32 = 5_u32;
+    return &local; //~ ERROR E0310
+}

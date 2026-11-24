@@ -1,0 +1,6 @@
+module build;
+
+pub fn build(b: *mut BuildCap) {
+    b.set_out_dir("out");
+    b.add_exe("eonc1", "src");
+}

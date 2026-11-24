@@ -1,0 +1,155 @@
+module kernel.main;
+
+import kernel.arch.x86_64.apic;
+import kernel.arch.x86_64.cpu;
+import kernel.arch.x86_64.fiber;
+import kernel.arch.x86_64.paging;
+import kernel.arch.x86_64.uart;
+import kernel.pmm;
+import kernel.sched;
+
+fn fail_and_exit(msg: *str) @noalloc @noblock {
+    uart.puts("[EonOS-Micro] FAIL: ");
+    uart.puts(msg);
+    uart.puts("\n");
+    cpu.qemu_debug_exit(0x01_u8);
+}
+
+/// 100% Safe Eon freestanding microkernel entry point (`EonOS-Micro`, x86_64).
+/// Zero `@hal`, zero `raw`, zero inline `asm` in `kernel/src/` (verified via `--audit-tcb`).
+pub fn kmain() @noalloc @noblock {
+    uart.init();
+    uart.puts("[EonOS-Micro] boot x86_64 freestanding (100% Safe Eon core + isolated @hal)\n");
+
+    // 1. Verify typed `MmioReg` UART self-test
+    if !uart.mmio_self_test() {
+        fail_and_exit("UART MmioReg self-test failed");
+    }
+    uart.puts("[EonOS-Micro] uart16550 MmioReg: ok\n");
+
+    // 2. Initialize shared atomic state, GDT/TSS, and 256-entry IDT
+    cpu.init_shared_state();
+    cpu.init_gdt_tss();
+    cpu.init_idt(sched.timer_isr);
+    uart.puts("[EonOS-Micro] gdt+tss+idt (vector 0x20 -> @interrupt @noalloc @stack(512)): ok\n");
+
+    // 3. Initialize Local APIC and probe IOAPIC via typed `MmioReg`
+    let bsp_id = apic.lapic_init();
+    let ioapic_ver = apic.ioapic_read_version();
+    let max_redir = ((ioapic_ver >> 16_u32) & 0xFF_u32) +% 1_u32;
+    uart.puts("[EonOS-Micro] lapic_id=");
+    uart.put_u64(bsp_id.widen.[u64]());
+    uart.puts(" ioapic_ver=");
+    uart.put_hex((ioapic_ver & 0xFF_u32).widen.[u64]());
+    uart.puts(" redirs=");
+    uart.put_u64(max_redir.widen.[u64]());
+    uart.puts("\n");
+
+    // 4. Verify Safe Eon PMM (`linear struct PhysPage` + `errdefer` rollback)
+    var pmm_inst = pmm.Pmm.init();
+    let initial_free = pmm_inst.free_count;
+    let probe_ok = pmm_inst.rollback_probe(false) catch { 0_u64 };
+    if probe_ok == 0_u64 || pmm_inst.free_count != initial_free {
+        fail_and_exit("PMM alloc/free roundtrip failed");
+    }
+    var rolled_back = false;
+    let _rb = pmm_inst.rollback_probe(true) catch {
+        rolled_back = true;
+        0_u64
+    };
+    if !rolled_back || pmm_inst.free_count != initial_free {
+        fail_and_exit("PMM errdefer linear rollback leaked pages");
+    }
+    uart.puts("[EonOS-Micro] pmm (linear PhysPage + errdefer): ok free_pages=");
+    uart.put_u64(pmm_inst.free_count.widen.[u64]());
+    uart.puts("\n");
+
+    // 5. Verify 4-level x86_64 paging (`bitfield PageEntry`, `PhysAddr`, `VirtAddr`, `invlpg`)
+    let pt_page = pmm_inst.alloc_page() catch {
+        fail_and_exit("PMM out of pages for PT");
+        return;
+    };
+    let data_page = pmm_inst.alloc_page() catch {
+        pmm_inst.free_page(pt_page);
+        fail_and_exit("PMM out of pages for data");
+        return;
+    };
+    let test_va = VirtAddr.from_usize(0x40001000_usize);
+    let mapped = paging.map_4k_in_cr3(test_va, data_page.addr, pt_page.addr, true);
+    if !mapped {
+        pmm_inst.free_page(data_page);
+        pmm_inst.free_page(pt_page);
+        fail_and_exit("4-level map_4k_in_cr3 failed");
+        return;
+    }
+    let magic: u64 = 0xE0405A1ECAFEBABE_u64;
+    paging.write_virt_u64(test_va, magic);
+    let read_va = paging.read_virt_u64(test_va);
+    let read_pa = paging.read_phys_u64(data_page.addr);
+    var trans_ok = false;
+    if let tr = paging.translate_4k(test_va) {
+        trans_ok = tr.as_u64() == data_page.addr.as_u64();
+    }
+    let unmapped = paging.unmap_4k_in_cr3(test_va);
+    var post_unmap_null = true;
+    if let _tr2 = paging.translate_4k(test_va) {
+        post_unmap_null = false;
+    }
+    pmm_inst.free_page(data_page);
+    pmm_inst.free_page(pt_page);
+
+    if read_va != magic || read_pa != magic || !trans_ok || !unmapped || !post_unmap_null {
+        fail_and_exit("4-level VM paging verification failed");
+    }
+    uart.puts("[EonOS-Micro] vm 4-level paging (bitfield PageEntry + PhysAddr/VirtAddr + invlpg): ok\n");
+
+    // 6. SMP Application Processor bringup (INIT-SIPI-SIPI via 0x8000 trampoline)
+    let online = apic.smp_bringup_aps(sched.ap_main);
+    uart.puts("[EonOS-Micro] smp cpus_online=");
+    uart.put_u64(online.widen.[u64]());
+    uart.puts(" ap_lapic_id=");
+    uart.put_u64(cpu.get_ap_lapic_id().widen.[u64]());
+    uart.puts("\n");
+    if online < 2_u32 {
+        fail_and_exit("SMP AP failed to come online");
+    }
+
+    // 7. Start periodic LAPIC timer (vector 0x20), enable IRQs, run 3 cooperative fibers,
+    //    and handle >= 1,000 hardware timer interrupts!
+    apic.lapic_start_periodic_timer(32_u8, 25000_u32);
+    cpu.sti();
+
+    let got_fhash = sched.run_fiber_demo();
+    let exp_fhash = sched.expected_fiber_checksum();
+    let fswitches = fiber.fiber_switch_count();
+    if got_fhash != exp_fhash || fswitches != 30_u64 {
+        apic.lapic_stop_timer();
+        cpu.cli();
+        fail_and_exit("cooperative fiber checksum/switch mismatch");
+    }
+
+    // Wait until >= 1,000 hardware timer interrupts have been handled by `@interrupt` timer_isr
+    while cpu.get_timer_ticks() < 1000_u64 {
+        cpu.hlt();
+    }
+    apic.lapic_stop_timer();
+    cpu.cli();
+
+    let final_ticks = cpu.get_timer_ticks();
+    uart.puts("[EonOS-Micro] fibers: switches=");
+    uart.put_u64(fswitches);
+    uart.puts(" checksum=");
+    uart.put_hex(got_fhash);
+    uart.puts(" ok\n");
+    uart.puts("[EonOS-Micro] timer_irqs=");
+    uart.put_u64(final_ticks);
+    uart.puts(" (>= 1000): ok\n");
+    uart.puts("[EonOS-Micro] ALL CHECKS PASSED (smp=");
+    uart.put_u64(online.widen.[u64]());
+    uart.puts(", irqs=");
+    uart.put_u64(final_ticks);
+    uart.puts(", pmm=ok, vm=ok, fibers=ok)\n");
+
+    // Clean exit via QEMU isa-debug-exit (port 0xF4, val 0x10 -> exit status (0x10<<1)|1 = 33)
+    cpu.qemu_debug_exit(0x10_u8);
+}

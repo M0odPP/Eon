@@ -1,0 +1,1536 @@
+module eonc.tcb_audit;
+
+import core.col;
+import core.str;
+import eonc.span;
+import eonc.ast;
+
+// ---------------------------------------------------------------------------
+// FIPS 180-4 SHA-256
+// ---------------------------------------------------------------------------
+
+pub struct Sha256Digest {
+    pub bytes: [32]u8;
+}
+
+pub fn sha256_zero() -> Sha256Digest {
+    return Sha256Digest.{ bytes: [0_u8; 32] };
+}
+
+pub fn sha256_eq(a: *Sha256Digest, b: *Sha256Digest) -> bool {
+    var i: usize = 0_usize;
+    while i < 32_usize {
+        if a.bytes[i] != b.bytes[i] {
+            return false;
+        }
+        i = i +% 1_usize;
+    }
+    return true;
+}
+
+fn init_sha256_k(k: *mut [64]u32) {
+    k[0] = 0x428a2f98_u32;
+    k[1] = 0x71374491_u32;
+    k[2] = 0xb5c0fbcf_u32;
+    k[3] = 0xe9b5dba5_u32;
+    k[4] = 0x3956c25b_u32;
+    k[5] = 0x59f111f1_u32;
+    k[6] = 0x923f82a4_u32;
+    k[7] = 0xab1c5ed5_u32;
+    k[8] = 0xd807aa98_u32;
+    k[9] = 0x12835b01_u32;
+    k[10] = 0x243185be_u32;
+    k[11] = 0x550c7dc3_u32;
+    k[12] = 0x72be5d74_u32;
+    k[13] = 0x80deb1fe_u32;
+    k[14] = 0x9bdc06a7_u32;
+    k[15] = 0xc19bf174_u32;
+    k[16] = 0xe49b69c1_u32;
+    k[17] = 0xefbe4786_u32;
+    k[18] = 0x0fc19dc6_u32;
+    k[19] = 0x240ca1cc_u32;
+    k[20] = 0x2de92c6f_u32;
+    k[21] = 0x4a7484aa_u32;
+    k[22] = 0x5cb0a9dc_u32;
+    k[23] = 0x76f988da_u32;
+    k[24] = 0x983e5152_u32;
+    k[25] = 0xa831c66d_u32;
+    k[26] = 0xb00327c8_u32;
+    k[27] = 0xbf597fc7_u32;
+    k[28] = 0xc6e00bf3_u32;
+    k[29] = 0xd5a79147_u32;
+    k[30] = 0x06ca6351_u32;
+    k[31] = 0x14292967_u32;
+    k[32] = 0x27b70a85_u32;
+    k[33] = 0x2e1b2138_u32;
+    k[34] = 0x4d2c6dfc_u32;
+    k[35] = 0x53380d13_u32;
+    k[36] = 0x650a7354_u32;
+    k[37] = 0x766a0abb_u32;
+    k[38] = 0x81c2c92e_u32;
+    k[39] = 0x92722c85_u32;
+    k[40] = 0xa2bfe8a1_u32;
+    k[41] = 0xa81a664b_u32;
+    k[42] = 0xc24b8b70_u32;
+    k[43] = 0xc76c51a3_u32;
+    k[44] = 0xd192e819_u32;
+    k[45] = 0xd6990624_u32;
+    k[46] = 0xf40e3585_u32;
+    k[47] = 0x106aa070_u32;
+    k[48] = 0x19a4c116_u32;
+    k[49] = 0x1e376c08_u32;
+    k[50] = 0x2748774c_u32;
+    k[51] = 0x34b0bcb5_u32;
+    k[52] = 0x391c0cb3_u32;
+    k[53] = 0x4ed8aa4a_u32;
+    k[54] = 0x5b9cca4f_u32;
+    k[55] = 0x682e6ff3_u32;
+    k[56] = 0x748f82ee_u32;
+    k[57] = 0x78a5636f_u32;
+    k[58] = 0x84c87814_u32;
+    k[59] = 0x8cc70208_u32;
+    k[60] = 0x90befffa_u32;
+    k[61] = 0xa4506ceb_u32;
+    k[62] = 0xbef9a3f7_u32;
+    k[63] = 0xc67178f2_u32;
+}
+
+fn sha256_compress_words(state: *mut [8]u32, k: *[64]u32, w: *mut [64]u32) {
+    var j: usize = 16_usize;
+    while j < 64_usize {
+        let w15 = w[j - 15_usize];
+        let w2 = w[j - 2_usize];
+        let s0 = ((w15 >> 7_u32) | (w15 <<% 25_u32))
+            ^ ((w15 >> 18_u32) | (w15 <<% 14_u32))
+            ^ (w15 >> 3_u32);
+        let s1 = ((w2 >> 17_u32) | (w2 <<% 15_u32))
+            ^ ((w2 >> 19_u32) | (w2 <<% 13_u32))
+            ^ (w2 >> 10_u32);
+        w[j] = ((w[j - 16_usize] +% s0) +% w[j - 7_usize]) +% s1;
+        j = j + 1_usize;
+    }
+
+    var a = state[0];
+    var b = state[1];
+    var c = state[2];
+    var d = state[3];
+    var e = state[4];
+    var f = state[5];
+    var g = state[6];
+    var h = state[7];
+
+    var r: usize = 0_usize;
+    while r < 64_usize {
+        let big_s1 = ((e >> 6_u32) | (e <<% 26_u32))
+            ^ ((e >> 11_u32) | (e <<% 21_u32))
+            ^ ((e >> 25_u32) | (e <<% 7_u32));
+        let ch = (e & f) ^ ((~e) & g);
+        let temp1 = (((h +% big_s1) +% ch) +% k[r]) +% w[r];
+        let big_s0 = ((a >> 2_u32) | (a <<% 30_u32))
+            ^ ((a >> 13_u32) | (a <<% 19_u32))
+            ^ ((a >> 22_u32) | (a <<% 10_u32));
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let temp2 = big_s0 +% maj;
+
+        h = g;
+        g = f;
+        f = e;
+        e = d +% temp1;
+        d = c;
+        c = b;
+        b = a;
+        a = temp1 +% temp2;
+        r = r + 1_usize;
+    }
+
+    state[0] = state[0] +% a;
+    state[1] = state[1] +% b;
+    state[2] = state[2] +% c;
+    state[3] = state[3] +% d;
+    state[4] = state[4] +% e;
+    state[5] = state[5] +% f;
+    state[6] = state[6] +% g;
+    state[7] = state[7] +% h;
+}
+
+fn sha256_compress_slice(state: *mut [8]u32, blk: *[u8], k: *[64]u32, w: *mut [64]u32) {
+    if blk.len < 64_usize {
+        return;
+    }
+    var i: usize = 0_usize;
+    while i < 16_usize {
+        let b0 = i <<% 2_usize;
+        let b1 = b0 +% 1_usize;
+        let b2 = b0 +% 2_usize;
+        let b3 = b0 +% 3_usize;
+        if b0 < blk.len && b1 < blk.len && b2 < blk.len && b3 < blk.len {
+            let v0 = blk[b0].widen.[u32]() <<% 24_u32;
+            let v1 = blk[b1].widen.[u32]() <<% 16_u32;
+            let v2 = blk[b2].widen.[u32]() <<% 8_u32;
+            let v3 = blk[b3].widen.[u32]();
+            w[i] = v0 | v1 | v2 | v3;
+        }
+        i = i + 1_usize;
+    }
+    sha256_compress_words(state, k, w);
+}
+
+fn sha256_compress_block(state: *mut [8]u32, block: *[64]u8, k: *[64]u32, w: *mut [64]u32) {
+    var i: usize = 0_usize;
+    while i < 16_usize {
+        let b0 = i * 4_usize;
+        let v0 = block[b0].widen.[u32]() <<% 24_u32;
+        let v1 = block[b0 + 1_usize].widen.[u32]() <<% 16_u32;
+        let v2 = block[b0 + 2_usize].widen.[u32]() <<% 8_u32;
+        let v3 = block[b0 + 3_usize].widen.[u32]();
+        w[i] = v0 | v1 | v2 | v3;
+        i = i + 1_usize;
+    }
+    sha256_compress_words(state, k, w);
+}
+
+pub fn sha256(data: *[u8]) -> Sha256Digest {
+    var state: [8]u32 = [0_u32; 8];
+    state[0] = 0x6a09e667_u32;
+    state[1] = 0xbb67ae85_u32;
+    state[2] = 0x3c6ef372_u32;
+    state[3] = 0xa54ff53a_u32;
+    state[4] = 0x510e527f_u32;
+    state[5] = 0x9b05688c_u32;
+    state[6] = 0x1f83d9ab_u32;
+    state[7] = 0x5be0cd19_u32;
+
+    var k: [64]u32 = [0_u32; 64];
+    init_sha256_k(&mut k);
+
+    var w: [64]u32 = [0_u32; 64];
+    let full_blocks = data.len / 64_usize;
+    var bi: usize = 0_usize;
+    while bi < full_blocks {
+        let base = bi *% 64_usize;
+        let blk = data.sub(base, base +% 64_usize) catch {
+            break;
+        };
+        sha256_compress_slice(&mut state, blk, &k, &mut w);
+        bi = bi +% 1_usize;
+    }
+
+    let rem_start = full_blocks *% 64_usize;
+    let rem_len = data.len -% rem_start;
+    var tail: [64]u8 = [0_u8; 64];
+    var rj: usize = 0_usize;
+    while rj < rem_len && rj < 64_usize {
+        let idx = rem_start +% rj;
+        if idx < data.len {
+            tail[rj] = data[idx];
+        }
+        rj = rj +% 1_usize;
+    }
+    if rem_len < 64_usize {
+        tail[rem_len] = 0x80_u8;
+    }
+    if rem_len >= 56_usize {
+        sha256_compress_block(&mut state, &tail, &k, &mut w);
+        var zi: usize = 0_usize;
+        while zi < 64_usize {
+            tail[zi] = 0_u8;
+            zi = zi +% 1_usize;
+        }
+    }
+
+    let bit_len = data.len.widen.[u64]() *% 8_u64;
+    tail[56] = ((bit_len >> 56_u64) & 0xFF_u64).trunc.[u8]();
+    tail[57] = ((bit_len >> 48_u64) & 0xFF_u64).trunc.[u8]();
+    tail[58] = ((bit_len >> 40_u64) & 0xFF_u64).trunc.[u8]();
+    tail[59] = ((bit_len >> 32_u64) & 0xFF_u64).trunc.[u8]();
+    tail[60] = ((bit_len >> 24_u64) & 0xFF_u64).trunc.[u8]();
+    tail[61] = ((bit_len >> 16_u64) & 0xFF_u64).trunc.[u8]();
+    tail[62] = ((bit_len >> 8_u64) & 0xFF_u64).trunc.[u8]();
+    tail[63] = (bit_len & 0xFF_u64).trunc.[u8]();
+    sha256_compress_block(&mut state, &tail, &k, &mut w);
+
+    var out: [32]u8 = [0_u8; 32];
+    var oi: usize = 0_usize;
+    while oi < 8_usize {
+        let word = state[oi];
+        let o0 = oi *% 4_usize;
+        let o1 = o0 +% 1_usize;
+        let o2 = o0 +% 2_usize;
+        let o3 = o0 +% 3_usize;
+        if o0 < 32_usize && o1 < 32_usize && o2 < 32_usize && o3 < 32_usize {
+            out[o0] = ((word >> 24_u32) & 0xFF_u32).trunc.[u8]();
+            out[o1] = ((word >> 16_u32) & 0xFF_u32).trunc.[u8]();
+            out[o2] = ((word >> 8_u32) & 0xFF_u32).trunc.[u8]();
+            out[o3] = (word & 0xFF_u32).trunc.[u8]();
+        }
+        oi = oi +% 1_usize;
+    }
+    return Sha256Digest.{ bytes: out };
+}
+
+fn hex_nibble(n: u8) -> u8 {
+    let v = n & 15_u8;
+    if v < 10_u8 {
+        return b'0' +% v;
+    }
+    return b'a' +% (v -% 10_u8);
+}
+
+pub fn sha256_hex(
+    alloc: *mut AllocCap,
+    digest: *Sha256Digest,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    try out.reserve(alloc, 64_usize);
+    var i: usize = 0_usize;
+    while i < 32_usize {
+        let b = digest.bytes[i];
+        try out.push_byte_grow(alloc, hex_nibble(b >> 4_u8));
+        try out.push_byte_grow(alloc, hex_nibble(b));
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// TCB Audit Report Data Model
+// ---------------------------------------------------------------------------
+
+pub struct StrRange {
+    pub off: u32;
+    pub len: u32;
+}
+
+pub struct HalFileAudit {
+    pub path: StrRange;
+    pub module_name: StrRange;
+    pub digest: Sha256Digest;
+    pub raw_lines: usize;
+    pub asm_sites: usize;
+    pub extern_start: u32;
+    pub extern_len: u32;
+}
+
+pub linear struct TcbAuditReport {
+    pub files: col.DynBuf[HalFileAudit];
+    pub str_data: col.DynBuf[u8];
+    pub extern_names: col.DynBuf[StrRange];
+    pub total_raw_lines: usize;
+    pub total_asm_sites: usize;
+    pub total_extern_c: usize;
+}
+
+view fn slice_str_range(all: *[u8], r: StrRange) -> *[u8] {
+    let empty: *str = "";
+    let start = r.off.widen.[usize]();
+    let end = start +% r.len.widen.[usize]();
+    let s = all.sub(start, end) catch {
+        return empty.as_bytes();
+    };
+    return s;
+}
+
+fn matches_module_prefix(module_name: *[u8], prefix: *[u8]) -> bool {
+    if module_name.len == 0_usize || prefix.len == 0_usize {
+        return false;
+    }
+    var base_len = prefix.len;
+    while base_len > 0_usize && prefix[base_len - 1_usize] == b'.' {
+        base_len = base_len - 1_usize;
+    }
+    if base_len == 0_usize {
+        return false;
+    }
+    let base = prefix.sub(0_usize, base_len) catch {
+        return false;
+    };
+    if str.bytes_eq(module_name, base) {
+        return true;
+    }
+    if str.starts_with(module_name, base) && base_len < module_name.len {
+        return module_name[base_len] == b'.';
+    }
+    return false;
+}
+
+fn is_hal_module_whitelisted(
+    module_name: *[u8],
+    path: *[u8],
+    allowed: *[u32],
+    interner: *span.SymInterner,
+) -> bool {
+    if matches_module_prefix(module_name, "core".as_bytes())
+        || matches_module_prefix(module_name, "std".as_bytes())
+    {
+        return true;
+    }
+    var i: usize = 0_usize;
+    while i < allowed.len {
+        let entry = interner.get(allowed[i]);
+        if (module_name.len > 0_usize && str.bytes_eq(module_name, entry))
+            || str.bytes_eq(path, entry)
+        {
+            return true;
+        }
+        if str.ends_with(entry, ".*".as_bytes()) && entry.len >= 2_usize {
+            let pref = entry.sub(0_usize, entry.len - 2_usize) catch {
+                i = i +% 1_usize;
+                continue;
+            };
+            if matches_module_prefix(module_name, pref) {
+                return true;
+            }
+        }
+        i = i +% 1_usize;
+    }
+    return false;
+}
+
+impl TcbAuditReport {
+    pub fn init(alloc: *mut AllocCap) -> TcbAuditReport ! OutOfMemory {
+        let files = try col.DynBuf.[HalFileAudit].init(alloc, 4_usize);
+        errdefer files.destroy(alloc);
+        let str_data = try col.DynBuf.[u8].init(alloc, 256_usize);
+        errdefer str_data.destroy(alloc);
+        let extern_names = try col.DynBuf.[StrRange].init(alloc, 16_usize);
+        errdefer extern_names.destroy(alloc);
+        return TcbAuditReport.{
+            files: files,
+            str_data: str_data,
+            extern_names: extern_names,
+            total_raw_lines: 0_usize,
+            total_asm_sites: 0_usize,
+            total_extern_c: 0_usize,
+        };
+    }
+
+    pub fn file_count(self: *Self) -> usize {
+        return self.files.len();
+    }
+
+    pub view fn str_slice(self: *Self, r: StrRange) -> *[u8] {
+        return slice_str_range(self.str_data.as_slice(), r);
+    }
+
+    pub view fn file_path(self: *Self, idx: usize) -> *[u8] {
+        let empty: *str = "";
+        let fs = self.files.as_slice();
+        if idx < fs.len {
+            return slice_str_range(self.str_data.as_slice(), fs[idx].path);
+        }
+        return empty.as_bytes();
+    }
+
+    pub view fn file_module_name(self: *Self, idx: usize) -> *[u8] {
+        let empty: *str = "";
+        let fs = self.files.as_slice();
+        if idx < fs.len {
+            return slice_str_range(self.str_data.as_slice(), fs[idx].module_name);
+        }
+        return empty.as_bytes();
+    }
+
+    fn intern_str_range(self: *mut Self, alloc: *mut AllocCap, bytes: *[u8]) -> StrRange ! OutOfMemory {
+        let off = self.str_data.len().trunc.[u32]();
+        let n = bytes.len.trunc.[u32]();
+        try self.str_data.push_slice(alloc, bytes);
+        return StrRange.{ off: off, len: n };
+    }
+
+    pub fn format_report(
+        self: *Self,
+        alloc: *mut AllocCap,
+        out: *mut str.StrBuf,
+    ) -> !OutOfMemory {
+        let fs = self.files.as_slice();
+        let exts = self.extern_names.as_slice();
+        let sdata = self.str_data.as_slice();
+
+        try out.push_str_grow(alloc, "=== EON TCB AUDIT REPORT ===\n");
+        try out.push_str_grow(alloc, "hal_files: ");
+        try out.push_u64_grow(alloc, fs.len.widen.[u64]());
+        try out.push_byte_grow(alloc, b'\n');
+
+        var fi: usize = 0_usize;
+        while fi < fs.len {
+            let f = fs[fi];
+            try out.push_str_grow(alloc, "  - module: ");
+            try out.push_bytes_grow(alloc, slice_str_range(sdata, f.module_name));
+            try out.push_str_grow(alloc, "\n    path: ");
+            try out.push_bytes_grow(alloc, slice_str_range(sdata, f.path));
+            try out.push_str_grow(alloc, "\n    sha256: ");
+            try sha256_hex(alloc, &f.digest, out);
+            try out.push_str_grow(alloc, "\n    raw_lines: ");
+            try out.push_u64_grow(alloc, f.raw_lines.widen.[u64]());
+            try out.push_str_grow(alloc, "\n    asm_sites: ");
+            try out.push_u64_grow(alloc, f.asm_sites.widen.[u64]());
+            if f.extern_len == 0_u32 {
+                try out.push_str_grow(alloc, "\n    extern_c: none\n");
+            } else {
+                try out.push_str_grow(alloc, "\n    extern_c: [");
+                let start = f.extern_start.widen.[usize]();
+                let count = f.extern_len.widen.[usize]();
+                var ei: usize = 0_usize;
+                while ei < count {
+                    if ei > 0_usize {
+                        try out.push_str_grow(alloc, ", ");
+                    }
+                    let idx = start +% ei;
+                    if idx < exts.len {
+                        try out.push_bytes_grow(alloc, slice_str_range(sdata, exts[idx]));
+                    }
+                    ei = ei +% 1_usize;
+                }
+                try out.push_str_grow(alloc, "]\n");
+            }
+            fi = fi +% 1_usize;
+        }
+
+        try out.push_str_grow(alloc, "totals:\n  files: ");
+        try out.push_u64_grow(alloc, fs.len.widen.[u64]());
+        try out.push_str_grow(alloc, "\n  raw_lines: ");
+        try out.push_u64_grow(alloc, self.total_raw_lines.widen.[u64]());
+        try out.push_str_grow(alloc, "\n  asm_sites: ");
+        try out.push_u64_grow(alloc, self.total_asm_sites.widen.[u64]());
+        try out.push_str_grow(alloc, "\n  extern_c: ");
+        try out.push_u64_grow(alloc, self.total_extern_c.widen.[u64]());
+        try out.push_byte_grow(alloc, b'\n');
+        return;
+    }
+
+    pub fn check_hal_whitelist(
+        self: *Self,
+        alloc: *mut AllocCap,
+        allowed: *[u32],
+        interner: *span.SymInterner,
+        err_out: *mut str.StrBuf,
+    ) -> bool ! OutOfMemory {
+        let fs = self.files.as_slice();
+        let sdata = self.str_data.as_slice();
+        var violations: usize = 0_usize;
+
+        var i: usize = 0_usize;
+        while i < fs.len {
+            let f = fs[i];
+            let mod_bytes = slice_str_range(sdata, f.module_name);
+            let path_bytes = slice_str_range(sdata, f.path);
+            if !is_hal_module_whitelisted(mod_bytes, path_bytes, allowed, interner) {
+                if violations > 0_usize {
+                    try err_out.push_byte_grow(alloc, b'\n');
+                }
+                let display_mod = if mod_bytes.len == 0_usize {
+                    "<unnamed>".as_bytes()
+                } else {
+                    mod_bytes
+                };
+                try err_out.push_str_grow(alloc, "disallowed @hal module `");
+                try err_out.push_bytes_grow(alloc, display_mod);
+                try err_out.push_str_grow(alloc, "` (");
+                try err_out.push_bytes_grow(alloc, path_bytes);
+                try err_out.push_str_grow(alloc, "); add `");
+                try err_out.push_bytes_grow(alloc, display_mod);
+                try err_out.push_str_grow(alloc, "` to `allow_hal` in build.eon to trust it");
+                violations = violations +% 1_usize;
+            }
+            i = i +% 1_usize;
+        }
+        return violations == 0_usize;
+    }
+
+    pub fn destroy(self: TcbAuditReport, alloc: *mut AllocCap) {
+        let TcbAuditReport.{
+            files,
+            str_data,
+            extern_names,
+            total_raw_lines: _,
+            total_asm_sites: _,
+            total_extern_c: _,
+        } = self;
+        files.destroy(alloc);
+        str_data.destroy(alloc);
+        extern_names.destroy(alloc);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AST Walker for `raw { ... }`, `asm(...)`, `extern "C"`, and `@hal`
+// ---------------------------------------------------------------------------
+
+linear struct TcbConstructScan {
+    raw_spans: col.DynBuf[span.Span];
+    extern_syms: col.DynBuf[u32];
+    asm_sites: usize;
+    has_hal_attr: bool;
+}
+
+impl TcbConstructScan {
+    fn init(alloc: *mut AllocCap) -> TcbConstructScan ! OutOfMemory {
+        let raw_spans = try col.DynBuf.[span.Span].init(alloc, 8_usize);
+        errdefer raw_spans.destroy(alloc);
+        let extern_syms = try col.DynBuf.[u32].init(alloc, 8_usize);
+        errdefer extern_syms.destroy(alloc);
+        return TcbConstructScan.{
+            raw_spans: raw_spans,
+            extern_syms: extern_syms,
+            asm_sites: 0_usize,
+            has_hal_attr: false,
+        };
+    }
+
+    fn destroy(self: TcbConstructScan, alloc: *mut AllocCap) {
+        let TcbConstructScan.{ raw_spans, extern_syms, asm_sites: _, has_hal_attr: _ } = self;
+        raw_spans.destroy(alloc);
+        extern_syms.destroy(alloc);
+    }
+}
+
+@recursive
+fn scan_attrs(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    r: ast.IdRange,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    let attrs = arena.attrs_range(r);
+    var i: usize = 0_usize;
+    while i < attrs.len {
+        let attr = attrs[i];
+        if str.bytes_eq(interner.get(attr.name.sym), "hal".as_bytes()) {
+            scan.has_hal_attr = true;
+        }
+        let args = arena.attr_args_range(attr.args);
+        var j: usize = 0_usize;
+        while j < args.len {
+            try scan_expr(arena, alloc, interner, args[j].value, scan);
+            j = j +% 1_usize;
+        }
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+@recursive
+fn scan_generic_params(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    r: ast.IdRange,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    let gps = arena.generic_params_range(r);
+    var i: usize = 0_usize;
+    while i < gps.len {
+        let gp = gps[i];
+        if gp.comptime_ty != ast.NONE_ID {
+            try scan_type(arena, alloc, interner, gp.comptime_ty, scan);
+        }
+        let bounds = arena.type_list_range(gp.bounds);
+        var j: usize = 0_usize;
+        while j < bounds.len {
+            try scan_type(arena, alloc, interner, bounds[j], scan);
+            j = j +% 1_usize;
+        }
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+@recursive
+fn scan_generic_args(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    r: ast.IdRange,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    let gas = arena.generic_args_range(r);
+    var i: usize = 0_usize;
+    while i < gas.len {
+        let ga = gas[i];
+        match ga.kind {
+            .Type => { try scan_type(arena, alloc, interner, ga.node_id, scan); }
+            .Expr => { try scan_expr(arena, alloc, interner, ga.node_id, scan); }
+            .TypeOrConst => {}
+        }
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+@recursive
+fn scan_params(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    r: ast.IdRange,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    let ps = arena.params_range(r);
+    var i: usize = 0_usize;
+    while i < ps.len {
+        try scan_attrs(arena, alloc, interner, ps[i].attrs, scan);
+        try scan_type(arena, alloc, interner, ps[i].ty, scan);
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+@recursive
+fn scan_sys_params(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    r: ast.IdRange,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    let ps = arena.sys_params_range(r);
+    var i: usize = 0_usize;
+    while i < ps.len {
+        try scan_attrs(arena, alloc, interner, ps[i].attrs, scan);
+        try scan_type(arena, alloc, interner, ps[i].ty, scan);
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+@recursive
+fn scan_fields(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    r: ast.IdRange,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    let fs = arena.fields_range(r);
+    var i: usize = 0_usize;
+    while i < fs.len {
+        try scan_attrs(arena, alloc, interner, fs[i].attrs, scan);
+        try scan_type(arena, alloc, interner, fs[i].ty, scan);
+        if fs[i].default != ast.NONE_ID {
+            try scan_expr(arena, alloc, interner, fs[i].default, scan);
+        }
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+@recursive
+fn scan_expr_list(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    r: ast.IdRange,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    let es = arena.expr_list_range(r);
+    var i: usize = 0_usize;
+    while i < es.len {
+        try scan_expr(arena, alloc, interner, es[i], scan);
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+@recursive
+fn scan_type_list(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    r: ast.IdRange,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    let ts = arena.type_list_range(r);
+    var i: usize = 0_usize;
+    while i < ts.len {
+        try scan_type(arena, alloc, interner, ts[i], scan);
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+@recursive
+fn scan_type(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    type_id: u32,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    let ty = arena.get_type(type_id) orelse { return; };
+    match ty.kind {
+        .ErrorUnion => {
+            if ty.primary != ast.NONE_ID {
+                try scan_type(arena, alloc, interner, ty.primary, scan);
+            }
+            try scan_type_list(arena, alloc, interner, ty.list, scan);
+        }
+        .Optional => {
+            try scan_type(arena, alloc, interner, ty.primary, scan);
+        }
+        .Borrow => {
+            match ty.borrow_target {
+                .Single => { try scan_type(arena, alloc, interner, ty.primary, scan); }
+                .Slice => { try scan_type(arena, alloc, interner, ty.primary, scan); }
+                .Str => {}
+            }
+        }
+        .Array => {
+            try scan_expr(arena, alloc, interner, ty.aux, scan);
+            try scan_type(arena, alloc, interner, ty.primary, scan);
+        }
+        .Dyn => {
+            try scan_generic_args(arena, alloc, interner, ty.list2, scan);
+        }
+        .Path => {
+            try scan_generic_args(arena, alloc, interner, ty.list2, scan);
+        }
+        .FnPtr => {
+            try scan_type_list(arena, alloc, interner, ty.list, scan);
+            if ty.primary != ast.NONE_ID {
+                try scan_type(arena, alloc, interner, ty.primary, scan);
+            }
+            try scan_attrs(arena, alloc, interner, ty.list2, scan);
+        }
+        .InlineStruct => {
+            try scan_fields(arena, alloc, interner, ty.list, scan);
+        }
+        .Tuple => {
+            try scan_type_list(arena, alloc, interner, ty.list, scan);
+        }
+        _ => {}
+    }
+    return;
+}
+
+@recursive
+fn scan_pat(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    pat_id: u32,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    let pat = arena.get_pat(pat_id) orelse { return; };
+    match pat.kind {
+        .Variant => {
+            let ps = arena.pat_list_range(pat.list);
+            var i: usize = 0_usize;
+            while i < ps.len {
+                try scan_pat(arena, alloc, interner, ps[i], scan);
+                i = i +% 1_usize;
+            }
+        }
+        .Tuple => {
+            let ps = arena.pat_list_range(pat.list);
+            var i: usize = 0_usize;
+            while i < ps.len {
+                try scan_pat(arena, alloc, interner, ps[i], scan);
+                i = i +% 1_usize;
+            }
+        }
+        .Struct => {
+            if pat.flag {
+                try scan_generic_args(arena, alloc, interner, pat.path_gens, scan);
+            }
+            let fps = arena.pat_fields_range(pat.list);
+            var i: usize = 0_usize;
+            while i < fps.len {
+                if fps[i].pat != ast.NONE_ID {
+                    try scan_pat(arena, alloc, interner, fps[i].pat, scan);
+                }
+                i = i +% 1_usize;
+            }
+        }
+        _ => {}
+    }
+    return;
+}
+
+@recursive
+fn scan_jump(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    jump_id: u32,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    let j = arena.get_jump(jump_id) orelse { return; };
+    match j.kind {
+        .Return => {
+            if j.value != ast.NONE_ID {
+                try scan_expr(arena, alloc, interner, j.value, scan);
+            }
+        }
+        .Break => {
+            if j.value != ast.NONE_ID {
+                try scan_expr(arena, alloc, interner, j.value, scan);
+            }
+        }
+        _ => {}
+    }
+    return;
+}
+
+@recursive
+fn scan_body(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    kind: ast.BodyKind,
+    id: u32,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    match kind {
+        .Block => { try scan_block(arena, alloc, interner, id, scan); }
+        .Expr => { try scan_expr(arena, alloc, interner, id, scan); }
+        .Jump => { try scan_jump(arena, alloc, interner, id, scan); }
+    }
+    return;
+}
+
+@recursive
+fn scan_if(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    if_id: u32,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    let node = arena.get_if(if_id) orelse { return; };
+    match node.cond_kind {
+        .Expr => { try scan_expr(arena, alloc, interner, node.cond_expr, scan); }
+        .Let => {
+            try scan_pat(arena, alloc, interner, node.cond_pat, scan);
+            try scan_expr(arena, alloc, interner, node.cond_expr, scan);
+        }
+    }
+    try scan_block(arena, alloc, interner, node.then_block, scan);
+    match node.else_kind {
+        .None => {}
+        .Block => { try scan_block(arena, alloc, interner, node.else_id, scan); }
+        .If => { try scan_if(arena, alloc, interner, node.else_id, scan); }
+    }
+    return;
+}
+
+@recursive
+fn scan_match_arms(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    r: ast.IdRange,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    let arms = arena.match_arms_range(r);
+    var i: usize = 0_usize;
+    while i < arms.len {
+        let arm = arms[i];
+        try scan_pat(arena, alloc, interner, arm.pat, scan);
+        if arm.guard != ast.NONE_ID {
+            try scan_expr(arena, alloc, interner, arm.guard, scan);
+        }
+        try scan_body(arena, alloc, interner, arm.body_kind, arm.body_id, scan);
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+@recursive
+fn scan_block(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    block_id: u32,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    let b = arena.get_block(block_id) orelse { return; };
+    let stmts = arena.stmt_list_range(b.stmts);
+    var i: usize = 0_usize;
+    while i < stmts.len {
+        try scan_stmt(arena, alloc, interner, stmts[i], scan);
+        i = i +% 1_usize;
+    }
+    if b.tail_expr != ast.NONE_ID {
+        try scan_expr(arena, alloc, interner, b.tail_expr, scan);
+    }
+    return;
+}
+
+@recursive
+fn scan_stmt_loops(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    s: *ast.StmtNode,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    match s.kind {
+        .While => {
+            try scan_expr(arena, alloc, interner, s.a, scan);
+            try scan_expr_list(arena, alloc, interner, s.list, scan);
+            try scan_block(arena, alloc, interner, s.b, scan);
+        }
+        .For => {
+            try scan_pat(arena, alloc, interner, s.a, scan);
+            try scan_expr(arena, alloc, interner, s.c, scan);
+            if s.has_range {
+                try scan_expr(arena, alloc, interner, s.d, scan);
+            }
+            try scan_block(arena, alloc, interner, s.b, scan);
+        }
+        .ParFor => {
+            try scan_pat(arena, alloc, interner, s.a, scan);
+            try scan_expr(arena, alloc, interner, s.c, scan);
+            if s.has_range {
+                try scan_expr(arena, alloc, interner, s.d, scan);
+            }
+            try scan_block(arena, alloc, interner, s.b, scan);
+        }
+        .Loop => {
+            try scan_block(arena, alloc, interner, s.a, scan);
+        }
+        .ComptimeBlock => {
+            try scan_block(arena, alloc, interner, s.a, scan);
+        }
+        .RawBlock => {
+            if let blk = arena.get_block(s.a) {
+                try scan.raw_spans.push(alloc, blk.span);
+            }
+            try scan_block(arena, alloc, interner, s.a, scan);
+        }
+        .Assign => {
+            try scan_expr(arena, alloc, interner, s.a, scan);
+            try scan_expr(arena, alloc, interner, s.b, scan);
+        }
+        .Discard => {
+            try scan_expr(arena, alloc, interner, s.a, scan);
+        }
+        .Expr => {
+            try scan_expr(arena, alloc, interner, s.a, scan);
+        }
+        _ => {}
+    }
+    return;
+}
+
+@recursive
+fn scan_stmt(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    stmt_id: u32,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    let s = arena.get_stmt(stmt_id) orelse { return; };
+    match s.kind {
+        .Let => {
+            try scan_attrs(arena, alloc, interner, s.list, scan);
+            try scan_pat(arena, alloc, interner, s.a, scan);
+            if s.b != ast.NONE_ID {
+                try scan_type(arena, alloc, interner, s.b, scan);
+            }
+            try scan_expr(arena, alloc, interner, s.c, scan);
+        }
+        .Var => {
+            try scan_attrs(arena, alloc, interner, s.list, scan);
+            if s.b != ast.NONE_ID {
+                try scan_type(arena, alloc, interner, s.b, scan);
+            }
+            try scan_expr(arena, alloc, interner, s.c, scan);
+        }
+        .Const => {
+            if let c = arena.get_const_decl(s.a) {
+                try scan_type(arena, alloc, interner, c.ty, scan);
+                try scan_expr(arena, alloc, interner, c.value, scan);
+            }
+        }
+        .Defer => {
+            try scan_body(arena, alloc, interner, s.body_kind, s.a, scan);
+        }
+        .Errdefer => {
+            try scan_body(arena, alloc, interner, s.body_kind, s.a, scan);
+        }
+        .Jump => {
+            try scan_jump(arena, alloc, interner, s.a, scan);
+        }
+        .If => {
+            try scan_if(arena, alloc, interner, s.a, scan);
+        }
+        .Match => {
+            try scan_expr(arena, alloc, interner, s.a, scan);
+            try scan_match_arms(arena, alloc, interner, s.list, scan);
+        }
+        _ => {
+            try scan_stmt_loops(arena, alloc, interner, s, scan);
+        }
+    }
+    return;
+}
+
+@recursive
+fn scan_expr_ops(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    e: *ast.ExprNode,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    match e.kind {
+        .Binary => {
+            try scan_expr(arena, alloc, interner, e.a, scan);
+            try scan_expr(arena, alloc, interner, e.b, scan);
+        }
+        .Is => {
+            try scan_expr(arena, alloc, interner, e.a, scan);
+            try scan_pat(arena, alloc, interner, e.b, scan);
+        }
+        .Orelse => {
+            try scan_expr(arena, alloc, interner, e.a, scan);
+            try scan_body(arena, alloc, interner, e.body_kind, e.b, scan);
+        }
+        .Catch => {
+            try scan_expr(arena, alloc, interner, e.a, scan);
+            try scan_body(arena, alloc, interner, e.body_kind, e.b, scan);
+        }
+        .Field => {
+            try scan_expr(arena, alloc, interner, e.a, scan);
+        }
+        .GenericApply => {
+            try scan_expr(arena, alloc, interner, e.a, scan);
+            try scan_generic_args(arena, alloc, interner, e.list, scan);
+        }
+        .Call => {
+            try scan_expr(arena, alloc, interner, e.a, scan);
+            try scan_expr_list(arena, alloc, interner, e.list, scan);
+        }
+        .Index => {
+            try scan_expr(arena, alloc, interner, e.a, scan);
+            try scan_expr(arena, alloc, interner, e.b, scan);
+        }
+        .Slice => {
+            try scan_expr(arena, alloc, interner, e.a, scan);
+            if e.b != ast.NONE_ID {
+                try scan_expr(arena, alloc, interner, e.b, scan);
+            }
+            if e.c != ast.NONE_ID {
+                try scan_expr(arena, alloc, interner, e.c, scan);
+            }
+        }
+        _ => {}
+    }
+    return;
+}
+
+@recursive
+fn scan_expr(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    expr_id: u32,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    let e = arena.get_expr(expr_id) orelse { return; };
+    match e.kind {
+        .AnonStructLit => {
+            let fis = arena.field_inits_range(e.list);
+            var i: usize = 0_usize;
+            while i < fis.len {
+                try scan_expr(arena, alloc, interner, fis[i].value, scan);
+                i = i +% 1_usize;
+            }
+        }
+        .NamedStructLit => {
+            try scan_expr(arena, alloc, interner, e.a, scan);
+            let fis = arena.field_inits_range(e.list);
+            var i: usize = 0_usize;
+            while i < fis.len {
+                try scan_expr(arena, alloc, interner, fis[i].value, scan);
+                i = i +% 1_usize;
+            }
+        }
+        .ArrayLit => { try scan_expr_list(arena, alloc, interner, e.list, scan); }
+        .Tuple => { try scan_expr_list(arena, alloc, interner, e.list, scan); }
+        .ArrayRepeat => {
+            try scan_expr(arena, alloc, interner, e.a, scan);
+            try scan_expr(arena, alloc, interner, e.b, scan);
+        }
+        .Paren => { try scan_expr(arena, alloc, interner, e.a, scan); }
+        .ComptimeExpr => { try scan_expr(arena, alloc, interner, e.a, scan); }
+        .Deref => { try scan_expr(arena, alloc, interner, e.a, scan); }
+        .Unary => { try scan_expr(arena, alloc, interner, e.a, scan); }
+        .Closure => {
+            try scan_params(arena, alloc, interner, e.list, scan);
+            try scan_block(arena, alloc, interner, e.a, scan);
+        }
+        .If => { try scan_if(arena, alloc, interner, e.a, scan); }
+        .Match => {
+            try scan_expr(arena, alloc, interner, e.a, scan);
+            try scan_match_arms(arena, alloc, interner, e.list, scan);
+        }
+        .Loop => { try scan_block(arena, alloc, interner, e.a, scan); }
+        .ComptimeBlock => { try scan_block(arena, alloc, interner, e.a, scan); }
+        .Builtin => { try scan_generic_args(arena, alloc, interner, e.list, scan); }
+        .Asm => {
+            scan.asm_sites = scan.asm_sites +% 1_usize;
+            let ops = arena.asm_ops_range(e.list2);
+            var i: usize = 0_usize;
+            while i < ops.len {
+                let op = ops[i];
+                try scan_expr(arena, alloc, interner, op.expr, scan);
+                if op.kind == .Named && op.arg != ast.NONE_ID {
+                    try scan_expr(arena, alloc, interner, op.arg, scan);
+                }
+                i = i +% 1_usize;
+            }
+        }
+        _ => {
+            try scan_expr_ops(arena, alloc, interner, e, scan);
+        }
+    }
+    return;
+}
+
+@recursive
+fn scan_decl_types(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    d: *ast.DeclNode,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    match d.kind {
+        .Enum => {
+            let e = arena.get_enum_decl(d.payload) orelse { return; };
+            let vs = arena.enum_variants_range(e.variants);
+            var i: usize = 0_usize;
+            while i < vs.len {
+                if vs[i].value != ast.NONE_ID {
+                    try scan_expr(arena, alloc, interner, vs[i].value, scan);
+                }
+                i = i +% 1_usize;
+            }
+        }
+        .Union => {
+            let u = arena.get_union_decl(d.payload) orelse { return; };
+            try scan_generic_params(arena, alloc, interner, u.generics, scan);
+            try scan_expr_list(arena, alloc, interner, u.where_clauses, scan);
+            let vs = arena.union_variants_range(u.variants);
+            var i: usize = 0_usize;
+            while i < vs.len {
+                if vs[i].ty != ast.NONE_ID {
+                    try scan_type(arena, alloc, interner, vs[i].ty, scan);
+                }
+                i = i +% 1_usize;
+            }
+        }
+        .Bitfield => {
+            let b = arena.get_bitfield_decl(d.payload) orelse { return; };
+            let ms = arena.bitfield_members_range(b.members);
+            var i: usize = 0_usize;
+            while i < ms.len {
+                if ms[i].has_bits {
+                    try scan_expr(arena, alloc, interner, ms[i].bits_lo, scan);
+                    try scan_expr(arena, alloc, interner, ms[i].bits_hi, scan);
+                }
+                i = i +% 1_usize;
+            }
+        }
+        .Iface => {
+            let ic = arena.get_iface_decl(d.payload) orelse { return; };
+            try scan_generic_params(arena, alloc, interner, ic.generics, scan);
+            let ms = arena.iface_methods_range(ic.methods);
+            var i: usize = 0_usize;
+            while i < ms.len {
+                let m = ms[i];
+                try scan_attrs(arena, alloc, interner, m.attrs, scan);
+                try scan_attrs(arena, alloc, interner, m.effects, scan);
+                try scan_generic_params(arena, alloc, interner, m.generics, scan);
+                try scan_params(arena, alloc, interner, m.params, scan);
+                if m.ret_type != ast.NONE_ID {
+                    try scan_type(arena, alloc, interner, m.ret_type, scan);
+                }
+                try scan_expr_list(arena, alloc, interner, m.where_clauses, scan);
+                try scan_expr_list(arena, alloc, interner, m.ensures_clauses, scan);
+                i = i +% 1_usize;
+            }
+        }
+        .TypeAlias => {
+            let t = arena.get_type_decl(d.payload) orelse { return; };
+            try scan_generic_params(arena, alloc, interner, t.generics, scan);
+            try scan_expr_list(arena, alloc, interner, t.where_clauses, scan);
+            try scan_type(arena, alloc, interner, t.ty, scan);
+        }
+        .Const => {
+            let c = arena.get_const_decl(d.payload) orelse { return; };
+            try scan_type(arena, alloc, interner, c.ty, scan);
+            try scan_expr(arena, alloc, interner, c.value, scan);
+        }
+        .ExternFn => {
+            let ex = arena.get_extern_decl(d.payload) orelse { return; };
+            try scan.extern_syms.push(alloc, ex.name.sym);
+            try scan_params(arena, alloc, interner, ex.params, scan);
+            if ex.ret_type != ast.NONE_ID {
+                try scan_type(arena, alloc, interner, ex.ret_type, scan);
+            }
+        }
+        .ExternStruct => {
+            let ex = arena.get_extern_decl(d.payload) orelse { return; };
+            try scan.extern_syms.push(alloc, ex.name.sym);
+            try scan_fields(arena, alloc, interner, ex.fields, scan);
+        }
+        .ExternUnion => {
+            let ex = arena.get_extern_decl(d.payload) orelse { return; };
+            try scan.extern_syms.push(alloc, ex.name.sym);
+            try scan_fields(arena, alloc, interner, ex.fields, scan);
+        }
+        _ => {}
+    }
+    return;
+}
+
+@recursive
+fn scan_decl(
+    arena: *ast.AstArena,
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    decl_id: u32,
+    scan: *mut TcbConstructScan,
+) -> !OutOfMemory {
+    let d = arena.get_decl(decl_id) orelse { return; };
+    try scan_attrs(arena, alloc, interner, d.attrs, scan);
+    match d.kind {
+        .Fn => {
+            let f = arena.get_fn_decl(d.payload) orelse { return; };
+            try scan_attrs(arena, alloc, interner, f.effects, scan);
+            try scan_generic_params(arena, alloc, interner, f.generics, scan);
+            try scan_params(arena, alloc, interner, f.params, scan);
+            if f.ret_type != ast.NONE_ID {
+                try scan_type(arena, alloc, interner, f.ret_type, scan);
+            }
+            try scan_expr_list(arena, alloc, interner, f.where_clauses, scan);
+            try scan_expr_list(arena, alloc, interner, f.ensures_clauses, scan);
+            try scan_block(arena, alloc, interner, f.body, scan);
+        }
+        .Sys => {
+            let s = arena.get_sys_decl(d.payload) orelse { return; };
+            try scan_attrs(arena, alloc, interner, s.effects, scan);
+            try scan_generic_params(arena, alloc, interner, s.generics, scan);
+            try scan_sys_params(arena, alloc, interner, s.params, scan);
+            if s.ret_type != ast.NONE_ID {
+                try scan_type(arena, alloc, interner, s.ret_type, scan);
+            }
+            try scan_expr_list(arena, alloc, interner, s.where_clauses, scan);
+            try scan_expr_list(arena, alloc, interner, s.ensures_clauses, scan);
+            try scan_block(arena, alloc, interner, s.body, scan);
+        }
+        .Struct => {
+            let s = arena.get_struct_decl(d.payload) orelse { return; };
+            try scan_generic_params(arena, alloc, interner, s.generics, scan);
+            try scan_expr_list(arena, alloc, interner, s.where_clauses, scan);
+            try scan_fields(arena, alloc, interner, s.fields, scan);
+        }
+        .Pool => {
+            let p = arena.get_struct_decl(d.payload) orelse { return; };
+            try scan_generic_params(arena, alloc, interner, p.generics, scan);
+            try scan_expr_list(arena, alloc, interner, p.where_clauses, scan);
+            try scan_fields(arena, alloc, interner, p.fields, scan);
+        }
+        .Impl => {
+            let im = arena.get_impl_decl(d.payload) orelse { return; };
+            try scan_generic_params(arena, alloc, interner, im.generics, scan);
+            if im.iface_type != ast.NONE_ID {
+                try scan_type(arena, alloc, interner, im.iface_type, scan);
+            }
+            try scan_type(arena, alloc, interner, im.target_type, scan);
+            try scan_expr_list(arena, alloc, interner, im.where_clauses, scan);
+            let subs = arena.decl_list_range(im.decls);
+            var i: usize = 0_usize;
+            while i < subs.len {
+                try scan_decl(arena, alloc, interner, subs[i], scan);
+                i = i +% 1_usize;
+            }
+        }
+        _ => {
+            try scan_decl_types(arena, alloc, interner, d, scan);
+        }
+    }
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// Lexicographic Sort & Top-Level `audit_tcb`
+// ---------------------------------------------------------------------------
+
+fn cmp_bytes_lex(a: *[u8], b: *[u8]) -> i32 {
+    let min_len = if a.len < b.len { a.len } else { b.len };
+    var i: usize = 0_usize;
+    while i < min_len {
+        if a[i] < b[i] {
+            return -1_i32;
+        }
+        if a[i] > b[i] {
+            return 1_i32;
+        }
+        i = i +% 1_usize;
+    }
+    if a.len < b.len {
+        return -1_i32;
+    }
+    if a.len > b.len {
+        return 1_i32;
+    }
+    return 0_i32;
+}
+
+fn sort_syms_lex(syms: *mut [u32], interner: *span.SymInterner) {
+    let n = syms.len;
+    if n <= 1_usize {
+        return;
+    }
+    var gap: usize = 1_usize;
+    let third = n / 3_usize;
+    while gap < third {
+        gap = (gap *% 3_usize) +% 1_usize;
+    }
+    while gap > 0_usize {
+        var i = gap;
+        while i < n {
+            let cur = syms[i];
+            let cur_bytes = interner.get(cur);
+            var j = i;
+            while j >= gap {
+                let prev = j - gap;
+                let prev_bytes = interner.get(syms[prev]);
+                if cmp_bytes_lex(prev_bytes, cur_bytes) <= 0_i32 {
+                    break;
+                }
+                syms[j] = syms[prev];
+                j = prev;
+            }
+            syms[j] = cur;
+            i = i +% 1_usize;
+        }
+        gap = gap / 3_usize;
+    }
+}
+
+fn audit_single_unit(
+    alloc: *mut AllocCap,
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    unit_id: u32,
+    interner: *span.SymInterner,
+    report: *mut TcbAuditReport,
+) -> !OutOfMemory {
+    let u = arena.get_unit(unit_id) orelse { return; };
+    if sm.file_profile(u.file) != .Hal && !u.is_hal {
+        return;
+    }
+
+    var mod_buf = try str.StrBuf.init(alloc, 64_usize);
+    errdefer mod_buf.destroy(alloc);
+    let segs = arena.idents_range(u.module_path);
+    var si: usize = 0_usize;
+    while si < segs.len {
+        if si > 0_usize {
+            try mod_buf.push_byte_grow(alloc, b'.');
+        }
+        try mod_buf.push_bytes_grow(alloc, interner.get(segs[si].sym));
+        si = si +% 1_usize;
+    }
+
+    let digest = sha256(sm.file_text(u.file));
+
+    var scan = try TcbConstructScan.init(alloc);
+    errdefer scan.destroy(alloc);
+    let decls = arena.decl_list_range(u.decls);
+    var di: usize = 0_usize;
+    while di < decls.len {
+        try scan_decl(arena, alloc, interner, decls[di], &mut scan);
+        di = di +% 1_usize;
+    }
+    sort_syms_lex(scan.extern_syms.as_mut_slice(), interner);
+
+    var raw_line_set = try col.HashMap.[u8].init(alloc, 16_usize);
+    errdefer raw_line_set.destroy(alloc);
+    let file_cnt = sm.file_count();
+    let rspans = scan.raw_spans.as_slice();
+    var ri: usize = 0_usize;
+    while ri < rspans.len {
+        let sp = rspans[ri];
+        let target_fid = if sp.file != span.FILE_DUMMY && sp.file < file_cnt {
+            sp.file
+        } else {
+            u.file
+        };
+        let s_off = if sp.start < sp.end { sp.start } else { sp.end };
+        let e_off = if sp.start > sp.end { sp.start } else { sp.end };
+        let l0 = sm.line_col(target_fid, s_off).line;
+        let l1 = sm.line_col(target_fid, e_off).line;
+        let lo_l = if l0 < l1 { l0 } else { l1 };
+        let hi_l = if l0 > l1 { l0 } else { l1 };
+        var line = lo_l;
+        while line <= hi_l {
+            try raw_line_set.insert(alloc, line.widen.[u64](), 1_u8);
+            if line == 4294967295_u32 {
+                break;
+            }
+            line = line +% 1_u32;
+        }
+        ri = ri +% 1_usize;
+    }
+
+    let raw_lines = raw_line_set.len();
+    let asm_sites = scan.asm_sites;
+    let ext_syms = scan.extern_syms.as_slice();
+    let ext_start = report.extern_names.len().trunc.[u32]();
+    var ei: usize = 0_usize;
+    while ei < ext_syms.len {
+        let r = try report.intern_str_range(alloc, interner.get(ext_syms[ei]));
+        try report.extern_names.push(alloc, r);
+        ei = ei +% 1_usize;
+    }
+    let ext_len = ext_syms.len.trunc.[u32]();
+
+    let path_range = try report.intern_str_range(alloc, sm.file_name(u.file));
+    let mod_range = try report.intern_str_range(alloc, mod_buf.as_bytes());
+    try report.files.push(
+        alloc,
+        HalFileAudit.{
+            path: path_range,
+            module_name: mod_range,
+            digest: digest,
+            raw_lines: raw_lines,
+            asm_sites: asm_sites,
+            extern_start: ext_start,
+            extern_len: ext_len,
+        },
+    );
+    report.total_raw_lines = report.total_raw_lines +% raw_lines;
+    report.total_asm_sites = report.total_asm_sites +% asm_sites;
+    report.total_extern_c = report.total_extern_c +% ext_syms.len;
+
+    raw_line_set.destroy(alloc);
+    scan.destroy(alloc);
+    mod_buf.destroy(alloc);
+    return;
+}
+
+pub fn audit_tcb(
+    alloc: *mut AllocCap,
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    unit_ids: *[u32],
+    interner: *span.SymInterner,
+) -> TcbAuditReport ! OutOfMemory {
+    var report = try TcbAuditReport.init(alloc);
+    errdefer report.destroy(alloc);
+
+    var i: usize = 0_usize;
+    while i < unit_ids.len {
+        try audit_single_unit(alloc, sm, arena, unit_ids[i], interner, &mut report);
+        i = i +% 1_usize;
+    }
+    return report;
+}

@@ -1,0 +1,5042 @@
+module eonc.borrow;
+
+import core.col;
+import core.str;
+import core.sync;
+import eonc.span;
+import eonc.diag;
+import eonc.ast;
+import eonc.resolve;
+import eonc.types;
+import eonc.cfg_ir;
+
+// ===========================================================================
+// Section 1: Shared View Source Helpers, Access Paths, and Path/Loan Arena
+// ===========================================================================
+
+const FNV_OFFSET: u64 = 0xCBF29CE484222325_u64;
+const FNV_PRIME: u64 = 0x100000001B3_u64;
+
+fn fnv_u8(h: u64, b: u8) -> u64 {
+    return (h ^ b.widen.[u64]()) *% FNV_PRIME;
+}
+
+fn fnv_u32(h: u64, v: u32) -> u64 {
+    var cur = fnv_u8(h, (v & 0xFF_u32).trunc.[u8]());
+    cur = fnv_u8(cur, ((v >> 8_u32) & 0xFF_u32).trunc.[u8]());
+    cur = fnv_u8(cur, ((v >> 16_u32) & 0xFF_u32).trunc.[u8]());
+    cur = fnv_u8(cur, ((v >> 24_u32) & 0xFF_u32).trunc.[u8]());
+    return cur;
+}
+
+fn fnv_u64(h: u64, v: u64) -> u64 {
+    let lo = (v & 0xFFFFFFFF_u64).trunc.[u32]();
+    let hi = (v >> 32_u64).trunc.[u32]();
+    return fnv_u32(fnv_u32(h, lo), hi);
+}
+
+view fn slice_id_range[T](all: *[T], r: ast.IdRange) -> *[T] {
+    let start = r.start.widen.[usize]();
+    let end = start +% r.len.widen.[usize]();
+    let s = all.sub(start, end) catch {
+        return all.sub(0_usize, 0_usize) catch {
+            return all;
+        };
+    };
+    return s;
+}
+
+fn slice_get_bool(s: *[bool], idx: usize) -> bool {
+    if idx < s.len {
+        return s[idx];
+    }
+    return false;
+}
+
+fn slice_set_bool(s: *mut [bool], idx: usize, v: bool) {
+    if idx < s.len {
+        s[idx] = v;
+    }
+}
+
+fn slice_get_u32(s: *[u32], idx: usize, fallback: u32) -> u32 {
+    if idx < s.len {
+        return s[idx];
+    }
+    return fallback;
+}
+
+fn slice_get_usize(s: *[usize], idx: usize) -> usize {
+    if idx < s.len {
+        return s[idx];
+    }
+    return 0_usize;
+}
+
+fn slice_get_range(s: *[ast.IdRange], idx: usize) -> ast.IdRange {
+    if idx < s.len {
+        return s[idx];
+    }
+    return ast.range_empty();
+}
+
+fn has_borrow(env: *types.TypeEnv, ty: types.TyId) -> bool {
+    return env.contains_second_class_ref(ty) || env.contains_borrowing_value(ty);
+}
+
+pub enum ViewSourceKind : u8 {
+    Ok = 0,
+    Missing = 1,
+    MultipleMarkers = 2,
+    NotBorrowed = 3,
+}
+
+pub struct ViewSourceResult {
+    pub kind: ViewSourceKind;
+    pub index: usize;
+    pub span: span.Span;
+}
+
+pub fn is_borrow_source(env: *types.TypeEnv, param: *types.ParamSig) -> bool {
+    return env.is_borrow_or_view(param.ty);
+}
+
+pub fn view_source_index(env: *types.TypeEnv, sig: *types.FnSig) -> ViewSourceResult {
+    let params = env.params_range(sig.params);
+    var marked_count: usize = 0_usize;
+    var marked_idx: usize = 0_usize;
+    var marked_span = span.span_dummy();
+    var i: usize = 0_usize;
+    while i < params.len {
+        if params[i].modifier == .From {
+            marked_count = marked_count +% 1_usize;
+            if marked_count == 1_usize {
+                marked_idx = i;
+                marked_span = params[i].span;
+            }
+        }
+        i = i +% 1_usize;
+    }
+    if marked_count > 1_usize {
+        return ViewSourceResult.{ kind: .MultipleMarkers, index: 0_usize, span: span.span_dummy() };
+    }
+    if marked_count == 1_usize && marked_idx < params.len {
+        if !is_borrow_source(env, &params[marked_idx]) {
+            return ViewSourceResult.{ kind: .NotBorrowed, index: 0_usize, span: marked_span };
+        }
+    }
+    if params.len > 0_usize && params[0_usize].is_self && is_borrow_source(env, &params[0_usize]) {
+        return ViewSourceResult.{ kind: .Ok, index: 0_usize, span: span.span_dummy() };
+    }
+    if marked_count == 1_usize {
+        return ViewSourceResult.{ kind: .Ok, index: marked_idx, span: span.span_dummy() };
+    }
+    var cand_count: usize = 0_usize;
+    var cand_idx: usize = 0_usize;
+    var ci: usize = 0_usize;
+    while ci < params.len {
+        if is_borrow_source(env, &params[ci]) {
+            cand_count = cand_count +% 1_usize;
+            cand_idx = ci;
+        }
+        ci = ci +% 1_usize;
+    }
+    if cand_count == 1_usize {
+        return ViewSourceResult.{ kind: .Ok, index: cand_idx, span: span.span_dummy() };
+    }
+    return ViewSourceResult.{ kind: .Missing, index: 0_usize, span: span.span_dummy() };
+}
+
+fn callee_view_source_index(
+    callee: *cfg_ir.CfgCallee,
+    cfg: *cfg_ir.CfgProgram,
+    env: *types.TypeEnv,
+) -> ?usize {
+    match callee.kind {
+        .DirectFn => {
+            if let sig = env.get_fn(callee.a) {
+                if sig.is_view {
+                    let vs = view_source_index(env, sig);
+                    if vs.kind == .Ok {
+                        return vs.index;
+                    }
+                }
+            }
+            return null;
+        }
+        .Method => {
+            if !callee.is_view {
+                return null;
+            }
+            if let im = env.decls.impls.get(callee.a.widen.[usize]()) {
+                let ms = env.impl_methods_range(im.methods);
+                var i: usize = 0_usize;
+                while i < ms.len {
+                    if ms[i].sub_idx == callee.b {
+                        let vs = view_source_index(env, &ms[i].sig);
+                        if vs.kind == .Ok {
+                            return vs.index;
+                        }
+                        return null;
+                    }
+                    i = i +% 1_usize;
+                }
+            }
+            return null;
+        }
+        .GenericInst => {
+            if !callee.is_view {
+                return null;
+            }
+            if let fi = cfg.find_fn_by_key(cfg_ir.fn_key_generic_inst(callee.a)) {
+                if let gf = cfg.get_fn(fi) {
+                    let vs = view_source_index(env, &gf.sig);
+                    if vs.kind == .Ok {
+                        return vs.index;
+                    }
+                }
+            }
+            return null;
+        }
+        _ => { return null; }
+    }
+}
+
+fn push_local_name(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    lid: cfg_ir.LocalId,
+    interner: *span.SymInterner,
+    fallback: *str,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    if let loc = cfg.fn_local(fn_id, lid) {
+        if loc.has_name {
+            try out.push_bytes_grow(alloc, interner.get(loc.name));
+            return;
+        }
+    }
+    try out.push_str_grow(alloc, fallback);
+    return;
+}
+
+pub enum PathIndexKeyKind : u8 {
+    Const = 0,
+    Ident = 1,
+    Dynamic = 2,
+}
+
+pub struct PathIndexKey {
+    pub kind: PathIndexKeyKind;
+    pub const_val: types.IntVal;
+    pub sym: u32;
+}
+
+pub enum PathSegKind : u8 {
+    Field = 0,
+    Index = 1,
+    Deref = 2,
+}
+
+pub struct PathSeg {
+    pub kind: PathSegKind;
+    pub sym: u32;
+    pub idx_key: PathIndexKey;
+}
+
+pub struct AccessPath {
+    pub root: u32;
+    pub segs: ast.IdRange;
+}
+
+struct Loan {
+    holder: cfg_ir.LocalId;
+    path_id: u32;
+    is_mut: bool;
+}
+
+fn seg_field(sym: u32) -> PathSeg {
+    return PathSeg.{
+        kind: .Field,
+        sym: sym,
+        idx_key: PathIndexKey.{ kind: .Dynamic, const_val: types.int_val_zero(), sym: 0_u32 },
+    };
+}
+
+fn seg_deref() -> PathSeg {
+    return PathSeg.{
+        kind: .Deref,
+        sym: 0_u32,
+        idx_key: PathIndexKey.{ kind: .Dynamic, const_val: types.int_val_zero(), sym: 0_u32 },
+    };
+}
+
+fn seg_index_const(v: types.IntVal) -> PathSeg {
+    return PathSeg.{
+        kind: .Index,
+        sym: 0_u32,
+        idx_key: PathIndexKey.{ kind: .Const, const_val: v, sym: 0_u32 },
+    };
+}
+
+fn seg_index_ident(sym: u32) -> PathSeg {
+    return PathSeg.{
+        kind: .Index,
+        sym: 0_u32,
+        idx_key: PathIndexKey.{ kind: .Ident, const_val: types.int_val_zero(), sym: sym },
+    };
+}
+
+fn seg_index_dynamic() -> PathSeg {
+    return PathSeg.{
+        kind: .Index,
+        sym: 0_u32,
+        idx_key: PathIndexKey.{ kind: .Dynamic, const_val: types.int_val_zero(), sym: 0_u32 },
+    };
+}
+
+fn idx_key_kind_u8(k: PathIndexKeyKind) -> u8 {
+    match k {
+        .Const => { return 0_u8; }
+        .Ident => { return 1_u8; }
+        .Dynamic => { return 2_u8; }
+    }
+}
+
+fn seg_kind_u8(k: PathSegKind) -> u8 {
+    match k {
+        .Field => { return 0_u8; }
+        .Index => { return 1_u8; }
+        .Deref => { return 2_u8; }
+    }
+}
+
+fn idx_key_cmp(a: PathIndexKey, b: PathIndexKey) -> i32 {
+    let ka = idx_key_kind_u8(a.kind);
+    let kb = idx_key_kind_u8(b.kind);
+    if ka < kb {
+        return -1_i32;
+    }
+    if ka > kb {
+        return 1_i32;
+    }
+    match a.kind {
+        .Const => { return types.int_val_cmp(a.const_val, b.const_val); }
+        .Ident => {
+            if a.sym < b.sym {
+                return -1_i32;
+            }
+            if a.sym > b.sym {
+                return 1_i32;
+            }
+            return 0_i32;
+        }
+        .Dynamic => { return 0_i32; }
+    }
+}
+
+fn seg_cmp(a: PathSeg, b: PathSeg) -> i32 {
+    let ka = seg_kind_u8(a.kind);
+    let kb = seg_kind_u8(b.kind);
+    if ka < kb {
+        return -1_i32;
+    }
+    if ka > kb {
+        return 1_i32;
+    }
+    match a.kind {
+        .Field => {
+            if a.sym < b.sym {
+                return -1_i32;
+            }
+            if a.sym > b.sym {
+                return 1_i32;
+            }
+            return 0_i32;
+        }
+        .Index => { return idx_key_cmp(a.idx_key, b.idx_key); }
+        .Deref => { return 0_i32; }
+    }
+}
+
+fn seg_slice_eq(a: *[PathSeg], b: *[PathSeg]) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0_usize;
+    while i < a.len {
+        if seg_cmp(a[i], b[i]) != 0_i32 {
+            return false;
+        }
+        i = i +% 1_usize;
+    }
+    return true;
+}
+
+fn hash_access_path(root: u32, segs: *[PathSeg]) -> u64 {
+    var h = fnv_u32(FNV_OFFSET, root);
+    h = fnv_u32(h, segs.len.trunc.[u32]());
+    var i: usize = 0_usize;
+    while i < segs.len {
+        let s = segs[i];
+        h = fnv_u8(h, seg_kind_u8(s.kind));
+        h = fnv_u32(h, s.sym);
+        h = fnv_u8(h, idx_key_kind_u8(s.idx_key.kind));
+        h = fnv_u32(h, s.idx_key.sym);
+        h = fnv_u64(h, s.idx_key.const_val.lo);
+        h = fnv_u64(h, s.idx_key.const_val.hi.bitcast.[u64]());
+        i = i +% 1_usize;
+    }
+    return h;
+}
+
+fn hash_loan(holder: cfg_ir.LocalId, path_id: u32, is_mut: bool) -> u64 {
+    var h = fnv_u32(FNV_OFFSET, holder);
+    h = fnv_u32(h, path_id);
+    h = fnv_u8(h, if is_mut { 1_u8 } else { 0_u8 });
+    return h;
+}
+
+linear struct PathLoanArena {
+    segs: col.DynBuf[PathSeg];
+    paths: col.DynBuf[AccessPath];
+    path_head: col.HashMap[u32];
+    path_next: col.DynBuf[u32];
+    loans: col.DynBuf[Loan];
+    loan_head: col.HashMap[u32];
+    loan_next: col.DynBuf[u32];
+    tmp_segs: col.DynBuf[PathSeg];
+}
+
+impl PathLoanArena {
+    fn init(alloc: *mut AllocCap) -> PathLoanArena ! OutOfMemory {
+        let segs = try col.DynBuf.[PathSeg].init(alloc, 32_usize);
+        errdefer segs.destroy(alloc);
+        let paths = try col.DynBuf.[AccessPath].init(alloc, 32_usize);
+        errdefer paths.destroy(alloc);
+        let path_head = try col.HashMap.[u32].init(alloc, 32_usize);
+        errdefer path_head.destroy(alloc);
+        let path_next = try col.DynBuf.[u32].init(alloc, 32_usize);
+        errdefer path_next.destroy(alloc);
+        let loans = try col.DynBuf.[Loan].init(alloc, 32_usize);
+        errdefer loans.destroy(alloc);
+        let loan_head = try col.HashMap.[u32].init(alloc, 32_usize);
+        errdefer loan_head.destroy(alloc);
+        let loan_next = try col.DynBuf.[u32].init(alloc, 32_usize);
+        errdefer loan_next.destroy(alloc);
+        let tmp_segs = try col.DynBuf.[PathSeg].init(alloc, 8_usize);
+        errdefer tmp_segs.destroy(alloc);
+        return PathLoanArena.{
+            segs: segs,
+            paths: paths,
+            path_head: path_head,
+            path_next: path_next,
+            loans: loans,
+            loan_head: loan_head,
+            loan_next: loan_next,
+            tmp_segs: tmp_segs,
+        };
+    }
+
+    fn destroy(self: PathLoanArena, alloc: *mut AllocCap) {
+        let PathLoanArena.{
+            segs,
+            paths,
+            path_head,
+            path_next,
+            loans,
+            loan_head,
+            loan_next,
+            tmp_segs,
+        } = self;
+        segs.destroy(alloc);
+        paths.destroy(alloc);
+        path_head.destroy(alloc);
+        path_next.destroy(alloc);
+        loans.destroy(alloc);
+        loan_head.destroy(alloc);
+        loan_next.destroy(alloc);
+        tmp_segs.destroy(alloc);
+    }
+
+    fn get_path(self: *Self, path_id: u32) -> AccessPath {
+        let ps = self.paths.as_slice();
+        let idx = path_id.widen.[usize]();
+        if idx < ps.len {
+            return ps[idx];
+        }
+        return AccessPath.{ root: 0_u32, segs: ast.range_empty() };
+    }
+
+    fn get_loan(self: *Self, loan_id: u32) -> Loan {
+        let ls = self.loans.as_slice();
+        let idx = loan_id.widen.[usize]();
+        if idx < ls.len {
+            return ls[idx];
+        }
+        return Loan.{ holder: 0_u32, path_id: 0_u32, is_mut: false };
+    }
+
+    fn intern_path_from_tmp(self: *mut Self, alloc: *mut AllocCap, root: u32) -> u32 ! OutOfMemory {
+        let cand = self.tmp_segs.as_slice();
+        let h = hash_access_path(root, cand);
+        if let head = self.path_head.get(h) {
+            let ps = self.paths.as_slice();
+            let all_segs = self.segs.as_slice();
+            let nexts = self.path_next.as_slice();
+            var cur = head;
+            while cur != cfg_ir.CFG_NONE {
+                let ci = cur.widen.[usize]();
+                if ci >= ps.len || ci >= nexts.len {
+                    break;
+                }
+                if ps[ci].root == root {
+                    let ex = slice_id_range.[PathSeg](all_segs, ps[ci].segs);
+                    if seg_slice_eq(ex, cand) {
+                        return cur;
+                    }
+                }
+                cur = nexts[ci];
+            }
+        }
+        let seg_start = self.segs.len().trunc.[u32]();
+        try self.segs.push_slice(alloc, self.tmp_segs.as_slice());
+        let seg_len = self.tmp_segs.len().trunc.[u32]();
+        let new_id = self.paths.len().trunc.[u32]();
+        let prev = self.path_head.get(h) orelse cfg_ir.CFG_NONE;
+        try self.paths.push(alloc, AccessPath.{ root: root, segs: ast.range_new(seg_start, seg_len) });
+        try self.path_next.push(alloc, prev);
+        try self.path_head.insert(alloc, h, new_id);
+        return new_id;
+    }
+
+    fn to_access_path(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        cfg: *cfg_ir.CfgProgram,
+        fn_id: u32,
+        place: *cfg_ir.CfgPlace,
+    ) -> ?u32 ! OutOfMemory {
+        let loc = cfg.fn_local(fn_id, place.local) orelse {
+            return null;
+        };
+        if !loc.has_name {
+            return null;
+        }
+        self.tmp_segs.clear();
+        let projs = cfg.projs_slice(place.projs);
+        var i: usize = 0_usize;
+        while i < projs.len {
+            let pr = projs[i];
+            match pr.kind {
+                .Field => { try self.tmp_segs.push(alloc, seg_field(pr.sym)); }
+                .PoolCol => { try self.tmp_segs.push(alloc, seg_field(pr.sym)); }
+                .Deref => { try self.tmp_segs.push(alloc, seg_deref()); }
+                .TupleField => {
+                    try self.tmp_segs.push(
+                        alloc,
+                        seg_index_const(types.int_val_from_u64(pr.index.widen.[u64]())),
+                    );
+                }
+                .Index => {
+                    if pr.has_const_idx {
+                        try self.tmp_segs.push(alloc, seg_index_const(pr.const_idx));
+                    } else if pr.has_key_sym {
+                        try self.tmp_segs.push(alloc, seg_index_ident(pr.sym));
+                    } else {
+                        try self.tmp_segs.push(alloc, seg_index_dynamic());
+                    }
+                }
+            }
+            i = i +% 1_usize;
+        }
+        let pid = try self.intern_path_from_tmp(alloc, loc.name);
+        return pid;
+    }
+
+    fn intern_loan(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        holder: cfg_ir.LocalId,
+        path_id: u32,
+        is_mut: bool,
+    ) -> u32 ! OutOfMemory {
+        let h = hash_loan(holder, path_id, is_mut);
+        if let head = self.loan_head.get(h) {
+            let ls = self.loans.as_slice();
+            let nexts = self.loan_next.as_slice();
+            var cur = head;
+            while cur != cfg_ir.CFG_NONE {
+                let ci = cur.widen.[usize]();
+                if ci >= ls.len || ci >= nexts.len {
+                    break;
+                }
+                if ls[ci].holder == holder && ls[ci].path_id == path_id && ls[ci].is_mut == is_mut {
+                    return cur;
+                }
+                cur = nexts[ci];
+            }
+        }
+        let new_id = self.loans.len().trunc.[u32]();
+        let prev = self.loan_head.get(h) orelse cfg_ir.CFG_NONE;
+        try self.loans.push(alloc, Loan.{ holder: holder, path_id: path_id, is_mut: is_mut });
+        try self.loan_next.push(alloc, prev);
+        try self.loan_head.insert(alloc, h, new_id);
+        return new_id;
+    }
+
+    fn path_cmp(self: *Self, a_id: u32, b_id: u32) -> i32 {
+        if a_id == b_id {
+            return 0_i32;
+        }
+        let pa = self.get_path(a_id);
+        let pb = self.get_path(b_id);
+        if pa.root < pb.root {
+            return -1_i32;
+        }
+        if pa.root > pb.root {
+            return 1_i32;
+        }
+        let all = self.segs.as_slice();
+        let sa = slice_id_range.[PathSeg](all, pa.segs);
+        let sb = slice_id_range.[PathSeg](all, pb.segs);
+        let min_len = if sa.len < sb.len { sa.len } else { sb.len };
+        var i: usize = 0_usize;
+        while i < min_len {
+            let c = seg_cmp(sa[i], sb[i]);
+            if c != 0_i32 {
+                return c;
+            }
+            i = i +% 1_usize;
+        }
+        if sa.len < sb.len {
+            return -1_i32;
+        }
+        if sa.len > sb.len {
+            return 1_i32;
+        }
+        return 0_i32;
+    }
+
+    fn loan_cmp(self: *Self, a_id: u32, b_id: u32) -> i32 {
+        if a_id == b_id {
+            return 0_i32;
+        }
+        let la = self.get_loan(a_id);
+        let lb = self.get_loan(b_id);
+        if la.holder < lb.holder {
+            return -1_i32;
+        }
+        if la.holder > lb.holder {
+            return 1_i32;
+        }
+        let pc = self.path_cmp(la.path_id, lb.path_id);
+        if pc != 0_i32 {
+            return pc;
+        }
+        if !la.is_mut && lb.is_mut {
+            return -1_i32;
+        }
+        if la.is_mut && !lb.is_mut {
+            return 1_i32;
+        }
+        return 0_i32;
+    }
+
+    fn paths_conflict(self: *Self, a_id: u32, b_id: u32) -> bool {
+        let pa = self.get_path(a_id);
+        let pb = self.get_path(b_id);
+        if pa.root != pb.root {
+            return false;
+        }
+        let all = self.segs.as_slice();
+        let sa = slice_id_range.[PathSeg](all, pa.segs);
+        let sb = slice_id_range.[PathSeg](all, pb.segs);
+        let min_len = if sa.len < sb.len { sa.len } else { sb.len };
+        var i: usize = 0_usize;
+        while i < min_len {
+            let x = sa[i];
+            let y = sb[i];
+            if x.kind != y.kind {
+                return false;
+            }
+            match x.kind {
+                .Field => {
+                    if x.sym != y.sym {
+                        return false;
+                    }
+                }
+                .Index => {
+                    if x.idx_key.kind == .Const && y.idx_key.kind == .Const {
+                        if !types.int_val_eq(x.idx_key.const_val, y.idx_key.const_val) {
+                            return false;
+                        }
+                    }
+                }
+                .Deref => {}
+            }
+            i = i +% 1_usize;
+        }
+        return true;
+    }
+
+    fn format_path(
+        self: *Self,
+        alloc: *mut AllocCap,
+        path_id: u32,
+        interner: *span.SymInterner,
+        out: *mut str.StrBuf,
+    ) -> !OutOfMemory {
+        let p = self.get_path(path_id);
+        try out.push_bytes_grow(alloc, interner.get(p.root));
+        let segs = slice_id_range.[PathSeg](self.segs.as_slice(), p.segs);
+        var i: usize = 0_usize;
+        while i < segs.len {
+            let s = segs[i];
+            match s.kind {
+                .Field => {
+                    try out.push_byte_grow(alloc, b'.');
+                    try out.push_bytes_grow(alloc, interner.get(s.sym));
+                }
+                .Index => {
+                    match s.idx_key.kind {
+                        .Const => {
+                            try out.push_byte_grow(alloc, b'[');
+                            try types.push_int_val_grow(alloc, s.idx_key.const_val, out);
+                            try out.push_byte_grow(alloc, b']');
+                        }
+                        .Ident => {
+                            try out.push_byte_grow(alloc, b'[');
+                            try out.push_bytes_grow(alloc, interner.get(s.idx_key.sym));
+                            try out.push_byte_grow(alloc, b']');
+                        }
+                        .Dynamic => {
+                            try out.push_str_grow(alloc, "[_]");
+                        }
+                    }
+                }
+                .Deref => {
+                    try out.push_str_grow(alloc, ".*");
+                }
+            }
+            i = i +% 1_usize;
+        }
+        return;
+    }
+}
+
+// ===========================================================================
+// Section 2: CFG Graph Information (RPO, CSR Predecessors, Immediate Dominators)
+// ===========================================================================
+
+struct DfsFrame {
+    bb: cfg_ir.BlockId;
+    next_succ: usize;
+}
+
+linear struct GraphInfo {
+    rpo: col.DynBuf[cfg_ir.BlockId];
+    rpo_idx: col.DynBuf[u32];
+    pred_ranges: col.DynBuf[ast.IdRange];
+    pred_data: col.DynBuf[cfg_ir.BlockId];
+    idom: col.DynBuf[cfg_ir.BlockId];
+}
+
+fn idom_intersect(
+    idom: *[cfg_ir.BlockId],
+    rpo_idx: *[u32],
+    b1_in: cfg_ir.BlockId,
+    b2_in: cfg_ir.BlockId,
+) -> cfg_ir.BlockId {
+    var b1 = b1_in;
+    var b2 = b2_in;
+    var guard: usize = 0_usize;
+    let max_steps = idom.len *% 2_usize +% 4_usize;
+    while b1 != b2 && guard < max_steps {
+        guard = guard +% 1_usize;
+        while b1.widen.[usize]() < rpo_idx.len
+            && b2.widen.[usize]() < rpo_idx.len
+            && rpo_idx[b1.widen.[usize]()] > rpo_idx[b2.widen.[usize]()]
+        {
+            let i1 = b1.widen.[usize]();
+            if i1 >= idom.len {
+                break;
+            }
+            let next = idom[i1];
+            if next == cfg_ir.CFG_NONE || next == b1 {
+                break;
+            }
+            b1 = next;
+        }
+        while b1.widen.[usize]() < rpo_idx.len
+            && b2.widen.[usize]() < rpo_idx.len
+            && rpo_idx[b2.widen.[usize]()] > rpo_idx[b1.widen.[usize]()]
+        {
+            let i2 = b2.widen.[usize]();
+            if i2 >= idom.len {
+                break;
+            }
+            let next = idom[i2];
+            if next == cfg_ir.CFG_NONE || next == b2 {
+                break;
+            }
+            b2 = next;
+        }
+    }
+    return b1;
+}
+
+fn graph_build_rpo(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    entry: cfg_ir.BlockId,
+    n: usize,
+    reachable: *mut col.DynBuf[bool],
+    rpo: *mut col.DynBuf[cfg_ir.BlockId],
+    rpo_idx: *mut col.DynBuf[u32],
+) -> !OutOfMemory {
+    var visited = try col.DynBuf.[bool].init(alloc, n);
+    errdefer visited.destroy(alloc);
+    var stack = try col.DynBuf.[DfsFrame].init(alloc, if n < 8_usize { 8_usize } else { n });
+    errdefer stack.destroy(alloc);
+    var i: usize = 0_usize;
+    while i < n {
+        try visited.push(alloc, false);
+        try reachable.push(alloc, false);
+        try rpo_idx.push(alloc, cfg_ir.CFG_NONE);
+        i = i +% 1_usize;
+    }
+    let ei = entry.widen.[usize]();
+    if ei < n {
+        let vm = visited.as_mut_slice();
+        let rm = reachable.as_mut_slice();
+        if ei < vm.len && ei < rm.len {
+            vm[ei] = true;
+            rm[ei] = true;
+        }
+        try stack.push(alloc, DfsFrame.{ bb: entry, next_succ: 0_usize });
+    }
+    while !stack.is_empty() {
+        let slen = stack.len();
+        if slen == 0_usize {
+            break;
+        }
+        let top_idx = slen - 1_usize;
+        let ss = stack.as_slice();
+        if top_idx >= ss.len {
+            break;
+        }
+        let frame = ss[top_idx];
+        let sc = cfg.block_successor_count(fn_id, frame.bb);
+        if frame.next_succ < sc {
+            let sm = stack.as_mut_slice();
+            if top_idx < sm.len {
+                sm[top_idx].next_succ = frame.next_succ +% 1_usize;
+            }
+            let v = cfg.block_successor_at(fn_id, frame.bb, frame.next_succ);
+            let vi = v.widen.[usize]();
+            if vi < n && !slice_get_bool(visited.as_slice(), vi) {
+                let vm = visited.as_mut_slice();
+                let rm = reachable.as_mut_slice();
+                if vi < vm.len && vi < rm.len {
+                    vm[vi] = true;
+                    rm[vi] = true;
+                }
+                try stack.push(alloc, DfsFrame.{ bb: v, next_succ: 0_usize });
+            }
+        } else {
+            _ = stack.pop();
+            try rpo.push(alloc, frame.bb);
+        }
+    }
+    // Reverse postorder in place to obtain RPO.
+    let rs = rpo.as_mut_slice();
+    var lo: usize = 0_usize;
+    var hi = rs.len;
+    while lo +% 1_usize < hi {
+        hi = hi - 1_usize;
+        if lo < rs.len && hi < rs.len {
+            let tmp = rs[lo];
+            rs[lo] = rs[hi];
+            rs[hi] = tmp;
+        }
+        lo = lo +% 1_usize;
+    }
+    let rpo_ro = rpo.as_slice();
+    let ridx_mut = rpo_idx.as_mut_slice();
+    var ri: usize = 0_usize;
+    while ri < rpo_ro.len {
+        let bi = rpo_ro[ri].widen.[usize]();
+        if bi < ridx_mut.len {
+            ridx_mut[bi] = ri.trunc.[u32]();
+        }
+        ri = ri +% 1_usize;
+    }
+    stack.destroy(alloc);
+    visited.destroy(alloc);
+    return;
+}
+
+fn graph_build_preds(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    n: usize,
+    reachable: *[bool],
+    rpo: *[cfg_ir.BlockId],
+    pred_ranges: *mut col.DynBuf[ast.IdRange],
+    pred_data: *mut col.DynBuf[cfg_ir.BlockId],
+) -> !OutOfMemory {
+    var counts = try col.DynBuf.[u32].init(alloc, n);
+    errdefer counts.destroy(alloc);
+    var cursor = try col.DynBuf.[u32].init(alloc, n);
+    errdefer cursor.destroy(alloc);
+    var i: usize = 0_usize;
+    while i < n {
+        try counts.push(alloc, 0_u32);
+        try cursor.push(alloc, 0_u32);
+        i = i +% 1_usize;
+    }
+    var total: usize = 0_usize;
+    var ri: usize = 0_usize;
+    while ri < rpo.len {
+        let u = rpo[ri];
+        let sc = cfg.block_successor_count(fn_id, u);
+        var si: usize = 0_usize;
+        while si < sc {
+            let v = cfg.block_successor_at(fn_id, u, si);
+            let vi = v.widen.[usize]();
+            if vi < n && vi < reachable.len && reachable[vi] {
+                let cm = counts.as_mut_slice();
+                if vi < cm.len {
+                    cm[vi] = cm[vi] +% 1_u32;
+                }
+                total = total +% 1_usize;
+            }
+            si = si +% 1_usize;
+        }
+        ri = ri +% 1_usize;
+    }
+    var off: u32 = 0_u32;
+    var bi: usize = 0_usize;
+    while bi < n {
+        let cnt = slice_get_u32(counts.as_slice(), bi, 0_u32);
+        try pred_ranges.push(alloc, ast.range_new(off, cnt));
+        let cur_m = cursor.as_mut_slice();
+        if bi < cur_m.len {
+            cur_m[bi] = off;
+        }
+        off = off +% cnt;
+        bi = bi +% 1_usize;
+    }
+    var pi: usize = 0_usize;
+    while pi < total {
+        try pred_data.push(alloc, 0_u32);
+        pi = pi +% 1_usize;
+    }
+    var ri2: usize = 0_usize;
+    while ri2 < rpo.len {
+        let u = rpo[ri2];
+        let sc = cfg.block_successor_count(fn_id, u);
+        var si: usize = 0_usize;
+        while si < sc {
+            let v = cfg.block_successor_at(fn_id, u, si);
+            let vi = v.widen.[usize]();
+            if vi < n && vi < reachable.len && reachable[vi] {
+                let cur_s = cursor.as_mut_slice();
+                let pd_s = pred_data.as_mut_slice();
+                if vi < cur_s.len {
+                    let pos = cur_s[vi].widen.[usize]();
+                    if pos < pd_s.len {
+                        pd_s[pos] = u;
+                    }
+                    cur_s[vi] = cur_s[vi] +% 1_u32;
+                }
+            }
+            si = si +% 1_usize;
+        }
+        ri2 = ri2 +% 1_usize;
+    }
+    cursor.destroy(alloc);
+    counts.destroy(alloc);
+    return;
+}
+
+impl GraphInfo {
+    fn build(alloc: *mut AllocCap, cfg: *cfg_ir.CfgProgram, fn_id: u32) -> GraphInfo ! OutOfMemory {
+        let f = cfg.get_fn(fn_id) orelse {
+            let rpo = try col.DynBuf.[cfg_ir.BlockId].init(alloc, 4_usize);
+            errdefer rpo.destroy(alloc);
+            let rpo_idx = try col.DynBuf.[u32].init(alloc, 4_usize);
+            errdefer rpo_idx.destroy(alloc);
+            let pred_ranges = try col.DynBuf.[ast.IdRange].init(alloc, 4_usize);
+            errdefer pred_ranges.destroy(alloc);
+            let pred_data = try col.DynBuf.[cfg_ir.BlockId].init(alloc, 4_usize);
+            errdefer pred_data.destroy(alloc);
+            let idom = try col.DynBuf.[cfg_ir.BlockId].init(alloc, 4_usize);
+            errdefer idom.destroy(alloc);
+            return GraphInfo.{
+                rpo: rpo,
+                rpo_idx: rpo_idx,
+                pred_ranges: pred_ranges,
+                pred_data: pred_data,
+                idom: idom,
+            };
+        };
+        let n = f.blocks.len.widen.[usize]();
+        let entry = f.entry;
+        var reachable = try col.DynBuf.[bool].init(alloc, n);
+        errdefer reachable.destroy(alloc);
+        var rpo = try col.DynBuf.[cfg_ir.BlockId].init(alloc, n);
+        errdefer rpo.destroy(alloc);
+        var rpo_idx = try col.DynBuf.[u32].init(alloc, n);
+        errdefer rpo_idx.destroy(alloc);
+        var pred_ranges = try col.DynBuf.[ast.IdRange].init(alloc, n);
+        errdefer pred_ranges.destroy(alloc);
+        var pred_data = try col.DynBuf.[cfg_ir.BlockId].init(alloc, n);
+        errdefer pred_data.destroy(alloc);
+        var idom = try col.DynBuf.[cfg_ir.BlockId].init(alloc, n);
+        errdefer idom.destroy(alloc);
+
+        try graph_build_rpo(alloc, cfg, fn_id, entry, n, &mut reachable, &mut rpo, &mut rpo_idx);
+        try graph_build_preds(
+            alloc,
+            cfg,
+            fn_id,
+            n,
+            reachable.as_slice(),
+            rpo.as_slice(),
+            &mut pred_ranges,
+            &mut pred_data,
+        );
+
+        var i: usize = 0_usize;
+        while i < n {
+            try idom.push(alloc, cfg_ir.CFG_NONE);
+            i = i +% 1_usize;
+        }
+        reachable.destroy(alloc);
+        let ei = entry.widen.[usize]();
+        let idom_init = idom.as_mut_slice();
+        if ei < idom_init.len {
+            idom_init[ei] = entry;
+        }
+        var changed = true;
+        while changed {
+            changed = false;
+            let rpo_s = rpo.as_slice();
+            let pr_s = pred_ranges.as_slice();
+            let pd_s = pred_data.as_slice();
+            let ridx_s = rpo_idx.as_slice();
+            var ri: usize = 1_usize;
+            while ri < rpo_s.len {
+                let b = rpo_s[ri];
+                let bi = b.widen.[usize]();
+                if bi < pr_s.len && bi < idom.len() {
+                    let ps = slice_id_range.[cfg_ir.BlockId](pd_s, pr_s[bi]);
+                    var new_idom = cfg_ir.CFG_NONE;
+                    var pi: usize = 0_usize;
+                    while pi < ps.len {
+                        let p = ps[pi];
+                        let p_idx = p.widen.[usize]();
+                        let idom_ro = idom.as_slice();
+                        if p_idx < idom_ro.len && idom_ro[p_idx] != cfg_ir.CFG_NONE {
+                            if new_idom == cfg_ir.CFG_NONE {
+                                new_idom = p;
+                            } else {
+                                new_idom = idom_intersect(idom_ro, ridx_s, p, new_idom);
+                            }
+                        }
+                        pi = pi +% 1_usize;
+                    }
+                    if new_idom != cfg_ir.CFG_NONE && slice_get_u32(idom.as_slice(), bi, cfg_ir.CFG_NONE) != new_idom {
+                        let idom_m = idom.as_mut_slice();
+                        if bi < idom_m.len {
+                            idom_m[bi] = new_idom;
+                        }
+                        changed = true;
+                    }
+                }
+                ri = ri +% 1_usize;
+            }
+        }
+        return GraphInfo.{
+            rpo: rpo,
+            rpo_idx: rpo_idx,
+            pred_ranges: pred_ranges,
+            pred_data: pred_data,
+            idom: idom,
+        };
+    }
+
+    view fn rpo_slice(self: *Self) -> *[cfg_ir.BlockId] {
+        return self.rpo.as_slice();
+    }
+
+    view fn preds_of(self: *Self, bb: cfg_ir.BlockId) -> *[cfg_ir.BlockId] {
+        let bi = bb.widen.[usize]();
+        let pr = self.pred_ranges.as_slice();
+        let pd = self.pred_data.as_slice();
+        if bi < pr.len {
+            return slice_id_range.[cfg_ir.BlockId](pd, pr[bi]);
+        }
+        return pd.sub(0_usize, 0_usize) catch {
+            return pd;
+        };
+    }
+
+    fn rpo_index_of(self: *Self, bb: cfg_ir.BlockId) -> u32 {
+        let bi = bb.widen.[usize]();
+        let s = self.rpo_idx.as_slice();
+        if bi < s.len {
+            return s[bi];
+        }
+        return cfg_ir.CFG_NONE;
+    }
+
+    fn dominates(self: *Self, a: cfg_ir.BlockId, b_in: cfg_ir.BlockId) -> bool {
+        if a == b_in {
+            return true;
+        }
+        let rpo_s = self.rpo.as_slice();
+        if rpo_s.len == 0_usize {
+            return false;
+        }
+        let root = rpo_s[0_usize];
+        let idom_s = self.idom.as_slice();
+        var b = b_in;
+        var steps: usize = 0_usize;
+        while b != root && steps <= idom_s.len {
+            steps = steps +% 1_usize;
+            let bi = b.widen.[usize]();
+            if bi >= idom_s.len {
+                return false;
+            }
+            let p = idom_s[bi];
+            if p == cfg_ir.CFG_NONE {
+                return false;
+            }
+            if p == a {
+                return true;
+            }
+            if p == b {
+                break;
+            }
+            b = p;
+        }
+        return a == b;
+    }
+
+    fn destroy(self: GraphInfo, alloc: *mut AllocCap) {
+        let GraphInfo.{ rpo, rpo_idx, pred_ranges, pred_data, idom } = self;
+        rpo.destroy(alloc);
+        rpo_idx.destroy(alloc);
+        pred_ranges.destroy(alloc);
+        pred_data.destroy(alloc);
+        idom.destroy(alloc);
+    }
+}
+
+// ===========================================================================
+// Section 3: Pass 1 — View Provenance (Forward Fixed-Point, E0310)
+// ===========================================================================
+
+enum OriginKind : u8 {
+    Bottom = 0,
+    NoBorrow = 1,
+    ParamBorrow = 2,
+    LocalStack = 3,
+    Other = 4,
+}
+
+struct Origin {
+    kind: OriginKind;
+    sym: u32;
+}
+
+fn origin_bottom() -> Origin {
+    return Origin.{ kind: .Bottom, sym: 0_u32 };
+}
+
+fn origin_no_borrow() -> Origin {
+    return Origin.{ kind: .NoBorrow, sym: 0_u32 };
+}
+
+fn origin_param(sym: u32) -> Origin {
+    return Origin.{ kind: .ParamBorrow, sym: sym };
+}
+
+fn origin_local(sym: u32) -> Origin {
+    return Origin.{ kind: .LocalStack, sym: sym };
+}
+
+fn origin_other() -> Origin {
+    return Origin.{ kind: .Other, sym: 0_u32 };
+}
+
+fn origin_eq(a: Origin, b: Origin) -> bool {
+    return a.kind == b.kind && a.sym == b.sym;
+}
+
+fn origin_join(a: Origin, b: Origin) -> Origin {
+    if a.kind == .Bottom {
+        return b;
+    }
+    if b.kind == .Bottom {
+        return a;
+    }
+    if a.kind == .NoBorrow {
+        return b;
+    }
+    if b.kind == .NoBorrow {
+        return a;
+    }
+    if origin_eq(a, b) {
+        return a;
+    }
+    if a.kind == .LocalStack && b.kind == .ParamBorrow {
+        return a;
+    }
+    if a.kind == .ParamBorrow && b.kind == .LocalStack {
+        return b;
+    }
+    return origin_other();
+}
+
+fn eval_place_address_origin(
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    p: *cfg_ir.CfgPlace,
+    st: *[Origin],
+    env: *types.TypeEnv,
+) -> Origin {
+    let loc = cfg.fn_local(fn_id, p.local) orelse {
+        return origin_other();
+    };
+    let bn = env.get(loc.ty);
+    let is_ref_base = bn.kind == .Borrow
+        || (bn.kind == .Builtin
+            && (bn.builtin_kind == .ArenaPool
+                || bn.builtin_kind == .ArenaStr
+                || bn.builtin_kind == .Arena));
+    var has_deref_or_col = false;
+    let projs = cfg.projs_slice(p.projs);
+    var i: usize = 0_usize;
+    while i < projs.len {
+        if projs[i].kind == .Deref || projs[i].kind == .PoolCol {
+            has_deref_or_col = true;
+            break;
+        }
+        i = i +% 1_usize;
+    }
+    if is_ref_base || has_deref_or_col {
+        let li = p.local.widen.[usize]();
+        if li < st.len {
+            return st[li];
+        }
+        return origin_other();
+    }
+    if loc.has_name {
+        return origin_local(loc.name);
+    }
+    return origin_other();
+}
+
+fn eval_operand_origin(
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    op: cfg_ir.CfgOperand,
+    st: *[Origin],
+    env: *types.TypeEnv,
+) -> Origin {
+    let ty = cfg.operand_ty(fn_id, op, env);
+    if !has_borrow(env, ty) {
+        return origin_no_borrow();
+    }
+    match op.kind {
+        .Const => {
+            if let c = cfg.get_const(op.id) {
+                if c.kind == .Null || c.kind == .Str || c.kind == .Bytes {
+                    return origin_no_borrow();
+                }
+            }
+            return origin_other();
+        }
+        .Copy => {
+            let p = cfg.get_place(op.id) orelse {
+                return origin_other();
+            };
+            let li = p.local.widen.[usize]();
+            if li >= st.len {
+                return origin_other();
+            }
+            let loc_orig = st[li];
+            if loc_orig.kind == .Bottom {
+                return origin_no_borrow();
+            }
+            return loc_orig;
+        }
+        .Move => {
+            let p = cfg.get_place(op.id) orelse {
+                return origin_other();
+            };
+            let li = p.local.widen.[usize]();
+            if li >= st.len {
+                return origin_other();
+            }
+            let loc_orig = st[li];
+            if loc_orig.kind == .Bottom {
+                return origin_no_borrow();
+            }
+            return loc_orig;
+        }
+    }
+}
+
+fn eval_rvalue_origin(
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    rv: *cfg_ir.CfgRvalue,
+    st: *[Origin],
+    env: *types.TypeEnv,
+) -> Origin {
+    match rv.kind {
+        .Use => { return eval_operand_origin(cfg, fn_id, rv.op0, st, env); }
+        .UnwrapOptional => { return eval_operand_origin(cfg, fn_id, rv.op0, st, env); }
+        .UnwrapErrorOk => { return eval_operand_origin(cfg, fn_id, rv.op0, st, env); }
+        .FieldExtract => { return eval_operand_origin(cfg, fn_id, rv.op0, st, env); }
+        .MakeDyn => { return eval_operand_origin(cfg, fn_id, rv.op0, st, env); }
+        .MakeClosure => {
+            if rv.has_op0 {
+                return eval_operand_origin(cfg, fn_id, rv.op0, st, env);
+            }
+            return origin_no_borrow();
+        }
+        .Borrow => {
+            if let p = cfg.get_place(rv.place_id) {
+                return eval_place_address_origin(cfg, fn_id, p, st, env);
+            }
+            return origin_other();
+        }
+        .Slice => {
+            let bt = cfg.operand_ty(fn_id, rv.op0, env);
+            if env.get(bt).kind == .Borrow {
+                return eval_operand_origin(cfg, fn_id, rv.op0, st, env);
+            }
+            if rv.op0.kind == .Copy || rv.op0.kind == .Move {
+                if let p = cfg.get_place(rv.op0.id) {
+                    return eval_place_address_origin(cfg, fn_id, p, st, env);
+                }
+            }
+            return origin_other();
+        }
+        .Cast => {
+            if rv.cast_kind == .WrapErr {
+                return origin_no_borrow();
+            }
+            if has_borrow(env, rv.ty) {
+                return eval_operand_origin(cfg, fn_id, rv.op0, st, env);
+            }
+            return origin_no_borrow();
+        }
+        .Aggregate => {
+            var acc = origin_no_borrow();
+            let elems = cfg.operands_slice(rv.range);
+            var i: usize = 0_usize;
+            while i < elems.len {
+                acc = origin_join(acc, eval_operand_origin(cfg, fn_id, elems[i], st, env));
+                i = i +% 1_usize;
+            }
+            return acc;
+        }
+        _ => { return origin_no_borrow(); }
+    }
+}
+
+fn is_recv_borrow_builtin(k: cfg_ir.CfgBuiltinOpKind) -> bool {
+    match k {
+        .StrAsBytes => { return true; }
+        .BytesAsStr => { return true; }
+        .ArgsGet => { return true; }
+        .SliceAt => { return true; }
+        .SliceGet => { return true; }
+        .SliceSub => { return true; }
+        .BufAsSlice => { return true; }
+        .BufAt => { return true; }
+        .BufGet => { return true; }
+        .BufSub => { return true; }
+        .SlotPoolGet => { return true; }
+        .SlotPoolAt => { return true; }
+        .ArrayAt => { return true; }
+        .ArrayGet => { return true; }
+        .ArraySub => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn eval_call_origin(
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    call: *cfg_ir.CfgCallData,
+    args: *[cfg_ir.CfgOperand],
+    dst_ty: types.TyId,
+    st: *[Origin],
+    env: *types.TypeEnv,
+) -> Origin {
+    if call.callee.kind == .Builtin {
+        let bk = call.callee.builtin.kind;
+        if is_recv_borrow_builtin(bk) {
+            if call.has_recv_place {
+                if let rp = cfg.get_place(call.recv_place_id) {
+                    return eval_place_address_origin(cfg, fn_id, rp, st, env);
+                }
+                return origin_other();
+            }
+            if args.len > 0_usize {
+                return eval_operand_origin(cfg, fn_id, args[0_usize], st, env);
+            }
+            return origin_other();
+        }
+        if bk == .ArenaAlloc || bk == .ArenaPoolInit {
+            if args.len > 0_usize {
+                return eval_operand_origin(cfg, fn_id, args[0_usize], st, env);
+            }
+            return origin_other();
+        }
+    } else if let idx = callee_view_source_index(&call.callee, cfg, env) {
+        if idx < args.len {
+            return eval_operand_origin(cfg, fn_id, args[idx], st, env);
+        }
+    }
+    if has_borrow(env, dst_ty) {
+        return origin_other();
+    }
+    return origin_no_borrow();
+}
+
+fn step_provenance_stmt(
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    stmt: *cfg_ir.CfgStmt,
+    st: *mut [Origin],
+    env: *types.TypeEnv,
+) {
+    match stmt.kind {
+        .StorageLive => {
+            if let loc = cfg.fn_local(fn_id, stmt.local) {
+                let li = stmt.local.widen.[usize]();
+                if !loc.is_param && li < st.len {
+                    st[li] = origin_no_borrow();
+                }
+            }
+        }
+        .Assign => {
+            let dst = cfg.get_place(stmt.dst_place_id) orelse {
+                return;
+            };
+            let rv = cfg.get_rvalue(stmt.payload_id) orelse {
+                return;
+            };
+            let o = eval_rvalue_origin(cfg, fn_id, rv, st, env);
+            let li = dst.local.widen.[usize]();
+            if dst.projs.len == 0_u32 && li < st.len {
+                st[li] = o;
+            }
+        }
+        .Call => {
+            if stmt.dst_place_id == cfg_ir.CFG_NONE {
+                return;
+            }
+            let dst = cfg.get_place(stmt.dst_place_id) orelse {
+                return;
+            };
+            let call = cfg.get_call(stmt.payload_id) orelse {
+                return;
+            };
+            let args = cfg.call_args(stmt.payload_id);
+            let o = eval_call_origin(cfg, fn_id, call, args, dst.ty, st, env);
+            let li = dst.local.widen.[usize]();
+            if dst.projs.len == 0_u32 && li < st.len {
+                st[li] = o;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn emit_provenance_ret_error(
+    alloc: *mut AllocCap,
+    ret_orig: Origin,
+    expected_source: u32,
+    sp: span.Span,
+    interner: *span.SymInterner,
+    msg_buf: *mut str.StrBuf,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    match ret_orig.kind {
+        .NoBorrow => { return; }
+        .Bottom => { return; }
+        .ParamBorrow => {
+            if ret_orig.sym == expected_source {
+                return;
+            }
+            msg_buf.clear();
+            try msg_buf.push_str_grow(alloc, "`view fn` returns a borrow from `");
+            try msg_buf.push_bytes_grow(alloc, interner.get(ret_orig.sym));
+            try msg_buf.push_str_grow(alloc, "`; expected a borrow derived from `");
+            try msg_buf.push_bytes_grow(alloc, interner.get(expected_source));
+            try msg_buf.push_byte_grow(alloc, b'`');
+            _ = try diags.emit_error_bytes(alloc, diag.E0310, sp, msg_buf.as_bytes());
+        }
+        .LocalStack => {
+            msg_buf.clear();
+            try msg_buf.push_str_grow(alloc, "`view fn` cannot return borrow derived from local variable `");
+            try msg_buf.push_bytes_grow(alloc, interner.get(ret_orig.sym));
+            try msg_buf.push_byte_grow(alloc, b'`');
+            _ = try diags.emit_error_bytes(alloc, diag.E0310, sp, msg_buf.as_bytes());
+        }
+        .Other => {
+            msg_buf.clear();
+            try msg_buf.push_str_grow(alloc, "cannot prove `view fn` result is derived from `");
+            try msg_buf.push_bytes_grow(alloc, interner.get(expected_source));
+            try msg_buf.push_byte_grow(alloc, b'`');
+            _ = try diags.emit_error_bytes(alloc, diag.E0310, sp, msg_buf.as_bytes());
+        }
+    }
+    return;
+}
+
+fn init_provenance_entry(
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    entry_idx: usize,
+    num_locals: usize,
+    params: *[types.ParamSig],
+    env: *types.TypeEnv,
+    in_states: *mut [Origin],
+    has_state: *mut [bool],
+) {
+    if entry_idx >= has_state.len {
+        return;
+    }
+    has_state[entry_idx] = true;
+    let base = entry_idx *% num_locals;
+    var k: usize = 0_usize;
+    while k < num_locals {
+        let idx = base +% k;
+        if idx < in_states.len {
+            in_states[idx] = origin_no_borrow();
+        }
+        k = k +% 1_usize;
+    }
+    let locals = cfg.fn_locals(fn_id);
+    var pi: usize = 0_usize;
+    while pi < params.len {
+        if is_borrow_source(env, &params[pi]) {
+            var li: usize = 0_usize;
+            while li < locals.len {
+                if locals[li].is_param && locals[li].has_name && locals[li].name == params[pi].name {
+                    let dst_i = base +% locals[li].id.widen.[usize]();
+                    if dst_i < in_states.len {
+                        in_states[dst_i] = origin_param(params[pi].name);
+                    }
+                    break;
+                }
+                li = li +% 1_usize;
+            }
+        }
+        pi = pi +% 1_usize;
+    }
+}
+
+fn run_provenance_fixpoint(
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    entry_idx: usize,
+    num_locals: usize,
+    num_blocks: usize,
+    g: *GraphInfo,
+    env: *types.TypeEnv,
+    in_states: *mut [Origin],
+    has_state: *mut [bool],
+    joined: *mut [Origin],
+    st: *mut [Origin],
+) {
+    let rpo = g.rpo_slice();
+    var changed = true;
+    while changed {
+        changed = false;
+        var ri: usize = 0_usize;
+        while ri < rpo.len {
+            let bb = rpo[ri];
+            let bi = bb.widen.[usize]();
+            if bi != entry_idx && bi < num_blocks && bi < has_state.len {
+                var k0: usize = 0_usize;
+                while k0 < joined.len {
+                    joined[k0] = origin_bottom();
+                    k0 = k0 +% 1_usize;
+                }
+                var any_pred = false;
+                let preds = g.preds_of(bb);
+                var pii: usize = 0_usize;
+                while pii < preds.len {
+                    let p = preds[pii];
+                    let pi = p.widen.[usize]();
+                    if pi < has_state.len && has_state[pi] {
+                        any_pred = true;
+                        let pbase = pi *% num_locals;
+                        var k1: usize = 0_usize;
+                        while k1 < num_locals && k1 < st.len {
+                            let si = pbase +% k1;
+                            if si < in_states.len {
+                                st[k1] = in_states[si];
+                            }
+                            k1 = k1 +% 1_usize;
+                        }
+                        let pstmts = cfg.fn_block_stmts(fn_id, p);
+                        var si2: usize = 0_usize;
+                        while si2 < pstmts.len {
+                            step_provenance_stmt(cfg, fn_id, &pstmts[si2], st, env);
+                            si2 = si2 +% 1_usize;
+                        }
+                        var k2: usize = 0_usize;
+                        while k2 < joined.len && k2 < st.len {
+                            joined[k2] = origin_join(joined[k2], st[k2]);
+                            k2 = k2 +% 1_usize;
+                        }
+                    }
+                    pii = pii +% 1_usize;
+                }
+                if any_pred {
+                    let bbase = bi *% num_locals;
+                    var diff = !slice_get_bool(has_state, bi);
+                    var k3: usize = 0_usize;
+                    while k3 < num_locals && k3 < joined.len {
+                        let di = bbase +% k3;
+                        if di < in_states.len && !origin_eq(in_states[di], joined[k3]) {
+                            in_states[di] = joined[k3];
+                            diff = true;
+                        }
+                        k3 = k3 +% 1_usize;
+                    }
+                    if diff {
+                        slice_set_bool(has_state, bi, true);
+                        changed = true;
+                    }
+                }
+            }
+            ri = ri +% 1_usize;
+        }
+    }
+}
+
+fn verify_provenance(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    num_locals: usize,
+    expected_source: u32,
+    g: *GraphInfo,
+    env: *types.TypeEnv,
+    in_states: *[Origin],
+    has_state: *[bool],
+    st: *mut [Origin],
+    interner: *span.SymInterner,
+    msg_buf: *mut str.StrBuf,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    let rpo = g.rpo_slice();
+    var vri: usize = 0_usize;
+    while vri < rpo.len {
+        let bb = rpo[vri];
+        let bi = bb.widen.[usize]();
+        if bi < has_state.len && has_state[bi] {
+            let bbase = bi *% num_locals;
+            var k: usize = 0_usize;
+            while k < num_locals && k < st.len {
+                let si = bbase +% k;
+                if si < in_states.len {
+                    st[k] = in_states[si];
+                }
+                k = k +% 1_usize;
+            }
+            if let b = cfg.fn_block(fn_id, bb) {
+                let bstmts = cfg.stmts_slice(b.stmts);
+                var si2: usize = 0_usize;
+                while si2 < bstmts.len {
+                    step_provenance_stmt(cfg, fn_id, &bstmts[si2], st, env);
+                    si2 = si2 +% 1_usize;
+                }
+                if b.term.kind == .Return && b.term.flag {
+                    let is_err_ret = b.is_cleanup && b.has_error_site_span;
+                    if !is_err_ret {
+                        let ret_orig = eval_operand_origin(cfg, fn_id, b.term.operand, st, env);
+                        try emit_provenance_ret_error(
+                            alloc,
+                            ret_orig,
+                            expected_source,
+                            b.term.span,
+                            interner,
+                            msg_buf,
+                            diags,
+                        );
+                    }
+                }
+            }
+        }
+        vri = vri +% 1_usize;
+    }
+    return;
+}
+
+fn analyze_view_provenance(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    g: *GraphInfo,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    let f = cfg.get_fn(fn_id) orelse {
+        return;
+    };
+    if !f.sig.is_view {
+        return;
+    }
+    let vs = view_source_index(env, &f.sig);
+    let params = env.params_range(f.sig.params);
+    if vs.kind != .Ok {
+        let first_sp = if params.len > 0_usize { params[0_usize].span } else { f.body_span };
+        match vs.kind {
+            .MultipleMarkers => {
+                _ = try diags.emit_error(
+                    alloc,
+                    diag.E0310,
+                    first_sp,
+                    "`view fn` cannot have multiple `from` source parameters",
+                );
+            }
+            .NotBorrowed => {
+                _ = try diags.emit_error(
+                    alloc,
+                    diag.E0310,
+                    vs.span,
+                    "`from` must mark a reference or borrowing value",
+                );
+            }
+            _ => {
+                _ = try diags.emit_error(
+                    alloc,
+                    diag.E0310,
+                    first_sp,
+                    "`view fn` requires `self`, a single borrow parameter, or explicit `from` marker to anchor returned borrow",
+                );
+            }
+        }
+        return;
+    }
+    if !has_borrow(env, f.sig.ret) || vs.index >= params.len {
+        return;
+    }
+    let expected_source = params[vs.index].name;
+    let num_locals = f.locals.len.widen.[usize]();
+    let num_blocks = f.blocks.len.widen.[usize]();
+    let entry_idx = f.entry.widen.[usize]();
+
+    var in_states = try col.DynBuf.[Origin].init(alloc, num_blocks *% num_locals);
+    errdefer in_states.destroy(alloc);
+    var has_state = try col.DynBuf.[bool].init(alloc, num_blocks);
+    errdefer has_state.destroy(alloc);
+    var joined = try col.DynBuf.[Origin].init(alloc, num_locals);
+    errdefer joined.destroy(alloc);
+    var st = try col.DynBuf.[Origin].init(alloc, num_locals);
+    errdefer st.destroy(alloc);
+    var msg_buf = try str.StrBuf.init(alloc, 128_usize);
+    errdefer msg_buf.destroy(alloc);
+
+    var zi: usize = 0_usize;
+    let total_cells = num_blocks *% num_locals;
+    while zi < total_cells {
+        try in_states.push(alloc, origin_bottom());
+        zi = zi +% 1_usize;
+    }
+    var bi0: usize = 0_usize;
+    while bi0 < num_blocks {
+        try has_state.push(alloc, false);
+        bi0 = bi0 +% 1_usize;
+    }
+    var li0: usize = 0_usize;
+    while li0 < num_locals {
+        try joined.push(alloc, origin_bottom());
+        try st.push(alloc, origin_bottom());
+        li0 = li0 +% 1_usize;
+    }
+
+    init_provenance_entry(
+        cfg, fn_id, entry_idx, num_locals, params, env, in_states.as_mut_slice(), has_state.as_mut_slice(),
+    );
+    run_provenance_fixpoint(
+        cfg, fn_id, entry_idx, num_locals, num_blocks, g, env,
+        in_states.as_mut_slice(), has_state.as_mut_slice(), joined.as_mut_slice(), st.as_mut_slice(),
+    );
+    try verify_provenance(
+        alloc, cfg, fn_id, num_locals, expected_source, g, env,
+        in_states.as_slice(), has_state.as_slice(), st.as_mut_slice(), interner, &mut msg_buf, diags,
+    );
+
+    msg_buf.destroy(alloc);
+    st.destroy(alloc);
+    joined.destroy(alloc);
+    has_state.destroy(alloc);
+    in_states.destroy(alloc);
+    return;
+}
+
+// ===========================================================================
+// Section 4: Pass 2 — Linearity Dataflow (E0109, E0321, E0323, E0324, E0325)
+// ===========================================================================
+
+enum LinState : u8 {
+    Bot = 0,
+    Uninit = 1,
+    Live = 2,
+    Consumed = 3,
+    Conflict = 4,
+}
+
+fn lin_join(a: LinState, b: LinState) -> LinState {
+    if a == .Bot {
+        return b;
+    }
+    if b == .Bot {
+        return a;
+    }
+    if a == .Conflict || b == .Conflict {
+        return .Conflict;
+    }
+    if a == b {
+        return a;
+    }
+    if (a == .Uninit && b == .Consumed) || (a == .Consumed && b == .Uninit) {
+        return .Consumed;
+    }
+    return .Conflict;
+}
+
+struct OptSpan {
+    has: bool;
+    sp: span.Span;
+}
+
+fn opt_span_none() -> OptSpan {
+    return OptSpan.{ has: false, sp: span.span_dummy() };
+}
+
+fn opt_span_some(sp: span.Span) -> OptSpan {
+    return OptSpan.{ has: true, sp: sp };
+}
+
+fn opt_span_eq(a: OptSpan, b: OptSpan) -> bool {
+    if a.has != b.has {
+        return false;
+    }
+    if !a.has {
+        return true;
+    }
+    return a.sp.file == b.sp.file && a.sp.start == b.sp.start && a.sp.end == b.sp.end;
+}
+
+fn opt_span_or(a: OptSpan, b: OptSpan) -> OptSpan {
+    if a.has {
+        return a;
+    }
+    return b;
+}
+
+enum BranchPredTag : u8 {
+    None = 0,
+    IsError = 1,
+    IsNonNull = 2,
+}
+
+struct BranchPred {
+    tag: BranchPredTag;
+    local: cfg_ir.LocalId;
+}
+
+fn branch_pred_none() -> BranchPred {
+    return BranchPred.{ tag: .None, local: 0_u32 };
+}
+
+fn term_dummy_span(t: *cfg_ir.CfgTerm) -> span.Span {
+    if t.kind == .Goto {
+        return span.span_dummy();
+    }
+    return t.span;
+}
+
+linear struct LinCtx {
+    m: usize;
+    num_blocks: usize;
+    entry_idx: usize;
+    lin_locals: col.DynBuf[cfg_ir.LocalId];
+    lin_idx_of: col.DynBuf[u32];
+    block_pred_cond: col.DynBuf[BranchPred];
+    in_state: col.DynBuf[LinState];
+    out_state: col.DynBuf[LinState];
+    in_move_spans: col.DynBuf[OptSpan];
+    out_move_spans: col.DynBuf[OptSpan];
+    has_in: col.DynBuf[bool];
+    has_out: col.DynBuf[bool];
+    joined: col.DynBuf[LinState];
+    jspans: col.DynBuf[OptSpan];
+    edge_buf: col.DynBuf[LinState];
+    st: col.DynBuf[LinState];
+    mspans: col.DynBuf[OptSpan];
+    reported_conflict: col.DynBuf[bool];
+    entry_preds: col.DynBuf[cfg_ir.BlockId];
+    back_preds: col.DynBuf[cfg_ir.BlockId];
+    msg_buf: str.StrBuf;
+}
+
+impl LinCtx {
+    fn init(
+        alloc: *mut AllocCap,
+        cfg: *cfg_ir.CfgProgram,
+        fn_id: u32,
+        num_locals: usize,
+        num_blocks: usize,
+        entry_idx: usize,
+    ) -> LinCtx ! OutOfMemory {
+        var lin_locals = try col.DynBuf.[cfg_ir.LocalId].init(alloc, 8_usize);
+        errdefer lin_locals.destroy(alloc);
+        var lin_idx_of = try col.DynBuf.[u32].init(alloc, num_locals);
+        errdefer lin_idx_of.destroy(alloc);
+        var i: usize = 0_usize;
+        while i < num_locals {
+            try lin_idx_of.push(alloc, cfg_ir.CFG_NONE);
+            i = i +% 1_usize;
+        }
+        let locals = cfg.fn_locals(fn_id);
+        var li: usize = 0_usize;
+        while li < locals.len {
+            if locals[li].is_linear {
+                let k = lin_locals.len().trunc.[u32]();
+                try lin_locals.push(alloc, locals[li].id);
+                let lidx = locals[li].id.widen.[usize]();
+                let lio_m = lin_idx_of.as_mut_slice();
+                if lidx < lio_m.len {
+                    lio_m[lidx] = k;
+                }
+            }
+            li = li +% 1_usize;
+        }
+        let m = lin_locals.len();
+        let cells = num_blocks *% m;
+
+        var block_pred_cond = try col.DynBuf.[BranchPred].init(alloc, num_blocks);
+        errdefer block_pred_cond.destroy(alloc);
+        var in_state = try col.DynBuf.[LinState].init(alloc, cells);
+        errdefer in_state.destroy(alloc);
+        var out_state = try col.DynBuf.[LinState].init(alloc, cells);
+        errdefer out_state.destroy(alloc);
+        var in_move_spans = try col.DynBuf.[OptSpan].init(alloc, cells);
+        errdefer in_move_spans.destroy(alloc);
+        var out_move_spans = try col.DynBuf.[OptSpan].init(alloc, cells);
+        errdefer out_move_spans.destroy(alloc);
+        var has_in = try col.DynBuf.[bool].init(alloc, num_blocks);
+        errdefer has_in.destroy(alloc);
+        var has_out = try col.DynBuf.[bool].init(alloc, num_blocks);
+        errdefer has_out.destroy(alloc);
+        var joined = try col.DynBuf.[LinState].init(alloc, m);
+        errdefer joined.destroy(alloc);
+        var jspans = try col.DynBuf.[OptSpan].init(alloc, m);
+        errdefer jspans.destroy(alloc);
+        var edge_buf = try col.DynBuf.[LinState].init(alloc, m);
+        errdefer edge_buf.destroy(alloc);
+        var st = try col.DynBuf.[LinState].init(alloc, m);
+        errdefer st.destroy(alloc);
+        var mspans = try col.DynBuf.[OptSpan].init(alloc, m);
+        errdefer mspans.destroy(alloc);
+        var reported_conflict = try col.DynBuf.[bool].init(alloc, m);
+        errdefer reported_conflict.destroy(alloc);
+        let entry_preds = try col.DynBuf.[cfg_ir.BlockId].init(alloc, 4_usize);
+        errdefer entry_preds.destroy(alloc);
+        let back_preds = try col.DynBuf.[cfg_ir.BlockId].init(alloc, 4_usize);
+        errdefer back_preds.destroy(alloc);
+        let msg_buf = try str.StrBuf.init(alloc, 128_usize);
+        errdefer msg_buf.destroy(alloc);
+
+        var bi: usize = 0_usize;
+        while bi < num_blocks {
+            try block_pred_cond.push(alloc, branch_pred_none());
+            try has_in.push(alloc, false);
+            try has_out.push(alloc, false);
+            bi = bi +% 1_usize;
+        }
+        var ci: usize = 0_usize;
+        while ci < cells {
+            try in_state.push(alloc, .Bot);
+            try out_state.push(alloc, .Bot);
+            try in_move_spans.push(alloc, opt_span_none());
+            try out_move_spans.push(alloc, opt_span_none());
+            ci = ci +% 1_usize;
+        }
+        var ki: usize = 0_usize;
+        while ki < m {
+            try joined.push(alloc, .Bot);
+            try jspans.push(alloc, opt_span_none());
+            try edge_buf.push(alloc, .Bot);
+            try st.push(alloc, .Bot);
+            try mspans.push(alloc, opt_span_none());
+            try reported_conflict.push(alloc, false);
+            ki = ki +% 1_usize;
+        }
+        return LinCtx.{
+            m: m,
+            num_blocks: num_blocks,
+            entry_idx: entry_idx,
+            lin_locals: lin_locals,
+            lin_idx_of: lin_idx_of,
+            block_pred_cond: block_pred_cond,
+            in_state: in_state,
+            out_state: out_state,
+            in_move_spans: in_move_spans,
+            out_move_spans: out_move_spans,
+            has_in: has_in,
+            has_out: has_out,
+            joined: joined,
+            jspans: jspans,
+            edge_buf: edge_buf,
+            st: st,
+            mspans: mspans,
+            reported_conflict: reported_conflict,
+            entry_preds: entry_preds,
+            back_preds: back_preds,
+            msg_buf: msg_buf,
+        };
+    }
+
+    fn destroy(self: LinCtx, alloc: *mut AllocCap) {
+        let LinCtx.{
+            m: _,
+            num_blocks: _,
+            entry_idx: _,
+            lin_locals,
+            lin_idx_of,
+            block_pred_cond,
+            in_state,
+            out_state,
+            in_move_spans,
+            out_move_spans,
+            has_in,
+            has_out,
+            joined,
+            jspans,
+            edge_buf,
+            st,
+            mspans,
+            reported_conflict,
+            entry_preds,
+            back_preds,
+            msg_buf,
+        } = self;
+        lin_locals.destroy(alloc);
+        lin_idx_of.destroy(alloc);
+        block_pred_cond.destroy(alloc);
+        in_state.destroy(alloc);
+        out_state.destroy(alloc);
+        in_move_spans.destroy(alloc);
+        out_move_spans.destroy(alloc);
+        has_in.destroy(alloc);
+        has_out.destroy(alloc);
+        joined.destroy(alloc);
+        jspans.destroy(alloc);
+        edge_buf.destroy(alloc);
+        st.destroy(alloc);
+        mspans.destroy(alloc);
+        reported_conflict.destroy(alloc);
+        entry_preds.destroy(alloc);
+        back_preds.destroy(alloc);
+        msg_buf.destroy(alloc);
+    }
+}
+
+fn detect_branch_preds(
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    g: *GraphInfo,
+    preds_out: *mut [BranchPred],
+) {
+    let rpo = g.rpo_slice();
+    var ri: usize = 0_usize;
+    while ri < rpo.len {
+        let bb = rpo[ri];
+        let bi = bb.widen.[usize]();
+        if let b = cfg.fn_block(fn_id, bb) {
+            if b.term.kind == .Branch
+                && (b.term.operand.kind == .Copy || b.term.operand.kind == .Move)
+                && bi < preds_out.len
+            {
+                if let cp = cfg.get_place(b.term.operand.id) {
+                    if cp.projs.len == 0_u32 {
+                        let stmts = cfg.stmts_slice(b.stmts);
+                        var si = stmts.len;
+                        while si > 0_usize {
+                            si = si - 1_usize;
+                            if stmts[si].kind == .Assign {
+                                if let dst = cfg.get_place(stmts[si].dst_place_id) {
+                                    if dst.projs.len == 0_u32 && dst.local == cp.local {
+                                        if let rv = cfg.get_rvalue(stmts[si].payload_id) {
+                                            if (rv.kind == .IsError || rv.kind == .IsNonNull)
+                                                && (rv.op0.kind == .Copy || rv.op0.kind == .Move)
+                                            {
+                                                if let p = cfg.get_place(rv.op0.id) {
+                                                    if p.projs.len == 0_u32 {
+                                                        let tag: BranchPredTag = if rv.kind == .IsError {
+                                                            .IsError
+                                                        } else {
+                                                            .IsNonNull
+                                                        };
+                                                        preds_out[bi] = BranchPred.{ tag: tag, local: p.local };
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ri = ri +% 1_usize;
+    }
+}
+
+fn compute_edge_state(
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    p: cfg_ir.BlockId,
+    succ: cfg_ir.BlockId,
+    ctx: *mut LinCtx,
+) {
+    let m = ctx.m;
+    let pi = p.widen.[usize]();
+    let base = pi *% m;
+    let out_ro = ctx.out_state.as_slice();
+    let es = ctx.edge_buf.as_mut_slice();
+    var k: usize = 0_usize;
+    while k < m && k < es.len {
+        let idx = base +% k;
+        es[k] = if idx < out_ro.len { out_ro[idx] } else { .Bot };
+        k = k +% 1_usize;
+    }
+    let bp_s = ctx.block_pred_cond.as_slice();
+    if pi >= bp_s.len {
+        return;
+    }
+    let bp = bp_s[pi];
+    if bp.tag == .None {
+        return;
+    }
+    let pb = cfg.fn_block(fn_id, p) orelse {
+        return;
+    };
+    if pb.term.kind != .Branch {
+        return;
+    }
+    let lidx = bp.local.widen.[usize]();
+    let lmap = ctx.lin_idx_of.as_slice();
+    if lidx >= lmap.len {
+        return;
+    }
+    let ki_u32 = lmap[lidx];
+    if ki_u32 == cfg_ir.CFG_NONE {
+        return;
+    }
+    let ki = ki_u32.widen.[usize]();
+    if ki >= es.len {
+        return;
+    }
+    if bp.tag == .IsError && succ == pb.term.bb0 {
+        es[ki] = .Consumed;
+    } else if bp.tag == .IsNonNull && succ == pb.term.bb1 {
+        es[ki] = .Consumed;
+    }
+}
+
+fn consume_lin_local(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    lid: cfg_ir.LocalId,
+    k: usize,
+    sp: span.Span,
+    st: *mut [LinState],
+    mspans: *mut [OptSpan],
+    bb: *cfg_ir.CfgBlock,
+    report: bool,
+    interner: *span.SymInterner,
+    msg_buf: *mut str.StrBuf,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    if k >= st.len || k >= mspans.len {
+        return;
+    }
+    if !mspans[k].has {
+        mspans[k] = opt_span_some(sp);
+    }
+    if st[k] == .Live {
+        st[k] = .Consumed;
+    } else if st[k] == .Consumed {
+        if report {
+            msg_buf.clear();
+            if bb.is_errdefer {
+                try msg_buf.push_byte_grow(alloc, b'`');
+                try push_local_name(alloc, cfg, fn_id, lid, interner, "_", msg_buf);
+                try msg_buf.push_str_grow(alloc, "` was already consumed before `errdefer` ran on error path");
+                let err_sp = if bb.has_error_site_span { bb.error_site_span } else { sp };
+                _ = try diags.emit_error_bytes(alloc, diag.E0325, err_sp, msg_buf.as_bytes());
+            } else {
+                try msg_buf.push_str_grow(alloc, "`linear` value `");
+                try push_local_name(alloc, cfg, fn_id, lid, interner, "_", msg_buf);
+                try msg_buf.push_str_grow(alloc, "` was already consumed");
+                _ = try diags.emit_error_bytes(alloc, diag.E0321, sp, msg_buf.as_bytes());
+            }
+        }
+        st[k] = .Conflict;
+    }
+    return;
+}
+
+fn step_linearity_operand(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    op: cfg_ir.CfgOperand,
+    sp: span.Span,
+    lin_idx_of: *[u32],
+    st: *mut [LinState],
+    mspans: *mut [OptSpan],
+    bb: *cfg_ir.CfgBlock,
+    report: bool,
+    interner: *span.SymInterner,
+    msg_buf: *mut str.StrBuf,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    if op.kind != .Move {
+        return;
+    }
+    let p = cfg.get_place(op.id) orelse {
+        return;
+    };
+    if p.projs.len != 0_u32 {
+        return;
+    }
+    let li = p.local.widen.[usize]();
+    if li >= lin_idx_of.len {
+        return;
+    }
+    let ki = lin_idx_of[li];
+    if ki == cfg_ir.CFG_NONE {
+        return;
+    }
+    try consume_lin_local(
+        alloc,
+        cfg,
+        fn_id,
+        p.local,
+        ki.widen.[usize](),
+        sp,
+        st,
+        mspans,
+        bb,
+        report,
+        interner,
+        msg_buf,
+        diags,
+    );
+    return;
+}
+
+fn step_linearity_assign(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    stmt: *cfg_ir.CfgStmt,
+    lin_idx_of: *[u32],
+    st: *mut [LinState],
+    mspans: *mut [OptSpan],
+    bb: *cfg_ir.CfgBlock,
+    report: bool,
+    interner: *span.SymInterner,
+    msg_buf: *mut str.StrBuf,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    if let rv = cfg.get_rvalue(stmt.payload_id) {
+        match rv.kind {
+            .Use => {
+                try step_linearity_operand(
+                    alloc, cfg, fn_id, rv.op0, stmt.span, lin_idx_of, st, mspans, bb, report, interner, msg_buf, diags,
+                );
+            }
+            .UnwrapOptional => {
+                try step_linearity_operand(
+                    alloc, cfg, fn_id, rv.op0, stmt.span, lin_idx_of, st, mspans, bb, report, interner, msg_buf, diags,
+                );
+            }
+            .UnwrapErrorOk => {
+                try step_linearity_operand(
+                    alloc, cfg, fn_id, rv.op0, stmt.span, lin_idx_of, st, mspans, bb, report, interner, msg_buf, diags,
+                );
+            }
+            .UnwrapErrorErr => {
+                try step_linearity_operand(
+                    alloc, cfg, fn_id, rv.op0, stmt.span, lin_idx_of, st, mspans, bb, report, interner, msg_buf, diags,
+                );
+            }
+            .Unary => {
+                try step_linearity_operand(
+                    alloc, cfg, fn_id, rv.op0, stmt.span, lin_idx_of, st, mspans, bb, report, interner, msg_buf, diags,
+                );
+            }
+            .Cast => {
+                try step_linearity_operand(
+                    alloc, cfg, fn_id, rv.op0, stmt.span, lin_idx_of, st, mspans, bb, report, interner, msg_buf, diags,
+                );
+            }
+            .FieldExtract => {
+                try step_linearity_operand(
+                    alloc, cfg, fn_id, rv.op0, stmt.span, lin_idx_of, st, mspans, bb, report, interner, msg_buf, diags,
+                );
+            }
+            .MakeDyn => {
+                try step_linearity_operand(
+                    alloc, cfg, fn_id, rv.op0, stmt.span, lin_idx_of, st, mspans, bb, report, interner, msg_buf, diags,
+                );
+            }
+            .MakeClosure => {
+                if rv.has_op0 {
+                    try step_linearity_operand(
+                        alloc, cfg, fn_id, rv.op0, stmt.span, lin_idx_of, st, mspans, bb, report, interner, msg_buf, diags,
+                    );
+                }
+            }
+            .Aggregate => {
+                let elems = cfg.operands_slice(rv.range);
+                var ei: usize = 0_usize;
+                while ei < elems.len {
+                    try step_linearity_operand(
+                        alloc, cfg, fn_id, elems[ei], stmt.span, lin_idx_of, st, mspans, bb, report, interner, msg_buf, diags,
+                    );
+                    ei = ei +% 1_usize;
+                }
+            }
+            _ => {}
+        }
+    }
+    if let dst = cfg.get_place(stmt.dst_place_id) {
+        let li = dst.local.widen.[usize]();
+        if dst.projs.len == 0_u32 && li < lin_idx_of.len {
+            let ki_u32 = lin_idx_of[li];
+            if ki_u32 != cfg_ir.CFG_NONE {
+                let k = ki_u32.widen.[usize]();
+                if k < st.len && k < mspans.len {
+                    if st[k] == .Live && report {
+                        if let loc = cfg.fn_local(fn_id, dst.local) {
+                            if !loc.is_temp {
+                                msg_buf.clear();
+                                try msg_buf.push_str_grow(alloc, "ZM-09: overwriting unconsumed `linear` variable `");
+                                try push_local_name(alloc, cfg, fn_id, dst.local, interner, "_", msg_buf);
+                                try msg_buf.push_byte_grow(alloc, b'`');
+                                _ = try diags.emit_error_bytes(alloc, diag.E0109, stmt.span, msg_buf.as_bytes());
+                            }
+                        }
+                    }
+                    st[k] = .Live;
+                    mspans[k] = opt_span_none();
+                }
+            }
+        }
+    }
+    return;
+}
+
+fn step_linearity_call(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    stmt: *cfg_ir.CfgStmt,
+    lin_idx_of: *[u32],
+    st: *mut [LinState],
+    mspans: *mut [OptSpan],
+    bb: *cfg_ir.CfgBlock,
+    report: bool,
+    interner: *span.SymInterner,
+    msg_buf: *mut str.StrBuf,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    let call = cfg.get_call(stmt.payload_id) orelse {
+        return;
+    };
+    var moved_recv = false;
+    if call.consumes_recv && call.has_recv_place {
+        if let rp = cfg.get_place(call.recv_place_id) {
+            let rli = rp.local.widen.[usize]();
+            if rp.projs.len == 0_u32 && rli < lin_idx_of.len {
+                let ki_u32 = lin_idx_of[rli];
+                if ki_u32 != cfg_ir.CFG_NONE {
+                    moved_recv = true;
+                    try consume_lin_local(
+                        alloc,
+                        cfg,
+                        fn_id,
+                        rp.local,
+                        ki_u32.widen.[usize](),
+                        stmt.span,
+                        st,
+                        mspans,
+                        bb,
+                        report,
+                        interner,
+                        msg_buf,
+                        diags,
+                    );
+                }
+            }
+        }
+    }
+    let args = cfg.call_args(stmt.payload_id);
+    var ai: usize = 0_usize;
+    while ai < args.len {
+        if !(moved_recv && ai == 0_usize) {
+            try step_linearity_operand(
+                alloc, cfg, fn_id, args[ai], stmt.span, lin_idx_of, st, mspans, bb, report, interner, msg_buf, diags,
+            );
+        }
+        ai = ai +% 1_usize;
+    }
+    if stmt.dst_place_id != cfg_ir.CFG_NONE {
+        if let d = cfg.get_place(stmt.dst_place_id) {
+            let dli = d.local.widen.[usize]();
+            if d.projs.len == 0_u32 && dli < lin_idx_of.len {
+                let ki_u32 = lin_idx_of[dli];
+                if ki_u32 != cfg_ir.CFG_NONE {
+                    let k = ki_u32.widen.[usize]();
+                    if k < st.len && k < mspans.len {
+                        st[k] = .Live;
+                        mspans[k] = opt_span_none();
+                    }
+                }
+            }
+        }
+    }
+    return;
+}
+
+fn step_linearity_stmt(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    stmt: *cfg_ir.CfgStmt,
+    lin_idx_of: *[u32],
+    st: *mut [LinState],
+    mspans: *mut [OptSpan],
+    bb: *cfg_ir.CfgBlock,
+    report: bool,
+    interner: *span.SymInterner,
+    msg_buf: *mut str.StrBuf,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    match stmt.kind {
+        .StorageLive => {
+            let li = stmt.local.widen.[usize]();
+            if li < lin_idx_of.len {
+                let ki_u32 = lin_idx_of[li];
+                if ki_u32 != cfg_ir.CFG_NONE {
+                    let k = ki_u32.widen.[usize]();
+                    if k < st.len && k < mspans.len {
+                        st[k] = .Uninit;
+                        mspans[k] = opt_span_none();
+                    }
+                }
+            }
+        }
+        .StorageDead => {
+            let li = stmt.local.widen.[usize]();
+            if li < lin_idx_of.len {
+                let ki_u32 = lin_idx_of[li];
+                if ki_u32 != cfg_ir.CFG_NONE {
+                    let k = ki_u32.widen.[usize]();
+                    if k < st.len && st[k] == .Live {
+                        if report {
+                            if let loc = cfg.fn_local(fn_id, stmt.local) {
+                                if !loc.is_temp {
+                                    let sp = if bb.has_error_site_span { bb.error_site_span } else { loc.span };
+                                    msg_buf.clear();
+                                    try msg_buf.push_str_grow(alloc, "ZM-09: `linear` value `");
+                                    try push_local_name(alloc, cfg, fn_id, stmt.local, interner, "_", msg_buf);
+                                    if bb.has_error_site_span {
+                                        try msg_buf.push_str_grow(
+                                            alloc,
+                                            "` is unconsumed on error path (`try` / error `return`); add `errdefer`",
+                                        );
+                                    } else {
+                                        try msg_buf.push_str_grow(
+                                            alloc,
+                                            "` dropped at scope exit without being consumed",
+                                        );
+                                    }
+                                    _ = try diags.emit_error_bytes(alloc, diag.E0109, sp, msg_buf.as_bytes());
+                                }
+                            }
+                        }
+                        st[k] = .Conflict;
+                    }
+                }
+            }
+        }
+        .ConsumeDestructured => {
+            let li = stmt.local.widen.[usize]();
+            if li < lin_idx_of.len {
+                let ki_u32 = lin_idx_of[li];
+                if ki_u32 != cfg_ir.CFG_NONE {
+                    let k = ki_u32.widen.[usize]();
+                    if k < st.len {
+                        st[k] = .Consumed;
+                    }
+                }
+            }
+        }
+        .Assign => {
+            try step_linearity_assign(
+                alloc, cfg, fn_id, stmt, lin_idx_of, st, mspans, bb, report, interner, msg_buf, diags,
+            );
+        }
+        .Call => {
+            try step_linearity_call(
+                alloc, cfg, fn_id, stmt, lin_idx_of, st, mspans, bb, report, interner, msg_buf, diags,
+            );
+        }
+        _ => {}
+    }
+    return;
+}
+
+fn slice_get_lin_state(s: *[LinState], idx: usize) -> LinState {
+    if idx < s.len {
+        return s[idx];
+    }
+    return .Bot;
+}
+
+fn slice_get_opt_span(s: *[OptSpan], idx: usize) -> OptSpan {
+    if idx < s.len {
+        return s[idx];
+    }
+    return opt_span_none();
+}
+
+fn join_linearity_preds(
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    bb: cfg_ir.BlockId,
+    bi: usize,
+    b: *cfg_ir.CfgBlock,
+    g: *GraphInfo,
+    ctx: *mut LinCtx,
+) -> bool {
+    let m = ctx.m;
+    let js = ctx.joined.as_mut_slice();
+    let jsp = ctx.jspans.as_mut_slice();
+    var k0: usize = 0_usize;
+    while k0 < m && k0 < js.len && k0 < jsp.len {
+        js[k0] = .Bot;
+        jsp[k0] = opt_span_none();
+        k0 = k0 +% 1_usize;
+    }
+    var any_pred = false;
+    let preds = g.preds_of(bb);
+    var pii: usize = 0_usize;
+    while pii < preds.len {
+        let p = preds[pii];
+        let pi = p.widen.[usize]();
+        if pi < ctx.num_blocks && slice_get_bool(ctx.has_out.as_slice(), pi) {
+            any_pred = true;
+            compute_edge_state(cfg, fn_id, p, bb, ctx);
+            let es = ctx.edge_buf.as_slice();
+            let oms = ctx.out_move_spans.as_slice();
+            let pbase = pi *% m;
+            let jsm = ctx.joined.as_mut_slice();
+            let jspm = ctx.jspans.as_mut_slice();
+            var k1: usize = 0_usize;
+            while k1 < m && k1 < jsm.len && k1 < es.len {
+                jsm[k1] = lin_join(jsm[k1], es[k1]);
+                if !b.is_loop_header && k1 < jspm.len {
+                    let p_idx = pbase +% k1;
+                    if p_idx < oms.len {
+                        jspm[k1] = opt_span_or(jspm[k1], oms[p_idx]);
+                    }
+                }
+                k1 = k1 +% 1_usize;
+            }
+        }
+        pii = pii +% 1_usize;
+    }
+    if !any_pred {
+        return false;
+    }
+    let bbase = bi *% m;
+    var diff = !slice_get_bool(ctx.has_in.as_slice(), bi);
+    let in_m = ctx.in_state.as_mut_slice();
+    let ims_m = ctx.in_move_spans.as_mut_slice();
+    let j_ro = ctx.joined.as_slice();
+    let jsp_ro = ctx.jspans.as_slice();
+    var k2: usize = 0_usize;
+    while k2 < m && k2 < j_ro.len && k2 < jsp_ro.len {
+        let di = bbase +% k2;
+        if di < in_m.len && in_m[di] != j_ro[k2] {
+            in_m[di] = j_ro[k2];
+            diff = true;
+        }
+        if di < ims_m.len && !opt_span_eq(ims_m[di], jsp_ro[k2]) {
+            ims_m[di] = jsp_ro[k2];
+            diff = true;
+        }
+        k2 = k2 +% 1_usize;
+    }
+    if diff {
+        let hi_m = ctx.has_in.as_mut_slice();
+        if bi < hi_m.len {
+            hi_m[bi] = true;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn step_linearity_block_fixpoint(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    bi: usize,
+    b: *cfg_ir.CfgBlock,
+    ctx: *mut LinCtx,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> bool ! OutOfMemory {
+    let m = ctx.m;
+    let bbase = bi *% m;
+    let in_ro = ctx.in_state.as_slice();
+    let ims_ro = ctx.in_move_spans.as_slice();
+    let st_m = ctx.st.as_mut_slice();
+    let ms_m = ctx.mspans.as_mut_slice();
+    var k3: usize = 0_usize;
+    while k3 < m && k3 < st_m.len && k3 < ms_m.len {
+        let si = bbase +% k3;
+        if si < in_ro.len {
+            st_m[k3] = in_ro[si];
+        }
+        if b.is_loop_header {
+            ms_m[k3] = opt_span_none();
+        } else if si < ims_ro.len {
+            ms_m[k3] = ims_ro[si];
+        }
+        k3 = k3 +% 1_usize;
+    }
+    let stmts = cfg.stmts_slice(b.stmts);
+    var si2: usize = 0_usize;
+    while si2 < stmts.len {
+        try step_linearity_stmt(
+            alloc,
+            cfg,
+            fn_id,
+            &stmts[si2],
+            ctx.lin_idx_of.as_slice(),
+            ctx.st.as_mut_slice(),
+            ctx.mspans.as_mut_slice(),
+            b,
+            false,
+            interner,
+            &mut ctx.msg_buf,
+            diags,
+        );
+        si2 = si2 +% 1_usize;
+    }
+    if b.term.kind == .Return && b.term.flag {
+        try step_linearity_operand(
+            alloc,
+            cfg,
+            fn_id,
+            b.term.operand,
+            term_dummy_span(&b.term),
+            ctx.lin_idx_of.as_slice(),
+            ctx.st.as_mut_slice(),
+            ctx.mspans.as_mut_slice(),
+            b,
+            false,
+            interner,
+            &mut ctx.msg_buf,
+            diags,
+        );
+    }
+    var diff_out = !slice_get_bool(ctx.has_out.as_slice(), bi);
+    let out_m = ctx.out_state.as_mut_slice();
+    let oms_m = ctx.out_move_spans.as_mut_slice();
+    let st_ro = ctx.st.as_slice();
+    let ms_ro = ctx.mspans.as_slice();
+    var k4: usize = 0_usize;
+    while k4 < m && k4 < st_ro.len && k4 < ms_ro.len {
+        let di = bbase +% k4;
+        if di < out_m.len && out_m[di] != st_ro[k4] {
+            out_m[di] = st_ro[k4];
+            diff_out = true;
+        }
+        if di < oms_m.len && !opt_span_eq(oms_m[di], ms_ro[k4]) {
+            oms_m[di] = ms_ro[k4];
+            diff_out = true;
+        }
+        k4 = k4 +% 1_usize;
+    }
+    if diff_out {
+        let ho_m = ctx.has_out.as_mut_slice();
+        if bi < ho_m.len {
+            ho_m[bi] = true;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn run_linearity_fixpoint(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    g: *GraphInfo,
+    ctx: *mut LinCtx,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    let rpo = g.rpo_slice();
+    var changed = true;
+    while changed {
+        changed = false;
+        var ri: usize = 0_usize;
+        while ri < rpo.len {
+            let bb = rpo[ri];
+            let bi = bb.widen.[usize]();
+            if let b = cfg.fn_block(fn_id, bb) {
+                if bi != ctx.entry_idx && bi < ctx.num_blocks {
+                    if join_linearity_preds(cfg, fn_id, bb, bi, b, g, ctx) {
+                        changed = true;
+                    }
+                }
+                if bi < ctx.num_blocks && slice_get_bool(ctx.has_in.as_slice(), bi) {
+                    if try step_linearity_block_fixpoint(alloc, cfg, fn_id, bi, b, ctx, interner, diags) {
+                        changed = true;
+                    }
+                }
+            }
+            ri = ri +% 1_usize;
+        }
+    }
+    return;
+}
+
+fn check_loop_header_linearity(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    bb: cfg_ir.BlockId,
+    b: *cfg_ir.CfgBlock,
+    g: *GraphInfo,
+    ctx: *mut LinCtx,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    let header_depth = if b.has_loop_entry_depth { b.loop_entry_depth } else { 0_u32 };
+    ctx.entry_preds.clear();
+    ctx.back_preds.clear();
+    let preds = g.preds_of(bb);
+    let bb_rpo = g.rpo_index_of(bb);
+    var pi: usize = 0_usize;
+    while pi < preds.len {
+        let p = preds[pi];
+        let pidx = p.widen.[usize]();
+        if pidx < ctx.num_blocks && slice_get_bool(ctx.has_out.as_slice(), pidx) {
+            if g.dominates(bb, p) || g.rpo_index_of(p) >= bb_rpo {
+                try ctx.back_preds.push(alloc, p);
+            } else {
+                try ctx.entry_preds.push(alloc, p);
+            }
+        }
+        pi = pi +% 1_usize;
+    }
+    let m = ctx.m;
+    var k: usize = 0_usize;
+    while k < m {
+        let lid = slice_get_u32(ctx.lin_locals.as_slice(), k, 0_u32);
+        if let loc = cfg.fn_local(fn_id, lid) {
+            if !loc.is_temp && loc.scope_depth <= header_depth && !slice_get_bool(ctx.reported_conflict.as_slice(), k) {
+                var entry_st: LinState = .Bot;
+                var ei: usize = 0_usize;
+                while ei < ctx.entry_preds.len() {
+                    let ep = slice_get_u32(ctx.entry_preds.as_slice(), ei, 0_u32);
+                    compute_edge_state(cfg, fn_id, ep, bb, ctx);
+                    entry_st = lin_join(entry_st, slice_get_lin_state(ctx.edge_buf.as_slice(), k));
+                    ei = ei +% 1_usize;
+                }
+                if entry_st == .Live {
+                    var bpi: usize = 0_usize;
+                    while bpi < ctx.back_preds.len() {
+                        let bp = slice_get_u32(ctx.back_preds.as_slice(), bpi, 0_u32);
+                        compute_edge_state(cfg, fn_id, bp, bb, ctx);
+                        let bs_k = slice_get_lin_state(ctx.edge_buf.as_slice(), k);
+                        let ms_idx = bp.widen.[usize]() *% m +% k;
+                        let bp_ms = slice_get_opt_span(ctx.out_move_spans.as_slice(), ms_idx);
+                        if bs_k == .Consumed || bp_ms.has {
+                            let sp = if bp_ms.has { bp_ms.sp } else { loc.span };
+                            ctx.msg_buf.clear();
+                            try ctx.msg_buf.push_str_grow(alloc, "cannot consume outer `linear` variable `");
+                            try push_local_name(alloc, cfg, fn_id, lid, interner, "_", &mut ctx.msg_buf);
+                            try ctx.msg_buf.push_str_grow(
+                                alloc,
+                                "` in loop body without exiting via `break` or `return`",
+                            );
+                            _ = try diags.emit_error_bytes(alloc, diag.E0324, sp, ctx.msg_buf.as_bytes());
+                            let rc_m = ctx.reported_conflict.as_mut_slice();
+                            if k < rc_m.len {
+                                rc_m[k] = true;
+                            }
+                            break;
+                        }
+                        bpi = bpi +% 1_usize;
+                    }
+                }
+            }
+        }
+        k = k +% 1_usize;
+    }
+    return;
+}
+
+fn check_merge_block_linearity(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    bb: cfg_ir.BlockId,
+    b: *cfg_ir.CfgBlock,
+    g: *GraphInfo,
+    ctx: *mut LinCtx,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    let preds = g.preds_of(bb);
+    if preds.len < 2_usize {
+        return;
+    }
+    let m = ctx.m;
+    var k: usize = 0_usize;
+    while k < m {
+        let lid = slice_get_u32(ctx.lin_locals.as_slice(), k, 0_u32);
+        if let loc = cfg.fn_local(fn_id, lid) {
+            if !loc.is_temp && !slice_get_bool(ctx.reported_conflict.as_slice(), k) {
+                var seen_live = false;
+                var seen_consumed = false;
+                var pi: usize = 0_usize;
+                while pi < preds.len {
+                    let p = preds[pi];
+                    let pidx = p.widen.[usize]();
+                    if pidx < ctx.num_blocks && slice_get_bool(ctx.has_out.as_slice(), pidx) {
+                        compute_edge_state(cfg, fn_id, p, bb, ctx);
+                        let es_k = slice_get_lin_state(ctx.edge_buf.as_slice(), k);
+                        if es_k == .Live {
+                            seen_live = true;
+                        } else if es_k == .Consumed {
+                            seen_consumed = true;
+                        }
+                    }
+                    pi = pi +% 1_usize;
+                }
+                if seen_live && seen_consumed {
+                    let sp = if b.has_join_span { b.join_span } else { loc.span };
+                    ctx.msg_buf.clear();
+                    try ctx.msg_buf.push_str_grow(alloc, "`linear` variable `");
+                    try push_local_name(alloc, cfg, fn_id, lid, interner, "_", &mut ctx.msg_buf);
+                    try ctx.msg_buf.push_str_grow(
+                        alloc,
+                        "` has inconsistent consumption state across branches",
+                    );
+                    _ = try diags.emit_error_bytes(alloc, diag.E0323, sp, ctx.msg_buf.as_bytes());
+                    let rc_m = ctx.reported_conflict.as_mut_slice();
+                    if k < rc_m.len {
+                        rc_m[k] = true;
+                    }
+                }
+            }
+        }
+        k = k +% 1_usize;
+    }
+    return;
+}
+
+fn verify_linearity(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    g: *GraphInfo,
+    ctx: *mut LinCtx,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    let m = ctx.m;
+    let rpo = g.rpo_slice();
+    var ri: usize = 0_usize;
+    while ri < rpo.len {
+        let bb = rpo[ri];
+        let bi = bb.widen.[usize]();
+        if bi < ctx.num_blocks && slice_get_bool(ctx.has_in.as_slice(), bi) {
+            if let b = cfg.fn_block(fn_id, bb) {
+                if bi != ctx.entry_idx {
+                    if b.is_loop_header {
+                        try check_loop_header_linearity(alloc, cfg, fn_id, bb, b, g, ctx, interner, diags);
+                    } else {
+                        try check_merge_block_linearity(alloc, cfg, fn_id, bb, b, g, ctx, interner, diags);
+                    }
+                }
+                let bbase = bi *% m;
+                let in_ro = ctx.in_state.as_slice();
+                let rc_ro = ctx.reported_conflict.as_slice();
+                let st_m = ctx.st.as_mut_slice();
+                let ms_m = ctx.mspans.as_mut_slice();
+                var k: usize = 0_usize;
+                while k < m && k < st_m.len && k < ms_m.len {
+                    let si = bbase +% k;
+                    let is_rc = slice_get_bool(rc_ro, k);
+                    let init_v = if is_rc {
+                        LinState.Conflict
+                    } else {
+                        slice_get_lin_state(in_ro, si)
+                    };
+                    st_m[k] = init_v;
+                    ms_m[k] = opt_span_none();
+                    k = k +% 1_usize;
+                }
+                let stmts = cfg.stmts_slice(b.stmts);
+                var si2: usize = 0_usize;
+                while si2 < stmts.len {
+                    let stmt = stmts[si2];
+                    if stmt.kind == .DiscardLinearError {
+                        let dsp = if stmt.aux_span.file != span.FILE_DUMMY {
+                            stmt.aux_span
+                        } else {
+                            stmt.span
+                        };
+                        _ = try diags.emit_error(
+                            alloc,
+                            diag.E0109,
+                            dsp,
+                            "ZM-09: cannot drop `linear` value with `let _ = ...`; destructure fields or call a consuming function",
+                        );
+                        if stmt.has_local {
+                            let li = stmt.local.widen.[usize]();
+                            let lmap = ctx.lin_idx_of.as_slice();
+                            if li < lmap.len && lmap[li] != cfg_ir.CFG_NONE {
+                                let lk = lmap[li].widen.[usize]();
+                                let st_c = ctx.st.as_mut_slice();
+                                if lk < st_c.len {
+                                    st_c[lk] = .Conflict;
+                                }
+                            }
+                        }
+                    } else {
+                        try step_linearity_stmt(
+                            alloc,
+                            cfg,
+                            fn_id,
+                            &stmt,
+                            ctx.lin_idx_of.as_slice(),
+                            ctx.st.as_mut_slice(),
+                            ctx.mspans.as_mut_slice(),
+                            b,
+                            true,
+                            interner,
+                            &mut ctx.msg_buf,
+                            diags,
+                        );
+                    }
+                    si2 = si2 +% 1_usize;
+                }
+                if b.term.kind == .Return && b.term.flag {
+                    try step_linearity_operand(
+                        alloc,
+                        cfg,
+                        fn_id,
+                        b.term.operand,
+                        b.term.span,
+                        ctx.lin_idx_of.as_slice(),
+                        ctx.st.as_mut_slice(),
+                        ctx.mspans.as_mut_slice(),
+                        b,
+                        true,
+                        interner,
+                        &mut ctx.msg_buf,
+                        diags,
+                    );
+                }
+            }
+        }
+        ri = ri +% 1_usize;
+    }
+    return;
+}
+
+fn fn_has_discard_linear(cfg: *cfg_ir.CfgProgram, fn_id: u32) -> bool {
+    let blks = cfg.fn_blocks(fn_id);
+    var bi: usize = 0_usize;
+    while bi < blks.len {
+        let stmts = cfg.stmts_slice(blks[bi].stmts);
+        var si: usize = 0_usize;
+        while si < stmts.len {
+            if stmts[si].kind == .DiscardLinearError {
+                return true;
+            }
+            si = si +% 1_usize;
+        }
+        bi = bi +% 1_usize;
+    }
+    return false;
+}
+
+fn fn_has_linear_local(cfg: *cfg_ir.CfgProgram, fn_id: u32) -> bool {
+    let locals = cfg.fn_locals(fn_id);
+    var i: usize = 0_usize;
+    while i < locals.len {
+        if locals[i].is_linear {
+            return true;
+        }
+        i = i +% 1_usize;
+    }
+    return false;
+}
+
+fn analyze_linearity(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    g: *GraphInfo,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    if !fn_has_linear_local(cfg, fn_id) && !fn_has_discard_linear(cfg, fn_id) {
+        return;
+    }
+    let f = cfg.get_fn(fn_id) orelse {
+        return;
+    };
+    let num_locals = f.locals.len.widen.[usize]();
+    let num_blocks = f.blocks.len.widen.[usize]();
+    let entry_idx = f.entry.widen.[usize]();
+
+    var ctx = try LinCtx.init(alloc, cfg, fn_id, num_locals, num_blocks, entry_idx);
+    errdefer ctx.destroy(alloc);
+
+    detect_branch_preds(cfg, fn_id, g, ctx.block_pred_cond.as_mut_slice());
+    if entry_idx < num_blocks {
+        let hi_m = ctx.has_in.as_mut_slice();
+        if entry_idx < hi_m.len {
+            hi_m[entry_idx] = true;
+        }
+        let base = entry_idx *% ctx.m;
+        let in_m = ctx.in_state.as_mut_slice();
+        let lls = ctx.lin_locals.as_slice();
+        var k: usize = 0_usize;
+        while k < ctx.m && k < lls.len {
+            let di = base +% k;
+            if di < in_m.len {
+                var init_st: LinState = .Uninit;
+                if let loc = cfg.fn_local(fn_id, lls[k]) {
+                    if loc.is_param {
+                        init_st = .Live;
+                    }
+                }
+                in_m[di] = init_st;
+            }
+            k = k +% 1_usize;
+        }
+    }
+
+    try run_linearity_fixpoint(alloc, cfg, fn_id, g, &mut ctx, interner, diags);
+    try verify_linearity(alloc, cfg, fn_id, g, &mut ctx, interner, diags);
+    ctx.destroy(alloc);
+    return;
+}
+
+// ===========================================================================
+// Section 5: Pass 3 — Backward NLL Liveness (BitSet) + AccessPath Exclusivity
+// ===========================================================================
+
+@recursive
+fn collect_place_uses(cfg: *cfg_ir.CfgProgram, p: *cfg_ir.CfgPlace, set: *mut col.BitSet) {
+    set.set(p.local.widen.[usize]());
+    let projs = cfg.projs_slice(p.projs);
+    var i: usize = 0_usize;
+    while i < projs.len {
+        if projs[i].kind == .Index {
+            if let idx_op = cfg.get_operand(projs[i].operand_id) {
+                if idx_op.kind == .Copy || idx_op.kind == .Move {
+                    if let ip = cfg.get_place(idx_op.id) {
+                        collect_place_uses(cfg, ip, set);
+                    }
+                }
+            }
+        }
+        i = i +% 1_usize;
+    }
+}
+
+fn collect_op_uses(cfg: *cfg_ir.CfgProgram, op: cfg_ir.CfgOperand, set: *mut col.BitSet) {
+    if op.kind == .Copy || op.kind == .Move {
+        if let p = cfg.get_place(op.id) {
+            collect_place_uses(cfg, p, set);
+        }
+    }
+}
+
+fn collect_term_uses(cfg: *cfg_ir.CfgProgram, term: *cfg_ir.CfgTerm, set: *mut col.BitSet) {
+    match term.kind {
+        .Branch => { collect_op_uses(cfg, term.operand, set); }
+        .SwitchInt => { collect_op_uses(cfg, term.operand, set); }
+        .Return => {
+            if term.flag {
+                collect_op_uses(cfg, term.operand, set);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_rvalue_uses(cfg: *cfg_ir.CfgProgram, rv: *cfg_ir.CfgRvalue, set: *mut col.BitSet) {
+    match rv.kind {
+        .Borrow => {
+            if let p = cfg.get_place(rv.place_id) {
+                collect_place_uses(cfg, p, set);
+            }
+        }
+        .Binary => {
+            collect_op_uses(cfg, rv.op0, set);
+            collect_op_uses(cfg, rv.op1, set);
+        }
+        .Slice => {
+            collect_op_uses(cfg, rv.op0, set);
+            if rv.has_op1 {
+                collect_op_uses(cfg, rv.op1, set);
+            }
+            if rv.has_op2 {
+                collect_op_uses(cfg, rv.op2, set);
+            }
+        }
+        .Aggregate => {
+            let elems = cfg.operands_slice(rv.range);
+            var i: usize = 0_usize;
+            while i < elems.len {
+                collect_op_uses(cfg, elems[i], set);
+                i = i +% 1_usize;
+            }
+        }
+        .InlineAsm => {
+            let inps = cfg.asm_inputs_slice(rv.range);
+            var i: usize = 0_usize;
+            while i < inps.len {
+                collect_op_uses(cfg, inps[i].operand, set);
+                i = i +% 1_usize;
+            }
+        }
+        .MakeClosure => {
+            if rv.has_op0 {
+                collect_op_uses(cfg, rv.op0, set);
+            }
+        }
+        _ => {
+            collect_op_uses(cfg, rv.op0, set);
+        }
+    }
+}
+
+fn step_liveness_back_stmt(cfg: *cfg_ir.CfgProgram, stmt: *cfg_ir.CfgStmt, live: *mut col.BitSet) {
+    match stmt.kind {
+        .Assign => {
+            if let dst = cfg.get_place(stmt.dst_place_id) {
+                if dst.projs.len == 0_u32 {
+                    live.unset(dst.local.widen.[usize]());
+                } else {
+                    collect_place_uses(cfg, dst, live);
+                }
+            }
+            if let rv = cfg.get_rvalue(stmt.payload_id) {
+                collect_rvalue_uses(cfg, rv, live);
+            }
+        }
+        .Call => {
+            if stmt.dst_place_id != cfg_ir.CFG_NONE {
+                if let d = cfg.get_place(stmt.dst_place_id) {
+                    if d.projs.len == 0_u32 {
+                        live.unset(d.local.widen.[usize]());
+                    } else {
+                        collect_place_uses(cfg, d, live);
+                    }
+                }
+            }
+            if let call = cfg.get_call(stmt.payload_id) {
+                if call.callee.kind == .FnPtr {
+                    collect_op_uses(cfg, call.callee.fn_ptr, live);
+                }
+                if call.has_recv_place {
+                    if let rp = cfg.get_place(call.recv_place_id) {
+                        collect_place_uses(cfg, rp, live);
+                    }
+                }
+                let args = cfg.call_args(stmt.payload_id);
+                var i: usize = 0_usize;
+                while i < args.len {
+                    collect_op_uses(cfg, args[i], live);
+                    i = i +% 1_usize;
+                }
+            }
+        }
+        .StorageLive => {
+            live.unset(stmt.local.widen.[usize]());
+        }
+        .PoolResetEpoch => {
+            live.set(stmt.local.widen.[usize]());
+        }
+        _ => {}
+    }
+}
+
+linear struct NllLiveness {
+    num_locals: usize;
+    num_blocks: usize;
+    row_words: usize;
+    stride_bits: usize;
+    live_in: col.BitSet;
+    live_out: col.BitSet;
+    live_before_stmt: col.BitSet;
+    block_stmt_off: col.DynBuf[usize];
+}
+
+impl NllLiveness {
+    fn build(
+        alloc: *mut AllocCap,
+        cfg: *cfg_ir.CfgProgram,
+        fn_id: u32,
+        g: *GraphInfo,
+        num_locals: usize,
+        num_blocks: usize,
+    ) -> NllLiveness ! OutOfMemory {
+        let row_words = (num_locals +% 63_usize) >> 6_usize;
+        let stride_bits = row_words *% 64_usize;
+        var live_in = try col.BitSet.init(alloc, num_blocks *% stride_bits);
+        errdefer live_in.destroy(alloc);
+        var live_out = try col.BitSet.init(alloc, num_blocks *% stride_bits);
+        errdefer live_out.destroy(alloc);
+        var out_cur = try col.BitSet.init(alloc, stride_bits);
+        errdefer out_cur.destroy(alloc);
+        var cur = try col.BitSet.init(alloc, stride_bits);
+        errdefer cur.destroy(alloc);
+
+        let rpo = g.rpo_slice();
+        var changed = true;
+        while changed {
+            changed = false;
+            var ri = rpo.len;
+            while ri > 0_usize && ri <= rpo.len {
+                ri = ri - 1_usize;
+                let bb = rpo[ri];
+                let bi = bb.widen.[usize]();
+                if bi < num_blocks {
+                    out_cur.clear();
+                    let sc = cfg.block_successor_count(fn_id, bb);
+                    var si: usize = 0_usize;
+                    while si < sc {
+                        let s = cfg.block_successor_at(fn_id, bb, si);
+                        let s_idx = s.widen.[usize]();
+                        if s_idx < num_blocks {
+                            live_in.union_row_words_into(s_idx *% row_words, row_words, &mut out_cur);
+                        }
+                        si = si +% 1_usize;
+                    }
+                    cur.clear();
+                    cur.union_with(&out_cur);
+                    if let b = cfg.fn_block(fn_id, bb) {
+                        collect_term_uses(cfg, &b.term, &mut cur);
+                        let stmts = cfg.stmts_slice(b.stmts);
+                        var sti = stmts.len;
+                        while sti > 0_usize {
+                            sti = sti - 1_usize;
+                            step_liveness_back_stmt(cfg, &stmts[sti], &mut cur);
+                        }
+                    }
+                    let row_off = bi *% row_words;
+                    let d_out = live_out.write_row_words_diff(row_off, row_words, &out_cur);
+                    let d_in = live_in.write_row_words_diff(row_off, row_words, &cur);
+                    if d_out || d_in {
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        var block_stmt_off = try col.DynBuf.[usize].init(alloc, num_blocks);
+        errdefer block_stmt_off.destroy(alloc);
+        var total_stmts: usize = 0_usize;
+        var bi0: usize = 0_usize;
+        while bi0 < num_blocks {
+            try block_stmt_off.push(alloc, total_stmts);
+            if let b = cfg.fn_block(fn_id, bi0.trunc.[u32]()) {
+                total_stmts = total_stmts +% b.stmts.len.widen.[usize]();
+            }
+            bi0 = bi0 +% 1_usize;
+        }
+        var live_before_stmt = try col.BitSet.init(alloc, total_stmts *% stride_bits);
+        errdefer live_before_stmt.destroy(alloc);
+
+        var bi1: usize = 0_usize;
+        while bi1 < num_blocks {
+            if let b = cfg.fn_block(fn_id, bi1.trunc.[u32]()) {
+                cur.clear();
+                live_out.union_row_words_into(bi1 *% row_words, row_words, &mut cur);
+                collect_term_uses(cfg, &b.term, &mut cur);
+                let stmts = cfg.stmts_slice(b.stmts);
+                let s_off = slice_get_usize(block_stmt_off.as_slice(), bi1);
+                var sti = stmts.len;
+                while sti > 0_usize {
+                    sti = sti - 1_usize;
+                    step_liveness_back_stmt(cfg, &stmts[sti], &mut cur);
+                    live_before_stmt.copy_row_words_from((s_off +% sti) *% row_words, row_words, &cur);
+                }
+            }
+            bi1 = bi1 +% 1_usize;
+        }
+
+        cur.destroy(alloc);
+        out_cur.destroy(alloc);
+        return NllLiveness.{
+            num_locals: num_locals,
+            num_blocks: num_blocks,
+            row_words: row_words,
+            stride_bits: stride_bits,
+            live_in: live_in,
+            live_out: live_out,
+            live_before_stmt: live_before_stmt,
+            block_stmt_off: block_stmt_off,
+        };
+    }
+
+    fn destroy(self: NllLiveness, alloc: *mut AllocCap) {
+        let NllLiveness.{
+            num_locals: _,
+            num_blocks: _,
+            row_words: _,
+            stride_bits: _,
+            live_in,
+            live_out,
+            live_before_stmt,
+            block_stmt_off,
+        } = self;
+        live_in.destroy(alloc);
+        live_out.destroy(alloc);
+        live_before_stmt.destroy(alloc);
+        block_stmt_off.destroy(alloc);
+    }
+}
+
+fn loan_set_insert(
+    alloc: *mut AllocCap,
+    set: *mut col.DynBuf[u32],
+    arena: *PathLoanArena,
+    lid: u32,
+) -> !OutOfMemory {
+    let s = set.as_slice();
+    var pos: usize = 0_usize;
+    while pos < s.len {
+        let c = arena.loan_cmp(s[pos], lid);
+        if c == 0_i32 {
+            return;
+        }
+        if c > 0_i32 {
+            break;
+        }
+        pos = pos +% 1_usize;
+    }
+    try set.push(alloc, lid);
+    let mut_s = set.as_mut_slice();
+    var j = mut_s.len;
+    while j > pos +% 1_usize && j > 0_usize {
+        j = j - 1_usize;
+        if j > 0_usize && j < mut_s.len {
+            let prev = j - 1_usize;
+            mut_s[j] = mut_s[prev];
+        }
+    }
+    if pos < mut_s.len {
+        mut_s[pos] = lid;
+    }
+    return;
+}
+
+fn loan_set_eq_range(set: *[u32], loan_pool: *[u32], r: ast.IdRange) -> bool {
+    let other = slice_id_range.[u32](loan_pool, r);
+    if set.len != other.len {
+        return false;
+    }
+    var i: usize = 0_usize;
+    while i < set.len {
+        if set[i] != other[i] {
+            return false;
+        }
+        i = i +% 1_usize;
+    }
+    return true;
+}
+
+fn loan_set_retain_live(
+    set: *mut col.DynBuf[u32],
+    arena: *PathLoanArena,
+    bs: *col.BitSet,
+    base: usize,
+) {
+    let n = set.len();
+    var write_i: usize = 0_usize;
+    var read_i: usize = 0_usize;
+    while read_i < n {
+        let lid = slice_get_u32(set.as_slice(), read_i, 0_u32);
+        let holder = arena.get_loan(lid).holder.widen.[usize]();
+        if bs.test(base +% holder) {
+            if write_i != read_i {
+                let sm = set.as_mut_slice();
+                if write_i < sm.len {
+                    sm[write_i] = lid;
+                }
+            }
+            write_i = write_i +% 1_usize;
+        }
+        read_i = read_i +% 1_usize;
+    }
+    while set.len() > write_i {
+        _ = set.pop();
+    }
+}
+
+linear struct LoanDataflow {
+    arena: PathLoanArena;
+    loans_in: col.DynBuf[ast.IdRange];
+    loans_out: col.DynBuf[ast.IdRange];
+    loan_pool: col.DynBuf[u32];
+    active: col.DynBuf[u32];
+    joined: col.DynBuf[u32];
+    prop_loans: col.DynBuf[Loan];
+    msg_buf: str.StrBuf;
+}
+
+impl LoanDataflow {
+    fn init(alloc: *mut AllocCap, num_blocks: usize) -> LoanDataflow ! OutOfMemory {
+        let arena = try PathLoanArena.init(alloc);
+        errdefer arena.destroy(alloc);
+        var loans_in = try col.DynBuf.[ast.IdRange].init(alloc, num_blocks);
+        errdefer loans_in.destroy(alloc);
+        var loans_out = try col.DynBuf.[ast.IdRange].init(alloc, num_blocks);
+        errdefer loans_out.destroy(alloc);
+        let loan_pool = try col.DynBuf.[u32].init(alloc, 64_usize);
+        errdefer loan_pool.destroy(alloc);
+        let active = try col.DynBuf.[u32].init(alloc, 16_usize);
+        errdefer active.destroy(alloc);
+        let joined = try col.DynBuf.[u32].init(alloc, 16_usize);
+        errdefer joined.destroy(alloc);
+        let prop_loans = try col.DynBuf.[Loan].init(alloc, 8_usize);
+        errdefer prop_loans.destroy(alloc);
+        let msg_buf = try str.StrBuf.init(alloc, 128_usize);
+        errdefer msg_buf.destroy(alloc);
+
+        var bi: usize = 0_usize;
+        while bi < num_blocks {
+            try loans_in.push(alloc, ast.range_empty());
+            try loans_out.push(alloc, ast.range_empty());
+            bi = bi +% 1_usize;
+        }
+        return LoanDataflow.{
+            arena: arena,
+            loans_in: loans_in,
+            loans_out: loans_out,
+            loan_pool: loan_pool,
+            active: active,
+            joined: joined,
+            prop_loans: prop_loans,
+            msg_buf: msg_buf,
+        };
+    }
+
+    fn destroy(self: LoanDataflow, alloc: *mut AllocCap) {
+        let LoanDataflow.{
+            arena,
+            loans_in,
+            loans_out,
+            loan_pool,
+            active,
+            joined,
+            prop_loans,
+            msg_buf,
+        } = self;
+        arena.destroy(alloc);
+        loans_in.destroy(alloc);
+        loans_out.destroy(alloc);
+        loan_pool.destroy(alloc);
+        active.destroy(alloc);
+        joined.destroy(alloc);
+        prop_loans.destroy(alloc);
+        msg_buf.destroy(alloc);
+    }
+}
+
+fn check_loan_conflict(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    arena: *PathLoanArena,
+    active: *[u32],
+    access_path_id: u32,
+    is_mut_access: bool,
+    base_local: cfg_ir.LocalId,
+    sp: span.Span,
+    emit: bool,
+    interner: *span.SymInterner,
+    msg_buf: *mut str.StrBuf,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    if !emit {
+        return;
+    }
+    var i: usize = 0_usize;
+    while i < active.len {
+        let loan = arena.get_loan(active[i]);
+        if loan.holder != base_local
+            && (loan.is_mut || is_mut_access)
+            && arena.paths_conflict(loan.path_id, access_path_id)
+        {
+            msg_buf.clear();
+            try msg_buf.push_str_grow(alloc, "ZM-18: cannot access `");
+            try arena.format_path(alloc, access_path_id, interner, msg_buf);
+            try msg_buf.push_str_grow(alloc, "` while borrowed by `");
+            try push_local_name(alloc, cfg, fn_id, loan.holder, interner, "<borrow>", msg_buf);
+            try msg_buf.push_byte_grow(alloc, b'`');
+            _ = try diags.emit_error_bytes(alloc, diag.E0118, sp, msg_buf.as_bytes());
+            return;
+        }
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+fn propagate_holder_loans(
+    alloc: *mut AllocCap,
+    df: *mut LoanDataflow,
+    src_local: cfg_ir.LocalId,
+    dst_local: cfg_ir.LocalId,
+) -> bool ! OutOfMemory {
+    df.prop_loans.clear();
+    let act = df.active.as_slice();
+    var i: usize = 0_usize;
+    while i < act.len {
+        let ln = df.arena.get_loan(act[i]);
+        if ln.holder == src_local {
+            try df.prop_loans.push(alloc, ln);
+        }
+        i = i +% 1_usize;
+    }
+    let count = df.prop_loans.len();
+    var j: usize = 0_usize;
+    while j < count {
+        let ps = df.prop_loans.as_slice();
+        if j >= ps.len {
+            break;
+        }
+        let ln = ps[j];
+        let new_lid = try df.arena.intern_loan(alloc, dst_local, ln.path_id, ln.is_mut);
+        try loan_set_insert(alloc, &mut df.active, &df.arena, new_lid);
+        j = j +% 1_usize;
+    }
+    return count > 0_usize;
+}
+
+fn propagate_arg_loans_to_dst(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    arg: cfg_ir.CfgOperand,
+    dst: cfg_ir.LocalId,
+    df: *mut LoanDataflow,
+) -> !OutOfMemory {
+    if arg.kind != .Copy && arg.kind != .Move {
+        return;
+    }
+    let p = cfg.get_place(arg.id) orelse {
+        return;
+    };
+    if p.projs.len == 0_u32 {
+        let carried = try propagate_holder_loans(alloc, df, p.local, dst);
+        if carried {
+            return;
+        }
+    }
+    if let ap_id = try df.arena.to_access_path(alloc, cfg, fn_id, p) {
+        let lid = try df.arena.intern_loan(alloc, dst, ap_id, false);
+        try loan_set_insert(alloc, &mut df.active, &df.arena, lid);
+    }
+    return;
+}
+
+fn is_mut_flag_loan_builtin(k: cfg_ir.CfgBuiltinOpKind) -> bool {
+    match k {
+        .SlotPoolGet => { return true; }
+        .SliceAt => { return true; }
+        .ArrayAt => { return true; }
+        .BufAt => { return true; }
+        .SliceGet => { return true; }
+        .ArrayGet => { return true; }
+        .BufGet => { return true; }
+        .SliceSub => { return true; }
+        .ArraySub => { return true; }
+        .BufSub => { return true; }
+        .BufAsSlice => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn is_imm_loan_builtin(k: cfg_ir.CfgBuiltinOpKind) -> bool {
+    return k == .SlotPoolAt || k == .StrAsBytes || k == .BytesAsStr;
+}
+
+fn is_propagate_rvalue(k: cfg_ir.CfgRvalueKind) -> bool {
+    match k {
+        .Use => { return true; }
+        .UnwrapOptional => { return true; }
+        .UnwrapErrorOk => { return true; }
+        .FieldExtract => { return true; }
+        .Cast => { return true; }
+        .MakeDyn => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn step_loans_assign(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    stmt: *cfg_ir.CfgStmt,
+    df: *mut LoanDataflow,
+    env: *types.TypeEnv,
+    emit: bool,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    let dst = cfg.get_place(stmt.dst_place_id) orelse {
+        return;
+    };
+    let rv = cfg.get_rvalue(stmt.payload_id) orelse {
+        return;
+    };
+    var dst_is_temp = false;
+    if let dloc = cfg.fn_local(fn_id, dst.local) {
+        dst_is_temp = dloc.is_temp;
+    }
+    if emit && (dst.projs.len > 0_u32 || !dst_is_temp) {
+        if let dp_id = try df.arena.to_access_path(alloc, cfg, fn_id, dst) {
+            try check_loan_conflict(
+                alloc, cfg, fn_id, &df.arena, df.active.as_slice(), dp_id, true, dst.local, stmt.span,
+                emit, interner, &mut df.msg_buf, diags,
+            );
+        }
+    }
+    if rv.kind == .Borrow {
+        let is_mut = rv.flag;
+        if let place = cfg.get_place(rv.place_id) {
+            if let ap_id = try df.arena.to_access_path(alloc, cfg, fn_id, place) {
+                try check_loan_conflict(
+                    alloc, cfg, fn_id, &df.arena, df.active.as_slice(), ap_id, is_mut, place.local, stmt.span,
+                    emit, interner, &mut df.msg_buf, diags,
+                );
+                if dst.projs.len == 0_u32 {
+                    let lid = try df.arena.intern_loan(alloc, dst.local, ap_id, is_mut);
+                    try loan_set_insert(alloc, &mut df.active, &df.arena, lid);
+                }
+            }
+            if dst.projs.len == 0_u32 && place.projs.len == 0_u32 {
+                _ = try propagate_holder_loans(alloc, df, place.local, dst.local);
+            }
+        }
+        return;
+    }
+    if rv.kind == .MakeClosure {
+        if rv.has_op0 && (rv.op0.kind == .Copy || rv.op0.kind == .Move) && dst.projs.len == 0_u32 {
+            if let p = cfg.get_place(rv.op0.id) {
+                _ = try propagate_holder_loans(alloc, df, p.local, dst.local);
+            }
+        }
+        return;
+    }
+    if is_propagate_rvalue(rv.kind) {
+        if rv.op0.kind == .Copy || rv.op0.kind == .Move {
+            if let p = cfg.get_place(rv.op0.id) {
+                if emit {
+                    if let ap_id = try df.arena.to_access_path(alloc, cfg, fn_id, p) {
+                        var p_is_temp = false;
+                        if let ploc = cfg.fn_local(fn_id, p.local) {
+                            p_is_temp = ploc.is_temp;
+                        }
+                        let is_move = rv.kind == .Use && rv.op0.kind == .Move && !p_is_temp;
+                        try check_loan_conflict(
+                            alloc, cfg, fn_id, &df.arena, df.active.as_slice(), ap_id, is_move, p.local,
+                            stmt.span, emit, interner, &mut df.msg_buf, diags,
+                        );
+                    }
+                }
+                if p.projs.len == 0_u32 || has_borrow(env, dst.ty) {
+                    _ = try propagate_holder_loans(alloc, df, p.local, dst.local);
+                }
+            }
+        }
+        return;
+    }
+    if rv.kind == .Aggregate {
+        let elems = cfg.operands_slice(rv.range);
+        var ei: usize = 0_usize;
+        while ei < elems.len {
+            if elems[ei].kind == .Copy || elems[ei].kind == .Move {
+                if let p = cfg.get_place(elems[ei].id) {
+                    _ = try propagate_holder_loans(alloc, df, p.local, dst.local);
+                }
+            }
+            ei = ei +% 1_usize;
+        }
+        return;
+    }
+    if rv.kind == .Slice {
+        if rv.op0.kind == .Copy || rv.op0.kind == .Move {
+            if let p = cfg.get_place(rv.op0.id) {
+                if let ap_id = try df.arena.to_access_path(alloc, cfg, fn_id, p) {
+                    try check_loan_conflict(
+                        alloc, cfg, fn_id, &df.arena, df.active.as_slice(), ap_id, false, p.local, stmt.span,
+                        emit, interner, &mut df.msg_buf, diags,
+                    );
+                    if dst.projs.len == 0_u32 {
+                        let lid = try df.arena.intern_loan(alloc, dst.local, ap_id, false);
+                        try loan_set_insert(alloc, &mut df.active, &df.arena, lid);
+                    }
+                }
+            }
+        }
+    }
+    return;
+}
+
+fn step_loans_call_ret(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    call: *cfg_ir.CfgCallData,
+    args: *[cfg_ir.CfgOperand],
+    dst_local: cfg_ir.LocalId,
+    df: *mut LoanDataflow,
+    env: *types.TypeEnv,
+) -> !OutOfMemory {
+    if call.callee.kind == .Builtin {
+        let bk = call.callee.builtin.kind;
+        if bk == .ArenaPoolInit {
+            if args.len > 0_usize && (args[0_usize].kind == .Copy || args[0_usize].kind == .Move) {
+                if let aplace = cfg.get_place(args[0_usize].id) {
+                    if let ap_id = try df.arena.to_access_path(alloc, cfg, fn_id, aplace) {
+                        let lid = try df.arena.intern_loan(alloc, dst_local, ap_id, true);
+                        try loan_set_insert(alloc, &mut df.active, &df.arena, lid);
+                    }
+                }
+            }
+            return;
+        }
+        if bk == .ArenaAlloc {
+            if call.has_recv_place {
+                if let rp = cfg.get_place(call.recv_place_id) {
+                    if let ap_id = try df.arena.to_access_path(alloc, cfg, fn_id, rp) {
+                        let lid = try df.arena.intern_loan(alloc, dst_local, ap_id, true);
+                        try loan_set_insert(alloc, &mut df.active, &df.arena, lid);
+                    }
+                }
+            }
+            return;
+        }
+        if is_mut_flag_loan_builtin(bk) {
+            if call.has_recv_place {
+                if let rp = cfg.get_place(call.recv_place_id) {
+                    if let ap_id = try df.arena.to_access_path(alloc, cfg, fn_id, rp) {
+                        let lid = try df.arena.intern_loan(alloc, dst_local, ap_id, call.callee.builtin.flag);
+                        try loan_set_insert(alloc, &mut df.active, &df.arena, lid);
+                    }
+                }
+            }
+            return;
+        }
+        if is_imm_loan_builtin(bk) {
+            if call.has_recv_place {
+                if let rp = cfg.get_place(call.recv_place_id) {
+                    if let ap_id = try df.arena.to_access_path(alloc, cfg, fn_id, rp) {
+                        let lid = try df.arena.intern_loan(alloc, dst_local, ap_id, false);
+                        try loan_set_insert(alloc, &mut df.active, &df.arena, lid);
+                    }
+                }
+            }
+            return;
+        }
+        return;
+    }
+    if let idx = callee_view_source_index(&call.callee, cfg, env) {
+        if idx < args.len {
+            try propagate_arg_loans_to_dst(alloc, cfg, fn_id, args[idx], dst_local, df);
+        }
+    }
+    return;
+}
+
+fn step_loans_call(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    stmt: *cfg_ir.CfgStmt,
+    df: *mut LoanDataflow,
+    env: *types.TypeEnv,
+    emit: bool,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    let call = cfg.get_call(stmt.payload_id) orelse {
+        return;
+    };
+    let args = cfg.call_args(stmt.payload_id);
+    if emit && call.has_recv_place {
+        if let rp = cfg.get_place(call.recv_place_id) {
+            if let ap_id = try df.arena.to_access_path(alloc, cfg, fn_id, rp) {
+                let mut_acc = call.is_mut_recv || call.consumes_recv;
+                let sp = if call.has_recv_span { call.recv_span } else { stmt.span };
+                try check_loan_conflict(
+                    alloc, cfg, fn_id, &df.arena, df.active.as_slice(), ap_id, mut_acc, rp.local, sp,
+                    emit, interner, &mut df.msg_buf, diags,
+                );
+            }
+        }
+    }
+    if emit && call.callee.kind == .Builtin && call.callee.builtin.kind == .ArenaPoolInit {
+        if args.len > 0_usize && (args[0_usize].kind == .Copy || args[0_usize].kind == .Move) {
+            if let aplace = cfg.get_place(args[0_usize].id) {
+                if let ap_id = try df.arena.to_access_path(alloc, cfg, fn_id, aplace) {
+                    try check_loan_conflict(
+                        alloc, cfg, fn_id, &df.arena, df.active.as_slice(), ap_id, true, aplace.local,
+                        stmt.span, emit, interner, &mut df.msg_buf, diags,
+                    );
+                }
+            }
+        }
+    }
+    if stmt.dst_place_id != cfg_ir.CFG_NONE {
+        if let d = cfg.get_place(stmt.dst_place_id) {
+            if d.projs.len == 0_u32 {
+                try step_loans_call_ret(alloc, cfg, fn_id, call, args, d.local, df, env);
+            }
+        }
+    }
+    return;
+}
+
+fn step_loans_stmt(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    stmt: *cfg_ir.CfgStmt,
+    df: *mut LoanDataflow,
+    env: *types.TypeEnv,
+    emit: bool,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    if stmt.kind == .Assign {
+        try step_loans_assign(alloc, cfg, fn_id, stmt, df, env, emit, interner, diags);
+    } else if stmt.kind == .Call {
+        try step_loans_call(alloc, cfg, fn_id, stmt, df, env, emit, interner, diags);
+    }
+    return;
+}
+
+fn copy_pool_range_to_active(
+    alloc: *mut AllocCap,
+    loan_pool: *col.DynBuf[u32],
+    r: ast.IdRange,
+    active: *mut col.DynBuf[u32],
+) -> !OutOfMemory {
+    active.clear();
+    let s = slice_id_range.[u32](loan_pool.as_slice(), r);
+    try active.push_slice(alloc, s);
+    return;
+}
+
+fn run_loan_fixpoint(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    entry_idx: usize,
+    g: *GraphInfo,
+    live: *NllLiveness,
+    df: *mut LoanDataflow,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    let rpo = g.rpo_slice();
+    let stride_bits = live.stride_bits;
+    let num_blocks = live.num_blocks;
+    var lchanged = true;
+    while lchanged {
+        lchanged = false;
+        var ri: usize = 0_usize;
+        while ri < rpo.len {
+            let bb = rpo[ri];
+            let bi = bb.widen.[usize]();
+            if bi < num_blocks {
+                if bi != entry_idx {
+                    df.joined.clear();
+                    let preds = g.preds_of(bb);
+                    let in_base = bi *% stride_bits;
+                    var pi: usize = 0_usize;
+                    while pi < preds.len {
+                        let p_idx = preds[pi].widen.[usize]();
+                        if p_idx < num_blocks {
+                            let pr = slice_get_range(df.loans_out.as_slice(), p_idx);
+                            var j: u32 = 0_u32;
+                            while j < pr.len {
+                                let pid = (pr.start +% j).widen.[usize]();
+                                if pid < df.loan_pool.len() {
+                                    let lid = slice_get_u32(df.loan_pool.as_slice(), pid, 0_u32);
+                                    let holder = df.arena.get_loan(lid).holder.widen.[usize]();
+                                    if live.live_in.test(in_base +% holder) {
+                                        try loan_set_insert(alloc, &mut df.joined, &df.arena, lid);
+                                    }
+                                }
+                                j = j +% 1_u32;
+                            }
+                        }
+                        pi = pi +% 1_usize;
+                    }
+                    let cur_in = slice_get_range(df.loans_in.as_slice(), bi);
+                    if !loan_set_eq_range(df.joined.as_slice(), df.loan_pool.as_slice(), cur_in) {
+                        let start = df.loan_pool.len().trunc.[u32]();
+                        try df.loan_pool.push_slice(alloc, df.joined.as_slice());
+                        let lin_m = df.loans_in.as_mut_slice();
+                        if bi < lin_m.len {
+                            lin_m[bi] = ast.range_new(start, df.joined.len().trunc.[u32]());
+                        }
+                        lchanged = true;
+                    }
+                }
+                let in_r = slice_get_range(df.loans_in.as_slice(), bi);
+                try copy_pool_range_to_active(alloc, &df.loan_pool, in_r, &mut df.active);
+                if let b = cfg.fn_block(fn_id, bb) {
+                    let stmts = cfg.stmts_slice(b.stmts);
+                    let s_off = slice_get_usize(live.block_stmt_off.as_slice(), bi);
+                    var si: usize = 0_usize;
+                    while si < stmts.len {
+                        loan_set_retain_live(
+                            &mut df.active,
+                            &df.arena,
+                            &live.live_before_stmt,
+                            (s_off +% si) *% stride_bits,
+                        );
+                        try step_loans_stmt(alloc, cfg, fn_id, &stmts[si], df, env, false, interner, diags);
+                        si = si +% 1_usize;
+                    }
+                }
+                loan_set_retain_live(&mut df.active, &df.arena, &live.live_out, bi *% stride_bits);
+                let cur_out = slice_get_range(df.loans_out.as_slice(), bi);
+                if !loan_set_eq_range(df.active.as_slice(), df.loan_pool.as_slice(), cur_out) {
+                    let start = df.loan_pool.len().trunc.[u32]();
+                    try df.loan_pool.push_slice(alloc, df.active.as_slice());
+                    let lout_m = df.loans_out.as_mut_slice();
+                    if bi < lout_m.len {
+                        lout_m[bi] = ast.range_new(start, df.active.len().trunc.[u32]());
+                    }
+                    lchanged = true;
+                }
+            }
+            ri = ri +% 1_usize;
+        }
+    }
+    return;
+}
+
+fn analyze_borrows_and_nll(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    g: *GraphInfo,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    let f = cfg.get_fn(fn_id) orelse {
+        return;
+    };
+    let num_locals = f.locals.len.widen.[usize]();
+    let num_blocks = f.blocks.len.widen.[usize]();
+    if num_locals == 0_usize || num_blocks == 0_usize {
+        return;
+    }
+    let entry_idx = f.entry.widen.[usize]();
+
+    let live = try NllLiveness.build(alloc, cfg, fn_id, g, num_locals, num_blocks);
+    errdefer live.destroy(alloc);
+    var df = try LoanDataflow.init(alloc, num_blocks);
+    errdefer df.destroy(alloc);
+
+    try run_loan_fixpoint(alloc, cfg, fn_id, entry_idx, g, &live, &mut df, env, interner, diags);
+
+    // Step 3C: Single verification pass emitting E0118 on conflicts.
+    let rpo = g.rpo_slice();
+    var ri: usize = 0_usize;
+    while ri < rpo.len {
+        let bb = rpo[ri];
+        let bi = bb.widen.[usize]();
+        if bi < num_blocks {
+            let in_r = slice_get_range(df.loans_in.as_slice(), bi);
+            try copy_pool_range_to_active(alloc, &df.loan_pool, in_r, &mut df.active);
+            if let b = cfg.fn_block(fn_id, bb) {
+                let stmts = cfg.stmts_slice(b.stmts);
+                let s_off = slice_get_usize(live.block_stmt_off.as_slice(), bi);
+                var si: usize = 0_usize;
+                while si < stmts.len {
+                    loan_set_retain_live(
+                        &mut df.active,
+                        &df.arena,
+                        &live.live_before_stmt,
+                        (s_off +% si) *% live.stride_bits,
+                    );
+                    try step_loans_stmt(alloc, cfg, fn_id, &stmts[si], &mut df, env, true, interner, diags);
+                    si = si +% 1_usize;
+                }
+            }
+        }
+        ri = ri +% 1_usize;
+    }
+
+    df.destroy(alloc);
+    live.destroy(alloc);
+    return;
+}
+
+// ===========================================================================
+// Section 6: Pass 4 — Pool Brand & Epoch Tracking (E0331) + Public Entrypoints
+// ===========================================================================
+
+enum EpochKind : u8 {
+    Bot = 0,
+    Initial = 1,
+    ResetAt = 2,
+    Mixed = 3,
+}
+
+struct EpochVal {
+    kind: EpochKind;
+    a: u32;
+    b: u32;
+}
+
+fn epoch_bot() -> EpochVal {
+    return EpochVal.{ kind: .Bot, a: 0_u32, b: 0_u32 };
+}
+
+fn epoch_initial(lid: cfg_ir.LocalId) -> EpochVal {
+    return EpochVal.{ kind: .Initial, a: lid, b: 0_u32 };
+}
+
+fn epoch_reset_at(bb: cfg_ir.BlockId, si: u32) -> EpochVal {
+    return EpochVal.{ kind: .ResetAt, a: bb, b: si };
+}
+
+fn epoch_mixed() -> EpochVal {
+    return EpochVal.{ kind: .Mixed, a: 0_u32, b: 0_u32 };
+}
+
+fn epoch_eq(x: EpochVal, y: EpochVal) -> bool {
+    return x.kind == y.kind && x.a == y.a && x.b == y.b;
+}
+
+fn epoch_join(x: EpochVal, y: EpochVal) -> EpochVal {
+    if x.kind == .Bot {
+        return y;
+    }
+    if y.kind == .Bot {
+        return x;
+    }
+    if epoch_eq(x, y) {
+        return x;
+    }
+    return epoch_mixed();
+}
+
+enum IdOriginKind : u8 {
+    Bot = 0,
+    Valid = 1,
+    Unknown = 2,
+}
+
+struct IdOrigin {
+    kind: IdOriginKind;
+    pool_local: cfg_ir.LocalId;
+    epoch: EpochVal;
+}
+
+fn id_org_bot() -> IdOrigin {
+    return IdOrigin.{ kind: .Bot, pool_local: 0_u32, epoch: epoch_bot() };
+}
+
+fn id_org_valid(pl: cfg_ir.LocalId, ep: EpochVal) -> IdOrigin {
+    return IdOrigin.{ kind: .Valid, pool_local: pl, epoch: ep };
+}
+
+fn id_org_unknown() -> IdOrigin {
+    return IdOrigin.{ kind: .Unknown, pool_local: 0_u32, epoch: epoch_bot() };
+}
+
+fn id_org_eq(x: IdOrigin, y: IdOrigin) -> bool {
+    return x.kind == y.kind && x.pool_local == y.pool_local && epoch_eq(x.epoch, y.epoch);
+}
+
+fn id_org_join(x: IdOrigin, y: IdOrigin) -> IdOrigin {
+    if x.kind == .Bot {
+        return y;
+    }
+    if y.kind == .Bot {
+        return x;
+    }
+    if x.kind == .Valid && y.kind == .Valid && x.pool_local == y.pool_local && epoch_eq(x.epoch, y.epoch) {
+        return x;
+    }
+    return id_org_unknown();
+}
+
+fn fn_has_pool_reset(cfg: *cfg_ir.CfgProgram, fn_id: u32) -> bool {
+    let blks = cfg.fn_blocks(fn_id);
+    var bi: usize = 0_usize;
+    while bi < blks.len {
+        let stmts = cfg.stmts_slice(blks[bi].stmts);
+        var si: usize = 0_usize;
+        while si < stmts.len {
+            if stmts[si].kind == .PoolResetEpoch {
+                return true;
+            }
+            si = si +% 1_usize;
+        }
+        bi = bi +% 1_usize;
+    }
+    return false;
+}
+
+fn step_epoch_stmt(
+    cfg: *cfg_ir.CfgProgram,
+    bb: cfg_ir.BlockId,
+    si: u32,
+    stmt: *cfg_ir.CfgStmt,
+    pep: *mut [EpochVal],
+    iorg: *mut [IdOrigin],
+) {
+    match stmt.kind {
+        .PoolResetEpoch => {
+            let pli = stmt.local.widen.[usize]();
+            if pli < pep.len {
+                pep[pli] = epoch_reset_at(bb, si);
+            }
+        }
+        .Call => {
+            if stmt.dst_place_id == cfg_ir.CFG_NONE {
+                return;
+            }
+            let dst = cfg.get_place(stmt.dst_place_id) orelse {
+                return;
+            };
+            if dst.projs.len != 0_u32 {
+                return;
+            }
+            let call = cfg.get_call(stmt.payload_id) orelse {
+                return;
+            };
+            if call.has_recv_place
+                && call.callee.kind == .Builtin
+                && (call.callee.builtin.kind == .ArenaPoolPush || call.callee.builtin.kind == .ArenaPoolIdAt)
+            {
+                if let rp = cfg.get_place(call.recv_place_id) {
+                    let pli = rp.local.widen.[usize]();
+                    let dli = dst.local.widen.[usize]();
+                    if pli < pep.len && dli < iorg.len {
+                        iorg[dli] = id_org_valid(rp.local, pep[pli]);
+                    }
+                }
+            }
+        }
+        .Assign => {
+            let dst = cfg.get_place(stmt.dst_place_id) orelse {
+                return;
+            };
+            if dst.projs.len != 0_u32 {
+                return;
+            }
+            let rv = cfg.get_rvalue(stmt.payload_id) orelse {
+                return;
+            };
+            if (rv.kind == .Use || rv.kind == .UnwrapErrorOk || rv.kind == .UnwrapOptional)
+                && (rv.op0.kind == .Copy || rv.op0.kind == .Move)
+            {
+                if let p = cfg.get_place(rv.op0.id) {
+                    let pli = p.local.widen.[usize]();
+                    let dli = dst.local.widen.[usize]();
+                    if dli < iorg.len {
+                        if p.projs.len == 0_u32 {
+                            if pli < iorg.len {
+                                iorg[dli] = iorg[pli];
+                            }
+                        } else {
+                            let projs = cfg.projs_slice(p.projs);
+                            if projs.len > 0_usize
+                                && projs[0_usize].kind == .PoolCol
+                                && !projs[0_usize].is_slot_pool
+                                && pli < pep.len
+                            {
+                                iorg[dli] = id_org_valid(p.local, pep[pli]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn emit_stale_id_error(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    pool_local: cfg_ir.LocalId,
+    sp: span.Span,
+    interner: *span.SymInterner,
+    msg_buf: *mut str.StrBuf,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    msg_buf.clear();
+    try msg_buf.push_str_grow(alloc, "use of invalidated `Id[");
+    try push_local_name(alloc, cfg, fn_id, pool_local, interner, "pool", msg_buf);
+    try msg_buf.push_str_grow(alloc, "]` after `");
+    try push_local_name(alloc, cfg, fn_id, pool_local, interner, "pool", msg_buf);
+    try msg_buf.push_str_grow(alloc, ".reset()`");
+    _ = try diags.emit_error_bytes(alloc, diag.E0331, sp, msg_buf.as_bytes());
+    return;
+}
+
+fn check_place_epochs(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    p: *cfg_ir.CfgPlace,
+    sp: span.Span,
+    pep: *[EpochVal],
+    iorg: *[IdOrigin],
+    interner: *span.SymInterner,
+    msg_buf: *mut str.StrBuf,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    let projs = cfg.projs_slice(p.projs);
+    var i: usize = 0_usize;
+    while i < projs.len {
+        if projs[i].kind == .Index {
+            if let idx_op = cfg.get_operand(projs[i].operand_id) {
+                if idx_op.kind == .Copy || idx_op.kind == .Move {
+                    if let ip = cfg.get_place(idx_op.id) {
+                        let ili = ip.local.widen.[usize]();
+                        if ip.projs.len == 0_u32 && ili < iorg.len {
+                            let org = iorg[ili];
+                            if org.kind == .Valid {
+                                let pli = org.pool_local.widen.[usize]();
+                                if pli < pep.len && !epoch_eq(org.epoch, pep[pli]) {
+                                    try emit_stale_id_error(
+                                        alloc, cfg, fn_id, org.pool_local, sp, interner, msg_buf, diags,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+fn check_stmt_id_uses(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    stmt: *cfg_ir.CfgStmt,
+    pep: *[EpochVal],
+    iorg: *[IdOrigin],
+    interner: *span.SymInterner,
+    msg_buf: *mut str.StrBuf,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    if stmt.kind == .Assign {
+        if let dst = cfg.get_place(stmt.dst_place_id) {
+            try check_place_epochs(alloc, cfg, fn_id, dst, dst.span, pep, iorg, interner, msg_buf, diags);
+        }
+        if let rv = cfg.get_rvalue(stmt.payload_id) {
+            if rv.kind == .Use && (rv.op0.kind == .Copy || rv.op0.kind == .Move) {
+                if let p = cfg.get_place(rv.op0.id) {
+                    try check_place_epochs(alloc, cfg, fn_id, p, p.span, pep, iorg, interner, msg_buf, diags);
+                }
+            }
+        }
+        return;
+    }
+    if stmt.kind == .Call {
+        let call = cfg.get_call(stmt.payload_id) orelse {
+            return;
+        };
+        if call.has_recv_place {
+            if let rp = cfg.get_place(call.recv_place_id) {
+                try check_place_epochs(alloc, cfg, fn_id, rp, stmt.span, pep, iorg, interner, msg_buf, diags);
+            }
+        }
+        let args = cfg.call_args(stmt.payload_id);
+        var ai: usize = 0_usize;
+        while ai < args.len {
+            if args[ai].kind == .Copy || args[ai].kind == .Move {
+                if let p = cfg.get_place(args[ai].id) {
+                    try check_place_epochs(alloc, cfg, fn_id, p, p.span, pep, iorg, interner, msg_buf, diags);
+                    let pli = p.local.widen.[usize]();
+                    if p.projs.len == 0_u32 && pli < iorg.len {
+                        let org = iorg[pli];
+                        if org.kind == .Valid {
+                            let pool_i = org.pool_local.widen.[usize]();
+                            if pool_i < pep.len && !epoch_eq(org.epoch, pep[pool_i]) {
+                                try emit_stale_id_error(
+                                    alloc, cfg, fn_id, org.pool_local, p.span, interner, msg_buf, diags,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            ai = ai +% 1_usize;
+        }
+    }
+    return;
+}
+
+linear struct EpochCtx {
+    n: usize;
+    num_blocks: usize;
+    entry_idx: usize;
+    in_pool_ep: col.DynBuf[EpochVal];
+    in_id_org: col.DynBuf[IdOrigin];
+    has_ep: col.DynBuf[bool];
+    jep: col.DynBuf[EpochVal];
+    jorg: col.DynBuf[IdOrigin];
+    pep: col.DynBuf[EpochVal];
+    iorg: col.DynBuf[IdOrigin];
+    msg_buf: str.StrBuf;
+}
+
+impl EpochCtx {
+    fn init(
+        alloc: *mut AllocCap,
+        n: usize,
+        num_blocks: usize,
+        entry_idx: usize,
+    ) -> EpochCtx ! OutOfMemory {
+        let cells = num_blocks *% n;
+        var in_pool_ep = try col.DynBuf.[EpochVal].init(alloc, cells);
+        errdefer in_pool_ep.destroy(alloc);
+        var in_id_org = try col.DynBuf.[IdOrigin].init(alloc, cells);
+        errdefer in_id_org.destroy(alloc);
+        var has_ep = try col.DynBuf.[bool].init(alloc, num_blocks);
+        errdefer has_ep.destroy(alloc);
+        var jep = try col.DynBuf.[EpochVal].init(alloc, n);
+        errdefer jep.destroy(alloc);
+        var jorg = try col.DynBuf.[IdOrigin].init(alloc, n);
+        errdefer jorg.destroy(alloc);
+        var pep = try col.DynBuf.[EpochVal].init(alloc, n);
+        errdefer pep.destroy(alloc);
+        var iorg = try col.DynBuf.[IdOrigin].init(alloc, n);
+        errdefer iorg.destroy(alloc);
+        let msg_buf = try str.StrBuf.init(alloc, 128_usize);
+        errdefer msg_buf.destroy(alloc);
+
+        var ci: usize = 0_usize;
+        while ci < cells {
+            try in_pool_ep.push(alloc, epoch_bot());
+            try in_id_org.push(alloc, id_org_bot());
+            ci = ci +% 1_usize;
+        }
+        var bi: usize = 0_usize;
+        while bi < num_blocks {
+            try has_ep.push(alloc, false);
+            bi = bi +% 1_usize;
+        }
+        var ki: usize = 0_usize;
+        while ki < n {
+            try jep.push(alloc, epoch_bot());
+            try jorg.push(alloc, id_org_bot());
+            try pep.push(alloc, epoch_bot());
+            try iorg.push(alloc, id_org_bot());
+            ki = ki +% 1_usize;
+        }
+        return EpochCtx.{
+            n: n,
+            num_blocks: num_blocks,
+            entry_idx: entry_idx,
+            in_pool_ep: in_pool_ep,
+            in_id_org: in_id_org,
+            has_ep: has_ep,
+            jep: jep,
+            jorg: jorg,
+            pep: pep,
+            iorg: iorg,
+            msg_buf: msg_buf,
+        };
+    }
+
+    fn destroy(self: EpochCtx, alloc: *mut AllocCap) {
+        let EpochCtx.{
+            n: _,
+            num_blocks: _,
+            entry_idx: _,
+            in_pool_ep,
+            in_id_org,
+            has_ep,
+            jep,
+            jorg,
+            pep,
+            iorg,
+            msg_buf,
+        } = self;
+        in_pool_ep.destroy(alloc);
+        in_id_org.destroy(alloc);
+        has_ep.destroy(alloc);
+        jep.destroy(alloc);
+        jorg.destroy(alloc);
+        pep.destroy(alloc);
+        iorg.destroy(alloc);
+        msg_buf.destroy(alloc);
+    }
+}
+
+fn init_pool_epochs_entry(
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    env: *types.TypeEnv,
+    ctx: *mut EpochCtx,
+) {
+    if ctx.entry_idx >= ctx.num_blocks {
+        return;
+    }
+    let he_m = ctx.has_ep.as_mut_slice();
+    if ctx.entry_idx < he_m.len {
+        he_m[ctx.entry_idx] = true;
+    }
+    let base = ctx.entry_idx *% ctx.n;
+    let locals = cfg.fn_locals(fn_id);
+    let ep_m = ctx.in_pool_ep.as_mut_slice();
+    let org_m = ctx.in_id_org.as_mut_slice();
+    var i: usize = 0_usize;
+    while i < locals.len && i < ctx.n {
+        let loc = locals[i];
+        let di = base +% i;
+        if di < ep_m.len {
+            ep_m[di] = epoch_initial(loc.id);
+        }
+        if loc.is_param && di < org_m.len {
+            let tn = env.get(loc.ty);
+            if tn.kind == .Builtin && tn.builtin_kind == .IdBrand {
+                let gargs = env.node_gval_list(&tn);
+                if gargs.len > 0_usize && gargs[0_usize].kind == .Variant {
+                    let psym = gargs[0_usize].id;
+                    var pi: usize = 0_usize;
+                    while pi < locals.len {
+                        if locals[pi].is_param && locals[pi].has_name && locals[pi].name == psym {
+                            org_m[di] = id_org_valid(locals[pi].id, epoch_initial(locals[pi].id));
+                            break;
+                        }
+                        pi = pi +% 1_usize;
+                    }
+                }
+            }
+        }
+        i = i +% 1_usize;
+    }
+}
+
+fn run_pool_epochs_fixpoint(
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    g: *GraphInfo,
+    ctx: *mut EpochCtx,
+) {
+    let n = ctx.n;
+    let rpo = g.rpo_slice();
+    var changed = true;
+    while changed {
+        changed = false;
+        var ri: usize = 0_usize;
+        while ri < rpo.len {
+            let bb = rpo[ri];
+            let bi = bb.widen.[usize]();
+            if bi != ctx.entry_idx && bi < ctx.num_blocks {
+                let jep_m = ctx.jep.as_mut_slice();
+                let jorg_m = ctx.jorg.as_mut_slice();
+                var k0: usize = 0_usize;
+                while k0 < n && k0 < jep_m.len && k0 < jorg_m.len {
+                    jep_m[k0] = epoch_bot();
+                    jorg_m[k0] = id_org_bot();
+                    k0 = k0 +% 1_usize;
+                }
+                var any_pred = false;
+                let preds = g.preds_of(bb);
+                var pii: usize = 0_usize;
+                while pii < preds.len {
+                    let p = preds[pii];
+                    let pi = p.widen.[usize]();
+                    if pi < ctx.num_blocks && slice_get_bool(ctx.has_ep.as_slice(), pi) {
+                        any_pred = true;
+                        let pbase = pi *% n;
+                        let in_ep = ctx.in_pool_ep.as_slice();
+                        let in_org = ctx.in_id_org.as_slice();
+                        let pep_m = ctx.pep.as_mut_slice();
+                        let iorg_m = ctx.iorg.as_mut_slice();
+                        var k1: usize = 0_usize;
+                        while k1 < n && k1 < pep_m.len && k1 < iorg_m.len {
+                            let si = pbase +% k1;
+                            if si < in_ep.len {
+                                pep_m[k1] = in_ep[si];
+                            }
+                            if si < in_org.len {
+                                iorg_m[k1] = in_org[si];
+                            }
+                            k1 = k1 +% 1_usize;
+                        }
+                        let stmts = cfg.fn_block_stmts(fn_id, p);
+                        var si2: usize = 0_usize;
+                        while si2 < stmts.len {
+                            step_epoch_stmt(cfg, p, si2.trunc.[u32](), &stmts[si2], pep_m, iorg_m);
+                            si2 = si2 +% 1_usize;
+                        }
+                        var k2: usize = 0_usize;
+                        while k2 < n && k2 < jep_m.len && k2 < jorg_m.len && k2 < pep_m.len && k2 < iorg_m.len {
+                            jep_m[k2] = epoch_join(jep_m[k2], pep_m[k2]);
+                            jorg_m[k2] = id_org_join(jorg_m[k2], iorg_m[k2]);
+                            k2 = k2 +% 1_usize;
+                        }
+                    }
+                    pii = pii +% 1_usize;
+                }
+                if any_pred {
+                    let bbase = bi *% n;
+                    let ep_mut = ctx.in_pool_ep.as_mut_slice();
+                    let org_mut = ctx.in_id_org.as_mut_slice();
+                    var diff = !slice_get_bool(ctx.has_ep.as_slice(), bi);
+                    var k3: usize = 0_usize;
+                    while k3 < n && k3 < jep_m.len && k3 < jorg_m.len {
+                        let di = bbase +% k3;
+                        if di < ep_mut.len && !epoch_eq(ep_mut[di], jep_m[k3]) {
+                            ep_mut[di] = jep_m[k3];
+                            diff = true;
+                        }
+                        if di < org_mut.len && !id_org_eq(org_mut[di], jorg_m[k3]) {
+                            org_mut[di] = jorg_m[k3];
+                            diff = true;
+                        }
+                        k3 = k3 +% 1_usize;
+                    }
+                    if diff {
+                        let he_m = ctx.has_ep.as_mut_slice();
+                        if bi < he_m.len {
+                            he_m[bi] = true;
+                        }
+                        changed = true;
+                    }
+                }
+            }
+            ri = ri +% 1_usize;
+        }
+    }
+}
+
+fn analyze_pool_epochs(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    g: *GraphInfo,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    if !fn_has_pool_reset(cfg, fn_id) {
+        return;
+    }
+    let f = cfg.get_fn(fn_id) orelse {
+        return;
+    };
+    let n = f.locals.len.widen.[usize]();
+    let num_blocks = f.blocks.len.widen.[usize]();
+    if n == 0_usize || num_blocks == 0_usize {
+        return;
+    }
+    let entry_idx = f.entry.widen.[usize]();
+
+    var ctx = try EpochCtx.init(alloc, n, num_blocks, entry_idx);
+    errdefer ctx.destroy(alloc);
+
+    init_pool_epochs_entry(cfg, fn_id, env, &mut ctx);
+    run_pool_epochs_fixpoint(cfg, fn_id, g, &mut ctx);
+
+    let rpo = g.rpo_slice();
+    var ri: usize = 0_usize;
+    while ri < rpo.len {
+        let bb = rpo[ri];
+        let bi = bb.widen.[usize]();
+        if bi < num_blocks && slice_get_bool(ctx.has_ep.as_slice(), bi) {
+            let bbase = bi *% n;
+            let in_ep = ctx.in_pool_ep.as_slice();
+            let in_org = ctx.in_id_org.as_slice();
+            let pep_m = ctx.pep.as_mut_slice();
+            let iorg_m = ctx.iorg.as_mut_slice();
+            var k: usize = 0_usize;
+            while k < n && k < pep_m.len && k < iorg_m.len {
+                let si = bbase +% k;
+                if si < in_ep.len {
+                    pep_m[k] = in_ep[si];
+                }
+                if si < in_org.len {
+                    iorg_m[k] = in_org[si];
+                }
+                k = k +% 1_usize;
+            }
+            let stmts = cfg.fn_block_stmts(fn_id, bb);
+            var si2: usize = 0_usize;
+            while si2 < stmts.len {
+                try check_stmt_id_uses(
+                    alloc,
+                    cfg,
+                    fn_id,
+                    &stmts[si2],
+                    ctx.pep.as_slice(),
+                    ctx.iorg.as_slice(),
+                    interner,
+                    &mut ctx.msg_buf,
+                    diags,
+                );
+                step_epoch_stmt(
+                    cfg,
+                    bb,
+                    si2.trunc.[u32](),
+                    &stmts[si2],
+                    ctx.pep.as_mut_slice(),
+                    ctx.iorg.as_mut_slice(),
+                );
+                si2 = si2 +% 1_usize;
+            }
+        }
+        ri = ri +% 1_usize;
+    }
+
+    ctx.destroy(alloc);
+    return;
+}
+
+pub fn analyze_function(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    fn_id: u32,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    let f = cfg.get_fn(fn_id) orelse {
+        return;
+    };
+    if f.blocks.len == 0_u32 {
+        return;
+    }
+    let g = try GraphInfo.build(alloc, cfg, fn_id);
+    errdefer g.destroy(alloc);
+    try analyze_view_provenance(alloc, cfg, fn_id, &g, env, interner, diags);
+    try analyze_linearity(alloc, cfg, fn_id, &g, interner, diags);
+    try analyze_borrows_and_nll(alloc, cfg, fn_id, &g, env, interner, diags);
+    try analyze_pool_epochs(alloc, cfg, fn_id, &g, env, interner, diags);
+    g.destroy(alloc);
+    return;
+}
+
+linear struct WorkerBorrowOut {
+    diags_pool: diag.DiagBag;
+    diag_spans: col.DynBuf[ast.IdRange];
+    oom: bool;
+}
+
+impl WorkerBorrowOut {
+    fn init(alloc: *mut AllocCap) -> WorkerBorrowOut ! OutOfMemory {
+        let dp = try diag.DiagBag.init(alloc);
+        errdefer dp.destroy(alloc);
+        let ds = try col.DynBuf.[ast.IdRange].init(alloc, 16_usize);
+        errdefer ds.destroy(alloc);
+        return WorkerBorrowOut.{
+            diags_pool: dp,
+            diag_spans: ds,
+            oom: false,
+        };
+    }
+
+    fn destroy(self: WorkerBorrowOut, alloc: *mut AllocCap) {
+        let WorkerBorrowOut.{ diags_pool, diag_spans, oom: _ } = self;
+        diags_pool.destroy(alloc);
+        diag_spans.destroy(alloc);
+    }
+}
+
+fn borrow_weight_of(weights: *[u32], fi: u32) -> u32 {
+    let idx = fi.widen.[usize]();
+    if idx < weights.len {
+        return weights[idx];
+    }
+    return 0_u32;
+}
+
+fn sort_borrow_work_desc(order: *mut [u32], weights: *[u32]) {
+    if order.len <= 1_usize {
+        return;
+    }
+    var gap: usize = 1_usize;
+    let third = order.len / 3_usize;
+    while gap < third {
+        gap = (gap *% 3_usize) +% 1_usize;
+    }
+    while gap > 0_usize {
+        var i = gap;
+        while i < order.len {
+            let cur = order[i];
+            let cw = borrow_weight_of(weights, cur);
+            var j = i;
+            while j >= gap && j < order.len {
+                let prev = j - gap;
+                let pv = order[prev];
+                let pw = borrow_weight_of(weights, pv);
+                if pw > cw || (pw == cw && pv <= cur) {
+                    break;
+                }
+                order[j] = pv;
+                j = prev;
+            }
+            order[j] = cur;
+            i = i +% 1_usize;
+        }
+        gap = gap / 3_usize;
+    }
+}
+
+fn borrow_worker_loop(
+    wi: u32,
+    alloc: *mut AllocCap,
+    next_pos: *mut sync.AtomicCounter,
+    work_order: *[u32],
+    fn_loc: *mut [u64],
+    cfg: *cfg_ir.CfgProgram,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    out: *mut WorkerBorrowOut,
+) -> !OutOfMemory {
+    loop {
+        let pos = next_pos.fetch_add(1_u64, .AcqRel);
+        let pu = pos.trunc.[usize]();
+        if pu >= work_order.len {
+            break;
+        }
+        let fi = work_order[pu];
+        let fiu = fi.widen.[usize]();
+        let d_start = out.diags_pool.count().trunc.[u32]();
+        try analyze_function(alloc, cfg, fi, env, interner, &mut out.diags_pool);
+        let d_end = out.diags_pool.count().trunc.[u32]();
+        let d_len = if d_end >= d_start { d_end -% d_start } else { 0_u32 };
+        if d_len > 0_u32 {
+            let local_idx = out.diag_spans.len().trunc.[u32]();
+            try out.diag_spans.push(alloc, ast.range_new(d_start, d_len));
+            if fiu < fn_loc.len {
+                fn_loc[fiu] = ((wi +% 1_u32).widen.[u64]() <<% 32_u64) | local_idx.widen.[u64]();
+            }
+        }
+    }
+    return;
+}
+
+fn run_borrow_worker_entry(
+    wi: u32,
+    alloc: *mut AllocCap,
+    next_pos: *mut sync.AtomicCounter,
+    work_order: *[u32],
+    fn_loc: *mut [u64],
+    cfg: *cfg_ir.CfgProgram,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    out: *mut WorkerBorrowOut,
+) {
+    borrow_worker_loop(wi, alloc, next_pos, work_order, fn_loc, cfg, env, interner, out) catch {
+        out.oom = true;
+    };
+}
+
+fn dispatch_borrow_workers(
+    n_workers: usize,
+    alloc: *mut AllocCap,
+    next_pos: *mut sync.AtomicCounter,
+    work_order: *[u32],
+    fn_loc: *mut [u64],
+    cfg: *cfg_ir.CfgProgram,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    w0: *mut WorkerBorrowOut,
+    w1: *mut WorkerBorrowOut,
+    w2: *mut WorkerBorrowOut,
+    w3: *mut WorkerBorrowOut,
+    w4: *mut WorkerBorrowOut,
+    w5: *mut WorkerBorrowOut,
+    w6: *mut WorkerBorrowOut,
+    w7: *mut WorkerBorrowOut,
+    w8: *mut WorkerBorrowOut,
+    w9: *mut WorkerBorrowOut,
+    w10: *mut WorkerBorrowOut,
+    w11: *mut WorkerBorrowOut,
+) {
+    par for wi in 0_usize..n_workers {
+        if wi == 0_usize {
+            run_borrow_worker_entry(0_u32, alloc, next_pos, work_order, fn_loc, cfg, env, interner, w0);
+        } else if wi == 1_usize {
+            run_borrow_worker_entry(1_u32, alloc, next_pos, work_order, fn_loc, cfg, env, interner, w1);
+        } else if wi == 2_usize {
+            run_borrow_worker_entry(2_u32, alloc, next_pos, work_order, fn_loc, cfg, env, interner, w2);
+        } else if wi == 3_usize {
+            run_borrow_worker_entry(3_u32, alloc, next_pos, work_order, fn_loc, cfg, env, interner, w3);
+        } else if wi == 4_usize {
+            run_borrow_worker_entry(4_u32, alloc, next_pos, work_order, fn_loc, cfg, env, interner, w4);
+        } else if wi == 5_usize {
+            run_borrow_worker_entry(5_u32, alloc, next_pos, work_order, fn_loc, cfg, env, interner, w5);
+        } else if wi == 6_usize {
+            run_borrow_worker_entry(6_u32, alloc, next_pos, work_order, fn_loc, cfg, env, interner, w6);
+        } else if wi == 7_usize {
+            run_borrow_worker_entry(7_u32, alloc, next_pos, work_order, fn_loc, cfg, env, interner, w7);
+        } else if wi == 8_usize {
+            run_borrow_worker_entry(8_u32, alloc, next_pos, work_order, fn_loc, cfg, env, interner, w8);
+        } else if wi == 9_usize {
+            run_borrow_worker_entry(9_u32, alloc, next_pos, work_order, fn_loc, cfg, env, interner, w9);
+        } else if wi == 10_usize {
+            run_borrow_worker_entry(10_u32, alloc, next_pos, work_order, fn_loc, cfg, env, interner, w10);
+        } else if wi == 11_usize {
+            run_borrow_worker_entry(11_u32, alloc, next_pos, work_order, fn_loc, cfg, env, interner, w11);
+        }
+    }
+}
+
+fn commit_worker_borrow_diags(
+    alloc: *mut AllocCap,
+    diags: *mut diag.DiagBag,
+    li: usize,
+    w: *WorkerBorrowOut,
+) -> !OutOfMemory {
+    if let ds = w.diag_spans.get(li) {
+        if ds.len > 0_u32 {
+            try diags.append_diag_range(alloc, &w.diags_pool, ds.start, ds.len);
+        }
+    }
+    return;
+}
+
+pub fn analyze_program_with_jobs(
+    alloc: *mut AllocCap,
+    prog: *resolve.ResolvedProgram,
+    env: *types.TypeEnv,
+    cfg: *cfg_ir.CfgProgram,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+    jobs: u32,
+) -> !OutOfMemory {
+    _ = prog;
+    let n_fns = cfg.fn_count();
+    let n_u = n_fns.widen.[usize]();
+    var nw: usize = 1_usize;
+    if jobs == 1_u32 {
+        nw = 1_usize;
+    } else if jobs > 1_u32 {
+        nw = jobs.widen.[usize]();
+        if nw > 12_usize { nw = 12_usize; }
+    } else if n_u < 32_usize {
+        nw = 1_usize;
+    } else if n_u < 192_usize {
+        nw = 4_usize;
+    } else if n_u < 480_usize {
+        nw = 8_usize;
+    } else {
+        nw = 12_usize;
+    }
+    if nw <= 1_usize || n_u < 16_usize {
+        var fi: u32 = 0_u32;
+        while fi < n_fns {
+            if let f = cfg.get_fn(fi) {
+                if f.key.kind != .GenericInst && f.unsupported.len == 0_u32 {
+                    try analyze_function(alloc, cfg, fi, env, interner, diags);
+                }
+            }
+            fi = fi +% 1_u32;
+        }
+        return;
+    }
+
+    var work_order = try col.DynBuf.[u32].init(alloc, n_u);
+    errdefer work_order.destroy(alloc);
+    var weights = try col.DynBuf.[u32].init(alloc, n_u);
+    errdefer weights.destroy(alloc);
+    var fn_loc = try col.DynBuf.[u64].init(alloc, n_u);
+    errdefer fn_loc.destroy(alloc);
+
+    var fi: u32 = 0_u32;
+    while fi < n_fns {
+        var blks: u32 = 0_u32;
+        if let f = cfg.get_fn(fi) {
+            if f.key.kind != .GenericInst && f.unsupported.len == 0_u32 && f.blocks.len > 0_u32 {
+                blks = f.blocks.len;
+                try work_order.push(alloc, fi);
+            }
+        }
+        try weights.push(alloc, blks);
+        try fn_loc.push(alloc, 0_u64);
+        fi = fi +% 1_u32;
+    }
+    if work_order.len() < 16_usize {
+        let wo = work_order.as_slice();
+        var wi0: usize = 0_usize;
+        while wi0 < wo.len {
+            try analyze_function(alloc, cfg, wo[wi0], env, interner, diags);
+            wi0 = wi0 +% 1_usize;
+        }
+        fn_loc.destroy(alloc);
+        weights.destroy(alloc);
+        work_order.destroy(alloc);
+        return;
+    }
+    sort_borrow_work_desc(work_order.as_mut_slice(), weights.as_slice());
+
+    var w0 = try WorkerBorrowOut.init(alloc);
+    errdefer w0.destroy(alloc);
+    var w1 = try WorkerBorrowOut.init(alloc);
+    errdefer w1.destroy(alloc);
+    var w2 = try WorkerBorrowOut.init(alloc);
+    errdefer w2.destroy(alloc);
+    var w3 = try WorkerBorrowOut.init(alloc);
+    errdefer w3.destroy(alloc);
+    var w4 = try WorkerBorrowOut.init(alloc);
+    errdefer w4.destroy(alloc);
+    var w5 = try WorkerBorrowOut.init(alloc);
+    errdefer w5.destroy(alloc);
+    var w6 = try WorkerBorrowOut.init(alloc);
+    errdefer w6.destroy(alloc);
+    var w7 = try WorkerBorrowOut.init(alloc);
+    errdefer w7.destroy(alloc);
+    var w8 = try WorkerBorrowOut.init(alloc);
+    errdefer w8.destroy(alloc);
+    var w9 = try WorkerBorrowOut.init(alloc);
+    errdefer w9.destroy(alloc);
+    var w10 = try WorkerBorrowOut.init(alloc);
+    errdefer w10.destroy(alloc);
+    var w11 = try WorkerBorrowOut.init(alloc);
+    errdefer w11.destroy(alloc);
+
+    var next_pos = sync.AtomicCounter.init(0_u64);
+    dispatch_borrow_workers(
+        nw, alloc, &mut next_pos, work_order.as_slice(), fn_loc.as_mut_slice(),
+        cfg, env, interner,
+        &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5,
+        &mut w6, &mut w7, &mut w8, &mut w9, &mut w10, &mut w11,
+    );
+
+    if w0.oom || w1.oom || w2.oom || w3.oom || w4.oom || w5.oom
+        || w6.oom || w7.oom || w8.oom || w9.oom || w10.oom || w11.oom
+    {
+        return .OutOfMemory;
+    }
+
+    let locs = fn_loc.as_slice();
+    var ci: usize = 0_usize;
+    while ci < locs.len {
+        let loc = locs[ci];
+        if loc != 0_u64 {
+            let wid = ((loc >> 32_u64) -% 1_u64).trunc.[u32]();
+            let li = (loc & 0xFFFFFFFF_u64).trunc.[usize]();
+            if wid == 0_u32 { try commit_worker_borrow_diags(alloc, diags, li, &w0); }
+            else if wid == 1_u32 { try commit_worker_borrow_diags(alloc, diags, li, &w1); }
+            else if wid == 2_u32 { try commit_worker_borrow_diags(alloc, diags, li, &w2); }
+            else if wid == 3_u32 { try commit_worker_borrow_diags(alloc, diags, li, &w3); }
+            else if wid == 4_u32 { try commit_worker_borrow_diags(alloc, diags, li, &w4); }
+            else if wid == 5_u32 { try commit_worker_borrow_diags(alloc, diags, li, &w5); }
+            else if wid == 6_u32 { try commit_worker_borrow_diags(alloc, diags, li, &w6); }
+            else if wid == 7_u32 { try commit_worker_borrow_diags(alloc, diags, li, &w7); }
+            else if wid == 8_u32 { try commit_worker_borrow_diags(alloc, diags, li, &w8); }
+            else if wid == 9_u32 { try commit_worker_borrow_diags(alloc, diags, li, &w9); }
+            else if wid == 10_u32 { try commit_worker_borrow_diags(alloc, diags, li, &w10); }
+            else if wid == 11_u32 { try commit_worker_borrow_diags(alloc, diags, li, &w11); }
+        }
+        ci = ci +% 1_usize;
+    }
+
+    w11.destroy(alloc);
+    w10.destroy(alloc);
+    w9.destroy(alloc);
+    w8.destroy(alloc);
+    w7.destroy(alloc);
+    w6.destroy(alloc);
+    w5.destroy(alloc);
+    w4.destroy(alloc);
+    w3.destroy(alloc);
+    w2.destroy(alloc);
+    w1.destroy(alloc);
+    w0.destroy(alloc);
+    fn_loc.destroy(alloc);
+    weights.destroy(alloc);
+    work_order.destroy(alloc);
+    return;
+}
+
+pub fn analyze_program(
+    alloc: *mut AllocCap,
+    prog: *resolve.ResolvedProgram,
+    env: *types.TypeEnv,
+    cfg: *cfg_ir.CfgProgram,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    try analyze_program_with_jobs(alloc, prog, env, cfg, interner, diags, 0_u32);
+    return;
+}

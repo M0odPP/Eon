@@ -1,0 +1,144 @@
+module core.io;
+
+pub enum IoOp : u8 {
+    Nop = 0,
+    Read = 1,
+    Write = 2,
+    Accept = 3,
+    Connect = 4,
+    Timeout = 5,
+    Fsync = 6,
+    IpcSend = 7,
+}
+
+@align(64)
+pub struct IoSqe {
+    pub op: IoOp;
+    pub flags: u8;
+    pub pad: u16;
+    pub fd: u32;
+    pub offset: u64;
+    pub buf_addr: u64;
+    pub buf_len: u32;
+    pub op_flags: u32;
+    pub user_data: u64;
+    pub ext: [24]u8;
+}
+
+@align(16)
+pub struct IoCqe {
+    pub user_data: u64;
+    pub result: i32;
+    pub flags: u32;
+}
+
+/// Fixed-capacity 32-entry submission/completion ring matching EonOS/io_uring SQE/CQE layout.
+pub struct IoRing {
+    sq: [32]IoSqe;
+    cq: [32]IoCqe;
+    sq_head: usize;
+    sq_tail: usize;
+    cq_head: usize;
+    cq_tail: usize;
+}
+
+impl IoRing {
+    pub fn init() -> IoRing {
+        let empty_sqe = IoSqe.{
+            op: .Nop,
+            flags: 0_u8,
+            pad: 0_u16,
+            fd: 0_u32,
+            offset: 0_u64,
+            buf_addr: 0_u64,
+            buf_len: 0_u32,
+            op_flags: 0_u32,
+            user_data: 0_u64,
+            ext: [0_u8; 24],
+        };
+        let empty_cqe = IoCqe.{
+            user_data: 0_u64,
+            result: 0_i32,
+            flags: 0_u32,
+        };
+        return IoRing.{
+            sq: [empty_sqe; 32],
+            cq: [empty_cqe; 32],
+            sq_head: 0_usize,
+            sq_tail: 0_usize,
+            cq_head: 0_usize,
+            cq_tail: 0_usize,
+        };
+    }
+
+    pub fn submit(self: *mut Self, sqe: IoSqe) -> bool {
+        if self.sq_tail -% self.sq_head >= 32_usize {
+            return false;
+        }
+        let idx = self.sq_tail & 31_usize;
+        self.sq[idx] = sqe;
+        self.sq_tail = self.sq_tail +% 1_usize;
+        return true;
+    }
+
+    pub fn process_one(self: *mut Self) -> bool {
+        if self.sq_head == self.sq_tail {
+            return false;
+        }
+        if self.cq_tail -% self.cq_head >= 32_usize {
+            return false;
+        }
+        let sidx = self.sq_head & 31_usize;
+        let req = self.sq[sidx];
+        self.sq_head = self.sq_head +% 1_usize;
+
+        let cidx = self.cq_tail & 31_usize;
+        self.cq[cidx] = IoCqe.{
+            user_data: req.user_data,
+            result: req.buf_len.trunc.[i32](),
+            flags: 0_u32,
+        };
+        self.cq_tail = self.cq_tail +% 1_usize;
+        return true;
+    }
+
+    pub fn poll_cqe(self: *mut Self) -> ?IoCqe {
+        if self.cq_head == self.cq_tail {
+            return null;
+        }
+        let cidx = self.cq_head & 31_usize;
+        let cqe = self.cq[cidx];
+        self.cq_head = self.cq_head +% 1_usize;
+        return cqe;
+    }
+}
+
+/// Callee-saved register frame for static-stack fibers (`x86_64` = 7 regs, `arm64` = 13 regs).
+pub struct FiberContext {
+    pub regs: [13]u64;
+    pub sp: u64;
+    pub stack_bytes: u64;
+    pub active: bool;
+}
+
+impl FiberContext {
+    pub fn init(stack_top: u64, stack_bytes: u64) -> FiberContext {
+        let reg_count: u64 = comptime if @target_arch() == .X86_64 {
+            7_u64
+        } else {
+            13_u64
+        };
+        var regs: [13]u64 = [0_u64; 13];
+        regs[0] = reg_count;
+        return FiberContext.{
+            regs: regs,
+            sp: stack_top,
+            stack_bytes: stack_bytes,
+            active: true,
+        };
+    }
+
+    pub fn saved_reg_count(self: *Self) -> u64 {
+        return self.regs[0];
+    }
+}

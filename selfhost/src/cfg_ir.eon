@@ -1,0 +1,3697 @@
+module eonc.cfg_ir;
+
+import core.col;
+import core.str;
+import eonc.span;
+import eonc.ast;
+import eonc.resolve;
+import eonc.types;
+
+// ===========================================================================
+// Section 1: Core IDs, Constants, Function Keys, and Slice Helpers
+// ===========================================================================
+
+pub type BlockId = u32;
+pub type LocalId = u32;
+
+pub const CFG_NONE: u32 = 4294967295_u32;
+
+pub enum CfgFnKeyKind : u8 {
+    TopDef = 0,
+    ImplMethod = 1,
+    GenericInst = 2,
+    Closure = 3,
+}
+
+pub struct CfgFnKey {
+    pub kind: CfgFnKeyKind;
+    pub a: u32;
+    pub b: u32;
+}
+
+pub fn fn_key_top_def(def_id: u32) -> CfgFnKey {
+    return CfgFnKey.{ kind: .TopDef, a: def_id, b: 0_u32 };
+}
+
+pub fn fn_key_impl_method(impl_idx: u32, sub_idx: u32) -> CfgFnKey {
+    return CfgFnKey.{ kind: .ImplMethod, a: impl_idx, b: sub_idx };
+}
+
+pub fn fn_key_generic_inst(inst_id: u32) -> CfgFnKey {
+    return CfgFnKey.{ kind: .GenericInst, a: inst_id, b: 0_u32 };
+}
+
+pub fn fn_key_closure(closure_id: u32) -> CfgFnKey {
+    return CfgFnKey.{ kind: .Closure, a: closure_id, b: 0_u32 };
+}
+
+pub fn fn_key_eq(x: CfgFnKey, y: CfgFnKey) -> bool {
+    return x.kind == y.kind && x.a == y.a && x.b == y.b;
+}
+
+fn fn_key_kind_u8(kind: CfgFnKeyKind) -> u8 {
+    match kind {
+        .TopDef => { return 0_u8; }
+        .ImplMethod => { return 1_u8; }
+        .GenericInst => { return 2_u8; }
+        .Closure => { return 3_u8; }
+    }
+}
+
+/// Collision-free `u64` key encoding for `HashMap[u32]` (`by_key`).
+/// Encodes `kind` in bits 62..63, `b` (`sub_idx`) in bits 32..61, and `a` in bits 0..31.
+pub fn fn_key_u64(k: CfgFnKey) -> u64 {
+    let tag = fn_key_kind_u8(k.kind).widen.[u64]();
+    let hi_b = (k.b.widen.[u64]() & 0x3FFFFFFF_u64) <<% 32_u64;
+    return (tag <<% 62_u64) | hi_b | k.a.widen.[u64]();
+}
+
+pub fn write_fn_key_kind(
+    alloc: *mut AllocCap,
+    key: CfgFnKey,
+    is_sys: bool,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    match key.kind {
+        .TopDef => {
+            if is_sys {
+                try out.push_str_grow(alloc, "sys");
+            } else {
+                try out.push_str_grow(alloc, "fn");
+            }
+        }
+        .ImplMethod => { try out.push_str_grow(alloc, "method"); }
+        .GenericInst => { try out.push_str_grow(alloc, "inst"); }
+        .Closure => { try out.push_str_grow(alloc, "closure"); }
+    }
+    return;
+}
+
+view fn slice_id_range[T](all: *[T], r: ast.IdRange) -> *[T] {
+    let start = r.start.widen.[usize]();
+    let end = start +% r.len.widen.[usize]();
+    let s = all.sub(start, end) catch {
+        return all.sub(0_usize, 0_usize) catch {
+            return all;
+        };
+    };
+    return s;
+}
+
+view fn empty_slice[T](all: *[T]) -> *[T] {
+    return all.sub(0_usize, 0_usize) catch {
+        return all;
+    };
+}
+
+// ===========================================================================
+// Section 2: Projections, Places, Constants, and Operands
+// ===========================================================================
+
+pub enum CfgProjKind : u8 {
+    Deref = 0,
+    Field = 1,
+    TupleField = 2,
+    PoolCol = 3,
+    Index = 4,
+}
+
+pub struct CfgProj {
+    pub kind: CfgProjKind;
+    pub is_slot_pool: bool;
+    pub has_const_idx: bool;
+    pub has_key_sym: bool;
+    pub sym: u32;
+    pub index: u32;
+    pub ty: types.TyId;
+    pub operand_id: u32;
+    pub const_idx: types.IntVal;
+}
+
+pub fn proj_deref() -> CfgProj {
+    return CfgProj.{
+        kind: .Deref,
+        is_slot_pool: false,
+        has_const_idx: false,
+        has_key_sym: false,
+        sym: span.SYM_EMPTY,
+        index: 0_u32,
+        ty: types.TY_ERROR,
+        operand_id: CFG_NONE,
+        const_idx: types.int_val_zero(),
+    };
+}
+
+pub fn proj_field(name: u32, field_idx: u32, ty: types.TyId) -> CfgProj {
+    return CfgProj.{
+        kind: .Field,
+        is_slot_pool: false,
+        has_const_idx: false,
+        has_key_sym: false,
+        sym: name,
+        index: field_idx,
+        ty: ty,
+        operand_id: CFG_NONE,
+        const_idx: types.int_val_zero(),
+    };
+}
+
+pub fn proj_tuple_field(index: u32, ty: types.TyId) -> CfgProj {
+    return CfgProj.{
+        kind: .TupleField,
+        is_slot_pool: false,
+        has_const_idx: false,
+        has_key_sym: false,
+        sym: span.SYM_EMPTY,
+        index: index,
+        ty: ty,
+        operand_id: CFG_NONE,
+        const_idx: types.int_val_zero(),
+    };
+}
+
+pub fn proj_pool_col(
+    col_sym: u32,
+    col_idx: u32,
+    is_slot_pool: bool,
+    elem_ty: types.TyId,
+) -> CfgProj {
+    return CfgProj.{
+        kind: .PoolCol,
+        is_slot_pool: is_slot_pool,
+        has_const_idx: false,
+        has_key_sym: false,
+        sym: col_sym,
+        index: col_idx,
+        ty: elem_ty,
+        operand_id: CFG_NONE,
+        const_idx: types.int_val_zero(),
+    };
+}
+
+pub fn proj_index(
+    operand_id: u32,
+    has_const_idx: bool,
+    const_idx: types.IntVal,
+    has_key_sym: bool,
+    key_sym: u32,
+    ty: types.TyId,
+) -> CfgProj {
+    return CfgProj.{
+        kind: .Index,
+        is_slot_pool: false,
+        has_const_idx: has_const_idx,
+        has_key_sym: has_key_sym,
+        sym: key_sym,
+        index: 0_u32,
+        ty: ty,
+        operand_id: operand_id,
+        const_idx: const_idx,
+    };
+}
+
+pub struct CfgPlace {
+    pub local: LocalId;
+    pub projs: ast.IdRange;
+    pub ty: types.TyId;
+    pub span: span.Span;
+}
+
+pub fn place_local(local: LocalId, ty: types.TyId, sp: span.Span) -> CfgPlace {
+    return CfgPlace.{
+        local: local,
+        projs: ast.range_empty(),
+        ty: ty,
+        span: sp,
+    };
+}
+
+pub fn place_new(local: LocalId, projs: ast.IdRange, ty: types.TyId, sp: span.Span) -> CfgPlace {
+    return CfgPlace.{
+        local: local,
+        projs: projs,
+        ty: ty,
+        span: sp,
+    };
+}
+
+pub enum CfgConstKind : u8 {
+    Void = 0,
+    Bool = 1,
+    Char = 2,
+    Int = 3,
+    Float = 4,
+    Str = 5,
+    Bytes = 6,
+    Null = 7,
+    EnumTag = 8,
+    ErrorTag = 9,
+    FnRef = 10,
+    ConstDef = 11,
+}
+
+pub struct CfgConst {
+    pub kind: CfgConstKind;
+    pub bool_val: bool;
+    pub ty: types.TyId;
+    pub aux_u32: u32;
+    pub sym: u32;
+    pub int_val: types.IntVal;
+    pub bytes: ast.IdRange;
+}
+
+pub fn const_void() -> CfgConst {
+    return CfgConst.{
+        kind: .Void,
+        bool_val: false,
+        ty: types.TY_VOID,
+        aux_u32: 0_u32,
+        sym: span.SYM_EMPTY,
+        int_val: types.int_val_zero(),
+        bytes: ast.range_empty(),
+    };
+}
+
+pub fn const_bool(v: bool) -> CfgConst {
+    var c = const_void();
+    c.kind = .Bool;
+    c.bool_val = v;
+    c.ty = types.TY_BOOL;
+    return c;
+}
+
+pub fn const_char(cp: u32) -> CfgConst {
+    var c = const_void();
+    c.kind = .Char;
+    c.aux_u32 = cp;
+    c.ty = types.TY_CHAR;
+    return c;
+}
+
+pub fn const_int(val: types.IntVal, ty: types.TyId) -> CfgConst {
+    var c = const_void();
+    c.kind = .Int;
+    c.int_val = val;
+    c.ty = ty;
+    return c;
+}
+
+pub fn const_float(text_range: ast.IdRange, ty: types.TyId) -> CfgConst {
+    var c = const_void();
+    c.kind = .Float;
+    c.bytes = text_range;
+    c.ty = ty;
+    return c;
+}
+
+pub fn const_str(bytes_range: ast.IdRange) -> CfgConst {
+    var c = const_void();
+    c.kind = .Str;
+    c.bytes = bytes_range;
+    c.ty = types.TY_STR;
+    return c;
+}
+
+pub fn const_bytes(bytes_range: ast.IdRange) -> CfgConst {
+    var c = const_void();
+    c.kind = .Bytes;
+    c.bytes = bytes_range;
+    c.ty = types.TY_STR;
+    return c;
+}
+
+pub fn const_null(ty: types.TyId) -> CfgConst {
+    var c = const_void();
+    c.kind = .Null;
+    c.ty = ty;
+    return c;
+}
+
+pub fn const_enum_tag(ty: types.TyId, variant: u32, tag_val: types.IntVal) -> CfgConst {
+    var c = const_void();
+    c.kind = .EnumTag;
+    c.ty = ty;
+    c.sym = variant;
+    c.int_val = tag_val;
+    return c;
+}
+
+pub fn const_error_tag(ty: types.TyId, variant: u32, tag_val: u32) -> CfgConst {
+    var c = const_void();
+    c.kind = .ErrorTag;
+    c.ty = ty;
+    c.sym = variant;
+    c.aux_u32 = tag_val;
+    return c;
+}
+
+pub fn const_fn_ref(def_id: u32, ty: types.TyId) -> CfgConst {
+    var c = const_void();
+    c.kind = .FnRef;
+    c.aux_u32 = def_id;
+    c.ty = ty;
+    return c;
+}
+
+pub fn const_def(def_id: u32, ty: types.TyId) -> CfgConst {
+    var c = const_void();
+    c.kind = .ConstDef;
+    c.aux_u32 = def_id;
+    c.ty = ty;
+    return c;
+}
+
+/// Returns the resolved `TyId` of a `CfgConst`, matching `compiler/src/cfg.rs::CfgConst::ty`.
+pub fn const_ty(c: *CfgConst, env: *types.TypeEnv) -> types.TyId {
+    match c.kind {
+        .Void => { return types.TY_VOID; }
+        .Bool => { return types.TY_BOOL; }
+        .Char => { return types.TY_CHAR; }
+        .Int => { return c.ty; }
+        .Float => { return c.ty; }
+        .Str => { return types.TY_STR; }
+        .Bytes => { return types.TY_STR; }
+        .Null => { return c.ty; }
+        .EnumTag => { return c.ty; }
+        .ErrorTag => {
+            if env.get(c.ty).kind == .ErrorSet {
+                return c.ty;
+            }
+            return types.TY_U32;
+        }
+        .FnRef => { return c.ty; }
+        .ConstDef => { return c.ty; }
+    }
+}
+
+pub enum CfgOperandKind : u8 {
+    Copy = 0,
+    Move = 1,
+    Const = 2,
+}
+
+pub struct CfgOperand {
+    pub kind: CfgOperandKind;
+    pub id: u32;
+}
+
+pub fn op_copy(place_id: u32) -> CfgOperand {
+    return CfgOperand.{ kind: .Copy, id: place_id };
+}
+
+pub fn op_move(place_id: u32) -> CfgOperand {
+    return CfgOperand.{ kind: .Move, id: place_id };
+}
+
+pub fn op_const(const_id: u32) -> CfgOperand {
+    return CfgOperand.{ kind: .Const, id: const_id };
+}
+
+pub fn op_none() -> CfgOperand {
+    return CfgOperand.{ kind: .Const, id: CFG_NONE };
+}
+
+pub fn operand_place_id(op: CfgOperand) -> ?u32 {
+    if op.kind == .Copy || op.kind == .Move {
+        return op.id;
+    }
+    return null;
+}
+
+pub fn operand_const_id(op: CfgOperand) -> ?u32 {
+    if op.kind == .Const {
+        return op.id;
+    }
+    return null;
+}
+
+// ===========================================================================
+// Section 3: Casts, Aggregates, Builtin Ops, Callees, and Rvalues
+// ===========================================================================
+
+pub enum CastKind : u8 {
+    Widen = 0,
+    Trunc = 1,
+    Clamp = 2,
+    ToFloat = 3,
+    TruncToInt = 4,
+    Bitcast = 5,
+    AsU64 = 6,
+    WrapOptional = 7,
+    WrapOk = 8,
+    WrapErr = 9,
+    MutToConst = 10,
+    ArrayBorrowToSlice = 11,
+}
+
+pub enum AggregateKindTag : u8 {
+    Struct = 0,
+    AnonStruct = 1,
+    Tuple = 2,
+    PoolRow = 3,
+    Array = 4,
+    ArrayRepeat = 5,
+    UnionVariant = 6,
+    Bitfield = 7,
+    Vec = 8,
+}
+
+pub struct AggregateKind {
+    pub tag: AggregateKindTag;
+    pub is_slot_pool: bool;
+    pub vec_len: u8;
+    pub def_id: u32;
+    pub variant_idx: u32;
+    pub elem_ty: types.TyId;
+    pub count: u64;
+    pub field_syms: ast.IdRange;
+}
+
+pub fn agg_tuple() -> AggregateKind {
+    return AggregateKind.{
+        tag: .Tuple,
+        is_slot_pool: false,
+        vec_len: 0_u8,
+        def_id: resolve.DEF_NONE,
+        variant_idx: 0_u32,
+        elem_ty: types.TY_VOID,
+        count: 0_u64,
+        field_syms: ast.range_empty(),
+    };
+}
+
+pub fn agg_struct(def_id: u32) -> AggregateKind {
+    var a = agg_tuple();
+    a.tag = .Struct;
+    a.def_id = def_id;
+    return a;
+}
+
+pub fn agg_anon_struct(field_syms: ast.IdRange) -> AggregateKind {
+    var a = agg_tuple();
+    a.tag = .AnonStruct;
+    a.field_syms = field_syms;
+    return a;
+}
+
+pub fn agg_pool_row(def_id: u32, is_slot_pool: bool) -> AggregateKind {
+    var a = agg_tuple();
+    a.tag = .PoolRow;
+    a.def_id = def_id;
+    a.is_slot_pool = is_slot_pool;
+    return a;
+}
+
+pub fn agg_array(elem_ty: types.TyId) -> AggregateKind {
+    var a = agg_tuple();
+    a.tag = .Array;
+    a.elem_ty = elem_ty;
+    return a;
+}
+
+pub fn agg_array_repeat(elem_ty: types.TyId, count: u64) -> AggregateKind {
+    var a = agg_tuple();
+    a.tag = .ArrayRepeat;
+    a.elem_ty = elem_ty;
+    a.count = count;
+    return a;
+}
+
+pub fn agg_union_variant(def_id: u32, variant_idx: u32) -> AggregateKind {
+    var a = agg_tuple();
+    a.tag = .UnionVariant;
+    a.def_id = def_id;
+    a.variant_idx = variant_idx;
+    return a;
+}
+
+pub fn agg_bitfield(def_id: u32) -> AggregateKind {
+    var a = agg_tuple();
+    a.tag = .Bitfield;
+    a.def_id = def_id;
+    return a;
+}
+
+pub fn agg_vec(elem_ty: types.TyId, len: u8) -> AggregateKind {
+    var a = agg_tuple();
+    a.tag = .Vec;
+    a.elem_ty = elem_ty;
+    a.vec_len = len;
+    return a;
+}
+
+/// Complete builtin op table matching `compiler/src/cfg.rs::CfgBuiltinOp` (116 variants).
+pub enum CfgBuiltinOpKind : u8 {
+    ArenaInit = 0,
+    ArenaAlloc = 1,
+    ArenaReset = 2,
+    ArenaDestroy = 3,
+    ArenaUsedBytes = 4,
+    ArenaCapacity = 5,
+    AllocCapLiveAllocs = 6,
+    AllocCapUsedBytes = 7,
+    AllocCapPeakBytes = 8,
+    AllocCapSubBudget = 9,
+    ClockNowNs = 10,
+    ArgsLen = 11,
+    ArgsGet = 12,
+    FsOpenDir = 13,
+    FsReadFile = 14,
+    FsWriteFile = 15,
+    FsWriteExecutable = 16,
+    FsIsDir = 17,
+    FsMkdirAll = 18,
+    FsListDir = 19,
+    FsSpawnWait = 20,
+    DirSubDir = 21,
+    DirReadFile = 22,
+    DirWriteFile = 23,
+    DirClose = 24,
+    NetRestrictHost = 25,
+    IoNopRoundtrip = 26,
+    IoRunFibers = 27,
+    BuildAddModule = 28,
+    BuildAddExe = 29,
+    BuildAddSharedLib = 30,
+    BuildSetOutDir = 31,
+    BuildSetSanitize = 32,
+    BuildSetAuditTcb = 33,
+    BuildSetOptLevel = 34,
+    BuildLinkLib = 35,
+    BuildAllowHal = 36,
+    BuildOutPath = 37,
+    ScheduleRun = 38,
+    MathSqrt = 39,
+    MathFma = 40,
+    MathLzcnt = 41,
+    MathTzcnt = 42,
+    MathPopcnt = 43,
+    MathBswap = 44,
+    ArenaPoolInit = 45,
+    ArenaPoolPush = 46,
+    ArenaPoolIdAt = 47,
+    ArenaPoolReset = 48,
+    ArenaPoolLen = 49,
+    SlotPoolInit = 50,
+    SlotPoolInsert = 51,
+    SlotPoolTryInsert = 52,
+    SlotPoolRemove = 53,
+    SlotPoolGet = 54,
+    SlotPoolAt = 55,
+    SlotPoolLen = 56,
+    SlotPoolCap = 57,
+    SlotPoolIsAlive = 58,
+    SlotPoolIdAt = 59,
+    SlotPoolDestroy = 60,
+    BufInit = 61,
+    BufPush = 62,
+    BufPushSlice = 63,
+    BufPop = 64,
+    BufLen = 65,
+    BufCap = 66,
+    BufClear = 67,
+    BufAsSlice = 68,
+    BufAt = 69,
+    BufGet = 70,
+    BufSub = 71,
+    BufDestroy = 72,
+    AtomicNew = 73,
+    AtomicLoad = 74,
+    AtomicStore = 75,
+    AtomicFetchAdd = 76,
+    AtomicFetchSub = 77,
+    AtomicSwap = 78,
+    AtomicCas = 79,
+    MmioRead = 80,
+    MmioWrite = 81,
+    RawPtrFromUsize = 82,
+    RawPtrAsUsize = 83,
+    ScheduleBuild = 84,
+    ParReduce = 85,
+    SliceLen = 86,
+    ArrayLen = 87,
+    StrLen = 88,
+    StrAsBytes = 89,
+    BytesAsStr = 90,
+    SliceAt = 91,
+    ArrayAt = 92,
+    SliceGet = 93,
+    ArrayGet = 94,
+    SliceSub = 95,
+    ArraySub = 96,
+    GpuGlobalId = 97,
+    GpuLocalId = 98,
+    GpuWorkgroupId = 99,
+    GpuWorkgroupBarrier = 100,
+    VecSplat = 101,
+    VecLen = 102,
+    VecCmp = 103,
+    VecMaskAny = 104,
+    VecMaskAll = 105,
+    VecBitmask = 106,
+    VecSelect = 107,
+    VecMin = 108,
+    VecMax = 109,
+    VecFma = 110,
+    VecReduceAdd = 111,
+    VecReduceMin = 112,
+    VecReduceMax = 113,
+    VecDot = 114,
+    VecShuffle = 115,
+}
+
+pub struct CfgBuiltinOp {
+    pub kind: CfgBuiltinOpKind;
+    pub flag: bool;
+    pub len_u8: u8;
+    pub bin_op: ast.BinaryOp;
+    pub ty0: types.TyId;
+    pub ty1: types.TyId;
+    pub sym: u32;
+}
+
+pub fn builtin_op_simple(kind: CfgBuiltinOpKind) -> CfgBuiltinOp {
+    return CfgBuiltinOp.{
+        kind: kind,
+        flag: false,
+        len_u8: 0_u8,
+        bin_op: .Add,
+        ty0: types.TY_VOID,
+        ty1: types.TY_VOID,
+        sym: span.SYM_EMPTY,
+    };
+}
+
+pub fn builtin_op_ty(kind: CfgBuiltinOpKind, ty: types.TyId) -> CfgBuiltinOp {
+    var b = builtin_op_simple(kind);
+    b.ty0 = ty;
+    return b;
+}
+
+pub fn builtin_op_ty_mut(kind: CfgBuiltinOpKind, elem_ty: types.TyId, is_mut: bool) -> CfgBuiltinOp {
+    var b = builtin_op_simple(kind);
+    b.ty0 = elem_ty;
+    b.flag = is_mut;
+    return b;
+}
+
+pub fn builtin_op_len(kind: CfgBuiltinOpKind, len: u8) -> CfgBuiltinOp {
+    var b = builtin_op_simple(kind);
+    b.len_u8 = len;
+    return b;
+}
+
+pub fn builtin_op_par_reduce(elem_ty: types.TyId, op_sym: u32) -> CfgBuiltinOp {
+    var b = builtin_op_simple(.ParReduce);
+    b.ty0 = elem_ty;
+    b.sym = op_sym;
+    return b;
+}
+
+pub fn builtin_op_vec_cmp(op: ast.BinaryOp, vec_ty: types.TyId) -> CfgBuiltinOp {
+    var b = builtin_op_simple(.VecCmp);
+    b.bin_op = op;
+    b.ty0 = vec_ty;
+    return b;
+}
+
+pub fn builtin_op_vec_shuffle(
+    src_ty: types.TyId,
+    idx_ty: types.TyId,
+    two_src: bool,
+) -> CfgBuiltinOp {
+    var b = builtin_op_simple(.VecShuffle);
+    b.ty0 = src_ty;
+    b.ty1 = idx_ty;
+    b.flag = two_src;
+    return b;
+}
+
+pub enum CfgCalleeKind : u8 {
+    DirectFn = 0,
+    Method = 1,
+    GenericInst = 2,
+    DynCall = 3,
+    ExternFn = 4,
+    FnPtr = 5,
+    Builtin = 6,
+}
+
+pub struct CfgCallee {
+    pub kind: CfgCalleeKind;
+    pub is_view: bool;
+    pub a: u32;
+    pub b: u32;
+    pub fn_ptr: CfgOperand;
+    pub builtin: CfgBuiltinOp;
+}
+
+pub fn callee_direct_fn(def_id: u32) -> CfgCallee {
+    return CfgCallee.{
+        kind: .DirectFn,
+        is_view: false,
+        a: def_id,
+        b: 0_u32,
+        fn_ptr: op_none(),
+        builtin: builtin_op_simple(.ArenaInit),
+    };
+}
+
+pub fn callee_method(impl_idx: u32, sub_idx: u32, is_view: bool) -> CfgCallee {
+    var c = callee_direct_fn(impl_idx);
+    c.kind = .Method;
+    c.is_view = is_view;
+    c.b = sub_idx;
+    return c;
+}
+
+pub fn callee_generic_inst(inst_id: u32, is_view: bool) -> CfgCallee {
+    var c = callee_direct_fn(inst_id);
+    c.kind = .GenericInst;
+    c.is_view = is_view;
+    return c;
+}
+
+pub fn callee_dyn_call(iface_def: u32, method_idx: u32) -> CfgCallee {
+    var c = callee_direct_fn(iface_def);
+    c.kind = .DynCall;
+    c.b = method_idx;
+    return c;
+}
+
+pub fn callee_extern_fn(def_id: u32, name_sym: u32) -> CfgCallee {
+    var c = callee_direct_fn(def_id);
+    c.kind = .ExternFn;
+    c.b = name_sym;
+    return c;
+}
+
+pub fn callee_fn_ptr(fn_ptr: CfgOperand) -> CfgCallee {
+    var c = callee_direct_fn(0_u32);
+    c.kind = .FnPtr;
+    c.fn_ptr = fn_ptr;
+    return c;
+}
+
+pub fn callee_builtin(op: CfgBuiltinOp) -> CfgCallee {
+    var c = callee_direct_fn(0_u32);
+    c.kind = .Builtin;
+    c.builtin = op;
+    return c;
+}
+
+pub struct CfgAsmInput {
+    pub name: ast.IdRange;
+    pub operand: CfgOperand;
+}
+
+pub enum CfgRvalueKind : u8 {
+    Use = 0,
+    Borrow = 1,
+    Unary = 2,
+    Binary = 3,
+    Slice = 4,
+    Cast = 5,
+    Aggregate = 6,
+    UnwrapOptional = 7,
+    UnwrapErrorOk = 8,
+    UnwrapErrorErr = 9,
+    IsNonNull = 10,
+    IsError = 11,
+    MatchTag = 12,
+    FieldExtract = 13,
+    MakeDyn = 14,
+    MakeClosure = 15,
+    InlineAsm = 16,
+}
+
+pub struct CfgRvalue {
+    pub kind: CfgRvalueKind;
+    pub flag: bool;
+    pub has_op0: bool;
+    pub has_op1: bool;
+    pub has_op2: bool;
+    pub unary_op: ast.UnaryOp;
+    pub bin_op: ast.BinaryOp;
+    pub cast_kind: CastKind;
+    pub op0: CfgOperand;
+    pub op1: CfgOperand;
+    pub op2: CfgOperand;
+    pub place_id: u32;
+    pub aux_u32: u32;
+    pub ty: types.TyId;
+    pub range: ast.IdRange;
+    pub bytes: ast.IdRange;
+}
+
+fn rvalue_zero(kind: CfgRvalueKind) -> CfgRvalue {
+    return CfgRvalue.{
+        kind: kind,
+        flag: false,
+        has_op0: false,
+        has_op1: false,
+        has_op2: false,
+        unary_op: .Neg,
+        bin_op: .Add,
+        cast_kind: .Widen,
+        op0: op_none(),
+        op1: op_none(),
+        op2: op_none(),
+        place_id: CFG_NONE,
+        aux_u32: 0_u32,
+        ty: types.TY_VOID,
+        range: ast.range_empty(),
+        bytes: ast.range_empty(),
+    };
+}
+
+pub fn rvalue_use(op: CfgOperand) -> CfgRvalue {
+    var r = rvalue_zero(.Use);
+    r.has_op0 = true;
+    r.op0 = op;
+    return r;
+}
+
+pub fn rvalue_borrow(is_mut: bool, place_id: u32) -> CfgRvalue {
+    var r = rvalue_zero(.Borrow);
+    r.flag = is_mut;
+    r.place_id = place_id;
+    return r;
+}
+
+pub fn rvalue_unary(op: ast.UnaryOp, operand: CfgOperand) -> CfgRvalue {
+    var r = rvalue_zero(.Unary);
+    r.unary_op = op;
+    r.has_op0 = true;
+    r.op0 = operand;
+    return r;
+}
+
+pub fn rvalue_binary(op: ast.BinaryOp, lhs: CfgOperand, rhs: CfgOperand) -> CfgRvalue {
+    var r = rvalue_zero(.Binary);
+    r.bin_op = op;
+    r.has_op0 = true;
+    r.has_op1 = true;
+    r.op0 = lhs;
+    r.op1 = rhs;
+    return r;
+}
+
+pub fn rvalue_slice(
+    base: CfgOperand,
+    has_lo: bool,
+    lo: CfgOperand,
+    has_hi: bool,
+    hi: CfgOperand,
+) -> CfgRvalue {
+    var r = rvalue_zero(.Slice);
+    r.has_op0 = true;
+    r.op0 = base;
+    r.has_op1 = has_lo;
+    r.op1 = lo;
+    r.has_op2 = has_hi;
+    r.op2 = hi;
+    return r;
+}
+
+pub fn rvalue_cast(kind: CastKind, operand: CfgOperand, to_ty: types.TyId) -> CfgRvalue {
+    var r = rvalue_zero(.Cast);
+    r.cast_kind = kind;
+    r.has_op0 = true;
+    r.op0 = operand;
+    r.ty = to_ty;
+    return r;
+}
+
+pub fn rvalue_aggregate(agg_id: u32, elems: ast.IdRange) -> CfgRvalue {
+    var r = rvalue_zero(.Aggregate);
+    r.aux_u32 = agg_id;
+    r.range = elems;
+    return r;
+}
+
+pub fn rvalue_unwrap_optional(op: CfgOperand) -> CfgRvalue {
+    var r = rvalue_zero(.UnwrapOptional);
+    r.has_op0 = true;
+    r.op0 = op;
+    return r;
+}
+
+pub fn rvalue_unwrap_error_ok(op: CfgOperand) -> CfgRvalue {
+    var r = rvalue_zero(.UnwrapErrorOk);
+    r.has_op0 = true;
+    r.op0 = op;
+    return r;
+}
+
+pub fn rvalue_unwrap_error_err(op: CfgOperand) -> CfgRvalue {
+    var r = rvalue_zero(.UnwrapErrorErr);
+    r.has_op0 = true;
+    r.op0 = op;
+    return r;
+}
+
+pub fn rvalue_is_non_null(op: CfgOperand) -> CfgRvalue {
+    var r = rvalue_zero(.IsNonNull);
+    r.has_op0 = true;
+    r.op0 = op;
+    return r;
+}
+
+pub fn rvalue_is_error(op: CfgOperand) -> CfgRvalue {
+    var r = rvalue_zero(.IsError);
+    r.has_op0 = true;
+    r.op0 = op;
+    return r;
+}
+
+pub fn rvalue_match_tag(op: CfgOperand) -> CfgRvalue {
+    var r = rvalue_zero(.MatchTag);
+    r.has_op0 = true;
+    r.op0 = op;
+    return r;
+}
+
+pub fn rvalue_field_extract(op: CfgOperand, field_idx: u32, ty: types.TyId) -> CfgRvalue {
+    var r = rvalue_zero(.FieldExtract);
+    r.has_op0 = true;
+    r.op0 = op;
+    r.aux_u32 = field_idx;
+    r.ty = ty;
+    return r;
+}
+
+pub fn rvalue_make_dyn(
+    ptr: CfgOperand,
+    iface_def: u32,
+    concrete_ty: types.TyId,
+    is_mut: bool,
+) -> CfgRvalue {
+    var r = rvalue_zero(.MakeDyn);
+    r.has_op0 = true;
+    r.op0 = ptr;
+    r.aux_u32 = iface_def;
+    r.ty = concrete_ty;
+    r.flag = is_mut;
+    return r;
+}
+
+pub fn rvalue_make_closure(
+    closure_id: u32,
+    has_env_ptr: bool,
+    env_ptr: CfgOperand,
+    fn_ty: types.TyId,
+) -> CfgRvalue {
+    var r = rvalue_zero(.MakeClosure);
+    r.aux_u32 = closure_id;
+    r.has_op0 = has_env_ptr;
+    r.op0 = env_ptr;
+    r.ty = fn_ty;
+    return r;
+}
+
+pub fn rvalue_inline_asm(template_bytes: ast.IdRange, inputs_range: ast.IdRange) -> CfgRvalue {
+    var r = rvalue_zero(.InlineAsm);
+    r.bytes = template_bytes;
+    r.range = inputs_range;
+    return r;
+}
+
+// ===========================================================================
+// Section 4: Statements, Call Data, Terminators, Blocks, Locals, Functions
+// ===========================================================================
+
+pub enum CfgStmtKindTag : u8 {
+    Assign = 0,
+    Call = 1,
+    StorageLive = 2,
+    StorageDead = 3,
+    DiscardLinearError = 4,
+    ConsumeDestructured = 5,
+    PoolResetEpoch = 6,
+}
+
+pub struct CfgCallData {
+    pub callee: CfgCallee;
+    pub args: ast.IdRange;
+    pub arg_spans: ast.IdRange;
+    pub has_recv_place: bool;
+    pub recv_place_id: u32;
+    pub has_recv_span: bool;
+    pub recv_span: span.Span;
+    pub is_mut_recv: bool;
+    pub consumes_recv: bool;
+}
+
+pub struct CfgStmt {
+    pub span: span.Span;
+    pub kind: CfgStmtKindTag;
+    pub has_local: bool;
+    pub local: LocalId;
+    pub dst_place_id: u32;
+    pub payload_id: u32;
+    pub aux_span: span.Span;
+}
+
+pub fn stmt_storage_live(sp: span.Span, local: LocalId) -> CfgStmt {
+    return CfgStmt.{
+        span: sp,
+        kind: .StorageLive,
+        has_local: true,
+        local: local,
+        dst_place_id: CFG_NONE,
+        payload_id: CFG_NONE,
+        aux_span: span.span_dummy(),
+    };
+}
+
+pub fn stmt_storage_dead(sp: span.Span, local: LocalId) -> CfgStmt {
+    return CfgStmt.{
+        span: sp,
+        kind: .StorageDead,
+        has_local: true,
+        local: local,
+        dst_place_id: CFG_NONE,
+        payload_id: CFG_NONE,
+        aux_span: span.span_dummy(),
+    };
+}
+
+pub fn stmt_assign(sp: span.Span, dst_place_id: u32, rvalue_id: u32) -> CfgStmt {
+    return CfgStmt.{
+        span: sp,
+        kind: .Assign,
+        has_local: false,
+        local: 0_u32,
+        dst_place_id: dst_place_id,
+        payload_id: rvalue_id,
+        aux_span: span.span_dummy(),
+    };
+}
+
+pub fn stmt_call(sp: span.Span, dst_place_id: u32, call_id: u32) -> CfgStmt {
+    return CfgStmt.{
+        span: sp,
+        kind: .Call,
+        has_local: false,
+        local: 0_u32,
+        dst_place_id: dst_place_id,
+        payload_id: call_id,
+        aux_span: span.span_dummy(),
+    };
+}
+
+pub fn stmt_discard_linear_error(
+    sp: span.Span,
+    has_local: bool,
+    local: LocalId,
+    err_span: span.Span,
+) -> CfgStmt {
+    return CfgStmt.{
+        span: sp,
+        kind: .DiscardLinearError,
+        has_local: has_local,
+        local: local,
+        dst_place_id: CFG_NONE,
+        payload_id: CFG_NONE,
+        aux_span: err_span,
+    };
+}
+
+pub fn stmt_consume_destructured(sp: span.Span, local: LocalId) -> CfgStmt {
+    return CfgStmt.{
+        span: sp,
+        kind: .ConsumeDestructured,
+        has_local: true,
+        local: local,
+        dst_place_id: CFG_NONE,
+        payload_id: CFG_NONE,
+        aux_span: span.span_dummy(),
+    };
+}
+
+pub fn stmt_pool_reset_epoch(sp: span.Span, pool_local: LocalId) -> CfgStmt {
+    return CfgStmt.{
+        span: sp,
+        kind: .PoolResetEpoch,
+        has_local: true,
+        local: pool_local,
+        dst_place_id: CFG_NONE,
+        payload_id: CFG_NONE,
+        aux_span: span.span_dummy(),
+    };
+}
+
+pub enum CfgTermKind : u8 {
+    Goto = 0,
+    Branch = 1,
+    SwitchInt = 2,
+    Return = 3,
+    Unreachable = 4,
+}
+
+pub struct SwitchTarget {
+    pub val: types.IntVal;
+    pub target: BlockId;
+}
+
+pub struct CfgTerm {
+    pub kind: CfgTermKind;
+    pub flag: bool;
+    pub bb0: BlockId;
+    pub bb1: BlockId;
+    pub operand: CfgOperand;
+    pub targets: ast.IdRange;
+    pub span: span.Span;
+}
+
+pub fn term_goto(target: BlockId) -> CfgTerm {
+    return CfgTerm.{
+        kind: .Goto,
+        flag: false,
+        bb0: target,
+        bb1: 0_u32,
+        operand: op_none(),
+        targets: ast.range_empty(),
+        span: span.span_dummy(),
+    };
+}
+
+pub fn term_branch(
+    cond: CfgOperand,
+    then_bb: BlockId,
+    else_bb: BlockId,
+    sp: span.Span,
+    is_user_if: bool,
+) -> CfgTerm {
+    return CfgTerm.{
+        kind: .Branch,
+        flag: is_user_if,
+        bb0: then_bb,
+        bb1: else_bb,
+        operand: cond,
+        targets: ast.range_empty(),
+        span: sp,
+    };
+}
+
+pub fn term_switch_int(
+    discr: CfgOperand,
+    targets: ast.IdRange,
+    otherwise: BlockId,
+    sp: span.Span,
+) -> CfgTerm {
+    return CfgTerm.{
+        kind: .SwitchInt,
+        flag: false,
+        bb0: otherwise,
+        bb1: 0_u32,
+        operand: discr,
+        targets: targets,
+        span: sp,
+    };
+}
+
+pub fn term_return_val(val: CfgOperand, sp: span.Span) -> CfgTerm {
+    return CfgTerm.{
+        kind: .Return,
+        flag: true,
+        bb0: 0_u32,
+        bb1: 0_u32,
+        operand: val,
+        targets: ast.range_empty(),
+        span: sp,
+    };
+}
+
+pub fn term_return_void(sp: span.Span) -> CfgTerm {
+    return CfgTerm.{
+        kind: .Return,
+        flag: false,
+        bb0: 0_u32,
+        bb1: 0_u32,
+        operand: op_none(),
+        targets: ast.range_empty(),
+        span: sp,
+    };
+}
+
+pub fn term_unreachable(sp: span.Span, explicit: bool) -> CfgTerm {
+    return CfgTerm.{
+        kind: .Unreachable,
+        flag: explicit,
+        bb0: 0_u32,
+        bb1: 0_u32,
+        operand: op_none(),
+        targets: ast.range_empty(),
+        span: sp,
+    };
+}
+
+pub struct CfgLocal {
+    pub id: LocalId;
+    pub has_name: bool;
+    pub name: u32;
+    pub span: span.Span;
+    pub ty: types.TyId;
+    pub is_mut: bool;
+    pub is_param: bool;
+    pub is_self: bool;
+    pub is_temp: bool;
+    pub is_linear: bool;
+    pub is_borrowing_val: bool;
+    pub scope_depth: u32;
+    pub has_param_index: bool;
+    pub param_index: u32;
+}
+
+pub fn local_new(id: LocalId, ty: types.TyId, sp: span.Span) -> CfgLocal {
+    return CfgLocal.{
+        id: id,
+        has_name: false,
+        name: span.SYM_EMPTY,
+        span: sp,
+        ty: ty,
+        is_mut: false,
+        is_param: false,
+        is_self: false,
+        is_temp: false,
+        is_linear: false,
+        is_borrowing_val: false,
+        scope_depth: 0_u32,
+        has_param_index: false,
+        param_index: 0_u32,
+    };
+}
+
+pub struct CfgBlock {
+    pub id: BlockId;
+    pub stmts: ast.IdRange;
+    pub term: CfgTerm;
+    pub is_cleanup: bool;
+    pub is_errdefer: bool;
+    pub has_error_site_span: bool;
+    pub error_site_span: span.Span;
+    pub is_loop_header: bool;
+    pub has_loop_entry_depth: bool;
+    pub loop_entry_depth: u32;
+    pub has_join_span: bool;
+    pub join_span: span.Span;
+}
+
+pub fn block_new(id: BlockId) -> CfgBlock {
+    return CfgBlock.{
+        id: id,
+        stmts: ast.range_empty(),
+        term: term_unreachable(span.span_dummy(), false),
+        is_cleanup: false,
+        is_errdefer: false,
+        has_error_site_span: false,
+        error_site_span: span.span_dummy(),
+        is_loop_header: false,
+        has_loop_entry_depth: false,
+        loop_entry_depth: 0_u32,
+        has_join_span: false,
+        join_span: span.span_dummy(),
+    };
+}
+
+pub struct ParForRegion {
+    pub header_bb: BlockId;
+    pub body_bb: BlockId;
+    pub step_bb: BlockId;
+    pub exit_bb: BlockId;
+    pub idx_local: LocalId;
+    pub end_local: LocalId;
+    pub chunk_size: u64;
+}
+
+pub struct UnsupportedItem {
+    pub kind_bytes: ast.IdRange;
+    pub span: span.Span;
+}
+
+pub struct LoopInvariantEntry {
+    pub block_id: BlockId;
+    pub exprs: ast.IdRange;
+}
+
+pub struct DynImplPair {
+    pub iface_def: u32;
+    pub concrete_ty: types.TyId;
+}
+
+pub struct GenericInstEntry {
+    pub base_key: CfgFnKey;
+    pub gargs: ast.IdRange;
+    pub inst_id: u32;
+}
+
+pub struct ScheduleWave {
+    pub systems: ast.IdRange;
+}
+
+pub struct ScheduleDagNode {
+    pub fn_def_id: u32;
+    pub deps_range: ast.IdRange;
+}
+
+pub struct ScheduleDag {
+    pub id: u32;
+    pub waves: ast.IdRange;
+    pub nodes: ast.IdRange;
+}
+
+pub struct CfgFunction {
+    pub key: CfgFnKey;
+    pub module_id: u32;
+    pub name: u32;
+    pub body_span: span.Span;
+    pub sig: types.FnSig;
+    pub params: ast.IdRange;
+    pub locals: ast.IdRange;
+    pub blocks: ast.IdRange;
+    pub entry: BlockId;
+    pub unsupported: ast.IdRange;
+    pub is_sys: bool;
+    pub where_clauses: ast.IdRange;
+    pub ensures_clauses: ast.IdRange;
+    pub loop_invariants: ast.IdRange;
+    pub has_base_generic: bool;
+    pub base_generic_key: CfgFnKey;
+    pub base_generic_args: ast.IdRange;
+    pub par_for_regions: ast.IdRange;
+}
+
+pub fn fn_new(
+    key: CfgFnKey,
+    module_id: u32,
+    name: u32,
+    body_span: span.Span,
+    sig: types.FnSig,
+    is_sys: bool,
+) -> CfgFunction {
+    return CfgFunction.{
+        key: key,
+        module_id: module_id,
+        name: name,
+        body_span: body_span,
+        sig: sig,
+        params: ast.range_empty(),
+        locals: ast.range_empty(),
+        blocks: ast.range_empty(),
+        entry: 0_u32,
+        unsupported: ast.range_empty(),
+        is_sys: is_sys,
+        where_clauses: ast.range_empty(),
+        ensures_clauses: ast.range_empty(),
+        loop_invariants: ast.range_empty(),
+        has_base_generic: false,
+        base_generic_key: fn_key_top_def(resolve.DEF_NONE),
+        base_generic_args: ast.range_empty(),
+        par_for_regions: ast.range_empty(),
+    };
+}
+
+// ===========================================================================
+// Section 5: Flat Arena Linear Sub-Pools & CfgProgram
+// ===========================================================================
+
+pub linear struct CfgFnPools {
+    pub fns: col.DynBuf[CfgFunction];
+    pub by_key: col.HashMap[u32];
+    pub blocks: col.DynBuf[CfgBlock];
+    pub locals: col.DynBuf[CfgLocal];
+    pub param_locals: col.DynBuf[LocalId];
+    pub stmts: col.DynBuf[CfgStmt];
+    pub switch_targets: col.DynBuf[SwitchTarget];
+    pub par_for_regions: col.DynBuf[ParForRegion];
+    pub unsupported: col.DynBuf[UnsupportedItem];
+}
+
+impl CfgFnPools {
+    pub fn init(alloc: *mut AllocCap) -> CfgFnPools ! OutOfMemory {
+        let fns = try col.DynBuf.[CfgFunction].init(alloc, 64_usize);
+        errdefer fns.destroy(alloc);
+        let by_key = try col.HashMap.[u32].init(alloc, 128_usize);
+        errdefer by_key.destroy(alloc);
+        let blocks = try col.DynBuf.[CfgBlock].init(alloc, 256_usize);
+        errdefer blocks.destroy(alloc);
+        let locals = try col.DynBuf.[CfgLocal].init(alloc, 512_usize);
+        errdefer locals.destroy(alloc);
+        let param_locals = try col.DynBuf.[LocalId].init(alloc, 128_usize);
+        errdefer param_locals.destroy(alloc);
+        let stmts = try col.DynBuf.[CfgStmt].init(alloc, 1024_usize);
+        errdefer stmts.destroy(alloc);
+        let switch_targets = try col.DynBuf.[SwitchTarget].init(alloc, 64_usize);
+        errdefer switch_targets.destroy(alloc);
+        let par_for_regions = try col.DynBuf.[ParForRegion].init(alloc, 8_usize);
+        errdefer par_for_regions.destroy(alloc);
+        let unsupported = try col.DynBuf.[UnsupportedItem].init(alloc, 8_usize);
+        errdefer unsupported.destroy(alloc);
+        return CfgFnPools.{
+            fns: fns,
+            by_key: by_key,
+            blocks: blocks,
+            locals: locals,
+            param_locals: param_locals,
+            stmts: stmts,
+            switch_targets: switch_targets,
+            par_for_regions: par_for_regions,
+            unsupported: unsupported,
+        };
+    }
+
+    pub fn destroy(self: CfgFnPools, alloc: *mut AllocCap) {
+        let CfgFnPools.{
+            fns,
+            by_key,
+            blocks,
+            locals,
+            param_locals,
+            stmts,
+            switch_targets,
+            par_for_regions,
+            unsupported,
+        } = self;
+        fns.destroy(alloc);
+        by_key.destroy(alloc);
+        blocks.destroy(alloc);
+        locals.destroy(alloc);
+        param_locals.destroy(alloc);
+        stmts.destroy(alloc);
+        switch_targets.destroy(alloc);
+        par_for_regions.destroy(alloc);
+        unsupported.destroy(alloc);
+    }
+}
+
+pub linear struct CfgExprPools {
+    pub places: col.DynBuf[CfgPlace];
+    pub projs: col.DynBuf[CfgProj];
+    pub operands: col.DynBuf[CfgOperand];
+    pub consts: col.DynBuf[CfgConst];
+    pub rvalues: col.DynBuf[CfgRvalue];
+    pub calls: col.DynBuf[CfgCallData];
+    pub args: col.DynBuf[CfgOperand];
+    pub arg_spans: col.DynBuf[span.Span];
+    pub aggregates: col.DynBuf[AggregateKind];
+    pub asm_inputs: col.DynBuf[CfgAsmInput];
+}
+
+impl CfgExprPools {
+    pub fn init(alloc: *mut AllocCap) -> CfgExprPools ! OutOfMemory {
+        let places = try col.DynBuf.[CfgPlace].init(alloc, 512_usize);
+        errdefer places.destroy(alloc);
+        let projs = try col.DynBuf.[CfgProj].init(alloc, 256_usize);
+        errdefer projs.destroy(alloc);
+        let operands = try col.DynBuf.[CfgOperand].init(alloc, 512_usize);
+        errdefer operands.destroy(alloc);
+        let consts = try col.DynBuf.[CfgConst].init(alloc, 256_usize);
+        errdefer consts.destroy(alloc);
+        let rvalues = try col.DynBuf.[CfgRvalue].init(alloc, 512_usize);
+        errdefer rvalues.destroy(alloc);
+        let calls = try col.DynBuf.[CfgCallData].init(alloc, 256_usize);
+        errdefer calls.destroy(alloc);
+        let args = try col.DynBuf.[CfgOperand].init(alloc, 512_usize);
+        errdefer args.destroy(alloc);
+        let arg_spans = try col.DynBuf.[span.Span].init(alloc, 512_usize);
+        errdefer arg_spans.destroy(alloc);
+        let aggregates = try col.DynBuf.[AggregateKind].init(alloc, 64_usize);
+        errdefer aggregates.destroy(alloc);
+        let asm_inputs = try col.DynBuf.[CfgAsmInput].init(alloc, 8_usize);
+        errdefer asm_inputs.destroy(alloc);
+        return CfgExprPools.{
+            places: places,
+            projs: projs,
+            operands: operands,
+            consts: consts,
+            rvalues: rvalues,
+            calls: calls,
+            args: args,
+            arg_spans: arg_spans,
+            aggregates: aggregates,
+            asm_inputs: asm_inputs,
+        };
+    }
+
+    pub fn destroy(self: CfgExprPools, alloc: *mut AllocCap) {
+        let CfgExprPools.{
+            places,
+            projs,
+            operands,
+            consts,
+            rvalues,
+            calls,
+            args,
+            arg_spans,
+            aggregates,
+            asm_inputs,
+        } = self;
+        places.destroy(alloc);
+        projs.destroy(alloc);
+        operands.destroy(alloc);
+        consts.destroy(alloc);
+        rvalues.destroy(alloc);
+        calls.destroy(alloc);
+        args.destroy(alloc);
+        arg_spans.destroy(alloc);
+        aggregates.destroy(alloc);
+        asm_inputs.destroy(alloc);
+    }
+}
+
+pub linear struct CfgAuxPools {
+    pub str_bytes: col.DynBuf[u8];
+    pub sym_list: col.DynBuf[u32];
+    pub expr_ids: col.DynBuf[u32];
+    pub loop_invariants: col.DynBuf[LoopInvariantEntry];
+    pub gvals: col.DynBuf[types.GenericVal];
+    pub dyn_impl_pairs: col.DynBuf[DynImplPair];
+    pub generic_insts: col.DynBuf[GenericInstEntry];
+    pub generic_inst_head: col.HashMap[u32];
+    pub generic_inst_next: col.DynBuf[u32];
+}
+
+impl CfgAuxPools {
+    pub fn init(alloc: *mut AllocCap) -> CfgAuxPools ! OutOfMemory {
+        let str_bytes = try col.DynBuf.[u8].init(alloc, 256_usize);
+        errdefer str_bytes.destroy(alloc);
+        let sym_list = try col.DynBuf.[u32].init(alloc, 32_usize);
+        errdefer sym_list.destroy(alloc);
+        let expr_ids = try col.DynBuf.[u32].init(alloc, 32_usize);
+        errdefer expr_ids.destroy(alloc);
+        let loop_invariants = try col.DynBuf.[LoopInvariantEntry].init(alloc, 16_usize);
+        errdefer loop_invariants.destroy(alloc);
+        let gvals = try col.DynBuf.[types.GenericVal].init(alloc, 64_usize);
+        errdefer gvals.destroy(alloc);
+        let dyn_impl_pairs = try col.DynBuf.[DynImplPair].init(alloc, 16_usize);
+        errdefer dyn_impl_pairs.destroy(alloc);
+        let generic_insts = try col.DynBuf.[GenericInstEntry].init(alloc, 32_usize);
+        errdefer generic_insts.destroy(alloc);
+        let generic_inst_head = try col.HashMap.[u32].init(alloc, 64_usize);
+        errdefer generic_inst_head.destroy(alloc);
+        let generic_inst_next = try col.DynBuf.[u32].init(alloc, 32_usize);
+        errdefer generic_inst_next.destroy(alloc);
+        return CfgAuxPools.{
+            str_bytes: str_bytes,
+            sym_list: sym_list,
+            expr_ids: expr_ids,
+            loop_invariants: loop_invariants,
+            gvals: gvals,
+            dyn_impl_pairs: dyn_impl_pairs,
+            generic_insts: generic_insts,
+            generic_inst_head: generic_inst_head,
+            generic_inst_next: generic_inst_next,
+        };
+    }
+
+    pub fn destroy(self: CfgAuxPools, alloc: *mut AllocCap) {
+        let CfgAuxPools.{
+            str_bytes,
+            sym_list,
+            expr_ids,
+            loop_invariants,
+            gvals,
+            dyn_impl_pairs,
+            generic_insts,
+            generic_inst_head,
+            generic_inst_next,
+        } = self;
+        str_bytes.destroy(alloc);
+        sym_list.destroy(alloc);
+        expr_ids.destroy(alloc);
+        loop_invariants.destroy(alloc);
+        gvals.destroy(alloc);
+        dyn_impl_pairs.destroy(alloc);
+        generic_insts.destroy(alloc);
+        generic_inst_head.destroy(alloc);
+        generic_inst_next.destroy(alloc);
+    }
+}
+
+pub linear struct CfgSchedPools {
+    pub schedules: col.DynBuf[ScheduleDag];
+    pub sched_waves: col.DynBuf[ScheduleWave];
+    pub sched_systems: col.DynBuf[u32];
+    pub dag_nodes: col.DynBuf[ScheduleDagNode];
+    pub dag_deps: col.DynBuf[u32];
+}
+
+impl CfgSchedPools {
+    pub fn init(alloc: *mut AllocCap) -> CfgSchedPools ! OutOfMemory {
+        let schedules = try col.DynBuf.[ScheduleDag].init(alloc, 4_usize);
+        errdefer schedules.destroy(alloc);
+        let sched_waves = try col.DynBuf.[ScheduleWave].init(alloc, 8_usize);
+        errdefer sched_waves.destroy(alloc);
+        let sched_systems = try col.DynBuf.[u32].init(alloc, 16_usize);
+        errdefer sched_systems.destroy(alloc);
+        let dag_nodes = try col.DynBuf.[ScheduleDagNode].init(alloc, 8_usize);
+        errdefer dag_nodes.destroy(alloc);
+        let dag_deps = try col.DynBuf.[u32].init(alloc, 16_usize);
+        errdefer dag_deps.destroy(alloc);
+        return CfgSchedPools.{
+            schedules: schedules,
+            sched_waves: sched_waves,
+            sched_systems: sched_systems,
+            dag_nodes: dag_nodes,
+            dag_deps: dag_deps,
+        };
+    }
+
+    pub fn destroy(self: CfgSchedPools, alloc: *mut AllocCap) {
+        let CfgSchedPools.{ schedules, sched_waves, sched_systems, dag_nodes, dag_deps } = self;
+        schedules.destroy(alloc);
+        sched_waves.destroy(alloc);
+        sched_systems.destroy(alloc);
+        dag_nodes.destroy(alloc);
+        dag_deps.destroy(alloc);
+    }
+}
+
+pub linear struct CfgProgram {
+    pub funcs: CfgFnPools;
+    pub exprs: CfgExprPools;
+    pub aux: CfgAuxPools;
+    pub scheds: CfgSchedPools;
+}
+
+// ===========================================================================
+// Section 6: Structural Hashing & Equality Helpers for Generic Instantiations
+// ===========================================================================
+
+const FNV_OFFSET: u64 = 0xCBF29CE484222325_u64;
+const FNV_PRIME: u64 = 0x100000001B3_u64;
+
+fn fnv_u8(h: u64, b: u8) -> u64 {
+    return (h ^ b.widen.[u64]()) *% FNV_PRIME;
+}
+
+fn fnv_u32(h: u64, v: u32) -> u64 {
+    var cur = fnv_u8(h, (v & 0xFF_u32).trunc.[u8]());
+    cur = fnv_u8(cur, ((v >> 8_u32) & 0xFF_u32).trunc.[u8]());
+    cur = fnv_u8(cur, ((v >> 16_u32) & 0xFF_u32).trunc.[u8]());
+    cur = fnv_u8(cur, ((v >> 24_u32) & 0xFF_u32).trunc.[u8]());
+    return cur;
+}
+
+fn fnv_u64(h: u64, v: u64) -> u64 {
+    let lo = (v & 0xFFFFFFFF_u64).trunc.[u32]();
+    let hi = (v >> 32_u64).trunc.[u32]();
+    return fnv_u32(fnv_u32(h, lo), hi);
+}
+
+fn gval_kind_u8(k: types.GenericValKind) -> u8 {
+    match k {
+        .Ty => { return 0_u8; }
+        .Int => { return 1_u8; }
+        .Variant => { return 2_u8; }
+    }
+}
+
+fn gval_eq(a: types.GenericVal, b: types.GenericVal) -> bool {
+    if a.kind != b.kind {
+        return false;
+    }
+    match a.kind {
+        .Ty => { return a.id == b.id; }
+        .Variant => { return a.id == b.id; }
+        .Int => { return types.int_val_eq(a.int_val, b.int_val); }
+    }
+}
+
+fn gvals_slice_eq(a: *[types.GenericVal], b: *[types.GenericVal]) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0_usize;
+    while i < a.len {
+        if !gval_eq(a[i], b[i]) {
+            return false;
+        }
+        i = i +% 1_usize;
+    }
+    return true;
+}
+
+fn hash_generic_inst_key(base_key: CfgFnKey, gargs: *[types.GenericVal]) -> u64 {
+    var h = FNV_OFFSET;
+    h = fnv_u64(h, fn_key_u64(base_key));
+    h = fnv_u32(h, gargs.len.trunc.[u32]());
+    var i: usize = 0_usize;
+    while i < gargs.len {
+        let g = gargs[i];
+        h = fnv_u8(h, gval_kind_u8(g.kind));
+        h = fnv_u32(h, g.id);
+        h = fnv_u64(h, g.int_val.lo);
+        h = fnv_u64(h, g.int_val.hi.bitcast.[u64]());
+        i = i +% 1_usize;
+    }
+    return h;
+}
+
+// ===========================================================================
+// Section 7: CfgProgram Lifecycle & Builder Methods
+// ===========================================================================
+
+impl CfgProgram {
+    pub fn init(alloc: *mut AllocCap) -> CfgProgram ! OutOfMemory {
+        let funcs = try CfgFnPools.init(alloc);
+        errdefer funcs.destroy(alloc);
+        let exprs = try CfgExprPools.init(alloc);
+        errdefer exprs.destroy(alloc);
+        let aux = try CfgAuxPools.init(alloc);
+        errdefer aux.destroy(alloc);
+        let scheds = try CfgSchedPools.init(alloc);
+        errdefer scheds.destroy(alloc);
+        return CfgProgram.{
+            funcs: funcs,
+            exprs: exprs,
+            aux: aux,
+            scheds: scheds,
+        };
+    }
+
+    pub fn destroy(self: CfgProgram, alloc: *mut AllocCap) {
+        let CfgProgram.{ funcs, exprs, aux, scheds } = self;
+        funcs.destroy(alloc);
+        exprs.destroy(alloc);
+        aux.destroy(alloc);
+        scheds.destroy(alloc);
+    }
+
+    pub fn clear_all(self: *mut Self) {
+        self.funcs.fns.clear();
+        self.funcs.by_key.clear();
+        self.funcs.blocks.clear();
+        self.funcs.locals.clear();
+        self.funcs.param_locals.clear();
+        self.funcs.stmts.clear();
+        self.funcs.switch_targets.clear();
+        self.funcs.par_for_regions.clear();
+        self.funcs.unsupported.clear();
+        self.exprs.places.clear();
+        self.exprs.projs.clear();
+        self.exprs.operands.clear();
+        self.exprs.consts.clear();
+        self.exprs.rvalues.clear();
+        self.exprs.calls.clear();
+        self.exprs.args.clear();
+        self.exprs.arg_spans.clear();
+        self.exprs.aggregates.clear();
+        self.exprs.asm_inputs.clear();
+        self.aux.str_bytes.clear();
+        self.aux.sym_list.clear();
+        self.aux.expr_ids.clear();
+        self.aux.loop_invariants.clear();
+        self.aux.gvals.clear();
+        self.aux.dyn_impl_pairs.clear();
+        self.aux.generic_insts.clear();
+        self.aux.generic_inst_head.clear();
+        self.aux.generic_inst_next.clear();
+        self.scheds.schedules.clear();
+        self.scheds.sched_waves.clear();
+        self.scheds.sched_systems.clear();
+        self.scheds.dag_nodes.clear();
+        self.scheds.dag_deps.clear();
+    }
+
+    pub fn seed_generic_insts_from(self: *mut Self, alloc: *mut AllocCap, src: *CfgProgram) -> !OutOfMemory {
+        let gs = src.aux.generic_insts.as_slice();
+        var i: usize = 0_usize;
+        while i < gs.len {
+            let e = gs[i];
+            try self.register_generic_inst(alloc, e.base_key, src.gvals_slice(e.gargs), e.inst_id);
+            i = i +% 1_usize;
+        }
+        return;
+    }
+
+    // --- Auxiliary & Byte Pool Builders ---
+
+    pub fn add_bytes(self: *mut Self, alloc: *mut AllocCap, data: *[u8]) -> ast.IdRange ! OutOfMemory {
+        let start = self.aux.str_bytes.len().trunc.[u32]();
+        try self.aux.str_bytes.push_slice(alloc, data);
+        return ast.range_new(start, data.len.trunc.[u32]());
+    }
+
+    pub fn add_str(self: *mut Self, alloc: *mut AllocCap, s: *str) -> ast.IdRange ! OutOfMemory {
+        return try self.add_bytes(alloc, s.as_bytes());
+    }
+
+    pub fn add_syms(self: *mut Self, alloc: *mut AllocCap, syms: *[u32]) -> ast.IdRange ! OutOfMemory {
+        let start = self.aux.sym_list.len().trunc.[u32]();
+        try self.aux.sym_list.push_slice(alloc, syms);
+        return ast.range_new(start, syms.len.trunc.[u32]());
+    }
+
+    pub fn add_expr_ids(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        ids: *[u32],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.aux.expr_ids.len().trunc.[u32]();
+        try self.aux.expr_ids.push_slice(alloc, ids);
+        return ast.range_new(start, ids.len.trunc.[u32]());
+    }
+
+    pub fn add_gvals(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        vals: *[types.GenericVal],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.aux.gvals.len().trunc.[u32]();
+        try self.aux.gvals.push_slice(alloc, vals);
+        return ast.range_new(start, vals.len.trunc.[u32]());
+    }
+
+    pub fn add_loop_invariants(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        invs: *[LoopInvariantEntry],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.aux.loop_invariants.len().trunc.[u32]();
+        try self.aux.loop_invariants.push_slice(alloc, invs);
+        return ast.range_new(start, invs.len.trunc.[u32]());
+    }
+
+    pub fn add_par_for_regions(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        regs: *[ParForRegion],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.funcs.par_for_regions.len().trunc.[u32]();
+        try self.funcs.par_for_regions.push_slice(alloc, regs);
+        return ast.range_new(start, regs.len.trunc.[u32]());
+    }
+
+    pub fn add_unsupported(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        items: *[UnsupportedItem],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.funcs.unsupported.len().trunc.[u32]();
+        try self.funcs.unsupported.push_slice(alloc, items);
+        return ast.range_new(start, items.len.trunc.[u32]());
+    }
+
+    pub fn add_dyn_impl_pair(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        iface_def: u32,
+        concrete_ty: types.TyId,
+    ) -> !OutOfMemory {
+        try self.aux.dyn_impl_pairs.push(
+            alloc,
+            DynImplPair.{ iface_def: iface_def, concrete_ty: concrete_ty },
+        );
+        return;
+    }
+
+    // --- Place, Constant, Operand, Rvalue, Call, and Statement Builders ---
+
+    pub fn add_projs(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        ps: *[CfgProj],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.exprs.projs.len().trunc.[u32]();
+        try self.exprs.projs.push_slice(alloc, ps);
+        return ast.range_new(start, ps.len.trunc.[u32]());
+    }
+
+    pub fn add_place(self: *mut Self, alloc: *mut AllocCap, p: CfgPlace) -> u32 ! OutOfMemory {
+        let id = self.exprs.places.len().trunc.[u32]();
+        try self.exprs.places.push(alloc, p);
+        return id;
+    }
+
+    pub fn add_local_place(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        local: LocalId,
+        ty: types.TyId,
+        sp: span.Span,
+    ) -> u32 ! OutOfMemory {
+        return try self.add_place(alloc, place_local(local, ty, sp));
+    }
+
+    pub fn add_place_with_projs(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        local: LocalId,
+        ps: *[CfgProj],
+        ty: types.TyId,
+        sp: span.Span,
+    ) -> u32 ! OutOfMemory {
+        let r = try self.add_projs(alloc, ps);
+        return try self.add_place(alloc, place_new(local, r, ty, sp));
+    }
+
+    pub fn add_const(self: *mut Self, alloc: *mut AllocCap, c: CfgConst) -> u32 ! OutOfMemory {
+        let id = self.exprs.consts.len().trunc.[u32]();
+        try self.exprs.consts.push(alloc, c);
+        return id;
+    }
+
+    pub fn add_const_op(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        c: CfgConst,
+    ) -> CfgOperand ! OutOfMemory {
+        let cid = try self.add_const(alloc, c);
+        return op_const(cid);
+    }
+
+    pub fn add_const_str_op(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        bytes: *[u8],
+    ) -> CfgOperand ! OutOfMemory {
+        let r = try self.add_bytes(alloc, bytes);
+        return try self.add_const_op(alloc, const_str(r));
+    }
+
+    pub fn add_const_bytes_op(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        bytes: *[u8],
+    ) -> CfgOperand ! OutOfMemory {
+        let r = try self.add_bytes(alloc, bytes);
+        return try self.add_const_op(alloc, const_bytes(r));
+    }
+
+    pub fn add_const_float_op(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        text: *[u8],
+        ty: types.TyId,
+    ) -> CfgOperand ! OutOfMemory {
+        let r = try self.add_bytes(alloc, text);
+        return try self.add_const_op(alloc, const_float(r, ty));
+    }
+
+    pub fn add_operand(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        op: CfgOperand,
+    ) -> u32 ! OutOfMemory {
+        let id = self.exprs.operands.len().trunc.[u32]();
+        try self.exprs.operands.push(alloc, op);
+        return id;
+    }
+
+    pub fn add_operands(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        ops: *[CfgOperand],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.exprs.operands.len().trunc.[u32]();
+        try self.exprs.operands.push_slice(alloc, ops);
+        return ast.range_new(start, ops.len.trunc.[u32]());
+    }
+
+    pub fn add_aggregate_kind(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        kind: AggregateKind,
+    ) -> u32 ! OutOfMemory {
+        let id = self.exprs.aggregates.len().trunc.[u32]();
+        try self.exprs.aggregates.push(alloc, kind);
+        return id;
+    }
+
+    pub fn add_asm_inputs(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        inputs: *[CfgAsmInput],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.exprs.asm_inputs.len().trunc.[u32]();
+        try self.exprs.asm_inputs.push_slice(alloc, inputs);
+        return ast.range_new(start, inputs.len.trunc.[u32]());
+    }
+
+    pub fn add_rvalue(self: *mut Self, alloc: *mut AllocCap, rv: CfgRvalue) -> u32 ! OutOfMemory {
+        let id = self.exprs.rvalues.len().trunc.[u32]();
+        try self.exprs.rvalues.push(alloc, rv);
+        return id;
+    }
+
+    pub fn add_call_data(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        callee: CfgCallee,
+        args: *[CfgOperand],
+        arg_spans: *[span.Span],
+        has_recv_place: bool,
+        recv_place_id: u32,
+        has_recv_span: bool,
+        recv_span: span.Span,
+        is_mut_recv: bool,
+        consumes_recv: bool,
+    ) -> u32 ! OutOfMemory {
+        let args_start = self.exprs.args.len().trunc.[u32]();
+        try self.exprs.args.push_slice(alloc, args);
+        let spans_start = self.exprs.arg_spans.len().trunc.[u32]();
+        try self.exprs.arg_spans.push_slice(alloc, arg_spans);
+        let call_id = self.exprs.calls.len().trunc.[u32]();
+        try self.exprs.calls.push(
+            alloc,
+            CfgCallData.{
+                callee: callee,
+                args: ast.range_new(args_start, args.len.trunc.[u32]()),
+                arg_spans: ast.range_new(spans_start, arg_spans.len.trunc.[u32]()),
+                has_recv_place: has_recv_place,
+                recv_place_id: recv_place_id,
+                has_recv_span: has_recv_span,
+                recv_span: recv_span,
+                is_mut_recv: is_mut_recv,
+                consumes_recv: consumes_recv,
+            },
+        );
+        return call_id;
+    }
+
+    pub fn add_switch_targets(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        targets: *[SwitchTarget],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.funcs.switch_targets.len().trunc.[u32]();
+        try self.funcs.switch_targets.push_slice(alloc, targets);
+        return ast.range_new(start, targets.len.trunc.[u32]());
+    }
+
+    pub fn add_stmts(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        stmts: *[CfgStmt],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.funcs.stmts.len().trunc.[u32]();
+        try self.funcs.stmts.push_slice(alloc, stmts);
+        return ast.range_new(start, stmts.len.trunc.[u32]());
+    }
+
+    // --- Function, Block, Local, GenericInst, and Schedule Builders ---
+
+    pub fn add_param_locals(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        params: *[LocalId],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.funcs.param_locals.len().trunc.[u32]();
+        try self.funcs.param_locals.push_slice(alloc, params);
+        return ast.range_new(start, params.len.trunc.[u32]());
+    }
+
+    pub fn add_locals(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        locals: *[CfgLocal],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.funcs.locals.len().trunc.[u32]();
+        try self.funcs.locals.push_slice(alloc, locals);
+        return ast.range_new(start, locals.len.trunc.[u32]());
+    }
+
+    pub fn add_blocks(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        blocks: *[CfgBlock],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.funcs.blocks.len().trunc.[u32]();
+        try self.funcs.blocks.push_slice(alloc, blocks);
+        return ast.range_new(start, blocks.len.trunc.[u32]());
+    }
+
+    pub fn add_fn(self: *mut Self, alloc: *mut AllocCap, func: CfgFunction) -> u32 ! OutOfMemory {
+        let fn_id = self.funcs.fns.len().trunc.[u32]();
+        let key_u64 = fn_key_u64(func.key);
+        try self.funcs.fns.push(alloc, func);
+        try self.funcs.by_key.insert(alloc, key_u64, fn_id);
+        return fn_id;
+    }
+
+    pub fn find_generic_inst(
+        self: *Self,
+        base_key: CfgFnKey,
+        gargs: *[types.GenericVal],
+    ) -> ?u32 {
+        let h = hash_generic_inst_key(base_key, gargs);
+        let entries = self.aux.generic_insts.as_slice();
+        let nexts = self.aux.generic_inst_next.as_slice();
+        let all_gvals = self.aux.gvals.as_slice();
+        var cur = self.aux.generic_inst_head.get(h) orelse {
+            return null;
+        };
+        while cur != CFG_NONE {
+            let idx = cur.widen.[usize]();
+            if idx >= entries.len {
+                break;
+            }
+            let e = entries[idx];
+            if fn_key_eq(e.base_key, base_key) {
+                let eg = slice_id_range.[types.GenericVal](all_gvals, e.gargs);
+                if gvals_slice_eq(eg, gargs) {
+                    return e.inst_id;
+                }
+            }
+            if idx >= nexts.len {
+                break;
+            }
+            cur = nexts[idx];
+        }
+        return null;
+    }
+
+    pub fn register_generic_inst(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        base_key: CfgFnKey,
+        gargs: *[types.GenericVal],
+        inst_id: u32,
+    ) -> !OutOfMemory {
+        if let _ = self.find_generic_inst(base_key, gargs) {
+            return;
+        }
+        let h = hash_generic_inst_key(base_key, gargs);
+        let gargs_range = try self.add_gvals(alloc, gargs);
+        let prev = self.aux.generic_inst_head.get(h) orelse CFG_NONE;
+        let entry_idx = self.aux.generic_insts.len().trunc.[u32]();
+        try self.aux.generic_insts.push(
+            alloc,
+            GenericInstEntry.{
+                base_key: base_key,
+                gargs: gargs_range,
+                inst_id: inst_id,
+            },
+        );
+        try self.aux.generic_inst_next.push(alloc, prev);
+        try self.aux.generic_inst_head.insert(alloc, h, entry_idx);
+        return;
+    }
+
+    pub fn add_sched_systems(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        defs: *[u32],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.scheds.sched_systems.len().trunc.[u32]();
+        try self.scheds.sched_systems.push_slice(alloc, defs);
+        return ast.range_new(start, defs.len.trunc.[u32]());
+    }
+
+    pub fn add_sched_waves(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        waves: *[ScheduleWave],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.scheds.sched_waves.len().trunc.[u32]();
+        try self.scheds.sched_waves.push_slice(alloc, waves);
+        return ast.range_new(start, waves.len.trunc.[u32]());
+    }
+
+    pub fn add_dag_deps(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        deps: *[u32],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.scheds.dag_deps.len().trunc.[u32]();
+        try self.scheds.dag_deps.push_slice(alloc, deps);
+        return ast.range_new(start, deps.len.trunc.[u32]());
+    }
+
+    pub fn add_dag_nodes(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        nodes: *[ScheduleDagNode],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.scheds.dag_nodes.len().trunc.[u32]();
+        try self.scheds.dag_nodes.push_slice(alloc, nodes);
+        return ast.range_new(start, nodes.len.trunc.[u32]());
+    }
+
+    pub fn add_schedule(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        waves: ast.IdRange,
+        nodes: ast.IdRange,
+    ) -> u32 ! OutOfMemory {
+        let id = self.scheds.schedules.len().trunc.[u32]();
+        try self.scheds.schedules.push(
+            alloc,
+            ScheduleDag.{ id: id, waves: waves, nodes: nodes },
+        );
+        return id;
+    }
+
+    // =======================================================================
+    // Section 8: Accessor & Query Methods (cfg, borrow, effects, verify, eir)
+    // =======================================================================
+
+    pub fn fn_count(self: *Self) -> u32 {
+        return self.funcs.fns.len().trunc.[u32]();
+    }
+
+    pub fn block_count(self: *Self) -> u32 {
+        return self.funcs.blocks.len().trunc.[u32]();
+    }
+
+    pub fn schedule_count(self: *Self) -> u32 {
+        return self.scheds.schedules.len().trunc.[u32]();
+    }
+
+    pub fn dyn_impl_pair_count(self: *Self) -> u32 {
+        return self.aux.dyn_impl_pairs.len().trunc.[u32]();
+    }
+
+    pub fn generic_inst_count(self: *Self) -> u32 {
+        return self.aux.generic_insts.len().trunc.[u32]();
+    }
+
+    pub fn find_fn_by_key(self: *Self, key: CfgFnKey) -> ?u32 {
+        return self.funcs.by_key.get(fn_key_u64(key));
+    }
+
+    pub view fn get_fn(self: *Self, fn_id: u32) -> ?*CfgFunction {
+        return self.funcs.fns.get(fn_id.widen.[usize]());
+    }
+
+    pub view fn get_fn_mut(self: *mut Self, fn_id: u32) -> ?*mut CfgFunction {
+        return self.funcs.fns.get_mut(fn_id.widen.[usize]());
+    }
+
+    pub view fn fn_params(self: *Self, fn_id: u32) -> *[LocalId] {
+        let all = self.funcs.param_locals.as_slice();
+        if let f = self.get_fn(fn_id) {
+            return slice_id_range.[LocalId](all, f.params);
+        }
+        return empty_slice.[LocalId](all);
+    }
+
+    pub view fn fn_locals(self: *Self, fn_id: u32) -> *[CfgLocal] {
+        let all = self.funcs.locals.as_slice();
+        if let f = self.get_fn(fn_id) {
+            return slice_id_range.[CfgLocal](all, f.locals);
+        }
+        return empty_slice.[CfgLocal](all);
+    }
+
+    pub view fn fn_local(self: *Self, fn_id: u32, local_id: LocalId) -> ?*CfgLocal {
+        let f = self.get_fn(fn_id) orelse {
+            return null;
+        };
+        if local_id >= f.locals.len {
+            return null;
+        }
+        return self.funcs.locals.get((f.locals.start +% local_id).widen.[usize]());
+    }
+
+    pub view fn fn_blocks(self: *Self, fn_id: u32) -> *[CfgBlock] {
+        let all = self.funcs.blocks.as_slice();
+        if let f = self.get_fn(fn_id) {
+            return slice_id_range.[CfgBlock](all, f.blocks);
+        }
+        return empty_slice.[CfgBlock](all);
+    }
+
+    pub fn fn_block_global_id(self: *Self, fn_id: u32, bb: BlockId) -> u32 {
+        let f = self.get_fn(fn_id) orelse {
+            return CFG_NONE;
+        };
+        if bb >= f.blocks.len {
+            return CFG_NONE;
+        }
+        return f.blocks.start +% bb;
+    }
+
+    pub view fn fn_block(self: *Self, fn_id: u32, bb: BlockId) -> ?*CfgBlock {
+        let gid = self.fn_block_global_id(fn_id, bb);
+        if gid == CFG_NONE {
+            return null;
+        }
+        return self.funcs.blocks.get(gid.widen.[usize]());
+    }
+
+    pub view fn get_block(self: *Self, global_block_id: u32) -> ?*CfgBlock {
+        return self.funcs.blocks.get(global_block_id.widen.[usize]());
+    }
+
+    pub view fn get_block_mut(self: *mut Self, global_block_id: u32) -> ?*mut CfgBlock {
+        return self.funcs.blocks.get_mut(global_block_id.widen.[usize]());
+    }
+
+    pub view fn stmts_slice(self: *Self, r: ast.IdRange) -> *[CfgStmt] {
+        return slice_id_range.[CfgStmt](self.funcs.stmts.as_slice(), r);
+    }
+
+    pub view fn block_stmts(self: *Self, global_block_id: u32) -> *[CfgStmt] {
+        let all = self.funcs.stmts.as_slice();
+        if let b = self.get_block(global_block_id) {
+            return slice_id_range.[CfgStmt](all, b.stmts);
+        }
+        return empty_slice.[CfgStmt](all);
+    }
+
+    pub view fn fn_block_stmts(self: *Self, fn_id: u32, bb: BlockId) -> *[CfgStmt] {
+        let all = self.funcs.stmts.as_slice();
+        if let b = self.fn_block(fn_id, bb) {
+            return slice_id_range.[CfgStmt](all, b.stmts);
+        }
+        return empty_slice.[CfgStmt](all);
+    }
+
+    pub view fn get_place(self: *Self, place_id: u32) -> ?*CfgPlace {
+        return self.exprs.places.get(place_id.widen.[usize]());
+    }
+
+    pub view fn projs_slice(self: *Self, r: ast.IdRange) -> *[CfgProj] {
+        return slice_id_range.[CfgProj](self.exprs.projs.as_slice(), r);
+    }
+
+    pub view fn place_projs(self: *Self, place_id: u32) -> *[CfgProj] {
+        let all = self.exprs.projs.as_slice();
+        if let p = self.get_place(place_id) {
+            return slice_id_range.[CfgProj](all, p.projs);
+        }
+        return empty_slice.[CfgProj](all);
+    }
+
+    pub fn place_is_local_only(self: *Self, place_id: u32) -> bool {
+        if let p = self.get_place(place_id) {
+            return p.projs.len == 0_u32;
+        }
+        return false;
+    }
+
+    pub fn place_has_deref(self: *Self, place_id: u32) -> bool {
+        let ps = self.place_projs(place_id);
+        var i: usize = 0_usize;
+        while i < ps.len {
+            if ps[i].kind == .Deref {
+                return true;
+            }
+            i = i +% 1_usize;
+        }
+        return false;
+    }
+
+    pub view fn get_const(self: *Self, const_id: u32) -> ?*CfgConst {
+        return self.exprs.consts.get(const_id.widen.[usize]());
+    }
+
+    pub view fn get_operand(self: *Self, op_id: u32) -> ?*CfgOperand {
+        return self.exprs.operands.get(op_id.widen.[usize]());
+    }
+
+    pub view fn operands_slice(self: *Self, r: ast.IdRange) -> *[CfgOperand] {
+        return slice_id_range.[CfgOperand](self.exprs.operands.as_slice(), r);
+    }
+
+    pub view fn get_rvalue(self: *Self, rv_id: u32) -> ?*CfgRvalue {
+        return self.exprs.rvalues.get(rv_id.widen.[usize]());
+    }
+
+    pub view fn get_call(self: *Self, call_id: u32) -> ?*CfgCallData {
+        return self.exprs.calls.get(call_id.widen.[usize]());
+    }
+
+    pub view fn call_args(self: *Self, call_id: u32) -> *[CfgOperand] {
+        let all = self.exprs.args.as_slice();
+        if let c = self.get_call(call_id) {
+            return slice_id_range.[CfgOperand](all, c.args);
+        }
+        return empty_slice.[CfgOperand](all);
+    }
+
+    pub view fn call_arg_spans(self: *Self, call_id: u32) -> *[span.Span] {
+        let all = self.exprs.arg_spans.as_slice();
+        if let c = self.get_call(call_id) {
+            return slice_id_range.[span.Span](all, c.arg_spans);
+        }
+        return empty_slice.[span.Span](all);
+    }
+
+    pub view fn get_aggregate_kind(self: *Self, agg_id: u32) -> ?*AggregateKind {
+        return self.exprs.aggregates.get(agg_id.widen.[usize]());
+    }
+
+    pub view fn asm_inputs_slice(self: *Self, r: ast.IdRange) -> *[CfgAsmInput] {
+        return slice_id_range.[CfgAsmInput](self.exprs.asm_inputs.as_slice(), r);
+    }
+
+    pub view fn switch_targets_slice(self: *Self, r: ast.IdRange) -> *[SwitchTarget] {
+        return slice_id_range.[SwitchTarget](self.funcs.switch_targets.as_slice(), r);
+    }
+
+    pub view fn bytes_slice(self: *Self, r: ast.IdRange) -> *[u8] {
+        return slice_id_range.[u8](self.aux.str_bytes.as_slice(), r);
+    }
+
+    pub view fn syms_slice(self: *Self, r: ast.IdRange) -> *[u32] {
+        return slice_id_range.[u32](self.aux.sym_list.as_slice(), r);
+    }
+
+    pub view fn expr_ids_slice(self: *Self, r: ast.IdRange) -> *[u32] {
+        return slice_id_range.[u32](self.aux.expr_ids.as_slice(), r);
+    }
+
+    pub view fn gvals_slice(self: *Self, r: ast.IdRange) -> *[types.GenericVal] {
+        return slice_id_range.[types.GenericVal](self.aux.gvals.as_slice(), r);
+    }
+
+    pub view fn fn_unsupported(self: *Self, fn_id: u32) -> *[UnsupportedItem] {
+        let all = self.funcs.unsupported.as_slice();
+        if let f = self.get_fn(fn_id) {
+            return slice_id_range.[UnsupportedItem](all, f.unsupported);
+        }
+        return empty_slice.[UnsupportedItem](all);
+    }
+
+    pub view fn fn_where_clauses(self: *Self, fn_id: u32) -> *[u32] {
+        let all = self.aux.expr_ids.as_slice();
+        if let f = self.get_fn(fn_id) {
+            return slice_id_range.[u32](all, f.where_clauses);
+        }
+        return empty_slice.[u32](all);
+    }
+
+    pub view fn fn_ensures_clauses(self: *Self, fn_id: u32) -> *[u32] {
+        let all = self.aux.expr_ids.as_slice();
+        if let f = self.get_fn(fn_id) {
+            return slice_id_range.[u32](all, f.ensures_clauses);
+        }
+        return empty_slice.[u32](all);
+    }
+
+    pub view fn fn_loop_invariants(self: *Self, fn_id: u32) -> *[LoopInvariantEntry] {
+        let all = self.aux.loop_invariants.as_slice();
+        if let f = self.get_fn(fn_id) {
+            return slice_id_range.[LoopInvariantEntry](all, f.loop_invariants);
+        }
+        return empty_slice.[LoopInvariantEntry](all);
+    }
+
+    pub view fn fn_block_invariants(self: *Self, fn_id: u32, bb: BlockId) -> *[u32] {
+        let all = self.aux.expr_ids.as_slice();
+        let invs = self.fn_loop_invariants(fn_id);
+        var i: usize = 0_usize;
+        while i < invs.len {
+            if invs[i].block_id == bb {
+                return slice_id_range.[u32](all, invs[i].exprs);
+            }
+            i = i +% 1_usize;
+        }
+        return empty_slice.[u32](all);
+    }
+
+    pub view fn fn_par_for_regions(self: *Self, fn_id: u32) -> *[ParForRegion] {
+        let all = self.funcs.par_for_regions.as_slice();
+        if let f = self.get_fn(fn_id) {
+            return slice_id_range.[ParForRegion](all, f.par_for_regions);
+        }
+        return empty_slice.[ParForRegion](all);
+    }
+
+    pub view fn fn_base_generic_args(self: *Self, fn_id: u32) -> *[types.GenericVal] {
+        let all = self.aux.gvals.as_slice();
+        if let f = self.get_fn(fn_id) {
+            if f.has_base_generic {
+                return slice_id_range.[types.GenericVal](all, f.base_generic_args);
+            }
+        }
+        return empty_slice.[types.GenericVal](all);
+    }
+
+    pub view fn dyn_impl_pairs_slice(self: *Self) -> *[DynImplPair] {
+        return self.aux.dyn_impl_pairs.as_slice();
+    }
+
+    pub view fn generic_insts_slice(self: *Self) -> *[GenericInstEntry] {
+        return self.aux.generic_insts.as_slice();
+    }
+
+    pub view fn get_schedule(self: *Self, sched_id: u32) -> ?*ScheduleDag {
+        return self.scheds.schedules.get(sched_id.widen.[usize]());
+    }
+
+    pub view fn schedule_waves(self: *Self, sched_id: u32) -> *[ScheduleWave] {
+        let all = self.scheds.sched_waves.as_slice();
+        if let s = self.get_schedule(sched_id) {
+            return slice_id_range.[ScheduleWave](all, s.waves);
+        }
+        return empty_slice.[ScheduleWave](all);
+    }
+
+    pub view fn wave_systems(self: *Self, r: ast.IdRange) -> *[u32] {
+        return slice_id_range.[u32](self.scheds.sched_systems.as_slice(), r);
+    }
+
+    pub view fn schedule_nodes(self: *Self, sched_id: u32) -> *[ScheduleDagNode] {
+        let all = self.scheds.dag_nodes.as_slice();
+        if let s = self.get_schedule(sched_id) {
+            return slice_id_range.[ScheduleDagNode](all, s.nodes);
+        }
+        return empty_slice.[ScheduleDagNode](all);
+    }
+
+    pub view fn dag_node_deps(self: *Self, r: ast.IdRange) -> *[u32] {
+        return slice_id_range.[u32](self.scheds.dag_deps.as_slice(), r);
+    }
+
+    // --- Typed & CFG Control-Flow Helpers ---
+
+    /// Returns the resolved `TyId` of `op` in function `fn_id`, matching `CfgOperand::ty`.
+    pub fn operand_ty(
+        self: *Self,
+        fn_id: u32,
+        op: CfgOperand,
+        env: *types.TypeEnv,
+    ) -> types.TyId {
+        _ = fn_id;
+        match op.kind {
+            .Copy => {
+                if let p = self.get_place(op.id) {
+                    return p.ty;
+                }
+                return types.TY_ERROR;
+            }
+            .Move => {
+                if let p = self.get_place(op.id) {
+                    return p.ty;
+                }
+                return types.TY_ERROR;
+            }
+            .Const => {
+                if let c = self.get_const(op.id) {
+                    return const_ty(c, env);
+                }
+                return types.TY_ERROR;
+            }
+        }
+    }
+
+    /// Zero-allocation count of outgoing successor blocks of a terminator.
+    pub fn term_successor_count(self: *Self, term: *CfgTerm) -> usize {
+        _ = self;
+        match term.kind {
+            .Goto => { return 1_usize; }
+            .Branch => { return 2_usize; }
+            .SwitchInt => { return term.targets.len.widen.[usize]() +% 1_usize; }
+            .Return => { return 0_usize; }
+            .Unreachable => { return 0_usize; }
+        }
+    }
+
+    /// Zero-allocation indexed outgoing successor block of a terminator (`0..term_successor_count`).
+    pub fn term_successor_at(self: *Self, term: *CfgTerm, idx: usize) -> BlockId {
+        match term.kind {
+            .Goto => { return term.bb0; }
+            .Branch => {
+                if idx == 0_usize {
+                    return term.bb0;
+                }
+                return term.bb1;
+            }
+            .SwitchInt => {
+                let ts = self.switch_targets_slice(term.targets);
+                if idx < ts.len {
+                    return ts[idx].target;
+                }
+                return term.bb0;
+            }
+            .Return => { return CFG_NONE; }
+            .Unreachable => { return CFG_NONE; }
+        }
+    }
+
+    pub fn block_successor_count(self: *Self, fn_id: u32, bb: BlockId) -> usize {
+        if let b = self.fn_block(fn_id, bb) {
+            return self.term_successor_count(&b.term);
+        }
+        return 0_usize;
+    }
+
+    pub fn block_successor_at(self: *Self, fn_id: u32, bb: BlockId, idx: usize) -> BlockId {
+        if let b = self.fn_block(fn_id, bb) {
+            return self.term_successor_at(&b.term, idx);
+        }
+        return CFG_NONE;
+    }
+
+    /// Appends all outgoing `BlockId` successors of `global_block_id` into `out`
+    /// in exact `compiler/src/cfg.rs::CfgBlock::successors` order.
+    pub fn block_successors(
+        self: *Self,
+        alloc: *mut AllocCap,
+        global_block_id: u32,
+        out: *mut col.DynBuf[BlockId],
+    ) -> !OutOfMemory {
+        let b = self.get_block(global_block_id) orelse {
+            return;
+        };
+        let n = self.term_successor_count(&b.term);
+        var i: usize = 0_usize;
+        while i < n {
+            try out.push(alloc, self.term_successor_at(&b.term, i));
+            i = i +% 1_usize;
+        }
+        return;
+    }
+
+    /// Appends all outgoing `BlockId` successors of `(fn_id, bb)` into `out`.
+    pub fn fn_block_successors(
+        self: *Self,
+        alloc: *mut AllocCap,
+        fn_id: u32,
+        bb: BlockId,
+        out: *mut col.DynBuf[BlockId],
+    ) -> !OutOfMemory {
+        let gid = self.fn_block_global_id(fn_id, bb);
+        if gid == CFG_NONE {
+            return;
+        }
+        try self.block_successors(alloc, gid, out);
+        return;
+    }
+
+    /// Canonical CFG dump matching `compiler/src/lib.rs::dump_cfg_canonical` byte-for-byte.
+    pub fn dump_cfg_canonical(
+        self: *Self,
+        alloc: *mut AllocCap,
+        env: *types.TypeEnv,
+        prog: *resolve.ResolvedProgram,
+        interner: *span.SymInterner,
+        out: *mut str.StrBuf,
+    ) -> !OutOfMemory {
+        _ = prog;
+        try dump_cfg_program_canonical(self, alloc, env, interner, out);
+        return;
+    }
+}
+
+// ===========================================================================
+// Section 9: Canonical CFG Dumper (`dump_cfg_canonical`)
+// ===========================================================================
+
+struct CfgDumpEntry {
+    key_off: u32;
+    key_len: u32;
+    body_off: u32;
+    body_len: u32;
+}
+
+fn cmp_bytes_lex(a: *[u8], b: *[u8]) -> i32 {
+    let min_len = if a.len < b.len { a.len } else { b.len };
+    var i: usize = 0_usize;
+    while i < min_len {
+        let ca = a[i];
+        let cb = b[i];
+        if ca < cb {
+            return -1_i32;
+        }
+        if ca > cb {
+            return 1_i32;
+        }
+        i = i +% 1_usize;
+    }
+    if a.len < b.len {
+        return -1_i32;
+    }
+    if a.len > b.len {
+        return 1_i32;
+    }
+    return 0_i32;
+}
+
+fn cmp_dump_entries(keys: *[u8], bodies: *[u8], a: CfgDumpEntry, b: CfgDumpEntry) -> i32 {
+    let ka = slice_id_range.[u8](keys, ast.range_new(a.key_off, a.key_len));
+    let kb = slice_id_range.[u8](keys, ast.range_new(b.key_off, b.key_len));
+    let ord = cmp_bytes_lex(ka, kb);
+    if ord != 0_i32 {
+        return ord;
+    }
+    let ba = slice_id_range.[u8](bodies, ast.range_new(a.body_off, a.body_len));
+    let bb = slice_id_range.[u8](bodies, ast.range_new(b.body_off, b.body_len));
+    return cmp_bytes_lex(ba, bb);
+}
+
+fn sort_dump_entries(keys: *[u8], bodies: *[u8], entries: *mut [CfgDumpEntry]) {
+    let n = entries.len;
+    if n <= 1_usize {
+        return;
+    }
+    var gap: usize = 1_usize;
+    let third = n / 3_usize;
+    while gap < third {
+        gap = (gap *% 3_usize) +% 1_usize;
+    }
+    while gap > 0_usize {
+        var i = gap;
+        while i < n {
+            let cur = entries[i];
+            var j = i;
+            while j >= gap {
+                let prev = j - gap;
+                if cmp_dump_entries(keys, bodies, entries[prev], cur) <= 0_i32 {
+                    break;
+                }
+                entries[j] = entries[prev];
+                j = prev;
+            }
+            entries[j] = cur;
+            i = i +% 1_usize;
+        }
+        gap = gap / 3_usize;
+    }
+}
+
+fn format_gargs_short(
+    cfg: *CfgProgram,
+    fn_id: u32,
+    alloc: *mut AllocCap,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let args = cfg.fn_base_generic_args(fn_id);
+    if args.len == 0_usize {
+        return;
+    }
+    try out.push_byte_grow(alloc, b'[');
+    var i: usize = 0_usize;
+    while i < args.len {
+        if i > 0_usize {
+            try out.push_str_grow(alloc, ", ");
+        }
+        let gv = args[i];
+        match gv.kind {
+            .Ty => { try env.format_ty_short(alloc, gv.id, interner, out); }
+            .Int => { try types.push_int_val_grow(alloc, gv.int_val, out); }
+            .Variant => { try out.push_bytes_grow(alloc, interner.get(gv.id)); }
+        }
+        i = i +% 1_usize;
+    }
+    try out.push_byte_grow(alloc, b']');
+    return;
+}
+
+fn format_param_tys_short(
+    alloc: *mut AllocCap,
+    env: *types.TypeEnv,
+    params_range: ast.IdRange,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let ps = env.params_range(params_range);
+    var i: usize = 0_usize;
+    while i < ps.len {
+        if i > 0_usize {
+            try out.push_str_grow(alloc, ", ");
+        }
+        try env.format_ty_short(alloc, ps[i].ty, interner, out);
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+fn write_dump_term(
+    cfg: *CfgProgram,
+    alloc: *mut AllocCap,
+    term: *CfgTerm,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    match term.kind {
+        .Goto => {
+            try out.push_str_grow(alloc, "goto bb");
+            try out.push_u64_grow(alloc, term.bb0.widen.[u64]());
+            try out.push_byte_grow(alloc, b'\n');
+        }
+        .Branch => {
+            try out.push_str_grow(alloc, "branch bb");
+            try out.push_u64_grow(alloc, term.bb0.widen.[u64]());
+            try out.push_str_grow(alloc, " bb");
+            try out.push_u64_grow(alloc, term.bb1.widen.[u64]());
+            try out.push_byte_grow(alloc, b'\n');
+        }
+        .SwitchInt => {
+            try out.push_str_grow(alloc, "switch [");
+            let ts = cfg.switch_targets_slice(term.targets);
+            var i: usize = 0_usize;
+            while i < ts.len {
+                if i > 0_usize {
+                    try out.push_str_grow(alloc, ", ");
+                }
+                try types.push_int_val_grow(alloc, ts[i].val, out);
+                try out.push_str_grow(alloc, "->bb");
+                try out.push_u64_grow(alloc, ts[i].target.widen.[u64]());
+                i = i +% 1_usize;
+            }
+            try out.push_str_grow(alloc, "] else bb");
+            try out.push_u64_grow(alloc, term.bb0.widen.[u64]());
+            try out.push_byte_grow(alloc, b'\n');
+        }
+        .Return => {
+            if term.flag {
+                try out.push_str_grow(alloc, "return val\n");
+            } else {
+                try out.push_str_grow(alloc, "return void\n");
+            }
+        }
+        .Unreachable => {
+            if term.flag {
+                try out.push_str_grow(alloc, "unreachable(explicit)\n");
+            } else {
+                try out.push_str_grow(alloc, "unreachable\n");
+            }
+        }
+    }
+    return;
+}
+
+fn append_fn_dump_entry(
+    cfg: *CfgProgram,
+    fn_id: u32,
+    alloc: *mut AllocCap,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    gstr_buf: *mut str.StrBuf,
+    params_buf: *mut str.StrBuf,
+    ret_buf: *mut str.StrBuf,
+    keys_buf: *mut str.StrBuf,
+    bodies_buf: *mut str.StrBuf,
+    entries: *mut col.DynBuf[CfgDumpEntry],
+) -> !OutOfMemory {
+    let f = cfg.get_fn(fn_id) orelse {
+        return;
+    };
+    let name = interner.get(f.name);
+
+    gstr_buf.clear();
+    try format_gargs_short(cfg, fn_id, alloc, env, interner, gstr_buf);
+
+    params_buf.clear();
+    try format_param_tys_short(alloc, env, f.sig.params, interner, params_buf);
+
+    ret_buf.clear();
+    try env.format_ty_short(alloc, f.sig.ret, interner, ret_buf);
+
+    let body_off = bodies_buf.len().trunc.[u32]();
+    try bodies_buf.push_str_grow(alloc, "cfg ");
+    try write_fn_key_kind(alloc, f.key, f.is_sys, bodies_buf);
+    try bodies_buf.push_byte_grow(alloc, b' ');
+    try bodies_buf.push_bytes_grow(alloc, name);
+    try bodies_buf.push_bytes_grow(alloc, gstr_buf.as_bytes());
+    try bodies_buf.push_byte_grow(alloc, b'(');
+    try bodies_buf.push_bytes_grow(alloc, params_buf.as_bytes());
+    try bodies_buf.push_str_grow(alloc, ") -> ");
+    try bodies_buf.push_bytes_grow(alloc, ret_buf.as_bytes());
+    try bodies_buf.push_str_grow(alloc, " locals=");
+    try bodies_buf.push_u64_grow(alloc, f.locals.len.widen.[u64]());
+    try bodies_buf.push_str_grow(alloc, " blocks=");
+    try bodies_buf.push_u64_grow(alloc, f.blocks.len.widen.[u64]());
+    try bodies_buf.push_byte_grow(alloc, b'\n');
+
+    let blks = cfg.fn_blocks(fn_id);
+    var bi: usize = 0_usize;
+    while bi < blks.len {
+        let b = blks[bi];
+        try bodies_buf.push_str_grow(alloc, "  bb");
+        try bodies_buf.push_u64_grow(alloc, b.id.widen.[u64]());
+        try bodies_buf.push_str_grow(alloc, ": stmts=");
+        try bodies_buf.push_u64_grow(alloc, b.stmts.len.widen.[u64]());
+        try bodies_buf.push_str_grow(alloc, " term=");
+        try write_dump_term(cfg, alloc, &b.term, bodies_buf);
+        bi = bi +% 1_usize;
+    }
+    let body_len = bodies_buf.len().trunc.[u32]() -% body_off;
+
+    let key_off = keys_buf.len().trunc.[u32]();
+    try keys_buf.push_bytes_grow(alloc, name);
+    try keys_buf.push_byte_grow(alloc, 9_u8);
+    try write_fn_key_kind(alloc, f.key, f.is_sys, keys_buf);
+    try keys_buf.push_byte_grow(alloc, 9_u8);
+    try keys_buf.push_bytes_grow(alloc, gstr_buf.as_bytes());
+    try keys_buf.push_byte_grow(alloc, 9_u8);
+    try keys_buf.push_byte_grow(alloc, b'(');
+    try keys_buf.push_bytes_grow(alloc, params_buf.as_bytes());
+    try keys_buf.push_byte_grow(alloc, b')');
+    try keys_buf.push_byte_grow(alloc, 9_u8);
+    try keys_buf.push_bytes_grow(alloc, ret_buf.as_bytes());
+    try keys_buf.push_byte_grow(alloc, 9_u8);
+    try keys_buf.push_u64_grow(alloc, f.locals.len.widen.[u64]());
+    try keys_buf.push_byte_grow(alloc, 9_u8);
+    try keys_buf.push_u64_grow(alloc, f.blocks.len.widen.[u64]());
+    let key_len = keys_buf.len().trunc.[u32]() -% key_off;
+
+    try entries.push(
+        alloc,
+        CfgDumpEntry.{
+            key_off: key_off,
+            key_len: key_len,
+            body_off: body_off,
+            body_len: body_len,
+        },
+    );
+    return;
+}
+
+fn dump_cfg_program_canonical(
+    cfg: *CfgProgram,
+    alloc: *mut AllocCap,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    let n_fns = cfg.fn_count();
+    let cap_entries = if n_fns < 4_u32 { 4_usize } else { n_fns.widen.[usize]() };
+    var entries = try col.DynBuf.[CfgDumpEntry].init(alloc, cap_entries);
+    errdefer entries.destroy(alloc);
+    var keys_buf = try str.StrBuf.init(alloc, 256_usize);
+    errdefer keys_buf.destroy(alloc);
+    var bodies_buf = try str.StrBuf.init(alloc, 1024_usize);
+    errdefer bodies_buf.destroy(alloc);
+    var gstr_buf = try str.StrBuf.init(alloc, 64_usize);
+    errdefer gstr_buf.destroy(alloc);
+    var params_buf = try str.StrBuf.init(alloc, 128_usize);
+    errdefer params_buf.destroy(alloc);
+    var ret_buf = try str.StrBuf.init(alloc, 64_usize);
+    errdefer ret_buf.destroy(alloc);
+
+    var fi: u32 = 0_u32;
+    while fi < n_fns {
+        try append_fn_dump_entry(
+            cfg,
+            fi,
+            alloc,
+            env,
+            interner,
+            &mut gstr_buf,
+            &mut params_buf,
+            &mut ret_buf,
+            &mut keys_buf,
+            &mut bodies_buf,
+            &mut entries,
+        );
+        fi = fi +% 1_u32;
+    }
+
+    sort_dump_entries(keys_buf.as_bytes(), bodies_buf.as_bytes(), entries.as_mut_slice());
+    let sorted = entries.as_slice();
+    let all_bodies = bodies_buf.as_bytes();
+    var ei: usize = 0_usize;
+    while ei < sorted.len {
+        let e = sorted[ei];
+        let bslice = slice_id_range.[u8](all_bodies, ast.range_new(e.body_off, e.body_len));
+        try out.push_bytes_grow(alloc, bslice);
+        ei = ei +% 1_usize;
+    }
+
+    ret_buf.destroy(alloc);
+    params_buf.destroy(alloc);
+    gstr_buf.destroy(alloc);
+    bodies_buf.destroy(alloc);
+    keys_buf.destroy(alloc);
+    entries.destroy(alloc);
+    return;
+}
+
+// ===========================================================================
+// Section 10: Parallel CFG Bulk-Offset Fixup & Merge Helpers
+// ===========================================================================
+
+pub struct CfgPoolOffsets {
+    pub blocks: u32;
+    pub locals: u32;
+    pub param_locals: u32;
+    pub stmts: u32;
+    pub switch_targets: u32;
+    pub par_for_regions: u32;
+    pub unsupported: u32;
+    pub places: u32;
+    pub projs: u32;
+    pub operands: u32;
+    pub consts: u32;
+    pub rvalues: u32;
+    pub calls: u32;
+    pub args: u32;
+    pub arg_spans: u32;
+    pub aggregates: u32;
+    pub asm_inputs: u32;
+    pub str_bytes: u32;
+    pub sym_list: u32;
+    pub expr_ids: u32;
+    pub loop_invariants: u32;
+    pub env_params: u32;
+}
+
+pub fn cfg_pool_offsets_from(cfg: *CfgProgram, env_params_len: u32) -> CfgPoolOffsets {
+    return CfgPoolOffsets.{
+        blocks: cfg.funcs.blocks.len().trunc.[u32](),
+        locals: cfg.funcs.locals.len().trunc.[u32](),
+        param_locals: cfg.funcs.param_locals.len().trunc.[u32](),
+        stmts: cfg.funcs.stmts.len().trunc.[u32](),
+        switch_targets: cfg.funcs.switch_targets.len().trunc.[u32](),
+        par_for_regions: cfg.funcs.par_for_regions.len().trunc.[u32](),
+        unsupported: cfg.funcs.unsupported.len().trunc.[u32](),
+        places: cfg.exprs.places.len().trunc.[u32](),
+        projs: cfg.exprs.projs.len().trunc.[u32](),
+        operands: cfg.exprs.operands.len().trunc.[u32](),
+        consts: cfg.exprs.consts.len().trunc.[u32](),
+        rvalues: cfg.exprs.rvalues.len().trunc.[u32](),
+        calls: cfg.exprs.calls.len().trunc.[u32](),
+        args: cfg.exprs.args.len().trunc.[u32](),
+        arg_spans: cfg.exprs.arg_spans.len().trunc.[u32](),
+        aggregates: cfg.exprs.aggregates.len().trunc.[u32](),
+        asm_inputs: cfg.exprs.asm_inputs.len().trunc.[u32](),
+        str_bytes: cfg.aux.str_bytes.len().trunc.[u32](),
+        sym_list: cfg.aux.sym_list.len().trunc.[u32](),
+        expr_ids: cfg.aux.expr_ids.len().trunc.[u32](),
+        loop_invariants: cfg.aux.loop_invariants.len().trunc.[u32](),
+        env_params: env_params_len,
+    };
+}
+
+pub fn cfg_pool_offsets_advance(
+    cur: *mut CfgPoolOffsets,
+    wcfg: *CfgProgram,
+    w_new_env_params: u32,
+) {
+    cur.blocks = cur.blocks +% wcfg.funcs.blocks.len().trunc.[u32]();
+    cur.locals = cur.locals +% wcfg.funcs.locals.len().trunc.[u32]();
+    cur.param_locals = cur.param_locals +% wcfg.funcs.param_locals.len().trunc.[u32]();
+    cur.stmts = cur.stmts +% wcfg.funcs.stmts.len().trunc.[u32]();
+    cur.switch_targets = cur.switch_targets +% wcfg.funcs.switch_targets.len().trunc.[u32]();
+    cur.par_for_regions = cur.par_for_regions +% wcfg.funcs.par_for_regions.len().trunc.[u32]();
+    cur.unsupported = cur.unsupported +% wcfg.funcs.unsupported.len().trunc.[u32]();
+    cur.places = cur.places +% wcfg.exprs.places.len().trunc.[u32]();
+    cur.projs = cur.projs +% wcfg.exprs.projs.len().trunc.[u32]();
+    cur.operands = cur.operands +% wcfg.exprs.operands.len().trunc.[u32]();
+    cur.consts = cur.consts +% wcfg.exprs.consts.len().trunc.[u32]();
+    cur.rvalues = cur.rvalues +% wcfg.exprs.rvalues.len().trunc.[u32]();
+    cur.calls = cur.calls +% wcfg.exprs.calls.len().trunc.[u32]();
+    cur.args = cur.args +% wcfg.exprs.args.len().trunc.[u32]();
+    cur.arg_spans = cur.arg_spans +% wcfg.exprs.arg_spans.len().trunc.[u32]();
+    cur.aggregates = cur.aggregates +% wcfg.exprs.aggregates.len().trunc.[u32]();
+    cur.asm_inputs = cur.asm_inputs +% wcfg.exprs.asm_inputs.len().trunc.[u32]();
+    cur.str_bytes = cur.str_bytes +% wcfg.aux.str_bytes.len().trunc.[u32]();
+    cur.sym_list = cur.sym_list +% wcfg.aux.sym_list.len().trunc.[u32]();
+    cur.expr_ids = cur.expr_ids +% wcfg.aux.expr_ids.len().trunc.[u32]();
+    cur.loop_invariants = cur.loop_invariants +% wcfg.aux.loop_invariants.len().trunc.[u32]();
+    cur.env_params = cur.env_params +% w_new_env_params;
+}
+
+pub linear struct CfgWaveRemap {
+    pub ty_remap: col.DynBuf[types.TyId];
+    pub inst_remap: col.DynBuf[u32];
+    pub cl_cid_map: col.DynBuf[u32];
+    pub sched_map: col.DynBuf[u32];
+    pub tmp_gvals: col.DynBuf[types.GenericVal];
+}
+
+impl CfgWaveRemap {
+    pub fn init(alloc: *mut AllocCap) -> CfgWaveRemap ! OutOfMemory {
+        let ty_remap = try col.DynBuf.[types.TyId].init(alloc, 64_usize);
+        errdefer ty_remap.destroy(alloc);
+        let inst_remap = try col.DynBuf.[u32].init(alloc, 32_usize);
+        errdefer inst_remap.destroy(alloc);
+        let cl_cid_map = try col.DynBuf.[u32].init(alloc, 16_usize);
+        errdefer cl_cid_map.destroy(alloc);
+        let sched_map = try col.DynBuf.[u32].init(alloc, 4_usize);
+        errdefer sched_map.destroy(alloc);
+        let tmp_gvals = try col.DynBuf.[types.GenericVal].init(alloc, 8_usize);
+        return CfgWaveRemap.{
+            ty_remap: ty_remap,
+            inst_remap: inst_remap,
+            cl_cid_map: cl_cid_map,
+            sched_map: sched_map,
+            tmp_gvals: tmp_gvals,
+        };
+    }
+
+    pub fn destroy(self: CfgWaveRemap, alloc: *mut AllocCap) {
+        let CfgWaveRemap.{ ty_remap, inst_remap, cl_cid_map, sched_map, tmp_gvals } = self;
+        tmp_gvals.destroy(alloc);
+        sched_map.destroy(alloc);
+        cl_cid_map.destroy(alloc);
+        inst_remap.destroy(alloc);
+        ty_remap.destroy(alloc);
+    }
+
+    pub fn prepare(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        base_ty_count: u32,
+        w_ty_count: u32,
+        base_inst_count: u32,
+        w_inst_count: u32,
+        w_cl_count: u32,
+        w_sched_count: u32,
+    ) -> !OutOfMemory {
+        self.ty_remap.clear();
+        let wt = w_ty_count.widen.[usize]();
+        var ti: usize = 0_usize;
+        while ti < wt {
+            let tid = ti.trunc.[u32]();
+            try self.ty_remap.push(alloc, if tid < base_ty_count { tid } else { types.TY_NONE });
+            ti = ti +% 1_usize;
+        }
+        self.inst_remap.clear();
+        let wi = w_inst_count.widen.[usize]();
+        var ii: usize = 0_usize;
+        while ii < wi {
+            let iid = ii.trunc.[u32]();
+            try self.inst_remap.push(alloc, if iid < base_inst_count { iid } else { CFG_NONE });
+            ii = ii +% 1_usize;
+        }
+        self.cl_cid_map.clear();
+        var ci: u32 = 0_u32;
+        while ci < w_cl_count {
+            try self.cl_cid_map.push(alloc, ci);
+            ci = ci +% 1_u32;
+        }
+        self.sched_map.clear();
+        var si: u32 = 0_u32;
+        while si < w_sched_count {
+            try self.sched_map.push(alloc, si);
+            si = si +% 1_u32;
+        }
+        return;
+    }
+}
+
+pub fn copy_cfg_schedules_range(
+    alloc: *mut AllocCap,
+    src_cfg: *CfgProgram,
+    src_start: u32,
+    count: u32,
+    dst_cfg: *mut CfgProgram,
+) -> u32 ! OutOfMemory {
+    let dst_start = dst_cfg.schedule_count();
+    if count == 0_u32 {
+        return dst_start;
+    }
+    var tmp_waves = try col.DynBuf.[ScheduleWave].init(alloc, 8_usize);
+    errdefer tmp_waves.destroy(alloc);
+    var tmp_nodes = try col.DynBuf.[ScheduleDagNode].init(alloc, 8_usize);
+    errdefer tmp_nodes.destroy(alloc);
+    var i: u32 = 0_u32;
+    while i < count {
+        let sid = src_start +% i;
+        tmp_waves.clear();
+        let sws = src_cfg.schedule_waves(sid);
+        var wi: usize = 0_usize;
+        while wi < sws.len {
+            let sys_r = try dst_cfg.add_sched_systems(alloc, src_cfg.wave_systems(sws[wi].systems));
+            try tmp_waves.push(alloc, ScheduleWave.{ systems: sys_r });
+            wi = wi +% 1_usize;
+        }
+        let waves_r = try dst_cfg.add_sched_waves(alloc, tmp_waves.as_slice());
+
+        tmp_nodes.clear();
+        let sns = src_cfg.schedule_nodes(sid);
+        var ni: usize = 0_usize;
+        while ni < sns.len {
+            let dr = try dst_cfg.add_dag_deps(alloc, src_cfg.dag_node_deps(sns[ni].deps_range));
+            try tmp_nodes.push(alloc, ScheduleDagNode.{ fn_def_id: sns[ni].fn_def_id, deps_range: dr });
+            ni = ni +% 1_usize;
+        }
+        let nodes_r = try dst_cfg.add_dag_nodes(alloc, tmp_nodes.as_slice());
+        _ = try dst_cfg.add_schedule(alloc, waves_r, nodes_r);
+        i = i +% 1_u32;
+    }
+    tmp_nodes.destroy(alloc);
+    tmp_waves.destroy(alloc);
+    return dst_start;
+}
+
+pub fn register_worker_call_insts_range(
+    alloc: *mut AllocCap,
+    src_cfg: *CfgProgram,
+    call_start: u32,
+    call_count: u32,
+    base_ty_count: u32,
+    base_inst_count: u32,
+    worker_env: *types.TypeEnv,
+    main_env: *mut types.TypeEnv,
+    rm: *mut CfgWaveRemap,
+    dst_cfg: *mut CfgProgram,
+) -> !OutOfMemory {
+    if call_count == 0_u32 {
+        return;
+    }
+    let calls = src_cfg.exprs.calls.as_slice();
+    let cs = call_start.widen.[usize]();
+    let ce = cs +% call_count.widen.[usize]();
+    var ci = cs;
+    while ci < ce && ci < calls.len {
+        let callee = calls[ci].callee;
+        if callee.kind == .GenericInst && callee.a >= base_inst_count {
+            let idx = callee.a.widen.[usize]();
+            var already = false;
+            if let mp = rm.inst_remap.get(idx) {
+                already = mp.* != CFG_NONE;
+            }
+            if !already {
+                if let entry = src_cfg.aux.generic_insts.get(idx) {
+                    let bk = entry.base_key;
+                    let src_gs = src_cfg.gvals_slice(entry.gargs);
+                    rm.tmp_gvals.clear();
+                    var gi: usize = 0_usize;
+                    while gi < src_gs.len {
+                        var gv = src_gs[gi];
+                        if gv.kind == .Ty {
+                            gv.id = try main_env.remap_worker_ty_lazy(
+                                alloc, worker_env, base_ty_count, &mut rm.ty_remap, gv.id,
+                            );
+                        }
+                        try rm.tmp_gvals.push(alloc, gv);
+                        gi = gi +% 1_usize;
+                    }
+                    let mapped = if let existing = dst_cfg.find_generic_inst(bk, rm.tmp_gvals.as_slice()) {
+                        existing
+                    } else {
+                        let next_id = dst_cfg.generic_inst_count();
+                        try dst_cfg.register_generic_inst(alloc, bk, rm.tmp_gvals.as_slice(), next_id);
+                        next_id
+                    };
+                    let ir_mut = rm.inst_remap.as_mut_slice();
+                    if idx < ir_mut.len {
+                        ir_mut[idx] = mapped;
+                    }
+                }
+            }
+        }
+        ci = ci +% 1_usize;
+    }
+    return;
+}
+
+pub fn finalize_worker_ty_remap(
+    alloc: *mut AllocCap,
+    base_ty_count: u32,
+    worker_env: *types.TypeEnv,
+    main_env: *mut types.TypeEnv,
+    rm: *mut CfgWaveRemap,
+) -> !OutOfMemory {
+    let w_cnt = worker_env.ty_count();
+    var tid = base_ty_count;
+    while tid < w_cnt {
+        _ = try main_env.remap_worker_ty_lazy(
+            alloc, worker_env, base_ty_count, &mut rm.ty_remap, tid,
+        );
+        tid = tid +% 1_u32;
+    }
+    return;
+}
+
+@inline
+fn remap_ty_ro(ty_remap: *[types.TyId], base_ty_count: u32, ty: types.TyId) -> types.TyId {
+    if ty == types.TY_NONE || ty == types.TY_ERROR || ty < base_ty_count {
+        return ty;
+    }
+    let idx = ty.widen.[usize]();
+    if idx < ty_remap.len {
+        let m = ty_remap[idx];
+        if m != types.TY_NONE {
+            return m;
+        }
+    }
+    return ty;
+}
+
+@inline
+fn fixup_operand_inplace(op: CfgOperand, off_places: u32, off_consts: u32) -> CfgOperand {
+    if op.id == CFG_NONE {
+        return op;
+    }
+    match op.kind {
+        .Copy => { return op_copy(op.id +% off_places); }
+        .Move => { return op_move(op.id +% off_places); }
+        .Const => { return op_const(op.id +% off_consts); }
+    }
+}
+
+pub fn fixup_cfg_fn_inplace(
+    f: *mut CfgFunction,
+    off: *CfgPoolOffsets,
+    base_ty_count: u32,
+    base_env_params: u32,
+    ty_remap: *[types.TyId],
+    cl_cid_map: *[u32],
+) {
+    if f.key.kind == .Closure {
+        let ci = f.key.a.widen.[usize]();
+        if ci < cl_cid_map.len {
+            f.key.a = cl_cid_map[ci];
+        }
+    }
+    f.sig.ret = remap_ty_ro(ty_remap, base_ty_count, f.sig.ret);
+    if f.sig.params.len > 0_u32 && f.sig.params.start >= base_env_params {
+        f.sig.params.start = off.env_params +% (f.sig.params.start -% base_env_params);
+    }
+    if f.params.len > 0_u32 { f.params.start = f.params.start +% off.param_locals; }
+    if f.locals.len > 0_u32 { f.locals.start = f.locals.start +% off.locals; }
+    if f.blocks.len > 0_u32 { f.blocks.start = f.blocks.start +% off.blocks; }
+    if f.unsupported.len > 0_u32 { f.unsupported.start = f.unsupported.start +% off.unsupported; }
+    if f.where_clauses.len > 0_u32 { f.where_clauses.start = f.where_clauses.start +% off.expr_ids; }
+    if f.ensures_clauses.len > 0_u32 { f.ensures_clauses.start = f.ensures_clauses.start +% off.expr_ids; }
+    if f.loop_invariants.len > 0_u32 { f.loop_invariants.start = f.loop_invariants.start +% off.loop_invariants; }
+    if f.par_for_regions.len > 0_u32 { f.par_for_regions.start = f.par_for_regions.start +% off.par_for_regions; }
+}
+
+/// Thread-safe parallel in-place offset & ID fixup of one worker's `CfgProgram` pools,
+/// `out_fns`, `out_closures`, and worker-added `sigs.params` before bulk `push_slice` merge.
+pub fn fixup_worker_cfg_inplace(
+    wcfg: *mut CfgProgram,
+    w_env_params: *mut [types.ParamSig],
+    out_fns: *mut [CfgFunction],
+    out_closures: *mut [CfgFunction],
+    main_env: *types.TypeEnv,
+    off: *CfgPoolOffsets,
+    base_ty_count: u32,
+    base_env_params: u32,
+    base_inst_count: u32,
+    rm: *CfgWaveRemap,
+) {
+    let ty_remap = rm.ty_remap.as_slice();
+    let inst_remap = rm.inst_remap.as_slice();
+    let cl_cid_map = rm.cl_cid_map.as_slice();
+    let sched_map = rm.sched_map.as_slice();
+    let off_places = off.places;
+    let off_consts = off.consts;
+
+    // 1. Worker-added ParamSigs
+    let ep_start = base_env_params.widen.[usize]();
+    var epi = ep_start;
+    while epi < w_env_params.len {
+        w_env_params[epi].ty = remap_ty_ro(ty_remap, base_ty_count, w_env_params[epi].ty);
+        epi = epi +% 1_usize;
+    }
+
+    // 2. CfgFunctions (out_fns and out_closures)
+    var fi: usize = 0_usize;
+    while fi < out_fns.len {
+        fixup_cfg_fn_inplace(&mut out_fns[fi], off, base_ty_count, base_env_params, ty_remap, cl_cid_map);
+        fi = fi +% 1_usize;
+    }
+    var cli: usize = 0_usize;
+    while cli < out_closures.len {
+        fixup_cfg_fn_inplace(&mut out_closures[cli], off, base_ty_count, base_env_params, ty_remap, cl_cid_map);
+        cli = cli +% 1_usize;
+    }
+
+    // 3. Locals
+    let locs = wcfg.funcs.locals.as_mut_slice();
+    var li: usize = 0_usize;
+    while li < locs.len {
+        locs[li].ty = remap_ty_ro(ty_remap, base_ty_count, locs[li].ty);
+        li = li +% 1_usize;
+    }
+
+    // 4. Stmts
+    let stmts = wcfg.funcs.stmts.as_mut_slice();
+    var si: usize = 0_usize;
+    while si < stmts.len {
+        let k = stmts[si].kind;
+        if k == .Assign {
+            if stmts[si].dst_place_id != CFG_NONE {
+                stmts[si].dst_place_id = stmts[si].dst_place_id +% off_places;
+            }
+            stmts[si].payload_id = stmts[si].payload_id +% off.rvalues;
+        } else if k == .Call {
+            if stmts[si].dst_place_id != CFG_NONE {
+                stmts[si].dst_place_id = stmts[si].dst_place_id +% off_places;
+            }
+            stmts[si].payload_id = stmts[si].payload_id +% off.calls;
+        }
+        si = si +% 1_usize;
+    }
+
+    // 5. Blocks
+    let blks = wcfg.funcs.blocks.as_mut_slice();
+    var bi: usize = 0_usize;
+    while bi < blks.len {
+        if blks[bi].stmts.len > 0_u32 {
+            blks[bi].stmts.start = blks[bi].stmts.start +% off.stmts;
+        }
+        let tk = blks[bi].term.kind;
+        if tk == .Branch {
+            blks[bi].term.operand = fixup_operand_inplace(blks[bi].term.operand, off_places, off_consts);
+        } else if tk == .SwitchInt {
+            blks[bi].term.operand = fixup_operand_inplace(blks[bi].term.operand, off_places, off_consts);
+            if blks[bi].term.targets.len > 0_u32 {
+                blks[bi].term.targets.start = blks[bi].term.targets.start +% off.switch_targets;
+            }
+        } else if tk == .Return && blks[bi].term.flag {
+            blks[bi].term.operand = fixup_operand_inplace(blks[bi].term.operand, off_places, off_consts);
+        }
+        bi = bi +% 1_usize;
+    }
+
+    // 6. Unsupported
+    let uns = wcfg.funcs.unsupported.as_mut_slice();
+    var ui: usize = 0_usize;
+    while ui < uns.len {
+        if uns[ui].kind_bytes.len > 0_u32 {
+            uns[ui].kind_bytes.start = uns[ui].kind_bytes.start +% off.str_bytes;
+        }
+        ui = ui +% 1_usize;
+    }
+
+    // 7. Places
+    let places = wcfg.exprs.places.as_mut_slice();
+    var pi: usize = 0_usize;
+    while pi < places.len {
+        if places[pi].projs.len > 0_u32 {
+            places[pi].projs.start = places[pi].projs.start +% off.projs;
+        }
+        places[pi].ty = remap_ty_ro(ty_remap, base_ty_count, places[pi].ty);
+        pi = pi +% 1_usize;
+    }
+
+    // 8. Projs
+    let projs = wcfg.exprs.projs.as_mut_slice();
+    var pri: usize = 0_usize;
+    while pri < projs.len {
+        projs[pri].ty = remap_ty_ro(ty_remap, base_ty_count, projs[pri].ty);
+        if projs[pri].kind == .Index && projs[pri].operand_id != CFG_NONE {
+            projs[pri].operand_id = projs[pri].operand_id +% off.operands;
+        }
+        pri = pri +% 1_usize;
+    }
+
+    // 9. Operands
+    let ops = wcfg.exprs.operands.as_mut_slice();
+    var oi: usize = 0_usize;
+    while oi < ops.len {
+        ops[oi] = fixup_operand_inplace(ops[oi], off_places, off_consts);
+        oi = oi +% 1_usize;
+    }
+
+    // 10. Consts
+    let consts = wcfg.exprs.consts.as_mut_slice();
+    var cni: usize = 0_usize;
+    while cni < consts.len {
+        let mty = remap_ty_ro(ty_remap, base_ty_count, consts[cni].ty);
+        consts[cni].ty = mty;
+        let ck = consts[cni].kind;
+        if ck == .Float || ck == .Str || ck == .Bytes {
+            if consts[cni].bytes.len > 0_u32 {
+                consts[cni].bytes.start = consts[cni].bytes.start +% off.str_bytes;
+            }
+        } else if ck == .Int && sched_map.len > 0_usize {
+            let tn = main_env.get(mty);
+            if tn.kind == .Builtin && tn.builtin_kind == .Schedule {
+                let sidx = consts[cni].int_val.lo.trunc.[usize]();
+                if sidx < sched_map.len {
+                    consts[cni].int_val = types.int_val_from_u64(sched_map[sidx].widen.[u64]());
+                }
+            }
+        }
+        cni = cni +% 1_usize;
+    }
+
+    // 11. Rvalues
+    let rvs = wcfg.exprs.rvalues.as_mut_slice();
+    var rvi: usize = 0_usize;
+    while rvi < rvs.len {
+        if rvs[rvi].has_op0 {
+            rvs[rvi].op0 = fixup_operand_inplace(rvs[rvi].op0, off_places, off_consts);
+        }
+        if rvs[rvi].has_op1 {
+            rvs[rvi].op1 = fixup_operand_inplace(rvs[rvi].op1, off_places, off_consts);
+        }
+        if rvs[rvi].has_op2 {
+            rvs[rvi].op2 = fixup_operand_inplace(rvs[rvi].op2, off_places, off_consts);
+        }
+        let rk = rvs[rvi].kind;
+        if rk == .Borrow {
+            if rvs[rvi].place_id != CFG_NONE {
+                rvs[rvi].place_id = rvs[rvi].place_id +% off_places;
+            }
+        } else if rk == .Cast || rk == .FieldExtract || rk == .MakeDyn {
+            rvs[rvi].ty = remap_ty_ro(ty_remap, base_ty_count, rvs[rvi].ty);
+        } else if rk == .MakeClosure {
+            rvs[rvi].ty = remap_ty_ro(ty_remap, base_ty_count, rvs[rvi].ty);
+            let ci = rvs[rvi].aux_u32.widen.[usize]();
+            if ci < cl_cid_map.len {
+                rvs[rvi].aux_u32 = cl_cid_map[ci];
+            }
+        } else if rk == .Aggregate {
+            rvs[rvi].aux_u32 = rvs[rvi].aux_u32 +% off.aggregates;
+            if rvs[rvi].range.len > 0_u32 {
+                rvs[rvi].range.start = rvs[rvi].range.start +% off.operands;
+            }
+        } else if rk == .InlineAsm {
+            if rvs[rvi].bytes.len > 0_u32 {
+                rvs[rvi].bytes.start = rvs[rvi].bytes.start +% off.str_bytes;
+            }
+            if rvs[rvi].range.len > 0_u32 {
+                rvs[rvi].range.start = rvs[rvi].range.start +% off.asm_inputs;
+            }
+        }
+        rvi = rvi +% 1_usize;
+    }
+
+    // 12. Aggregates
+    let aggs = wcfg.exprs.aggregates.as_mut_slice();
+    var agi: usize = 0_usize;
+    while agi < aggs.len {
+        aggs[agi].elem_ty = remap_ty_ro(ty_remap, base_ty_count, aggs[agi].elem_ty);
+        if aggs[agi].tag == .AnonStruct && aggs[agi].field_syms.len > 0_u32 {
+            aggs[agi].field_syms.start = aggs[agi].field_syms.start +% off.sym_list;
+        }
+        agi = agi +% 1_usize;
+    }
+
+    // 13. AsmInputs
+    let asms = wcfg.exprs.asm_inputs.as_mut_slice();
+    var asi: usize = 0_usize;
+    while asi < asms.len {
+        if asms[asi].name.len > 0_u32 {
+            asms[asi].name.start = asms[asi].name.start +% off.str_bytes;
+        }
+        asms[asi].operand = fixup_operand_inplace(asms[asi].operand, off_places, off_consts);
+        asi = asi +% 1_usize;
+    }
+
+    // 14. Calls & Args
+    let calls = wcfg.exprs.calls.as_mut_slice();
+    var cai: usize = 0_usize;
+    while cai < calls.len {
+        let ck = calls[cai].callee.kind;
+        if ck == .GenericInst && calls[cai].callee.a >= base_inst_count {
+            let idx = calls[cai].callee.a.widen.[usize]();
+            if idx < inst_remap.len && inst_remap[idx] != CFG_NONE {
+                calls[cai].callee.a = inst_remap[idx];
+            }
+        } else if ck == .FnPtr {
+            calls[cai].callee.fn_ptr = fixup_operand_inplace(calls[cai].callee.fn_ptr, off_places, off_consts);
+        } else if ck == .Builtin {
+            calls[cai].callee.builtin.ty0 = remap_ty_ro(ty_remap, base_ty_count, calls[cai].callee.builtin.ty0);
+            calls[cai].callee.builtin.ty1 = remap_ty_ro(ty_remap, base_ty_count, calls[cai].callee.builtin.ty1);
+        }
+        if calls[cai].args.len > 0_u32 {
+            calls[cai].args.start = calls[cai].args.start +% off.args;
+        }
+        if calls[cai].arg_spans.len > 0_u32 {
+            calls[cai].arg_spans.start = calls[cai].arg_spans.start +% off.arg_spans;
+        }
+        if calls[cai].has_recv_place && calls[cai].recv_place_id != CFG_NONE {
+            calls[cai].recv_place_id = calls[cai].recv_place_id +% off_places;
+        }
+        cai = cai +% 1_usize;
+    }
+
+    let args = wcfg.exprs.args.as_mut_slice();
+    var ari: usize = 0_usize;
+    while ari < args.len {
+        args[ari] = fixup_operand_inplace(args[ari], off_places, off_consts);
+        ari = ari +% 1_usize;
+    }
+
+    // 15. LoopInvariants
+    let invs = wcfg.aux.loop_invariants.as_mut_slice();
+    var ivi: usize = 0_usize;
+    while ivi < invs.len {
+        if invs[ivi].exprs.len > 0_u32 {
+            invs[ivi].exprs.start = invs[ivi].exprs.start +% off.expr_ids;
+        }
+        ivi = ivi +% 1_usize;
+    }
+}
+
+pub fn reserve_for_bulk_append(
+    alloc: *mut AllocCap,
+    dst: *mut CfgProgram,
+    dst_env_params: *mut col.DynBuf[types.ParamSig],
+    totals: *CfgPoolOffsets,
+) -> !OutOfMemory {
+    try dst.funcs.blocks.reserve_exact(alloc, totals.blocks.widen.[usize]());
+    try dst.funcs.locals.reserve_exact(alloc, totals.locals.widen.[usize]());
+    try dst.funcs.param_locals.reserve_exact(alloc, totals.param_locals.widen.[usize]());
+    try dst.funcs.stmts.reserve_exact(alloc, totals.stmts.widen.[usize]());
+    try dst.funcs.switch_targets.reserve_exact(alloc, totals.switch_targets.widen.[usize]());
+    try dst.funcs.par_for_regions.reserve_exact(alloc, totals.par_for_regions.widen.[usize]());
+    try dst.funcs.unsupported.reserve_exact(alloc, totals.unsupported.widen.[usize]());
+
+    try dst.exprs.places.reserve_exact(alloc, totals.places.widen.[usize]());
+    try dst.exprs.projs.reserve_exact(alloc, totals.projs.widen.[usize]());
+    try dst.exprs.operands.reserve_exact(alloc, totals.operands.widen.[usize]());
+    try dst.exprs.consts.reserve_exact(alloc, totals.consts.widen.[usize]());
+    try dst.exprs.rvalues.reserve_exact(alloc, totals.rvalues.widen.[usize]());
+    try dst.exprs.calls.reserve_exact(alloc, totals.calls.widen.[usize]());
+    try dst.exprs.args.reserve_exact(alloc, totals.args.widen.[usize]());
+    try dst.exprs.arg_spans.reserve_exact(alloc, totals.arg_spans.widen.[usize]());
+    try dst.exprs.aggregates.reserve_exact(alloc, totals.aggregates.widen.[usize]());
+    try dst.exprs.asm_inputs.reserve_exact(alloc, totals.asm_inputs.widen.[usize]());
+
+    try dst.aux.str_bytes.reserve_exact(alloc, totals.str_bytes.widen.[usize]());
+    try dst.aux.sym_list.reserve_exact(alloc, totals.sym_list.widen.[usize]());
+    try dst.aux.expr_ids.reserve_exact(alloc, totals.expr_ids.widen.[usize]());
+    try dst.aux.loop_invariants.reserve_exact(alloc, totals.loop_invariants.widen.[usize]());
+    try dst_env_params.reserve_exact(alloc, totals.env_params.widen.[usize]());
+    return;
+}
+
+/// Bulk-appends all pre-fixed-up pools of one worker's `CfgProgram` into `dst_cfg`.
+pub fn bulk_append_worker_cfg_pools(
+    alloc: *mut AllocCap,
+    src: *CfgProgram,
+    src_env_params: *[types.ParamSig],
+    base_env_params: u32,
+    dst: *mut CfgProgram,
+    dst_env_params: *mut col.DynBuf[types.ParamSig],
+) -> !OutOfMemory {
+    try dst.funcs.blocks.push_slice(alloc, src.funcs.blocks.as_slice());
+    try dst.funcs.locals.push_slice(alloc, src.funcs.locals.as_slice());
+    try dst.funcs.param_locals.push_slice(alloc, src.funcs.param_locals.as_slice());
+    try dst.funcs.stmts.push_slice(alloc, src.funcs.stmts.as_slice());
+    try dst.funcs.switch_targets.push_slice(alloc, src.funcs.switch_targets.as_slice());
+    try dst.funcs.par_for_regions.push_slice(alloc, src.funcs.par_for_regions.as_slice());
+    try dst.funcs.unsupported.push_slice(alloc, src.funcs.unsupported.as_slice());
+
+    try dst.exprs.places.push_slice(alloc, src.exprs.places.as_slice());
+    try dst.exprs.projs.push_slice(alloc, src.exprs.projs.as_slice());
+    try dst.exprs.operands.push_slice(alloc, src.exprs.operands.as_slice());
+    try dst.exprs.consts.push_slice(alloc, src.exprs.consts.as_slice());
+    try dst.exprs.rvalues.push_slice(alloc, src.exprs.rvalues.as_slice());
+    try dst.exprs.calls.push_slice(alloc, src.exprs.calls.as_slice());
+    try dst.exprs.args.push_slice(alloc, src.exprs.args.as_slice());
+    try dst.exprs.arg_spans.push_slice(alloc, src.exprs.arg_spans.as_slice());
+    try dst.exprs.aggregates.push_slice(alloc, src.exprs.aggregates.as_slice());
+    try dst.exprs.asm_inputs.push_slice(alloc, src.exprs.asm_inputs.as_slice());
+
+    try dst.aux.str_bytes.push_slice(alloc, src.aux.str_bytes.as_slice());
+    try dst.aux.sym_list.push_slice(alloc, src.aux.sym_list.as_slice());
+    try dst.aux.expr_ids.push_slice(alloc, src.aux.expr_ids.as_slice());
+    try dst.aux.loop_invariants.push_slice(alloc, src.aux.loop_invariants.as_slice());
+
+    let ep_start = base_env_params.widen.[usize]();
+    if ep_start < src_env_params.len {
+        let tail = src_env_params.sub(ep_start, src_env_params.len) catch { return; };
+        try dst_env_params.push_slice(alloc, tail);
+    }
+    return;
+}

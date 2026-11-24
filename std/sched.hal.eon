@@ -1,0 +1,31 @@
+module std.sched @hal;
+
+import core.io;
+import core.sync;
+
+/// Spawn and execute `count` cooperative static-stack fibers of `stack_bytes` bytes each.
+pub fn run_fibers(io_cap: *IoCap, count: usize, stack_bytes: usize) -> usize ! IoError {
+    return try io_cap.run_fibers(count, stack_bytes);
+}
+
+/// Submit and complete a batch of `count` io_uring NOP operations.
+pub fn iouring_nop_batch(io_cap: *IoCap, count: usize) -> usize ! IoError {
+    return try io_cap.nop_roundtrip(count);
+}
+
+/// Emit an x86_64 `pause` hint inside spin-wait loops.
+pub fn cpu_pause() {
+    raw {
+        asm("pause");
+    }
+}
+
+/// Initialize a fixed-capacity Chase-Lev work-stealing deque.
+pub fn init_work_deque() -> sync.WorkDeque {
+    return sync.WorkDeque.init();
+}
+
+/// Initialize a fixed-capacity 32-entry `core.io.IoRing`.
+pub fn init_io_ring() -> io.IoRing {
+    return io.IoRing.init();
+}

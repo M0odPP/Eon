@@ -1,0 +1,51 @@
+module ok.ownership;
+
+pub struct Pair {
+    pub a: u32;
+    pub b: u32;
+}
+
+pub pool Particle {
+    pub pos: u32;
+    pub color: u32;
+}
+
+pub fn pass_disjoint(x: *mut u32, y: *mut u32) {
+    x.* = x.* +% 1_u32;
+    y.* = y.* +% 2_u32;
+}
+
+pub view fn pick_first(from a: *mut u32, _b: *u32) -> *mut u32 {
+    return a;
+}
+
+pub view fn get_a(self_pair: *Pair) -> *u32 {
+    return &self_pair.a;
+}
+
+impl Pair {
+    pub view fn first_mut(self: *mut Self) -> *mut u32 {
+        return &mut self.a;
+    }
+}
+
+pub fn update_cols(pos: *mut [u32], color: *[u32]) {
+    let _ = color.len;
+    let _ = pos.len;
+}
+
+pub fn exercise_borrows(p: *mut ArenaPool[Particle]) -> u32 {
+    var pair = Pair.{ a: 10_u32, b: 20_u32 };
+    pass_disjoint(&mut pair.a, &mut pair.b);
+
+    // NLL: mutable borrow expires immediately after its last use.
+    let first_ref = pair.first_mut();
+    first_ref.* = 99_u32;
+
+    let picked = pick_first(&mut pair.a, &pair.b);
+    picked.* = 100_u32;
+
+    let second_read = get_a(&pair);
+    update_cols(&mut p.pos, &p.color);
+    return second_read.*;
+}

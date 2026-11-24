@@ -1,0 +1,70 @@
+module check_ok.layouts;
+
+@layout(c)
+pub struct HeaderC {
+    pub tag: u8;
+    pub addr: u64;
+    pub flags: u8;
+}
+
+@packed
+pub struct PackedHdr {
+    pub magic: u8;
+    pub len: u64;
+}
+
+pub bitfield PageFlags : u64 {
+    present:  u1  @bits(0..1);
+    writable: u1  @bits(1..2);
+    frame:    u40 @bits(12..52);
+}
+
+pub linear struct FileHandle {
+    fd: i32;
+}
+
+pub struct BigBuf {
+    data: [32]u8;
+}
+
+pub struct Pair[T] {
+    pub first: T;
+    pub second: T;
+}
+
+pub iface Measurable {
+    fn measure(self: *Self) -> usize;
+}
+
+impl Measurable for BigBuf {
+    fn measure(self: *Self) -> usize {
+        return self.data.len;
+    }
+}
+
+fn consume_buf(b: BigBuf) -> usize {
+    return b.data.len;
+}
+
+fn peek_buf(b: *BigBuf) -> usize {
+    return b.measure();
+}
+
+pub fn exercise() -> usize {
+    let hdr = HeaderC.{ tag: 1_u8, addr: 0_u64, flags: 2_u8 };
+    let pkt = PackedHdr.{ magic: 0xAA_u8, len: 64_u64 };
+    // Value copy of misaligned field is allowed; only borrow is forbidden.
+    let pkt_len = pkt.len;
+    let p: Pair[u32] = Pair.{ first: 10_u32, second: 20_u32 };
+
+    let buf = BigBuf.{ data: [0_u8; 32] };
+    let n1 = peek_buf(&buf);
+    let n2 = consume_buf(buf);
+    let handle = FileHandle.{ fd: 3_i32 };
+    let FileHandle.{ fd: _ } = handle;
+
+    let sz = @size_of(PageFlags);
+    let al = @align_of(HeaderC);
+    let _ = hdr.addr +% pkt_len +% p.first.widen.[u64]();
+    return n1 +% n2 +% sz +% al;
+}

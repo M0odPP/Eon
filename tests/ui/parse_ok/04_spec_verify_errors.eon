@@ -1,0 +1,67 @@
+module example.verify_ok;
+
+pub error ParseError {
+    UnexpectedEof,
+    InvalidUtf8,
+    NumberOverflow,
+}
+
+pub fn sum(xs: *[u32]) -> u64 ! ArithError {
+    var acc: u64 = 0_u64;
+    var i: usize = 0_usize;
+    while i < xs.len where i <= xs.len {
+        acc = try acc +? xs[i].widen.[u64]();
+        i = i + 1_usize;
+    }
+    return acc;
+}
+
+pub fn copy_prefix(dst: *mut [u8], src: *[u8], n: usize)
+    where n <= dst.len && n <= src.len
+{
+    for i in 0_usize..n {
+        dst[i] = src[i];
+    }
+}
+
+pub fn clamp_u32(x: u32, hi: u32) -> u32
+    ensures return <= hi
+{
+    if x > hi { return hi; }
+    return x;
+}
+
+pub fn dot_product(a: *[f32], b: *[f32]) -> f32
+    where a.len == b.len
+{
+    var sum_v: f32 = 0.0_f32;
+    for i in 0_usize..a.len {
+        sum_v = sum_v + (a[i] * b[i]);
+    }
+    return sum_v;
+}
+
+pub fn safe_div(a: u32, b: u32) -> u32 ! ArithError {
+    if b == 0_u32 {
+        return .DivByZero;
+    }
+    return a / b;
+}
+
+pub fn sum_bytes(xs: *[u8]) -> u64 ! ArithError {
+    var acc: u64 = 0_u64;
+    for i in 0_usize..xs.len {
+        acc = try acc +? xs[i].widen.[u64]();
+    }
+    return acc;
+}
+
+pub fn handle_parse(input: *str) -> u32 ! AppError {
+    let val = parse_int(input) catch |err| match err {
+        .UnexpectedEof  => 0_u32,
+        .InvalidUtf8    => return .BadEncoding,
+        .NumberOverflow => u32.MAX,
+    };
+    let next = get_opt() orelse return .BadEncoding;
+    return val +% next;
+}

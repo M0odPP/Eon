@@ -1,0 +1,523 @@
+module core.str;
+
+/// Strict RFC 3629 UTF-8 validation (zero hidden bounds checks via relational verifier).
+pub fn validate_utf8(bytes: *[u8]) -> !Utf8Error {
+    var i: usize = 0_usize;
+    while i < bytes.len {
+        let b0 = bytes[i];
+        if b0 < 0x80_u8 {
+            i = i + 1_usize;
+            continue;
+        }
+        if b0 >= 0xC2_u8 && b0 <= 0xDF_u8 {
+            let next_i = i + 1_usize;
+            if next_i >= bytes.len {
+                return .UnexpectedEof;
+            }
+            let b1 = bytes[next_i];
+            if (b1 & 0xC0_u8) != 0x80_u8 {
+                return .InvalidUtf8;
+            }
+            i = next_i + 1_usize;
+            continue;
+        }
+        if b0 >= 0xE0_u8 && b0 <= 0xEF_u8 {
+            let i1 = i + 1_usize;
+            if i1 >= bytes.len {
+                return .UnexpectedEof;
+            }
+            let i2 = i1 + 1_usize;
+            if i2 >= bytes.len {
+                return .UnexpectedEof;
+            }
+            let b1 = bytes[i1];
+            let b2 = bytes[i2];
+            if (b1 & 0xC0_u8) != 0x80_u8 || (b2 & 0xC0_u8) != 0x80_u8 {
+                return .InvalidUtf8;
+            }
+            // Reject overlong 3-byte sequences (E0 80..9F) and UTF-16 surrogates (ED A0..BF).
+            if (b0 == 0xE0_u8 && b1 < 0xA0_u8) || (b0 == 0xED_u8 && b1 >= 0xA0_u8) {
+                return .InvalidUtf8;
+            }
+            i = i2 + 1_usize;
+            continue;
+        }
+        if b0 >= 0xF0_u8 && b0 <= 0xF4_u8 {
+            let i1 = i + 1_usize;
+            if i1 >= bytes.len {
+                return .UnexpectedEof;
+            }
+            let i2 = i1 + 1_usize;
+            if i2 >= bytes.len {
+                return .UnexpectedEof;
+            }
+            let i3 = i2 + 1_usize;
+            if i3 >= bytes.len {
+                return .UnexpectedEof;
+            }
+            let b1 = bytes[i1];
+            let b2 = bytes[i2];
+            let b3 = bytes[i3];
+            if (b1 & 0xC0_u8) != 0x80_u8 || (b2 & 0xC0_u8) != 0x80_u8 || (b3 & 0xC0_u8) != 0x80_u8 {
+                return .InvalidUtf8;
+            }
+            if (b0 == 0xF0_u8 && b1 < 0x90_u8) || (b0 == 0xF4_u8 && b1 >= 0x90_u8) {
+                return .InvalidUtf8;
+            }
+            i = i3 + 1_usize;
+            continue;
+        }
+        return .InvalidUtf8;
+    }
+    return;
+}
+
+/// Decoded UTF-8 character result.
+pub struct Utf8Decode {
+    pub cp: u32;
+    pub len: usize;
+    pub valid: bool;
+}
+
+/// Strict RFC 3629 single UTF-8 scalar decoder starting at `pos`.
+/// Rejects overlongs, UTF-16 surrogates (`0xD800..=0xDFFF`), `> 0x10FFFF`, and truncated sequences.
+/// Returns `len = 1, valid = false` on invalid bytes at `pos < bytes.len` (or `len = 0, valid = false` at EOF).
+pub fn decode_utf8_char(bytes: *[u8], pos: usize) -> Utf8Decode {
+    if pos >= bytes.len {
+        return Utf8Decode.{ cp: 0_u32, len: 0_usize, valid: false };
+    }
+    let b0 = bytes[pos];
+    if b0 < 0x80_u8 {
+        return Utf8Decode.{ cp: b0.widen.[u32](), len: 1_usize, valid: true };
+    }
+    if b0 >= 0xC2_u8 && b0 <= 0xDF_u8 {
+        let i1 = pos + 1_usize;
+        if i1 >= bytes.len {
+            return Utf8Decode.{ cp: 0xFFFD_u32, len: 1_usize, valid: false };
+        }
+        let b1 = bytes[i1];
+        if (b1 & 0xC0_u8) != 0x80_u8 {
+            return Utf8Decode.{ cp: 0xFFFD_u32, len: 1_usize, valid: false };
+        }
+        let cp = (((b0 & 0x1F_u8).widen.[u32]()) <<% 6_u32)
+            | ((b1 & 0x3F_u8).widen.[u32]());
+        return Utf8Decode.{ cp: cp, len: 2_usize, valid: true };
+    }
+    if b0 >= 0xE0_u8 && b0 <= 0xEF_u8 {
+        let i1 = pos + 1_usize;
+        if i1 >= bytes.len {
+            return Utf8Decode.{ cp: 0xFFFD_u32, len: 1_usize, valid: false };
+        }
+        let i2 = i1 + 1_usize;
+        if i2 >= bytes.len {
+            return Utf8Decode.{ cp: 0xFFFD_u32, len: 1_usize, valid: false };
+        }
+        let b1 = bytes[i1];
+        let b2 = bytes[i2];
+        if (b1 & 0xC0_u8) != 0x80_u8 || (b2 & 0xC0_u8) != 0x80_u8 {
+            return Utf8Decode.{ cp: 0xFFFD_u32, len: 1_usize, valid: false };
+        }
+        if (b0 == 0xE0_u8 && b1 < 0xA0_u8) || (b0 == 0xED_u8 && b1 >= 0xA0_u8) {
+            return Utf8Decode.{ cp: 0xFFFD_u32, len: 1_usize, valid: false };
+        }
+        let cp = (((b0 & 0x0F_u8).widen.[u32]()) <<% 12_u32)
+            | (((b1 & 0x3F_u8).widen.[u32]()) <<% 6_u32)
+            | ((b2 & 0x3F_u8).widen.[u32]());
+        return Utf8Decode.{ cp: cp, len: 3_usize, valid: true };
+    }
+    if b0 >= 0xF0_u8 && b0 <= 0xF4_u8 {
+        let i1 = pos + 1_usize;
+        if i1 >= bytes.len {
+            return Utf8Decode.{ cp: 0xFFFD_u32, len: 1_usize, valid: false };
+        }
+        let i2 = i1 + 1_usize;
+        if i2 >= bytes.len {
+            return Utf8Decode.{ cp: 0xFFFD_u32, len: 1_usize, valid: false };
+        }
+        let i3 = i2 + 1_usize;
+        if i3 >= bytes.len {
+            return Utf8Decode.{ cp: 0xFFFD_u32, len: 1_usize, valid: false };
+        }
+        let b1 = bytes[i1];
+        let b2 = bytes[i2];
+        let b3 = bytes[i3];
+        if (b1 & 0xC0_u8) != 0x80_u8 || (b2 & 0xC0_u8) != 0x80_u8 || (b3 & 0xC0_u8) != 0x80_u8 {
+            return Utf8Decode.{ cp: 0xFFFD_u32, len: 1_usize, valid: false };
+        }
+        if (b0 == 0xF0_u8 && b1 < 0x90_u8) || (b0 == 0xF4_u8 && b1 >= 0x90_u8) {
+            return Utf8Decode.{ cp: 0xFFFD_u32, len: 1_usize, valid: false };
+        }
+        let cp = (((b0 & 0x07_u8).widen.[u32]()) <<% 18_u32)
+            | (((b1 & 0x3F_u8).widen.[u32]()) <<% 12_u32)
+            | (((b2 & 0x3F_u8).widen.[u32]()) <<% 6_u32)
+            | ((b3 & 0x3F_u8).widen.[u32]());
+        return Utf8Decode.{ cp: cp, len: 4_usize, valid: true };
+    }
+    return Utf8Decode.{ cp: 0xFFFD_u32, len: 1_usize, valid: false };
+}
+
+/// Counts UTF-8 Unicode scalar values in `bytes` (matching Rust `str::chars().count()` on valid UTF-8).
+pub fn count_utf8_chars(bytes: *[u8]) -> usize {
+    var count: usize = 0_usize;
+    var pos: usize = 0_usize;
+    while pos < bytes.len {
+        let d = decode_utf8_char(bytes, pos);
+        if d.len == 0_usize {
+            break;
+        }
+        count = count +% 1_usize;
+        pos = pos +% d.len;
+    }
+    return count;
+}
+
+/// Byte-wise slice equality (zero bounds checks).
+pub fn bytes_eq(a: *[u8], b: *[u8]) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0_usize;
+    while i < a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1_usize;
+    }
+    return true;
+}
+
+/// Returns `true` iff `haystack` starts with `prefix`.
+pub fn starts_with(haystack: *[u8], prefix: *[u8]) -> bool {
+    if prefix.len > haystack.len {
+        return false;
+    }
+    var i: usize = 0_usize;
+    while i < prefix.len {
+        if haystack[i] != prefix[i] {
+            return false;
+        }
+        i = i + 1_usize;
+    }
+    return true;
+}
+
+/// Returns `true` iff `haystack` ends with `suffix`.
+pub fn ends_with(haystack: *[u8], suffix: *[u8]) -> bool {
+    if suffix.len > haystack.len {
+        return false;
+    }
+    var hi = haystack.len - suffix.len;
+    var i: usize = 0_usize;
+    while i < suffix.len && hi < haystack.len {
+        if haystack[hi] != suffix[i] {
+            return false;
+        }
+        hi = hi + 1_usize;
+        i = i + 1_usize;
+    }
+    return i == suffix.len;
+}
+
+/// Checked decimal `u64` parser over ASCII byte slices.
+pub fn parse_u64(bytes: *[u8]) -> u64 ! ArithError {
+    if bytes.len == 0_usize {
+        return .Overflow;
+    }
+    var acc: u64 = 0_u64;
+    var i: usize = 0_usize;
+    while i < bytes.len {
+        let ch = bytes[i];
+        if ch < b'0' || ch > b'9' {
+            return .Overflow;
+        }
+        let digit = (ch - b'0').widen.[u64]();
+        let shifted = try (acc *? 10_u64);
+        acc = try (shifted +? digit);
+        i = i + 1_usize;
+    }
+    return acc;
+}
+
+/// Checked radix `u64` parser supporting radices 2, 8, 10, and 16 over pure ASCII digits.
+pub fn parse_u64_radix(bytes: *[u8], radix: u64) -> ?u64 {
+    if radix != 2_u64 && radix != 8_u64 && radix != 10_u64 && radix != 16_u64 {
+        return null;
+    }
+    if bytes.len == 0_usize {
+        return null;
+    }
+    var acc: u64 = 0_u64;
+    var i: usize = 0_usize;
+    while i < bytes.len {
+        let ch = bytes[i];
+        var digit: u64 = 0_u64;
+        if ch >= b'0' && ch <= b'9' {
+            digit = (ch - b'0').widen.[u64]();
+        } else if ch >= b'a' && ch <= b'f' {
+            digit = (ch - b'a').widen.[u64]() +% 10_u64;
+        } else if ch >= b'A' && ch <= b'F' {
+            digit = (ch - b'A').widen.[u64]() +% 10_u64;
+        } else {
+            return null;
+        }
+        if digit >= radix {
+            return null;
+        }
+        let shifted = (acc *? radix) catch {
+            return null;
+        };
+        acc = (shifted +? digit) catch {
+            return null;
+        };
+        i = i + 1_usize;
+    }
+    return acc;
+}
+
+/// Checked decimal `i64` parser supporting an optional leading `-` (including `i64.MIN`).
+pub fn parse_i64(bytes: *[u8]) -> ?i64 {
+    if bytes.len == 0_usize {
+        return null;
+    }
+    var neg = false;
+    var start: usize = 0_usize;
+    if bytes[0_usize] == b'-' {
+        neg = true;
+        start = 1_usize;
+        if bytes.len == 1_usize {
+            return null;
+        }
+    }
+    var acc: u64 = 0_u64;
+    var i = start;
+    while i < bytes.len {
+        let ch = bytes[i];
+        if ch < b'0' || ch > b'9' {
+            return null;
+        }
+        let digit = (ch - b'0').widen.[u64]();
+        let shifted = (acc *? 10_u64) catch {
+            return null;
+        };
+        acc = (shifted +? digit) catch {
+            return null;
+        };
+        i = i + 1_usize;
+    }
+    if neg {
+        if acc > 0x8000000000000000_u64 {
+            return null;
+        }
+        return (0_u64 -% acc).bitcast.[i64]();
+    }
+    if acc > 0x7FFFFFFFFFFFFFFF_u64 {
+        return null;
+    }
+    return acc.bitcast.[i64]();
+}
+
+/// Linear string builder backed by `Buf[u8]` (zero leaks via linear ownership).
+pub linear struct StrBuf {
+    buf: Buf[u8];
+}
+
+impl StrBuf {
+    pub fn init(alloc: *mut AllocCap, cap: usize) -> StrBuf ! OutOfMemory {
+        let buf = try Buf.[u8].init(alloc, cap);
+        return StrBuf.{ buf: buf };
+    }
+
+    pub fn len(self: *Self) -> usize {
+        return self.buf.len();
+    }
+
+    pub fn clear(self: *mut Self) {
+        self.buf.clear();
+    }
+
+    pub fn push_byte(self: *mut Self, b: u8) -> !OutOfMemory {
+        try self.buf.push(b);
+        return;
+    }
+
+    pub fn push_bytes(self: *mut Self, data: *[u8]) -> !OutOfMemory {
+        var i: usize = 0_usize;
+        while i < data.len {
+            try self.buf.push(data[i]);
+            i = i + 1_usize;
+        }
+        return;
+    }
+
+    pub fn push_str(self: *mut Self, s: *str) -> !OutOfMemory {
+        try self.push_bytes(s.as_bytes());
+        return;
+    }
+
+    pub fn push_u64(self: *mut Self, val: u64) -> !OutOfMemory {
+        if val == 0_u64 {
+            try self.buf.push(b'0');
+            return;
+        }
+        var digits: [24]u8 = [0_u8; 24];
+        var count: usize = 0_usize;
+        var cur = val;
+        while cur > 0_u64 && count < 24_usize {
+            let rem = (cur % 10_u64).trunc.[u8]();
+            digits[count] = rem +% b'0';
+            cur = cur / 10_u64;
+            count = count + 1_usize;
+        }
+        var idx = count;
+        while idx > 0_usize {
+            idx = idx - 1_usize;
+            if idx < 24_usize {
+                try self.buf.push(digits[idx]);
+            }
+        }
+        return;
+    }
+
+    pub fn reserve(self: *mut Self, alloc: *mut AllocCap, additional: usize) -> !OutOfMemory {
+        let cur_len = self.buf.len();
+        let cur_cap = self.buf.cap();
+        if cur_cap >= cur_len {
+            let avail = cur_cap - cur_len;
+            if additional <= avail {
+                return;
+            }
+        }
+        let need = (cur_len +? additional) catch {
+            return .OutOfMemory;
+        };
+        if need > 0x7FFFFFFF_usize {
+            return .OutOfMemory;
+        }
+        var new_cap: usize = if cur_cap < 16_usize { 16_usize } else { cur_cap };
+        while new_cap < need {
+            if new_cap >= 0x40000000_usize {
+                new_cap = need;
+                break;
+            }
+            new_cap = new_cap *% 2_usize;
+        }
+        var new_buf = try Buf.[u8].init(alloc, new_cap);
+        errdefer new_buf.destroy(alloc);
+        try new_buf.push_slice(self.buf.as_slice());
+        self.buf.destroy(alloc);
+        self.buf = new_buf;
+        return;
+    }
+
+    pub fn push_byte_grow(self: *mut Self, alloc: *mut AllocCap, b: u8) -> !OutOfMemory {
+        if self.buf.len() >= self.buf.cap() {
+            try self.reserve(alloc, 1_usize);
+        }
+        try self.buf.push(b);
+        return;
+    }
+
+    pub fn push_bytes_grow(self: *mut Self, alloc: *mut AllocCap, src: *[u8]) -> !OutOfMemory {
+        if src.len == 0_usize {
+            return;
+        }
+        try self.reserve(alloc, src.len);
+        try self.buf.push_slice(src);
+        return;
+    }
+
+    pub fn push_str_grow(self: *mut Self, alloc: *mut AllocCap, s: *str) -> !OutOfMemory {
+        try self.push_bytes_grow(alloc, s.as_bytes());
+        return;
+    }
+
+    pub fn push_u64_grow(self: *mut Self, alloc: *mut AllocCap, val: u64) -> !OutOfMemory {
+        if val == 0_u64 {
+            try self.push_byte_grow(alloc, b'0');
+            return;
+        }
+        var digits: [24]u8 = [0_u8; 24];
+        var count: usize = 0_usize;
+        var cur = val;
+        while cur > 0_u64 && count < 24_usize {
+            let rem = (cur % 10_u64).trunc.[u8]();
+            digits[count] = rem +% b'0';
+            cur = cur / 10_u64;
+            count = count + 1_usize;
+        }
+        try self.reserve(alloc, count);
+        var idx = count;
+        while idx > 0_usize {
+            idx = idx - 1_usize;
+            if idx < 24_usize {
+                try self.buf.push(digits[idx]);
+            }
+        }
+        return;
+    }
+
+    pub fn push_i64_grow(self: *mut Self, alloc: *mut AllocCap, val: i64) -> !OutOfMemory {
+        if val < 0_i64 {
+            try self.push_byte_grow(alloc, b'-');
+            let mag = 0_u64 -% val.bitcast.[u64]();
+            try self.push_u64_grow(alloc, mag);
+            return;
+        }
+        try self.push_u64_grow(alloc, val.bitcast.[u64]());
+        return;
+    }
+
+    pub fn push_u32_pad4_grow(self: *mut Self, alloc: *mut AllocCap, val: u32) -> !OutOfMemory {
+        if val < 10_u32 {
+            try self.push_str_grow(alloc, "000");
+        } else if val < 100_u32 {
+            try self.push_str_grow(alloc, "00");
+        } else if val < 1000_u32 {
+            try self.push_byte_grow(alloc, b'0');
+        }
+        try self.push_u64_grow(alloc, val.widen.[u64]());
+        return;
+    }
+
+    pub fn push_hex_u64_grow(self: *mut Self, alloc: *mut AllocCap, val: u64) -> !OutOfMemory {
+        if val == 0_u64 {
+            try self.push_byte_grow(alloc, b'0');
+            return;
+        }
+        var digits: [16]u8 = [0_u8; 16];
+        var count: usize = 0_usize;
+        var cur = val;
+        while cur > 0_u64 && count < 16_usize {
+            let nib = (cur & 15_u64).trunc.[u8]();
+            digits[count] = if nib < 10_u8 {
+                b'0' +% nib
+            } else {
+                b'a' +% (nib -% 10_u8)
+            };
+            cur = cur >> 4_u64;
+            count = count + 1_usize;
+        }
+        try self.reserve(alloc, count);
+        var idx = count;
+        while idx > 0_usize {
+            idx = idx - 1_usize;
+            if idx < 16_usize {
+                try self.buf.push(digits[idx]);
+            }
+        }
+        return;
+    }
+
+    pub view fn as_bytes(self: *Self) -> *[u8] {
+        return self.buf.as_slice();
+    }
+
+    pub view fn as_str(self: *Self) -> *str ! Utf8Error {
+        return try self.buf.as_slice().as_str();
+    }
+
+    pub fn destroy(self: StrBuf, alloc: *mut AllocCap) {
+        let StrBuf.{ buf } = self;
+        buf.destroy(alloc);
+    }
+}

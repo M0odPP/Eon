@@ -1,0 +1,8 @@
+module fail.read_discard;
+
+pub fn bad(_ignored: i32) -> i32 {
+    let _tmp: i32 = 42_i32;
+    let a = _ignored; //~ ERROR E0119
+    let b = _tmp; //~ ERROR E0119
+    return a +% b;
+}

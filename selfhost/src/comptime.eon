@@ -1,0 +1,4467 @@
+module eonc.ctvm;
+
+import core.col;
+import core.str;
+import eonc.span;
+import eonc.diag;
+import eonc.ast;
+import eonc.resolve;
+import eonc.types;
+
+// ===========================================================================
+// Section 1: Constants, Target Queries, CtVal Types, and Flat CtArena
+// ===========================================================================
+
+pub const DEFAULT_COMPTIME_FUEL: u64 = 10000000_u64;
+pub const CT_NONE: u32 = 4294967295_u32;
+
+const MAX_ARRAY_REPEAT: u32 = 1048576_u32;
+const MAX_CALL_DEPTH: u32 = 64_u32;
+
+pub const TARGET_ARCH_NAME: *str = "X86_64";
+pub const TARGET_OS_NAME: *str = "Linux";
+
+pub fn target_arch_sym(alloc: *mut AllocCap, interner: *mut span.SymInterner) -> u32 ! OutOfMemory {
+    return try interner.intern_str(alloc, TARGET_ARCH_NAME);
+}
+
+pub fn target_os_sym(alloc: *mut AllocCap, interner: *mut span.SymInterner) -> u32 ! OutOfMemory {
+    return try interner.intern_str(alloc, TARGET_OS_NAME);
+}
+
+pub enum CtValKind : u8 {
+    Void = 0,
+    Bool = 1,
+    Char = 2,
+    Int = 3,
+    Float = 4,
+    Str = 5,
+    EnumSym = 6,
+    Array = 7,
+    Tuple = 8,
+    Struct = 9,
+    TypeVal = 10,
+}
+
+pub struct CtValNode {
+    pub kind: CtValKind;
+    pub ty: types.TyId;
+    pub i_lo: u64;
+    pub i_hi: u64;
+    pub sym: u32;
+    pub range: ast.IdRange;
+}
+
+pub struct CtField {
+    pub name_sym: u32;
+    pub val_id: u32;
+}
+
+fn ct_val_void_node() -> CtValNode {
+    return CtValNode.{
+        kind: .Void,
+        ty: types.TY_VOID,
+        i_lo: 0_u64,
+        i_hi: 0_u64,
+        sym: span.SYM_EMPTY,
+        range: ast.range_empty(),
+    };
+}
+
+fn is_aggregate_kind(k: CtValKind) -> bool {
+    return k == .Array || k == .Tuple || k == .Struct;
+}
+
+view fn slice_range[T](all: *[T], r: ast.IdRange) -> *[T] {
+    let start = r.start.widen.[usize]();
+    let end = start +% r.len.widen.[usize]();
+    let s = all.sub(start, end) catch {
+        return all.sub(0_usize, 0_usize) catch {
+            return all;
+        };
+    };
+    return s;
+}
+
+pub linear struct CtArena {
+    pub vals: col.DynBuf[CtValNode];
+    pub elems: col.DynBuf[u32];
+    pub fields: col.DynBuf[CtField];
+    pub str_bytes: col.DynBuf[u8];
+    pub const_vals: col.HashMap[u32];
+}
+
+impl CtArena {
+    pub fn init(alloc: *mut AllocCap) -> CtArena ! OutOfMemory {
+        let vals = try col.DynBuf.[CtValNode].init(alloc, 64_usize);
+        errdefer vals.destroy(alloc);
+        let elems = try col.DynBuf.[u32].init(alloc, 64_usize);
+        errdefer elems.destroy(alloc);
+        let fields = try col.DynBuf.[CtField].init(alloc, 32_usize);
+        errdefer fields.destroy(alloc);
+        let str_bytes = try col.DynBuf.[u8].init(alloc, 128_usize);
+        errdefer str_bytes.destroy(alloc);
+        let const_vals = try col.HashMap.[u32].init(alloc, 32_usize);
+        errdefer const_vals.destroy(alloc);
+        return CtArena.{
+            vals: vals,
+            elems: elems,
+            fields: fields,
+            str_bytes: str_bytes,
+            const_vals: const_vals,
+        };
+    }
+
+    pub fn destroy(self: CtArena, alloc: *mut AllocCap) {
+        let CtArena.{ vals, elems, fields, str_bytes, const_vals } = self;
+        vals.destroy(alloc);
+        elems.destroy(alloc);
+        fields.destroy(alloc);
+        str_bytes.destroy(alloc);
+        const_vals.destroy(alloc);
+    }
+
+    pub fn clone_for_worker(self: *Self, alloc: *mut AllocCap) -> CtArena ! OutOfMemory {
+        var vals = try col.DynBuf.[CtValNode].init(alloc, self.vals.len() +% 16_usize);
+        errdefer vals.destroy(alloc);
+        try vals.push_slice(alloc, self.vals.as_slice());
+        var elems = try col.DynBuf.[u32].init(alloc, self.elems.len() +% 16_usize);
+        errdefer elems.destroy(alloc);
+        try elems.push_slice(alloc, self.elems.as_slice());
+        var fields = try col.DynBuf.[CtField].init(alloc, self.fields.len() +% 16_usize);
+        errdefer fields.destroy(alloc);
+        try fields.push_slice(alloc, self.fields.as_slice());
+        var str_bytes = try col.DynBuf.[u8].init(alloc, self.str_bytes.len() +% 64_usize);
+        errdefer str_bytes.destroy(alloc);
+        try str_bytes.push_slice(alloc, self.str_bytes.as_slice());
+        var const_vals = try col.HashMap.[u32].init(alloc, self.const_vals.cap());
+        errdefer const_vals.destroy(alloc);
+        try const_vals.copy_from(alloc, &self.const_vals);
+        return CtArena.{
+            vals: vals,
+            elems: elems,
+            fields: fields,
+            str_bytes: str_bytes,
+            const_vals: const_vals,
+        };
+    }
+
+    @recursive
+    pub fn import_worker_val_lazy(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        worker_ct: *CtArena,
+        base_ct_count: u32,
+        ct_remap: *mut col.DynBuf[u32],
+        worker_env: *types.TypeEnv,
+        main_env: *mut types.TypeEnv,
+        base_ty_count: u32,
+        ty_remap: *mut col.DynBuf[types.TyId],
+        worker_interner: *span.SymInterner,
+        main_interner: *mut span.SymInterner,
+        base_sym_count: u32,
+        val_id: u32,
+    ) -> u32 ! OutOfMemory {
+        if val_id == CT_NONE || val_id < base_ct_count {
+            return val_id;
+        }
+        let w_cnt = worker_ct.val_count().widen.[usize]();
+        let vu = val_id.widen.[usize]();
+        if vu >= w_cnt {
+            return val_id;
+        }
+        while ct_remap.len() < w_cnt {
+            let idx = ct_remap.len().trunc.[u32]();
+            try ct_remap.push(alloc, if idx < base_ct_count { idx } else { CT_NONE });
+        }
+        if let rp = ct_remap.get(vu) {
+            if rp.* != CT_NONE {
+                return rp.*;
+            }
+        }
+        var n = worker_ct.get_val(val_id);
+        n.ty = try main_env.remap_worker_ty_lazy(
+            alloc, worker_env, base_ty_count, ty_remap, n.ty,
+        );
+        if n.sym != span.SYM_EMPTY && n.sym >= base_sym_count {
+            n.sym = try main_interner.intern(alloc, worker_interner.get(n.sym));
+        }
+        match n.kind {
+            .Str => {
+                let s_start = self.str_bytes.len().trunc.[u32]();
+                let src_bs = slice_range.[u8](worker_ct.str_bytes.as_slice(), n.range);
+                try self.str_bytes.push_slice(alloc, src_bs);
+                n.range = ast.range_new(s_start, src_bs.len.trunc.[u32]());
+            }
+            .TypeVal => {
+                let tv_ty = n.i_lo.trunc.[types.TyId]();
+                let mapped_ty = try main_env.remap_worker_ty_lazy(
+                    alloc, worker_env, base_ty_count, ty_remap, tv_ty,
+                );
+                n.i_lo = mapped_ty.widen.[u64]();
+            }
+            .Array => {
+                let src_es = worker_ct.elems_slice(n.range);
+                var tmp = try col.DynBuf.[u32].init(alloc, src_es.len +% 1_usize);
+                errdefer tmp.destroy(alloc);
+                var i: usize = 0_usize;
+                while i < src_es.len {
+                    let me = try self.import_worker_val_lazy(
+                        alloc, worker_ct, base_ct_count, ct_remap,
+                        worker_env, main_env, base_ty_count, ty_remap,
+                        worker_interner, main_interner, base_sym_count, src_es[i],
+                    );
+                    try tmp.push(alloc, me);
+                    i = i +% 1_usize;
+                }
+                let e_start = self.elems.len().trunc.[u32]();
+                try self.elems.push_slice(alloc, tmp.as_slice());
+                n.range = ast.range_new(e_start, tmp.len().trunc.[u32]());
+                tmp.destroy(alloc);
+            }
+            .Tuple => {
+                let src_es = worker_ct.elems_slice(n.range);
+                var tmp = try col.DynBuf.[u32].init(alloc, src_es.len +% 1_usize);
+                errdefer tmp.destroy(alloc);
+                var i: usize = 0_usize;
+                while i < src_es.len {
+                    let me = try self.import_worker_val_lazy(
+                        alloc, worker_ct, base_ct_count, ct_remap,
+                        worker_env, main_env, base_ty_count, ty_remap,
+                        worker_interner, main_interner, base_sym_count, src_es[i],
+                    );
+                    try tmp.push(alloc, me);
+                    i = i +% 1_usize;
+                }
+                let e_start = self.elems.len().trunc.[u32]();
+                try self.elems.push_slice(alloc, tmp.as_slice());
+                n.range = ast.range_new(e_start, tmp.len().trunc.[u32]());
+                tmp.destroy(alloc);
+            }
+            .Struct => {
+                let src_fs = worker_ct.fields_slice(n.range);
+                var tmp = try col.DynBuf.[CtField].init(alloc, src_fs.len +% 1_usize);
+                errdefer tmp.destroy(alloc);
+                var i: usize = 0_usize;
+                while i < src_fs.len {
+                    var f = src_fs[i];
+                    if f.name_sym != span.SYM_EMPTY && f.name_sym >= base_sym_count {
+                        f.name_sym = try main_interner.intern(alloc, worker_interner.get(f.name_sym));
+                    }
+                    f.val_id = try self.import_worker_val_lazy(
+                        alloc, worker_ct, base_ct_count, ct_remap,
+                        worker_env, main_env, base_ty_count, ty_remap,
+                        worker_interner, main_interner, base_sym_count, f.val_id,
+                    );
+                    try tmp.push(alloc, f);
+                    i = i +% 1_usize;
+                }
+                let f_start = self.fields.len().trunc.[u32]();
+                try self.fields.push_slice(alloc, tmp.as_slice());
+                n.range = ast.range_new(f_start, tmp.len().trunc.[u32]());
+                tmp.destroy(alloc);
+            }
+            _ => {}
+        }
+        let nid = try self.push_val(alloc, n);
+        let rm = ct_remap.as_mut_slice();
+        if vu < rm.len {
+            rm[vu] = nid;
+        }
+        return nid;
+    }
+
+    pub fn val_count(self: *Self) -> u32 {
+        return self.vals.len().trunc.[u32]();
+    }
+
+    pub fn get_val(self: *Self, val_id: u32) -> CtValNode {
+        let idx = val_id.widen.[usize]();
+        let vs = self.vals.as_slice();
+        if idx < vs.len {
+            return vs[idx];
+        }
+        return ct_val_void_node();
+    }
+
+    pub view fn get_val_ref(self: *Self, val_id: u32) -> ?*CtValNode {
+        return self.vals.get(val_id.widen.[usize]());
+    }
+
+    pub view fn elems_slice(self: *Self, r: ast.IdRange) -> *[u32] {
+        return slice_range.[u32](self.elems.as_slice(), r);
+    }
+
+    pub fn get_elem(self: *Self, r: ast.IdRange, idx: usize) -> u32 {
+        let es = self.elems_slice(r);
+        if idx < es.len {
+            return es[idx];
+        }
+        return CT_NONE;
+    }
+
+    pub view fn fields_slice(self: *Self, r: ast.IdRange) -> *[CtField] {
+        return slice_range.[CtField](self.fields.as_slice(), r);
+    }
+
+    pub view fn str_slice(self: *Self, val_id: u32) -> *[u8] {
+        let n = self.get_val(val_id);
+        return slice_range.[u8](self.str_bytes.as_slice(), n.range);
+    }
+
+    pub fn get_str_byte(self: *Self, val_id: u32, idx: usize) -> u8 {
+        let bs = self.str_slice(val_id);
+        if idx < bs.len {
+            return bs[idx];
+        }
+        return 0_u8;
+    }
+
+    fn push_val(self: *mut Self, alloc: *mut AllocCap, node: CtValNode) -> u32 ! OutOfMemory {
+        let id = self.vals.len().trunc.[u32]();
+        try self.vals.push(alloc, node);
+        return id;
+    }
+
+    pub fn add_void(self: *mut Self, alloc: *mut AllocCap) -> u32 ! OutOfMemory {
+        return try self.push_val(alloc, ct_val_void_node());
+    }
+
+    pub fn add_bool(self: *mut Self, alloc: *mut AllocCap, b: bool) -> u32 ! OutOfMemory {
+        var n = ct_val_void_node();
+        n.kind = .Bool;
+        n.ty = types.TY_BOOL;
+        n.i_lo = if b { 1_u64 } else { 0_u64 };
+        return try self.push_val(alloc, n);
+    }
+
+    pub fn add_char(self: *mut Self, alloc: *mut AllocCap, cp: u32) -> u32 ! OutOfMemory {
+        var n = ct_val_void_node();
+        n.kind = .Char;
+        n.ty = types.TY_CHAR;
+        n.i_lo = cp.widen.[u64]();
+        return try self.push_val(alloc, n);
+    }
+
+    pub fn add_int(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        v: types.IntVal,
+        ty: types.TyId,
+    ) -> u32 ! OutOfMemory {
+        var n = ct_val_void_node();
+        n.kind = .Int;
+        n.ty = ty;
+        n.i_lo = v.lo;
+        n.i_hi = v.hi.bitcast.[u64]();
+        return try self.push_val(alloc, n);
+    }
+
+    pub fn add_float_bits(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        bits: u64,
+        ty: types.TyId,
+    ) -> u32 ! OutOfMemory {
+        var n = ct_val_void_node();
+        n.kind = .Float;
+        n.ty = ty;
+        n.i_lo = bits;
+        return try self.push_val(alloc, n);
+    }
+
+    pub fn add_float(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        f: f64,
+        ty: types.TyId,
+    ) -> u32 ! OutOfMemory {
+        return try self.add_float_bits(alloc, f.bitcast.[u64](), ty);
+    }
+
+    pub fn add_str(self: *mut Self, alloc: *mut AllocCap, bytes: *[u8]) -> u32 ! OutOfMemory {
+        let start = self.str_bytes.len().trunc.[u32]();
+        try self.str_bytes.push_slice(alloc, bytes);
+        var n = ct_val_void_node();
+        n.kind = .Str;
+        n.ty = types.TY_STR;
+        n.range = ast.range_new(start, bytes.len.trunc.[u32]());
+        return try self.push_val(alloc, n);
+    }
+
+    pub fn add_str_lit(self: *mut Self, alloc: *mut AllocCap, s: *str) -> u32 ! OutOfMemory {
+        return try self.add_str(alloc, s.as_bytes());
+    }
+
+    pub fn add_enum_sym(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        sym: u32,
+        v: types.IntVal,
+    ) -> u32 ! OutOfMemory {
+        var n = ct_val_void_node();
+        n.kind = .EnumSym;
+        n.ty = types.TY_VOID;
+        n.sym = sym;
+        n.i_lo = v.lo;
+        n.i_hi = v.hi.bitcast.[u64]();
+        return try self.push_val(alloc, n);
+    }
+
+    pub fn add_array(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        elem_ids: *[u32],
+        elem_ty: types.TyId,
+    ) -> u32 ! OutOfMemory {
+        let start = self.elems.len().trunc.[u32]();
+        try self.elems.push_slice(alloc, elem_ids);
+        var n = ct_val_void_node();
+        n.kind = .Array;
+        n.ty = elem_ty;
+        n.range = ast.range_new(start, elem_ids.len.trunc.[u32]());
+        return try self.push_val(alloc, n);
+    }
+
+    pub fn add_tuple(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        elem_ids: *[u32],
+    ) -> u32 ! OutOfMemory {
+        let start = self.elems.len().trunc.[u32]();
+        try self.elems.push_slice(alloc, elem_ids);
+        var n = ct_val_void_node();
+        n.kind = .Tuple;
+        n.ty = types.TY_VOID;
+        n.range = ast.range_new(start, elem_ids.len.trunc.[u32]());
+        return try self.push_val(alloc, n);
+    }
+
+    pub fn add_struct(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        ty: types.TyId,
+        flds: *[CtField],
+    ) -> u32 ! OutOfMemory {
+        let start = self.fields.len().trunc.[u32]();
+        try self.fields.push_slice(alloc, flds);
+        var n = ct_val_void_node();
+        n.kind = .Struct;
+        n.ty = ty;
+        n.range = ast.range_new(start, flds.len.trunc.[u32]());
+        return try self.push_val(alloc, n);
+    }
+
+    pub fn add_type_val(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        ty_val: types.TyId,
+    ) -> u32 ! OutOfMemory {
+        var n = ct_val_void_node();
+        n.kind = .TypeVal;
+        n.ty = types.TY_TYPE_TYPE;
+        n.i_lo = ty_val.widen.[u64]();
+        return try self.push_val(alloc, n);
+    }
+
+    pub fn as_i128(self: *Self, val_id: u32) -> ?types.IntVal {
+        let n = self.get_val(val_id);
+        match n.kind {
+            .Int => {
+                return types.IntVal.{ lo: n.i_lo, hi: n.i_hi.bitcast.[i64]() };
+            }
+            .EnumSym => {
+                return types.IntVal.{ lo: n.i_lo, hi: n.i_hi.bitcast.[i64]() };
+            }
+            .Char => {
+                return types.int_val_from_u64(n.i_lo);
+            }
+            .Bool => {
+                return types.int_val_from_u64(if n.i_lo != 0_u64 { 1_u64 } else { 0_u64 });
+            }
+            _ => {
+                return null;
+            }
+        }
+    }
+
+    pub fn as_bool(self: *Self, val_id: u32) -> ?bool {
+        let n = self.get_val(val_id);
+        if n.kind == .Bool {
+            return n.i_lo != 0_u64;
+        }
+        return null;
+    }
+
+    pub fn as_f64(self: *Self, val_id: u32) -> ?f64 {
+        let n = self.get_val(val_id);
+        if n.kind == .Float {
+            return n.i_lo.bitcast.[f64]();
+        }
+        return null;
+    }
+
+    pub fn get_struct_field(self: *Self, val_id: u32, name_sym: u32) -> ?u32 {
+        let n = self.get_val(val_id);
+        if n.kind != .Struct {
+            return null;
+        }
+        let fs = self.fields_slice(n.range);
+        var i: usize = fs.len;
+        while i > 0_usize {
+            i = i - 1_usize;
+            if fs[i].name_sym == name_sym {
+                return fs[i].val_id;
+            }
+        }
+        return null;
+    }
+
+    pub fn set_array_elem(self: *mut Self, val_id: u32, idx: usize, elem_val: u32) -> bool {
+        let n = self.get_val(val_id);
+        if n.kind != .Array {
+            return false;
+        }
+        if idx >= n.range.len.widen.[usize]() {
+            return false;
+        }
+        let pos = n.range.start.widen.[usize]() +% idx;
+        let es = self.elems.as_mut_slice();
+        if pos < es.len {
+            es[pos] = elem_val;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn set_struct_field(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        val_id: u32,
+        name_sym: u32,
+        field_val: u32,
+    ) -> bool ! OutOfMemory {
+        let n = self.get_val(val_id);
+        if n.kind != .Struct {
+            return false;
+        }
+        let start = n.range.start.widen.[usize]();
+        let flen = n.range.len.widen.[usize]();
+        let fs_mut = self.fields.as_mut_slice();
+        var i: usize = 0_usize;
+        while i < flen {
+            let pos = start +% i;
+            if pos < fs_mut.len && fs_mut[pos].name_sym == name_sym {
+                fs_mut[pos].val_id = field_val;
+                return true;
+            }
+            i = i +% 1_usize;
+        }
+        let new_start = self.fields.len().trunc.[u32]();
+        try self.fields.reserve(alloc, flen +% 1_usize);
+        var k: usize = 0_usize;
+        while k < flen {
+            let pos = start +% k;
+            var has_item = false;
+            var item = CtField.{ name_sym: span.SYM_EMPTY, val_id: CT_NONE };
+            let cur = self.fields.as_slice();
+            if pos < cur.len {
+                item = cur[pos];
+                has_item = true;
+            }
+            if has_item {
+                try self.fields.push(alloc, item);
+            }
+            k = k +% 1_usize;
+        }
+        try self.fields.push(alloc, CtField.{ name_sym: name_sym, val_id: field_val });
+        if let vref = self.vals.get_mut(val_id.widen.[usize]()) {
+            vref.range = ast.range_new(new_start, (flen +% 1_usize).trunc.[u32]());
+        }
+        return true;
+    }
+
+    @recursive
+    pub fn clone_val(self: *mut Self, alloc: *mut AllocCap, val_id: u32) -> u32 ! OutOfMemory {
+        let n = self.get_val(val_id);
+        if !is_aggregate_kind(n.kind) {
+            return val_id;
+        }
+        let start = n.range.start.widen.[usize]();
+        let cnt = n.range.len.widen.[usize]();
+        if n.kind == .Array || n.kind == .Tuple {
+            var tmp = try col.DynBuf.[u32].init(alloc, if cnt < 4_usize { 4_usize } else { cnt });
+            errdefer tmp.destroy(alloc);
+            var i: usize = 0_usize;
+            while i < cnt {
+                var eid: u32 = CT_NONE;
+                let pos = start +% i;
+                let es = self.elems.as_slice();
+                if pos < es.len {
+                    eid = es[pos];
+                }
+                if is_aggregate_kind(self.get_val(eid).kind) {
+                    eid = try self.clone_val(alloc, eid);
+                }
+                try tmp.push(alloc, eid);
+                i = i +% 1_usize;
+            }
+            let out_id = if n.kind == .Array {
+                try self.add_array(alloc, tmp.as_slice(), n.ty)
+            } else {
+                try self.add_tuple(alloc, tmp.as_slice())
+            };
+            tmp.destroy(alloc);
+            return out_id;
+        }
+        var ftmp = try col.DynBuf.[CtField].init(alloc, if cnt < 4_usize { 4_usize } else { cnt });
+        errdefer ftmp.destroy(alloc);
+        var j: usize = 0_usize;
+        while j < cnt {
+            var fname = span.SYM_EMPTY;
+            var fval: u32 = CT_NONE;
+            let pos = start +% j;
+            let fs = self.fields.as_slice();
+            if pos < fs.len {
+                fname = fs[pos].name_sym;
+                fval = fs[pos].val_id;
+            }
+            if is_aggregate_kind(self.get_val(fval).kind) {
+                fval = try self.clone_val(alloc, fval);
+            }
+            try ftmp.push(alloc, CtField.{ name_sym: fname, val_id: fval });
+            j = j +% 1_usize;
+        }
+        let st_id = try self.add_struct(alloc, n.ty, ftmp.as_slice());
+        ftmp.destroy(alloc);
+        return st_id;
+    }
+
+    pub fn set_const_val(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        def_id: u32,
+        val_id: u32,
+    ) -> !OutOfMemory {
+        try self.const_vals.insert(alloc, def_id.widen.[u64](), val_id);
+        return;
+    }
+
+    pub fn get_const_val(self: *Self, def_id: u32) -> ?u32 {
+        return self.const_vals.get(def_id.widen.[u64]());
+    }
+}
+
+// ===========================================================================
+// Section 2: Exact 128-bit Integer & IEEE-754 Float Helpers
+// ===========================================================================
+
+fn u128_as_int_val(u: types.U128Val) -> types.IntVal {
+    return types.IntVal.{ lo: u.lo, hi: u.hi.bitcast.[i64]() };
+}
+
+fn u64_mul_wide(a: u64, b: u64) -> types.U128Val {
+    let a0 = a & 0xFFFFFFFF_u64;
+    let a1 = a >> 32_u64;
+    let b0 = b & 0xFFFFFFFF_u64;
+    let b1 = b >> 32_u64;
+    let p00 = a0 *% b0;
+    let p01 = a0 *% b1;
+    let p10 = a1 *% b0;
+    let p11 = a1 *% b1;
+    let mid = (p00 >> 32_u64) +% (p01 & 0xFFFFFFFF_u64) +% (p10 & 0xFFFFFFFF_u64);
+    let lo = (p00 & 0xFFFFFFFF_u64) | (mid <<% 32_u64);
+    let hi = p11 +% (p01 >> 32_u64) +% (p10 >> 32_u64) +% (mid >> 32_u64);
+    return types.U128Val.{ lo: lo, hi: hi };
+}
+
+fn int_val_wrap_add(a: types.IntVal, b: types.IntVal) -> types.IntVal {
+    let lo = a.lo +% b.lo;
+    let carry: i64 = if lo < a.lo { 1_i64 } else { 0_i64 };
+    return types.IntVal.{ lo: lo, hi: a.hi +% b.hi +% carry };
+}
+
+fn int_val_wrap_sub(a: types.IntVal, b: types.IntVal) -> types.IntVal {
+    let lo = a.lo -% b.lo;
+    let borrow: i64 = if a.lo < b.lo { 1_i64 } else { 0_i64 };
+    return types.IntVal.{ lo: lo, hi: a.hi -% b.hi -% borrow };
+}
+
+fn int_val_wrap_mul(a: types.IntVal, b: types.IntVal) -> types.IntVal {
+    let p = u64_mul_wide(a.lo, b.lo);
+    let cross = (a.lo *% b.hi.bitcast.[u64]()) +% (a.hi.bitcast.[u64]() *% b.lo);
+    return types.IntVal.{ lo: p.lo, hi: (p.hi +% cross).bitcast.[i64]() };
+}
+
+fn int_val_sat_add(a: types.IntVal, b: types.IntVal) -> types.IntVal {
+    if let r = types.int_val_checked_add(a, b) {
+        return r;
+    }
+    return if a.hi < 0_i64 { types.int_val_min_i128() } else { types.int_val_max_i128() };
+}
+
+fn int_val_sat_sub(a: types.IntVal, b: types.IntVal) -> types.IntVal {
+    if let r = types.int_val_checked_sub(a, b) {
+        return r;
+    }
+    return if a.hi < 0_i64 { types.int_val_min_i128() } else { types.int_val_max_i128() };
+}
+
+fn int_val_sat_mul(a: types.IntVal, b: types.IntVal) -> types.IntVal {
+    if let r = types.int_val_checked_mul(a, b) {
+        return r;
+    }
+    let neg = (a.hi < 0_i64) != (b.hi < 0_i64);
+    return if neg { types.int_val_min_i128() } else { types.int_val_max_i128() };
+}
+
+fn int_val_bitnot(a: types.IntVal) -> types.IntVal {
+    return types.IntVal.{
+        lo: ~a.lo,
+        hi: (~(a.hi.bitcast.[u64]())).bitcast.[i64](),
+    };
+}
+
+fn int_val_bitand(a: types.IntVal, b: types.IntVal) -> types.IntVal {
+    return types.IntVal.{
+        lo: a.lo & b.lo,
+        hi: (a.hi.bitcast.[u64]() & b.hi.bitcast.[u64]()).bitcast.[i64](),
+    };
+}
+
+fn int_val_bitor(a: types.IntVal, b: types.IntVal) -> types.IntVal {
+    return types.IntVal.{
+        lo: a.lo | b.lo,
+        hi: (a.hi.bitcast.[u64]() | b.hi.bitcast.[u64]()).bitcast.[i64](),
+    };
+}
+
+fn int_val_bitxor(a: types.IntVal, b: types.IntVal) -> types.IntVal {
+    return types.IntVal.{
+        lo: a.lo ^ b.lo,
+        hi: (a.hi.bitcast.[u64]() ^ b.hi.bitcast.[u64]()).bitcast.[i64](),
+    };
+}
+
+fn u128_bitmask(bits: u32) -> types.U128Val {
+    if bits == 0_u32 {
+        return types.U128Val.{ lo: 0_u64, hi: 0_u64 };
+    }
+    if bits >= 128_u32 {
+        return types.U128Val.{ lo: 0xFFFFFFFFFFFFFFFF_u64, hi: 0xFFFFFFFFFFFFFFFF_u64 };
+    }
+    if bits < 64_u32 {
+        return types.U128Val.{ lo: (1_u64 <<% bits.widen.[u64]()) -% 1_u64, hi: 0_u64 };
+    }
+    if bits == 64_u32 {
+        return types.U128Val.{ lo: 0xFFFFFFFFFFFFFFFF_u64, hi: 0_u64 };
+    }
+    let hi_bits = (bits -% 64_u32).widen.[u64]();
+    return types.U128Val.{ lo: 0xFFFFFFFFFFFFFFFF_u64, hi: (1_u64 <<% hi_bits) -% 1_u64 };
+}
+
+fn u128_shr(v: types.U128Val, shift: u32) -> types.U128Val {
+    if shift == 0_u32 {
+        return v;
+    }
+    if shift >= 128_u32 {
+        return types.U128Val.{ lo: 0_u64, hi: 0_u64 };
+    }
+    if shift >= 64_u32 {
+        let s = (shift -% 64_u32).widen.[u64]() & 63_u64;
+        return types.U128Val.{ lo: v.hi >> s, hi: 0_u64 };
+    }
+    let s = shift.widen.[u64]() & 63_u64;
+    return types.U128Val.{
+        lo: (v.lo >> s) | (v.hi <<% (64_u64 -% s)),
+        hi: v.hi >> s,
+    };
+}
+
+fn int_bitwidth(env: *types.TypeEnv, ty: types.TyId) -> u32 {
+    let n = env.get(ty);
+    if n.kind == .Int {
+        return if n.flag1 { 64_u32 } else { n.u8_val.widen.[u32]() };
+    }
+    return 64_u32;
+}
+
+fn wrap_int(v: types.IntVal, env: *types.TypeEnv, ty: types.TyId) -> types.IntVal {
+    let n = env.get(ty);
+    if n.kind != .Int {
+        return v;
+    }
+    let bw: u32 = if n.flag1 { 64_u32 } else { n.u8_val.widen.[u32]() };
+    if bw >= 128_u32 || bw == 0_u32 {
+        return v;
+    }
+    let mask = u128_bitmask(bw);
+    var u_lo = v.lo & mask.lo;
+    var u_hi = v.hi.bitcast.[u64]() & mask.hi;
+    if n.flag0 {
+        let sign_set = if bw <= 64_u32 {
+            (u_lo & (1_u64 <<% (bw -% 1_u32).widen.[u64]())) != 0_u64
+        } else {
+            (u_hi & (1_u64 <<% (bw -% 65_u32).widen.[u64]())) != 0_u64
+        };
+        if sign_set {
+            u_lo = u_lo | (~mask.lo);
+            u_hi = u_hi | (~mask.hi);
+        }
+    }
+    return types.IntVal.{ lo: u_lo, hi: u_hi.bitcast.[i64]() };
+}
+
+fn sat_int(v: types.IntVal, env: *types.TypeEnv, ty: types.TyId) -> types.IntVal {
+    let b = types.int_bounds(env.get(ty));
+    if !b.valid {
+        return v;
+    }
+    if types.int_val_cmp(v, b.min) < 0_i32 {
+        return b.min;
+    }
+    if b.has_max && types.int_val_cmp(v, b.max) > 0_i32 {
+        return b.max;
+    }
+    return v;
+}
+
+fn int_val_to_f64(v: types.IntVal) -> f64 {
+    if let small = types.int_val_to_i64(v) {
+        return small.to_float.[f64]();
+    }
+    return v.hi.to_float.[f64]() * 18446744073709551616.0_f64 + v.lo.to_float.[f64]();
+}
+
+fn f64_to_int_val_sat(f: f64) -> types.IntVal {
+    let fb = f.bitcast.[u64]();
+    if ((fb >> 52_u64) & 0x7FF_u64) == 0x7FF_u64 && (fb & 0x000FFFFFFFFFFFFF_u64) != 0_u64 {
+        return types.int_val_zero();
+    }
+    if f >= -9223372036854775808.0_f64 && f < 9223372036854775808.0_f64 {
+        return types.int_val_from_i64(f.trunc_to_int.[i64]());
+    }
+    if f >= 170141183460469231731687303715884105728.0_f64 {
+        return types.int_val_max_i128();
+    }
+    if f <= -170141183460469231731687303715884105728.0_f64 {
+        return types.int_val_min_i128();
+    }
+    let scale = 9223372036854775808.0_f64;
+    let hi_f = f / scale;
+    let hi_q = hi_f.trunc_to_int.[i64]();
+    let rem_f = f - hi_q.to_float.[f64]() * scale;
+    let lo_r = rem_f.trunc_to_int.[i64]();
+    let hi_part = types.int_val_shl(types.int_val_from_i64(hi_q), 63_u32);
+    return int_val_wrap_add(hi_part, types.int_val_from_i64(lo_r));
+}
+
+fn parse_int_lit_signed(bytes: *[u8], neg: bool) -> types.IntVal {
+    let u = types.parse_int_literal_u128(bytes) orelse types.U128Val.{ lo: 0_u64, hi: 0_u64 };
+    if !neg {
+        return u128_as_int_val(u);
+    }
+    if u.hi == 0x8000000000000000_u64 && u.lo == 0_u64 {
+        return types.int_val_min_i128();
+    }
+    return types.int_val_checked_neg(u128_as_int_val(u)) orelse types.int_val_zero();
+}
+
+fn parse_f64_bytes(bytes: *[u8]) -> f64 {
+    var i: usize = 0_usize;
+    var neg = false;
+    if i < bytes.len && bytes[i] == b'-' {
+        neg = true;
+        i = i +% 1_usize;
+    } else if i < bytes.len && bytes[i] == b'+' {
+        i = i +% 1_usize;
+    }
+    var sig: u64 = 0_u64;
+    var dec_exp: i32 = 0_i32;
+    var in_frac = false;
+    while i < bytes.len {
+        let ch = bytes[i];
+        if ch == b'_' {
+            i = i +% 1_usize;
+            continue;
+        }
+        if ch == b'.' && !in_frac {
+            in_frac = true;
+            i = i +% 1_usize;
+            continue;
+        }
+        if ch == b'e' || ch == b'E' {
+            i = i +% 1_usize;
+            break;
+        }
+        if ch >= b'0' && ch <= b'9' {
+            let d = (ch - b'0').widen.[u64]();
+            if sig < 1000000000000000000_u64 {
+                sig = sig *% 10_u64 +% d;
+                if in_frac {
+                    dec_exp = dec_exp -% 1_i32;
+                }
+            } else if !in_frac {
+                dec_exp = dec_exp +% 1_i32;
+            }
+            i = i +% 1_usize;
+            continue;
+        }
+        break;
+    }
+    if i < bytes.len {
+        var exp_neg = false;
+        if bytes[i] == b'-' {
+            exp_neg = true;
+            i = i +% 1_usize;
+        } else if bytes[i] == b'+' {
+            i = i +% 1_usize;
+        }
+        var eacc: i32 = 0_i32;
+        while i < bytes.len {
+            let ch = bytes[i];
+            if ch == b'_' {
+                i = i +% 1_usize;
+                continue;
+            }
+            if ch >= b'0' && ch <= b'9' {
+                if eacc < 10000_i32 {
+                    eacc = eacc *% 10_i32 +% (ch - b'0').widen.[i32]();
+                }
+                i = i +% 1_usize;
+                continue;
+            }
+            break;
+        }
+        dec_exp = if exp_neg { dec_exp -% eacc } else { dec_exp +% eacc };
+    }
+    var val = sig.to_float.[f64]();
+    var p = if dec_exp < 0_i32 { 0_i32 -% dec_exp } else { dec_exp };
+    var scale = 1.0_f64;
+    var base = 10.0_f64;
+    var steps: u32 = 0_u32;
+    while p > 0_i32 && steps < 16_u32 {
+        if (p & 1_i32) != 0_i32 {
+            scale = scale * base;
+        }
+        base = base * base;
+        p = p >> 1_i32;
+        steps = steps +% 1_u32;
+    }
+    val = if dec_exp < 0_i32 { val / scale } else { val * scale };
+    return if neg { -val } else { val };
+}
+
+fn f64_bits_to_f32_bits(bits: u64) -> u32 {
+    let sign = ((bits >> 32_u64) & 0x80000000_u64).trunc.[u32]();
+    let exp = ((bits >> 52_u64) & 0x7FF_u64).trunc.[i32]();
+    let frac = bits & 0x000FFFFFFFFFFFFF_u64;
+    if exp == 0x7FF_i32 {
+        if frac != 0_u64 {
+            let payload = (frac >> 29_u64).trunc.[u32]();
+            return sign | 0x7F800000_u32 | (if payload == 0_u32 { 1_u32 } else { payload });
+        }
+        return sign | 0x7F800000_u32;
+    }
+    if exp == 0_i32 {
+        return sign;
+    }
+    let unbiased = exp -% 1023_i32;
+    if unbiased > 127_i32 {
+        return sign | 0x7F800000_u32;
+    }
+    if unbiased < -149_i32 {
+        return sign;
+    }
+    if unbiased < -126_i32 {
+        let full = frac | 0x0010000000000000_u64;
+        let shift = (((-126_i32 -% unbiased).bitcast.[u32]() +% 29_u32).widen.[u64]()) & 63_u64;
+        let mant = (full >> shift).trunc.[u32]();
+        let rem = full & ((1_u64 <<% shift) -% 1_u64);
+        let half = 1_u64 <<% (shift -% 1_u64);
+        let round: u32 = if rem > half || (rem == half && (mant & 1_u32) != 0_u32) { 1_u32 } else { 0_u32 };
+        return sign | (mant +% round);
+    }
+    let f_exp = ((unbiased +% 127_i32).bitcast.[u32]()) <<% 23_u32;
+    let mant = (frac >> 29_u64).trunc.[u32]();
+    let rem = frac & 0x1FFFFFFF_u64;
+    let round: u32 = if rem > 0x10000000_u64 || (rem == 0x10000000_u64 && (mant & 1_u32) != 0_u32) {
+        1_u32
+    } else {
+        0_u32
+    };
+    return sign | (f_exp +% mant +% round);
+}
+
+fn f32_bits_to_f16_bits(bits: u32) -> u16 {
+    let sign = ((bits >> 16_u32) & 0x8000_u32).trunc.[u16]();
+    let exp = ((bits >> 23_u32) & 0xFF_u32).bitcast.[i32]();
+    let frac = bits & 0x007FFFFF_u32;
+    if exp == 0xFF_i32 {
+        if frac != 0_u32 {
+            let p = (frac >> 13_u32).trunc.[u16]();
+            return sign | 0x7C00_u16 | (if p == 0_u16 { 1_u16 } else { p });
+        }
+        return sign | 0x7C00_u16;
+    }
+    let unbiased = exp -% 127_i32;
+    if unbiased > 15_i32 {
+        return sign | 0x7C00_u16;
+    }
+    if unbiased < -24_i32 {
+        return sign;
+    }
+    if unbiased < -14_i32 {
+        let full = frac | 0x00800000_u32;
+        let shift = ((-14_i32 -% unbiased).bitcast.[u32]() +% 13_u32) & 31_u32;
+        let mant = full >> shift;
+        let rem = full & ((1_u32 <<% shift) -% 1_u32);
+        let half = 1_u32 <<% (shift -% 1_u32);
+        let round: u32 = if rem > half || (rem == half && (mant & 1_u32) != 0_u32) { 1_u32 } else { 0_u32 };
+        return sign | (mant +% round).trunc.[u16]();
+    }
+    let h_exp = ((unbiased +% 15_i32).bitcast.[u32]()) <<% 10_u32;
+    let mant = frac >> 13_u32;
+    let rem = frac & 0x1FFF_u32;
+    let round: u32 = if rem > 0x1000_u32 || (rem == 0x1000_u32 && (mant & 1_u32) != 0_u32) { 1_u32 } else { 0_u32 };
+    return sign | (h_exp +% mant +% round).trunc.[u16]();
+}
+
+// ===========================================================================
+// Section 3: `@type_info` Type & Value Builders and Constant Predicates
+// ===========================================================================
+
+pub fn type_info_struct_ty(
+    alloc: *mut AllocCap,
+    env: *mut types.TypeEnv,
+    interner: *mut span.SymInterner,
+) -> types.TyId ! OutOfMemory {
+    let str_ty = try env.intern_borrow(alloc, false, .Str, types.TY_VOID);
+    let fields: [7]types.AnonField = [
+        types.AnonField.{ name: try interner.intern_str(alloc, "size"), ty: types.TY_USIZE },
+        types.AnonField.{ name: try interner.intern_str(alloc, "align"), ty: types.TY_USIZE },
+        types.AnonField.{ name: try interner.intern_str(alloc, "field_count"), ty: types.TY_USIZE },
+        types.AnonField.{ name: try interner.intern_str(alloc, "is_linear"), ty: types.TY_BOOL },
+        types.AnonField.{ name: try interner.intern_str(alloc, "is_trivial_copy"), ty: types.TY_BOOL },
+        types.AnonField.{ name: try interner.intern_str(alloc, "name"), ty: str_ty },
+        types.AnonField.{ name: try interner.intern_str(alloc, "kind"), ty: str_ty },
+    ];
+    return try env.intern_anon_struct(alloc, fields[0_usize..7_usize]);
+}
+
+fn format_ty_to_ct_str(
+    alloc: *mut AllocCap,
+    ct: *mut CtArena,
+    t: types.TyId,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+) -> u32 ! OutOfMemory {
+    var name_buf = try str.StrBuf.init(alloc, 32_usize);
+    errdefer name_buf.destroy(alloc);
+    try env.format_ty_short(alloc, t, interner, &mut name_buf);
+    let name_val = try ct.add_str(alloc, name_buf.as_bytes());
+    name_buf.destroy(alloc);
+    return name_val;
+}
+
+pub fn make_type_info_val(
+    alloc: *mut AllocCap,
+    ct: *mut CtArena,
+    t: types.TyId,
+    env: *mut types.TypeEnv,
+    interner: *mut span.SymInterner,
+) -> u32 ! OutOfMemory {
+    let lay = env.eon_layout(t);
+    let is_linear = env.is_linear(t);
+    let is_trivial_copy = env.is_trivial_copy(t);
+    let n = env.get(t);
+
+    var kind_str: *str = "other";
+    var field_count: u64 = 0_u64;
+    match n.kind {
+        .Struct => {
+            kind_str = "struct";
+            if let m = env.get_struct(n.primary) {
+                field_count = m.fields.len.widen.[u64]();
+            }
+        }
+        .Pool => {
+            kind_str = "pool";
+            if let m = env.get_pool(n.primary) {
+                field_count = m.columns.len.widen.[u64]();
+            }
+        }
+        .Enum => {
+            kind_str = "enum";
+            if let m = env.get_enum(n.primary) {
+                field_count = m.variants.len.widen.[u64]();
+            }
+        }
+        .Union => {
+            kind_str = "union";
+            if let m = env.get_union(n.primary) {
+                field_count = m.variants.len.widen.[u64]();
+            }
+        }
+        .Bitfield => {
+            kind_str = "bitfield";
+            if let m = env.get_bitfield(n.primary) {
+                field_count = m.members.len.widen.[u64]();
+            }
+        }
+        .Array => {
+            kind_str = "array";
+            field_count = n.u64_val;
+        }
+        .Tuple => {
+            kind_str = "tuple";
+            field_count = n.list_len.widen.[u64]();
+        }
+        .AnonStruct => {
+            kind_str = "struct";
+            field_count = n.list_len.widen.[u64]();
+        }
+        .Int => { kind_str = "int"; }
+        .Float => { kind_str = "float"; }
+        .Bool => { kind_str = "bool"; }
+        _ => { kind_str = "other"; }
+    }
+
+    let name_val = try format_ty_to_ct_str(alloc, ct, t, env, interner);
+    let info_ty = try type_info_struct_ty(alloc, env, interner);
+    let v_size = try ct.add_int(alloc, types.int_val_from_u64(lay.size), types.TY_USIZE);
+    let v_align = try ct.add_int(alloc, types.int_val_from_u64(lay.align), types.TY_USIZE);
+    let v_fc = try ct.add_int(alloc, types.int_val_from_u64(field_count), types.TY_USIZE);
+    let v_lin = try ct.add_bool(alloc, is_linear);
+    let v_copy = try ct.add_bool(alloc, is_trivial_copy);
+    let v_kind = try ct.add_str_lit(alloc, kind_str);
+
+    let fields: [7]CtField = [
+        CtField.{ name_sym: try interner.intern_str(alloc, "size"), val_id: v_size },
+        CtField.{ name_sym: try interner.intern_str(alloc, "align"), val_id: v_align },
+        CtField.{ name_sym: try interner.intern_str(alloc, "field_count"), val_id: v_fc },
+        CtField.{ name_sym: try interner.intern_str(alloc, "is_linear"), val_id: v_lin },
+        CtField.{ name_sym: try interner.intern_str(alloc, "is_trivial_copy"), val_id: v_copy },
+        CtField.{ name_sym: try interner.intern_str(alloc, "name"), val_id: name_val },
+        CtField.{ name_sym: try interner.intern_str(alloc, "kind"), val_id: v_kind },
+    ];
+    return try ct.add_struct(alloc, info_ty, fields[0_usize..7_usize]);
+}
+
+pub fn is_comptime_const_kind(ty: types.TyId, env: *types.TypeEnv) -> bool {
+    let n = env.get(ty);
+    match n.kind {
+        .Int => { return true; }
+        .Float => { return true; }
+        .Bool => { return true; }
+        .Char => { return true; }
+        .Array => { return true; }
+        .Tuple => { return true; }
+        .Struct => { return true; }
+        .AnonStruct => { return true; }
+        .Str => { return true; }
+        .Borrow => { return n.borrow_kind == .Str; }
+        .Builtin => { return n.builtin_kind == .Ordering; }
+        _ => { return false; }
+    }
+}
+
+// ===========================================================================
+// Section 4: Bytecode IR (CtOp, CtCode) & Compiler State
+// ===========================================================================
+
+enum CtOpKind : u8 {
+    LoadConst = 0,
+    Mov = 1,
+    Unary = 2,
+    Binary = 3,
+    Cast = 4,
+    ArrayInit = 5,
+    ArrayRepeat = 6,
+    ArrayLoad = 7,
+    ArrayStore = 8,
+    FieldLoad = 9,
+    FieldStore = 10,
+    StructInit = 11,
+    TupleInit = 12,
+    Jump = 13,
+    JumpIfFalse = 14,
+    JumpIfTrue = 15,
+    CallFn = 16,
+    SetBudget = 17,
+    CompileError = 18,
+    Ret = 19,
+}
+
+enum CtCastKind : u8 {
+    Widen = 0,
+    Trunc = 1,
+    Clamp = 2,
+    ToFloat = 3,
+    TruncToInt = 4,
+    Bitcast = 5,
+}
+
+struct CtFieldReg {
+    name_sym: u32;
+    reg: u32;
+}
+
+struct CtOp {
+    kind: CtOpKind;
+    dst: u32;
+    a: u32;
+    b: u32;
+    ty: types.TyId;
+    uop: ast.UnaryOp;
+    bop: ast.BinaryOp;
+    ckind: CtCastKind;
+    range: ast.IdRange;
+    span: span.Span;
+}
+
+fn ct_op_zero(kind: CtOpKind, sp: span.Span) -> CtOp {
+    return CtOp.{
+        kind: kind,
+        dst: 0_u32,
+        a: 0_u32,
+        b: 0_u32,
+        ty: types.TY_VOID,
+        uop: .Neg,
+        bop: .Add,
+        ckind: .Widen,
+        range: ast.range_empty(),
+        span: sp,
+    };
+}
+
+linear struct CtCode {
+    ops: col.DynBuf[CtOp];
+    reg_args: col.DynBuf[u32];
+    field_args: col.DynBuf[CtFieldReg];
+    num_regs: u32;
+}
+
+impl CtCode {
+    fn init(alloc: *mut AllocCap) -> CtCode ! OutOfMemory {
+        let ops = try col.DynBuf.[CtOp].init(alloc, 32_usize);
+        errdefer ops.destroy(alloc);
+        let reg_args = try col.DynBuf.[u32].init(alloc, 16_usize);
+        errdefer reg_args.destroy(alloc);
+        let field_args = try col.DynBuf.[CtFieldReg].init(alloc, 16_usize);
+        errdefer field_args.destroy(alloc);
+        return CtCode.{
+            ops: ops,
+            reg_args: reg_args,
+            field_args: field_args,
+            num_regs: 0_u32,
+        };
+    }
+
+    fn destroy(self: CtCode, alloc: *mut AllocCap) {
+        let CtCode.{ ops, reg_args, field_args, num_regs: _ } = self;
+        ops.destroy(alloc);
+        reg_args.destroy(alloc);
+        field_args.destroy(alloc);
+    }
+}
+
+struct ScopeVar {
+    sym: u32;
+    reg: u32;
+}
+
+struct LoopEntry {
+    has_label: bool;
+    label_sym: u32;
+    has_break_dst: bool;
+    break_dst: u32;
+}
+
+struct LoopJumpPatch {
+    loop_idx: u32;
+    pc: u32;
+}
+
+linear struct CtCompState {
+    code: CtCode;
+    scope_vars: col.DynBuf[ScopeVar];
+    scope_marks: col.DynBuf[usize];
+    loops: col.DynBuf[LoopEntry];
+    cont_jumps: col.DynBuf[LoopJumpPatch];
+    brk_jumps: col.DynBuf[LoopJumpPatch];
+    ret_expected_ty: types.TyId;
+    failed: bool;
+}
+
+impl CtCompState {
+    fn init(alloc: *mut AllocCap, ret_expected_ty: types.TyId) -> CtCompState ! OutOfMemory {
+        let code = try CtCode.init(alloc);
+        errdefer code.destroy(alloc);
+        let scope_vars = try col.DynBuf.[ScopeVar].init(alloc, 16_usize);
+        errdefer scope_vars.destroy(alloc);
+        var scope_marks = try col.DynBuf.[usize].init(alloc, 8_usize);
+        errdefer scope_marks.destroy(alloc);
+        try scope_marks.push(alloc, 0_usize);
+        let loops = try col.DynBuf.[LoopEntry].init(alloc, 4_usize);
+        errdefer loops.destroy(alloc);
+        let cont_jumps = try col.DynBuf.[LoopJumpPatch].init(alloc, 8_usize);
+        errdefer cont_jumps.destroy(alloc);
+        let brk_jumps = try col.DynBuf.[LoopJumpPatch].init(alloc, 8_usize);
+        errdefer brk_jumps.destroy(alloc);
+        return CtCompState.{
+            code: code,
+            scope_vars: scope_vars,
+            scope_marks: scope_marks,
+            loops: loops,
+            cont_jumps: cont_jumps,
+            brk_jumps: brk_jumps,
+            ret_expected_ty: ret_expected_ty,
+            failed: false,
+        };
+    }
+
+    fn destroy(self: CtCompState, alloc: *mut AllocCap) {
+        let CtCompState.{
+            code,
+            scope_vars,
+            scope_marks,
+            loops,
+            cont_jumps,
+            brk_jumps,
+            ret_expected_ty: _,
+            failed: _,
+        } = self;
+        code.destroy(alloc);
+        scope_vars.destroy(alloc);
+        scope_marks.destroy(alloc);
+        loops.destroy(alloc);
+        cont_jumps.destroy(alloc);
+        brk_jumps.destroy(alloc);
+    }
+}
+
+// ===========================================================================
+// Section 5: AST-to-Bytecode Compiler (CtComp)
+// ===========================================================================
+
+fn emit_e0520_fmt2(
+    alloc: *mut AllocCap,
+    diags: *mut diag.DiagBag,
+    sp: span.Span,
+    p0: *str,
+    s0: *[u8],
+    p1: *str,
+) -> !OutOfMemory {
+    var buf = try str.StrBuf.init(alloc, 96_usize);
+    errdefer buf.destroy(alloc);
+    try buf.push_str_grow(alloc, p0);
+    try buf.push_bytes_grow(alloc, s0);
+    try buf.push_str_grow(alloc, p1);
+    _ = try diags.emit_error_bytes(alloc, diag.E0520, sp, buf.as_bytes());
+    buf.destroy(alloc);
+    return;
+}
+
+fn intern_u64_decimal(
+    alloc: *mut AllocCap,
+    interner: *mut span.SymInterner,
+    val: u64,
+) -> u32 ! OutOfMemory {
+    var ibuf = try str.StrBuf.init(alloc, 16_usize);
+    errdefer ibuf.destroy(alloc);
+    try ibuf.push_u64_grow(alloc, val);
+    let sym = try interner.intern(alloc, ibuf.as_bytes());
+    ibuf.destroy(alloc);
+    return sym;
+}
+
+fn resolve_int_suffix_bytes(s: *[u8]) -> types.TyId {
+    if str.bytes_eq(s, "u8".as_bytes()) { return types.TY_U8; }
+    if str.bytes_eq(s, "u16".as_bytes()) { return types.TY_U16; }
+    if str.bytes_eq(s, "u32".as_bytes()) { return types.TY_U32; }
+    if str.bytes_eq(s, "u64".as_bytes()) { return types.TY_U64; }
+    if str.bytes_eq(s, "u128".as_bytes()) { return types.TY_U128; }
+    if str.bytes_eq(s, "usize".as_bytes()) { return types.TY_USIZE; }
+    if str.bytes_eq(s, "i8".as_bytes()) { return types.TY_I8; }
+    if str.bytes_eq(s, "i16".as_bytes()) { return types.TY_I16; }
+    if str.bytes_eq(s, "i32".as_bytes()) { return types.TY_I32; }
+    if str.bytes_eq(s, "i64".as_bytes()) { return types.TY_I64; }
+    if str.bytes_eq(s, "i128".as_bytes()) { return types.TY_I128; }
+    if str.bytes_eq(s, "isize".as_bytes()) { return types.TY_ISIZE; }
+    return types.TY_NONE;
+}
+
+fn resolve_cast_method_kind(s: *[u8]) -> ?CtCastKind {
+    if str.bytes_eq(s, "widen".as_bytes()) { return .Widen; }
+    if str.bytes_eq(s, "trunc".as_bytes()) { return .Trunc; }
+    if str.bytes_eq(s, "clamp".as_bytes()) { return .Clamp; }
+    if str.bytes_eq(s, "to_float".as_bytes()) { return .ToFloat; }
+    if str.bytes_eq(s, "trunc_to_int".as_bytes()) { return .TruncToInt; }
+    if str.bytes_eq(s, "bitcast".as_bytes()) { return .Bitcast; }
+    return null;
+}
+
+@recursive
+fn extract_expr_path_into(
+    alloc: *mut AllocCap,
+    arena: *ast.AstArena,
+    expr_id: u32,
+    out: *mut col.DynBuf[ast.IdentSpan],
+) -> bool ! OutOfMemory {
+    let e = arena.get_expr(expr_id) orelse { return false; };
+    if e.kind == .Ident {
+        try out.push(alloc, ast.ident_new(e.a, e.span));
+        return true;
+    }
+    if e.kind == .Field {
+        if !(try extract_expr_path_into(alloc, arena, e.a, out)) {
+            return false;
+        }
+        try out.push(alloc, e.ident);
+        return true;
+    }
+    return false;
+}
+
+fn assign_op_to_bin_op(op: ast.AssignOp) -> ?ast.BinaryOp {
+    match op {
+        .Assign => { return null; }
+        .AddAssign => { return .Add; }
+        .SubAssign => { return .Sub; }
+        .MulAssign => { return .Mul; }
+        .AddWrapAssign => { return .AddWrap; }
+        .SubWrapAssign => { return .SubWrap; }
+        .MulWrapAssign => { return .MulWrap; }
+        .AddSatAssign => { return .AddSat; }
+        .SubSatAssign => { return .SubSat; }
+        .MulSatAssign => { return .MulSat; }
+        .BitAndAssign => { return .BitAnd; }
+        .BitOrAssign => { return .BitOr; }
+        .BitXorAssign => { return .BitXor; }
+        .ShlAssign => { return .Shl; }
+        .ShrAssign => { return .Shr; }
+    }
+}
+
+fn resolve_bare_type_path(
+    alloc: *mut AllocCap,
+    segs: *[ast.IdentSpan],
+    mod_id: u32,
+    ctx: *types.GenericCtx,
+    prog: *mut resolve.ResolvedProgram,
+    env: *mut types.TypeEnv,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> types.TyId ! OutOfMemory {
+    if segs.len == 1_usize {
+        if let gp = ctx.find_param(segs[0_usize].sym) {
+            return try env.intern_generic_param(alloc, gp.idx, segs[0_usize].sym, gp.is_comptime);
+        }
+    }
+    let target = try types.resolve_path_segments(alloc, segs, mod_id, prog, interner, diags) orelse {
+        return types.TY_ERROR;
+    };
+    match target.kind {
+        .Builtin => {
+            let bi = resolve.decode_builtin(target.target_id);
+            match bi.kind {
+                .Prim => {
+                    return try types.prim_to_ty_id_in_env(alloc, bi.prim, bi.prim_bits, env);
+                }
+                .SimdAlias => {
+                    let et = types.prim_to_ty_id(bi.prim, bi.prim_bits);
+                    return try env.intern_vec(alloc, et, bi.lanes);
+                }
+                .Ordering => { return types.TY_ORDERING; }
+                .ArithError => { return types.TY_ARITH_ERROR; }
+                .BoundsError => { return types.TY_BOUNDS_ERROR; }
+                .Utf8Error => { return types.TY_UTF8_ERROR; }
+                .OutOfMemory => { return types.TY_OUT_OF_MEMORY; }
+                .MemError => { return types.TY_MEM_ERROR; }
+                .StaleId => { return types.TY_STALE_ID; }
+                .IoError => { return types.TY_IO_ERROR; }
+                _ => { return try env.intern_builtin_empty(alloc, bi.kind); }
+            }
+        }
+        .Def => {
+            let d = target.target_id;
+            let td = prog.get_def(d) orelse { return types.TY_ERROR; };
+            let empty_g: [1]types.GenericVal = [types.gval_ty(types.TY_VOID)];
+            let empty_slice = empty_g[0_usize..0_usize];
+            match td.kind {
+                .Struct => { return try env.intern_struct(alloc, d, empty_slice); }
+                .ExternStruct => { return try env.intern_struct(alloc, d, empty_slice); }
+                .Pool => { return try env.intern_pool_empty(alloc, d); }
+                .Enum => { return try env.intern_enum(alloc, d); }
+                .Union => { return try env.intern_union(alloc, d, empty_slice); }
+                .ExternUnion => { return try env.intern_union(alloc, d, empty_slice); }
+                .Bitfield => { return try env.intern_bitfield(alloc, d); }
+                .Error => { return try env.intern_error_set(alloc, types.err_src_user(d)); }
+                .TypeAlias => {
+                    if let ta = env.get_type_alias(d) {
+                        return ta.ty;
+                    }
+                    return types.TY_ERROR;
+                }
+                _ => { return types.TY_ERROR; }
+            }
+        }
+        .Module => { return types.TY_ERROR; }
+    }
+    return types.TY_ERROR;
+}
+
+view struct CtComp {
+    alloc: *mut AllocCap;
+    ct: *mut CtArena;
+    mod_id: u32;
+    ctx: *types.GenericCtx;
+    prog: *mut resolve.ResolvedProgram;
+    env: *mut types.TypeEnv;
+    interner: *mut span.SymInterner;
+    diags: *mut diag.DiagBag;
+    st: *mut CtCompState;
+}
+
+impl CtComp {
+    fn alloc_reg(self: *mut Self) -> u32 {
+        let r = self.st.code.num_regs;
+        self.st.code.num_regs = r +% 1_u32;
+        return r;
+    }
+
+    fn emit(self: *mut Self, op: CtOp) -> u32 ! OutOfMemory {
+        let pc = self.st.code.ops.len().trunc.[u32]();
+        try self.st.code.ops.push(self.alloc, op);
+        return pc;
+    }
+
+    fn emit_load_const(self: *mut Self, dst: u32, val_id: u32, sp: span.Span) -> !OutOfMemory {
+        var op = ct_op_zero(.LoadConst, sp);
+        op.dst = dst;
+        op.a = val_id;
+        _ = try self.emit(op);
+        return;
+    }
+
+    fn emit_mov(self: *mut Self, dst: u32, src: u32, sp: span.Span) -> !OutOfMemory {
+        var op = ct_op_zero(.Mov, sp);
+        op.dst = dst;
+        op.a = src;
+        _ = try self.emit(op);
+        return;
+    }
+
+    fn emit_void(self: *mut Self, sp: span.Span) -> u32 ! OutOfMemory {
+        let r = self.alloc_reg();
+        let v = try self.ct.add_void(self.alloc);
+        try self.emit_load_const(r, v, sp);
+        return r;
+    }
+
+    fn emit_jump(self: *mut Self, target: u32, sp: span.Span) -> u32 ! OutOfMemory {
+        var op = ct_op_zero(.Jump, sp);
+        op.a = target;
+        return try self.emit(op);
+    }
+
+    fn emit_jump_if_false(self: *mut Self, cond: u32, target: u32, sp: span.Span) -> u32 ! OutOfMemory {
+        var op = ct_op_zero(.JumpIfFalse, sp);
+        op.a = cond;
+        op.b = target;
+        return try self.emit(op);
+    }
+
+    fn emit_jump_if_true(self: *mut Self, cond: u32, target: u32, sp: span.Span) -> u32 ! OutOfMemory {
+        var op = ct_op_zero(.JumpIfTrue, sp);
+        op.a = cond;
+        op.b = target;
+        return try self.emit(op);
+    }
+
+    fn patch_jump(self: *mut Self, pc: u32, target: u32) {
+        if let op = self.st.code.ops.get_mut(pc.widen.[usize]()) {
+            if op.kind == .Jump {
+                op.a = target;
+            } else if op.kind == .JumpIfFalse || op.kind == .JumpIfTrue {
+                op.b = target;
+            }
+        }
+    }
+
+    fn push_scope(self: *mut Self) -> !OutOfMemory {
+        try self.st.scope_marks.push(self.alloc, self.st.scope_vars.len());
+        return;
+    }
+
+    fn pop_scope(self: *mut Self) {
+        if let mark = self.st.scope_marks.pop() {
+            while self.st.scope_vars.len() > mark {
+                _ = self.st.scope_vars.pop();
+            }
+        }
+    }
+
+    fn bind_var(self: *mut Self, sym: u32, reg: u32) -> !OutOfMemory {
+        try self.st.scope_vars.push(self.alloc, ScopeVar.{ sym: sym, reg: reg });
+        return;
+    }
+
+    fn lookup_var(self: *Self, sym: u32) -> ?u32 {
+        let vs = self.st.scope_vars.as_slice();
+        var i = vs.len;
+        while i > 0_usize {
+            i = i - 1_usize;
+            if vs[i].sym == sym {
+                return vs[i].reg;
+            }
+        }
+        return null;
+    }
+
+    fn find_loop_idx(self: *Self, label: ast.IdentSpan) -> ?u32 {
+        let ls = self.st.loops.as_slice();
+        if ast.ident_is_some(label) {
+            var i = ls.len;
+            while i > 0_usize {
+                i = i - 1_usize;
+                if ls[i].has_label && ls[i].label_sym == label.sym {
+                    return i.trunc.[u32]();
+                }
+            }
+            return null;
+        }
+        if ls.len == 0_usize {
+            return null;
+        }
+        return (ls.len - 1_usize).trunc.[u32]();
+    }
+
+    fn patch_loop_jumps(self: *mut Self, li: u32, cont_target: u32, brk_target: u32) {
+        var cw: usize = 0_usize;
+        let clen = self.st.cont_jumps.len();
+        var ci: usize = 0_usize;
+        while ci < clen {
+            var has_item = false;
+            var item = LoopJumpPatch.{ loop_idx: 0_u32, pc: 0_u32 };
+            let cslice = self.st.cont_jumps.as_slice();
+            if ci < cslice.len {
+                item = cslice[ci];
+                has_item = true;
+            }
+            if has_item {
+                if item.loop_idx == li {
+                    self.patch_jump(item.pc, cont_target);
+                } else {
+                    let cm = self.st.cont_jumps.as_mut_slice();
+                    if cw < cm.len {
+                        cm[cw] = item;
+                    }
+                    cw = cw +% 1_usize;
+                }
+            }
+            ci = ci +% 1_usize;
+        }
+        while self.st.cont_jumps.len() > cw {
+            _ = self.st.cont_jumps.pop();
+        }
+
+        var bw: usize = 0_usize;
+        let blen = self.st.brk_jumps.len();
+        var bi: usize = 0_usize;
+        while bi < blen {
+            var has_item = false;
+            var item = LoopJumpPatch.{ loop_idx: 0_u32, pc: 0_u32 };
+            let bslice = self.st.brk_jumps.as_slice();
+            if bi < bslice.len {
+                item = bslice[bi];
+                has_item = true;
+            }
+            if has_item {
+                if item.loop_idx == li {
+                    self.patch_jump(item.pc, brk_target);
+                } else {
+                    let bm = self.st.brk_jumps.as_mut_slice();
+                    if bw < bm.len {
+                        bm[bw] = item;
+                    }
+                    bw = bw +% 1_usize;
+                }
+            }
+            bi = bi +% 1_usize;
+        }
+        while self.st.brk_jumps.len() > bw {
+            _ = self.st.brk_jumps.pop();
+        }
+    }
+
+    fn resolve_generic_ty_arg(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        arg: ast.GenericArgNode,
+    ) -> types.TyId ! OutOfMemory {
+        match arg.kind {
+            .Type => {
+                return try types.resolve_type_expr(
+                    self.alloc, arg.node_id, self.mod_id, self.ctx,
+                    arena, self.prog, self.env, self.interner, self.diags,
+                );
+            }
+            .TypeOrConst => {
+                let segs = arena.idents_range(arg.segs);
+                return try resolve_bare_type_path(
+                    self.alloc, segs, self.mod_id, self.ctx,
+                    self.prog, self.env, self.interner, self.diags,
+                );
+            }
+            .Expr => {
+                return types.TY_ERROR;
+            }
+        }
+    }
+
+    fn try_prim_assoc_const(self: *mut Self, type_sym: u32, field_sym: u32) -> ?u32 ! OutOfMemory {
+        let tn = self.interner.get(type_sym);
+        let ty = resolve_int_suffix_bytes(tn);
+        if ty == types.TY_NONE {
+            return null;
+        }
+        let b = types.int_bounds(self.env.get(ty));
+        if !b.valid {
+            return null;
+        }
+        let fnm = self.interner.get(field_sym);
+        if str.bytes_eq(fnm, "MIN".as_bytes()) {
+            return try self.ct.add_int(self.alloc, b.min, ty);
+        }
+        if str.bytes_eq(fnm, "MAX".as_bytes()) {
+            return try self.ct.add_int(self.alloc, b.max, ty);
+        }
+        return null;
+    }
+
+    @recursive
+    fn bind_pat(self: *mut Self, arena: *ast.AstArena, pat_id: u32, val_reg: u32) -> !OutOfMemory {
+        let pat = arena.get_pat(pat_id) orelse { return; };
+        match pat.kind {
+            .Wildcard => {}
+            .Ident => {
+                let r = self.alloc_reg();
+                try self.emit_mov(r, val_reg, pat.span);
+                try self.bind_var(pat.data0, r);
+            }
+            .Tuple => {
+                let ps = arena.pat_list_range(pat.list);
+                var i: usize = 0_usize;
+                while i < ps.len {
+                    let elem_r = self.alloc_reg();
+                    let sym = try intern_u64_decimal(self.alloc, self.interner, i.widen.[u64]());
+                    var psp = pat.span;
+                    if let cp = arena.get_pat(ps[i]) {
+                        psp = cp.span;
+                    }
+                    var op = ct_op_zero(.FieldLoad, psp);
+                    op.dst = elem_r;
+                    op.a = val_reg;
+                    op.b = sym;
+                    _ = try self.emit(op);
+                    try self.bind_pat(arena, ps[i], elem_r);
+                    i = i +% 1_usize;
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    @recursive
+    fn compile_block(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        block_id: u32,
+        expected_ty: types.TyId,
+    ) -> u32 ! OutOfMemory {
+        let b = arena.get_block(block_id) orelse {
+            return try self.emit_void(span.span_dummy());
+        };
+        try self.push_scope();
+        let stmts = arena.stmt_list_range(b.stmts);
+        var i: usize = 0_usize;
+        while i < stmts.len {
+            try self.compile_stmt(arena, stmts[i]);
+            i = i +% 1_usize;
+        }
+        let res = if b.tail_expr != ast.NONE_ID {
+            try self.compile_expr(arena, b.tail_expr, expected_ty)
+        } else {
+            try self.emit_void(b.span)
+        };
+        self.pop_scope();
+        return res;
+    }
+
+    @recursive
+    fn compile_jump(self: *mut Self, arena: *ast.AstArena, jump_id: u32, sp: span.Span) -> !OutOfMemory {
+        let j = arena.get_jump(jump_id) orelse { return; };
+        match j.kind {
+            .Return => {
+                var op = ct_op_zero(.Ret, sp);
+                if j.value != ast.NONE_ID {
+                    op.a = try self.compile_expr(arena, j.value, self.st.ret_expected_ty);
+                    op.b = 1_u32;
+                } else {
+                    op.b = 0_u32;
+                }
+                _ = try self.emit(op);
+            }
+            .Break => {
+                var has_val = false;
+                var val_r: u32 = 0_u32;
+                if j.value != ast.NONE_ID {
+                    val_r = try self.compile_expr(arena, j.value, types.TY_NONE);
+                    has_val = true;
+                }
+                if let li = self.find_loop_idx(j.label) {
+                    var has_bdst = false;
+                    var bdst: u32 = 0_u32;
+                    if let le = self.st.loops.get(li.widen.[usize]()) {
+                        has_bdst = le.has_break_dst;
+                        bdst = le.break_dst;
+                    }
+                    if has_val && has_bdst {
+                        try self.emit_mov(bdst, val_r, sp);
+                    }
+                    let jpc = try self.emit_jump(0_u32, sp);
+                    try self.st.brk_jumps.push(self.alloc, LoopJumpPatch.{ loop_idx: li, pc: jpc });
+                }
+            }
+            .Continue => {
+                if let li = self.find_loop_idx(j.label) {
+                    let jpc = try self.emit_jump(0_u32, sp);
+                    try self.st.cont_jumps.push(self.alloc, LoopJumpPatch.{ loop_idx: li, pc: jpc });
+                }
+            }
+            .Unreachable => {
+                let msg_r = self.alloc_reg();
+                let vid = try self.ct.add_str_lit(
+                    self.alloc,
+                    "reached `unreachable;` in comptime evaluation",
+                );
+                try self.emit_load_const(msg_r, vid, sp);
+                var op = ct_op_zero(.CompileError, sp);
+                op.a = msg_r;
+                _ = try self.emit(op);
+            }
+        }
+        return;
+    }
+
+    @recursive
+    fn compile_stmt(self: *mut Self, arena: *ast.AstArena, stmt_id: u32) -> !OutOfMemory {
+        let s = arena.get_stmt(stmt_id) orelse { return; };
+        match s.kind {
+            .Let => {
+                var exp = types.TY_NONE;
+                if s.b != ast.NONE_ID {
+                    exp = try types.resolve_type_expr(
+                        self.alloc, s.b, self.mod_id, self.ctx,
+                        arena, self.prog, self.env, self.interner, self.diags,
+                    );
+                }
+                let vr = try self.compile_expr(arena, s.c, exp);
+                try self.bind_pat(arena, s.a, vr);
+            }
+            .Var => {
+                var exp = types.TY_NONE;
+                if s.b != ast.NONE_ID {
+                    exp = try types.resolve_type_expr(
+                        self.alloc, s.b, self.mod_id, self.ctx,
+                        arena, self.prog, self.env, self.interner, self.diags,
+                    );
+                }
+                let vr = try self.compile_expr(arena, s.c, exp);
+                let r = self.alloc_reg();
+                try self.emit_mov(r, vr, s.span);
+                try self.bind_var(s.ident.sym, r);
+            }
+            .Const => {
+                if let c = arena.get_const_decl(s.a) {
+                    var exp = types.TY_NONE;
+                    if c.ty != ast.NONE_ID {
+                        exp = try types.resolve_type_expr(
+                            self.alloc, c.ty, self.mod_id, self.ctx,
+                            arena, self.prog, self.env, self.interner, self.diags,
+                        );
+                    }
+                    let vr = try self.compile_expr(arena, c.value, exp);
+                    let r = self.alloc_reg();
+                    try self.emit_mov(r, vr, s.span);
+                    try self.bind_var(c.name.sym, r);
+                }
+            }
+            .Assign => {
+                let rhs_r = try self.compile_expr(arena, s.b, types.TY_NONE);
+                try self.compile_assign(arena, s.a, s.assign_op, rhs_r, s.span);
+            }
+            .Expr => { _ = try self.compile_expr(arena, s.a, types.TY_NONE); }
+            .Discard => { _ = try self.compile_expr(arena, s.a, types.TY_NONE); }
+            .ComptimeBlock => { _ = try self.compile_block(arena, s.a, types.TY_NONE); }
+            .If => { _ = try self.compile_if(arena, s.a, types.TY_NONE); }
+            .While => { try self.compile_while_stmt(arena, s); }
+            .Loop => { try self.compile_loop_stmt(arena, s); }
+            .For => { try self.compile_for_stmt(arena, s); }
+            .Jump => { try self.compile_jump(arena, s.a, s.span); }
+            .Match => { _ = try self.compile_match(arena, s.a, s.list, types.TY_NONE); }
+            _ => {}
+        }
+        return;
+    }
+
+    @recursive
+    fn compile_while_stmt(self: *mut Self, arena: *ast.AstArena, s: *ast.StmtNode) -> !OutOfMemory {
+        let loop_start = self.st.code.ops.len().trunc.[u32]();
+        let cond_r = try self.compile_expr(arena, s.a, types.TY_BOOL);
+        let j_exit = try self.emit_jump_if_false(cond_r, 0_u32, s.span);
+        let li = self.st.loops.len().trunc.[u32]();
+        try self.st.loops.push(self.alloc, LoopEntry.{
+            has_label: ast.ident_is_some(s.ident),
+            label_sym: s.ident.sym,
+            has_break_dst: false,
+            break_dst: 0_u32,
+        });
+        try self.st.brk_jumps.push(self.alloc, LoopJumpPatch.{ loop_idx: li, pc: j_exit });
+        _ = try self.compile_block(arena, s.b, types.TY_NONE);
+        _ = try self.emit_jump(loop_start, s.span);
+        let after = self.st.code.ops.len().trunc.[u32]();
+        _ = self.st.loops.pop();
+        self.patch_loop_jumps(li, loop_start, after);
+        return;
+    }
+
+    @recursive
+    fn compile_loop_stmt(self: *mut Self, arena: *ast.AstArena, s: *ast.StmtNode) -> !OutOfMemory {
+        let loop_start = self.st.code.ops.len().trunc.[u32]();
+        let li = self.st.loops.len().trunc.[u32]();
+        try self.st.loops.push(self.alloc, LoopEntry.{
+            has_label: ast.ident_is_some(s.ident),
+            label_sym: s.ident.sym,
+            has_break_dst: false,
+            break_dst: 0_u32,
+        });
+        _ = try self.compile_block(arena, s.a, types.TY_NONE);
+        _ = try self.emit_jump(loop_start, s.span);
+        let after = self.st.code.ops.len().trunc.[u32]();
+        _ = self.st.loops.pop();
+        self.patch_loop_jumps(li, loop_start, after);
+        return;
+    }
+
+    @recursive
+    fn compile_for_stmt(self: *mut Self, arena: *ast.AstArena, s: *ast.StmtNode) -> !OutOfMemory {
+        if !s.has_range || s.d == ast.NONE_ID {
+            return;
+        }
+        let start_r = try self.compile_expr(arena, s.c, types.TY_USIZE);
+        let end_r = try self.compile_expr(arena, s.d, types.TY_USIZE);
+        let idx_r = self.alloc_reg();
+        try self.emit_mov(idx_r, start_r, s.span);
+
+        let header_pc = self.st.code.ops.len().trunc.[u32]();
+        let cmp_r = self.alloc_reg();
+        var cmp_op = ct_op_zero(.Binary, s.span);
+        cmp_op.dst = cmp_r;
+        cmp_op.bop = if s.range_kind == .Inclusive { .LtEq } else { .Lt };
+        cmp_op.a = idx_r;
+        cmp_op.b = end_r;
+        _ = try self.emit(cmp_op);
+
+        let j_exit = try self.emit_jump_if_false(cmp_r, 0_u32, s.span);
+        let li = self.st.loops.len().trunc.[u32]();
+        try self.st.loops.push(self.alloc, LoopEntry.{
+            has_label: ast.ident_is_some(s.ident),
+            label_sym: s.ident.sym,
+            has_break_dst: false,
+            break_dst: 0_u32,
+        });
+        try self.st.brk_jumps.push(self.alloc, LoopJumpPatch.{ loop_idx: li, pc: j_exit });
+
+        try self.push_scope();
+        try self.bind_pat(arena, s.a, idx_r);
+        _ = try self.compile_block(arena, s.b, types.TY_NONE);
+        self.pop_scope();
+
+        let step_pc = self.st.code.ops.len().trunc.[u32]();
+        let one_r = self.alloc_reg();
+        let one_val = try self.ct.add_int(self.alloc, types.int_val_from_u64(1_u64), types.TY_COMPTIME_INT);
+        try self.emit_load_const(one_r, one_val, s.span);
+        var inc_op = ct_op_zero(.Binary, s.span);
+        inc_op.dst = idx_r;
+        inc_op.bop = .AddWrap;
+        inc_op.a = idx_r;
+        inc_op.b = one_r;
+        _ = try self.emit(inc_op);
+        _ = try self.emit_jump(header_pc, s.span);
+
+        let after = self.st.code.ops.len().trunc.[u32]();
+        _ = self.st.loops.pop();
+        self.patch_loop_jumps(li, step_pc, after);
+        return;
+    }
+
+    @recursive
+    fn compile_assign(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        lhs_id: u32,
+        op: ast.AssignOp,
+        rhs_r: u32,
+        sp: span.Span,
+    ) -> !OutOfMemory {
+        let bin_opt = assign_op_to_bin_op(op);
+        let lhs = arena.get_expr(lhs_id) orelse { return; };
+        match lhs.kind {
+            .Ident => {
+                if let dst = self.lookup_var(lhs.a) {
+                    if let bop = bin_opt {
+                        var bo = ct_op_zero(.Binary, sp);
+                        bo.dst = dst;
+                        bo.bop = bop;
+                        bo.a = dst;
+                        bo.b = rhs_r;
+                        _ = try self.emit(bo);
+                    } else {
+                        try self.emit_mov(dst, rhs_r, sp);
+                    }
+                }
+            }
+            .Index => {
+                let base_e = arena.get_expr(lhs.a) orelse { return; };
+                if base_e.kind == .Ident {
+                    if let arr_r = self.lookup_var(base_e.a) {
+                        let idx_r = try self.compile_expr(arena, lhs.b, types.TY_USIZE);
+                        var val_r = rhs_r;
+                        if let bop = bin_opt {
+                            let cur_r = self.alloc_reg();
+                            var ld = ct_op_zero(.ArrayLoad, sp);
+                            ld.dst = cur_r;
+                            ld.a = arr_r;
+                            ld.b = idx_r;
+                            _ = try self.emit(ld);
+                            let nxt = self.alloc_reg();
+                            var bo = ct_op_zero(.Binary, sp);
+                            bo.dst = nxt;
+                            bo.bop = bop;
+                            bo.a = cur_r;
+                            bo.b = rhs_r;
+                            _ = try self.emit(bo);
+                            val_r = nxt;
+                        }
+                        var st = ct_op_zero(.ArrayStore, sp);
+                        st.a = arr_r;
+                        st.b = idx_r;
+                        st.dst = val_r;
+                        _ = try self.emit(st);
+                    }
+                }
+            }
+            .Field => {
+                let base_e = arena.get_expr(lhs.a) orelse { return; };
+                if base_e.kind == .Ident {
+                    if let base_r = self.lookup_var(base_e.a) {
+                        var val_r = rhs_r;
+                        if let bop = bin_opt {
+                            let cur_r = self.alloc_reg();
+                            var ld = ct_op_zero(.FieldLoad, sp);
+                            ld.dst = cur_r;
+                            ld.a = base_r;
+                            ld.b = lhs.ident.sym;
+                            _ = try self.emit(ld);
+                            let nxt = self.alloc_reg();
+                            var bo = ct_op_zero(.Binary, sp);
+                            bo.dst = nxt;
+                            bo.bop = bop;
+                            bo.a = cur_r;
+                            bo.b = rhs_r;
+                            _ = try self.emit(bo);
+                            val_r = nxt;
+                        }
+                        var st = ct_op_zero(.FieldStore, sp);
+                        st.a = base_r;
+                        st.b = lhs.ident.sym;
+                        st.dst = val_r;
+                        _ = try self.emit(st);
+                    }
+                }
+            }
+            _ => {
+                _ = try self.diags.emit_error(
+                    self.alloc, diag.E0520, sp, "unsupported assignment target in `comptime`",
+                );
+                self.st.failed = true;
+            }
+        }
+        return;
+    }
+
+    @recursive
+    fn compile_if(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        if_id: u32,
+        expected_ty: types.TyId,
+    ) -> u32 ! OutOfMemory {
+        let data = arena.get_if(if_id) orelse {
+            return try self.emit_void(span.span_dummy());
+        };
+        let cond_r = if data.cond_kind == .Expr {
+            try self.compile_expr(arena, data.cond_expr, types.TY_BOOL)
+        } else {
+            let r = self.alloc_reg();
+            let fv = try self.ct.add_bool(self.alloc, false);
+            try self.emit_load_const(r, fv, data.span);
+            r
+        };
+        let out_r = self.alloc_reg();
+        let j_else = try self.emit_jump_if_false(cond_r, 0_u32, data.span);
+        let then_r = try self.compile_block(arena, data.then_block, expected_ty);
+        try self.emit_mov(out_r, then_r, data.span);
+        let j_end = try self.emit_jump(0_u32, data.span);
+
+        let else_pc = self.st.code.ops.len().trunc.[u32]();
+        self.patch_jump(j_else, else_pc);
+        match data.else_kind {
+            .Block => {
+                let else_r = try self.compile_block(arena, data.else_id, expected_ty);
+                try self.emit_mov(out_r, else_r, data.span);
+            }
+            .If => {
+                let else_r = try self.compile_if(arena, data.else_id, expected_ty);
+                try self.emit_mov(out_r, else_r, data.span);
+            }
+            .None => {
+                let vv = try self.ct.add_void(self.alloc);
+                try self.emit_load_const(out_r, vv, data.span);
+            }
+        }
+        let end_pc = self.st.code.ops.len().trunc.[u32]();
+        self.patch_jump(j_end, end_pc);
+        return out_r;
+    }
+
+    @recursive
+    fn compile_match(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        scr_id: u32,
+        arms_range: ast.IdRange,
+        expected_ty: types.TyId,
+    ) -> u32 ! OutOfMemory {
+        let scr_r = try self.compile_expr(arena, scr_id, types.TY_NONE);
+        let out_r = self.alloc_reg();
+        let vv = try self.ct.add_void(self.alloc);
+        try self.emit_load_const(out_r, vv, span.span_dummy());
+
+        var end_jumps = try col.DynBuf.[u32].init(self.alloc, 8_usize);
+        errdefer end_jumps.destroy(self.alloc);
+        let arms = arena.match_arms_range(arms_range);
+        var i: usize = 0_usize;
+        while i < arms.len {
+            let arm = arms[i];
+            let match_r = try self.compile_pat_test(arena, scr_r, arm.pat, arm.span);
+            let j_next = try self.emit_jump_if_false(match_r, 0_u32, arm.span);
+            try self.push_scope();
+            try self.bind_pat(arena, arm.pat, scr_r);
+            match arm.body_kind {
+                .Block => {
+                    let body_r = try self.compile_block(arena, arm.body_id, expected_ty);
+                    try self.emit_mov(out_r, body_r, arm.span);
+                }
+                .Expr => {
+                    let body_r = try self.compile_expr(arena, arm.body_id, expected_ty);
+                    try self.emit_mov(out_r, body_r, arm.span);
+                }
+                .Jump => {
+                    try self.compile_jump(arena, arm.body_id, arm.span);
+                }
+            }
+            self.pop_scope();
+            let ej = try self.emit_jump(0_u32, arm.span);
+            try end_jumps.push(self.alloc, ej);
+            let next_pc = self.st.code.ops.len().trunc.[u32]();
+            self.patch_jump(j_next, next_pc);
+            i = i +% 1_usize;
+        }
+        let end_pc = self.st.code.ops.len().trunc.[u32]();
+        let ejs = end_jumps.as_slice();
+        var k: usize = 0_usize;
+        while k < ejs.len {
+            self.patch_jump(ejs[k], end_pc);
+            k = k +% 1_usize;
+        }
+        end_jumps.destroy(self.alloc);
+        return out_r;
+    }
+
+    fn compile_pat_test(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        scr_r: u32,
+        pat_id: u32,
+        sp: span.Span,
+    ) -> u32 ! OutOfMemory {
+        let pat = arena.get_pat(pat_id) orelse {
+            let r = self.alloc_reg();
+            let fv = try self.ct.add_bool(self.alloc, false);
+            try self.emit_load_const(r, fv, sp);
+            return r;
+        };
+        match pat.kind {
+            .Wildcard => {
+                let r = self.alloc_reg();
+                let tv = try self.ct.add_bool(self.alloc, true);
+                try self.emit_load_const(r, tv, sp);
+                return r;
+            }
+            .Ident => {
+                let r = self.alloc_reg();
+                let tv = try self.ct.add_bool(self.alloc, true);
+                try self.emit_load_const(r, tv, sp);
+                return r;
+            }
+            .BoolLit => {
+                let lit_r = self.alloc_reg();
+                let bv = try self.ct.add_bool(self.alloc, pat.flag);
+                try self.emit_load_const(lit_r, bv, sp);
+                let r = self.alloc_reg();
+                var bo = ct_op_zero(.Binary, sp);
+                bo.dst = r;
+                bo.bop = .Eq;
+                bo.a = scr_r;
+                bo.b = lit_r;
+                _ = try self.emit(bo);
+                return r;
+            }
+            .IntLit => {
+                return try self.compile_pat_int_test(scr_r, pat, sp);
+            }
+            .CharLit => {
+                let lo_r = self.alloc_reg();
+                let lv = try self.ct.add_char(self.alloc, pat.data0);
+                try self.emit_load_const(lo_r, lv, sp);
+                let r = self.alloc_reg();
+                var bo = ct_op_zero(.Binary, sp);
+                bo.dst = r;
+                bo.bop = .Eq;
+                bo.a = scr_r;
+                bo.b = lo_r;
+                _ = try self.emit(bo);
+                return r;
+            }
+            .Variant => {
+                let lit_r = self.alloc_reg();
+                let ev = try self.ct.add_enum_sym(self.alloc, pat.ident.sym, types.int_val_zero());
+                try self.emit_load_const(lit_r, ev, sp);
+                let r = self.alloc_reg();
+                var bo = ct_op_zero(.Binary, sp);
+                bo.dst = r;
+                bo.bop = .Eq;
+                bo.a = scr_r;
+                bo.b = lit_r;
+                _ = try self.emit(bo);
+                return r;
+            }
+            _ => {
+                let r = self.alloc_reg();
+                let fv = try self.ct.add_bool(self.alloc, false);
+                try self.emit_load_const(r, fv, sp);
+                return r;
+            }
+        }
+    }
+
+    fn compile_pat_int_test(
+        self: *mut Self,
+        scr_r: u32,
+        pat: *ast.PatNode,
+        sp: span.Span,
+    ) -> u32 ! OutOfMemory {
+        let lo_v = parse_int_lit_signed(self.interner.get(pat.data0), pat.flag);
+        let lo_r = self.alloc_reg();
+        let lo_id = try self.ct.add_int(self.alloc, lo_v, types.TY_COMPTIME_INT);
+        try self.emit_load_const(lo_r, lo_id, sp);
+        if !pat.has_range {
+            let r = self.alloc_reg();
+            var eq = ct_op_zero(.Binary, sp);
+            eq.dst = r;
+            eq.bop = .Eq;
+            eq.a = scr_r;
+            eq.b = lo_r;
+            _ = try self.emit(eq);
+            return r;
+        }
+        let hi_v = parse_int_lit_signed(self.interner.get(pat.data1), pat.range_neg);
+        let hi_r = self.alloc_reg();
+        let hi_id = try self.ct.add_int(self.alloc, hi_v, types.TY_COMPTIME_INT);
+        try self.emit_load_const(hi_r, hi_id, sp);
+
+        let c1 = self.alloc_reg();
+        var op1 = ct_op_zero(.Binary, sp);
+        op1.dst = c1;
+        op1.bop = .GtEq;
+        op1.a = scr_r;
+        op1.b = lo_r;
+        _ = try self.emit(op1);
+
+        let c2 = self.alloc_reg();
+        var op2 = ct_op_zero(.Binary, sp);
+        op2.dst = c2;
+        op2.bop = if pat.range_kind == .Inclusive { .LtEq } else { .Lt };
+        op2.a = scr_r;
+        op2.b = hi_r;
+        _ = try self.emit(op2);
+
+        let res = self.alloc_reg();
+        var op3 = ct_op_zero(.Binary, sp);
+        op3.dst = res;
+        op3.bop = .And;
+        op3.a = c1;
+        op3.b = c2;
+        _ = try self.emit(op3);
+        return res;
+    }
+
+    fn compile_expr_lit(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        e: *ast.ExprNode,
+        expected_ty: types.TyId,
+    ) -> ?u32 ! OutOfMemory {
+        match e.kind {
+            .IntLit => {
+                let iv = parse_int_lit_signed(self.interner.get(e.a), false);
+                var ty = types.TY_COMPTIME_INT;
+                if e.b != ast.NONE_ID {
+                    let sty = resolve_int_suffix_bytes(self.interner.get(e.b));
+                    if sty != types.TY_NONE {
+                        ty = sty;
+                    }
+                } else if expected_ty != types.TY_NONE && self.env.is_integer(expected_ty) {
+                    ty = expected_ty;
+                }
+                let r = self.alloc_reg();
+                let vid = try self.ct.add_int(self.alloc, iv, ty);
+                try self.emit_load_const(r, vid, e.span);
+                return r;
+            }
+            .FloatLit => {
+                let fv = parse_f64_bytes(self.interner.get(e.a));
+                var ty = types.TY_F64;
+                if e.b != ast.NONE_ID {
+                    let sb = self.interner.get(e.b);
+                    if str.bytes_eq(sb, "f32".as_bytes()) {
+                        ty = types.TY_F32;
+                    } else if str.bytes_eq(sb, "f16".as_bytes()) {
+                        ty = types.TY_F16;
+                    } else if str.bytes_eq(sb, "f64".as_bytes()) {
+                        ty = types.TY_F64;
+                    }
+                } else if expected_ty != types.TY_NONE && self.env.is_float(expected_ty) {
+                    ty = expected_ty;
+                }
+                let r = self.alloc_reg();
+                let vid = try self.ct.add_float(self.alloc, fv, ty);
+                try self.emit_load_const(r, vid, e.span);
+                return r;
+            }
+            .BoolLit => {
+                let r = self.alloc_reg();
+                let vid = try self.ct.add_bool(self.alloc, e.flag);
+                try self.emit_load_const(r, vid, e.span);
+                return r;
+            }
+            .CharLit => {
+                let r = self.alloc_reg();
+                let vid = try self.ct.add_char(self.alloc, e.a);
+                try self.emit_load_const(r, vid, e.span);
+                return r;
+            }
+            .ByteCharLit => {
+                let r = self.alloc_reg();
+                let vid = try self.ct.add_int(
+                    self.alloc,
+                    types.int_val_from_u64((e.a & 0xFF_u32).widen.[u64]()),
+                    types.TY_U8,
+                );
+                try self.emit_load_const(r, vid, e.span);
+                return r;
+            }
+            .StringLit => {
+                let r = self.alloc_reg();
+                let vid = try self.ct.add_str(self.alloc, arena.str_bytes_range(e.list));
+                try self.emit_load_const(r, vid, e.span);
+                return r;
+            }
+            .RawStringLit => {
+                let r = self.alloc_reg();
+                let vid = try self.ct.add_str(self.alloc, arena.str_bytes_range(e.list));
+                try self.emit_load_const(r, vid, e.span);
+                return r;
+            }
+            .EnumLit => {
+                let r = self.alloc_reg();
+                let vid = try self.ct.add_enum_sym(self.alloc, e.ident.sym, types.int_val_zero());
+                try self.emit_load_const(r, vid, e.span);
+                return r;
+            }
+            _ => {
+                return null;
+            }
+        }
+    }
+
+    fn load_const_def_val(self: *mut Self, def_id: u32, sp: span.Span) -> u32 ! OutOfMemory {
+        let r = self.alloc_reg();
+        if let cid = self.ct.get_const_val(def_id) {
+            try self.emit_load_const(r, cid, sp);
+            return r;
+        }
+        if let cm = self.env.get_const(def_id) {
+            if cm.has_int_val {
+                let vid = try self.ct.add_int(self.alloc, cm.int_val, cm.ty);
+                try self.emit_load_const(r, vid, sp);
+                return r;
+            }
+        }
+        let vv = try self.ct.add_void(self.alloc);
+        try self.emit_load_const(r, vv, sp);
+        return r;
+    }
+
+    fn compile_ident_expr(self: *mut Self, e: *ast.ExprNode) -> u32 ! OutOfMemory {
+        let sym = e.a;
+        if let r = self.lookup_var(sym) {
+            return r;
+        }
+        if let cv = self.ctx.find_comptime_val(sym) {
+            let r = self.alloc_reg();
+            let vid = try self.ct.add_int(self.alloc, cv, types.TY_COMPTIME_INT);
+            try self.emit_load_const(r, vid, e.span);
+            return r;
+        }
+        let seg: [1]ast.IdentSpan = [ast.ident_new(sym, e.span)];
+        if let target = try types.resolve_path_segments(
+            self.alloc, seg[0_usize..1_usize], self.mod_id, self.prog, self.interner, self.diags,
+        ) {
+            if target.kind == .Def {
+                return try self.load_const_def_val(target.target_id, e.span);
+            }
+        }
+        return try self.emit_void(e.span);
+    }
+
+    @recursive
+    fn compile_binary_expr(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        e: *ast.ExprNode,
+        expected_ty: types.TyId,
+    ) -> u32 ! OutOfMemory {
+        if e.bin_op == .And {
+            let lr = try self.compile_expr(arena, e.a, types.TY_BOOL);
+            let dst = self.alloc_reg();
+            try self.emit_mov(dst, lr, e.span);
+            let j_false = try self.emit_jump_if_false(lr, 0_u32, e.span);
+            let rr = try self.compile_expr(arena, e.b, types.TY_BOOL);
+            try self.emit_mov(dst, rr, e.span);
+            let end_pc = self.st.code.ops.len().trunc.[u32]();
+            self.patch_jump(j_false, end_pc);
+            return dst;
+        }
+        if e.bin_op == .Or {
+            let lr = try self.compile_expr(arena, e.a, types.TY_BOOL);
+            let dst = self.alloc_reg();
+            try self.emit_mov(dst, lr, e.span);
+            let j_true = try self.emit_jump_if_true(lr, 0_u32, e.span);
+            let rr = try self.compile_expr(arena, e.b, types.TY_BOOL);
+            try self.emit_mov(dst, rr, e.span);
+            let end_pc = self.st.code.ops.len().trunc.[u32]();
+            self.patch_jump(j_true, end_pc);
+            return dst;
+        }
+        let is_cmp = e.bin_op == .Eq || e.bin_op == .NotEq || e.bin_op == .Lt
+            || e.bin_op == .LtEq || e.bin_op == .Gt || e.bin_op == .GtEq;
+        let op_exp = if is_cmp { types.TY_NONE } else { expected_ty };
+        let lr = try self.compile_expr(arena, e.a, op_exp);
+        let rr = try self.compile_expr(arena, e.b, op_exp);
+        let dst = self.alloc_reg();
+        var op = ct_op_zero(.Binary, e.span);
+        op.dst = dst;
+        op.bop = e.bin_op;
+        op.a = lr;
+        op.b = rr;
+        _ = try self.emit(op);
+        return dst;
+    }
+
+    fn try_resolve_mod_const_def(self: *mut Self, arena: *ast.AstArena, expr_id: u32) -> ?u32 ! OutOfMemory {
+        var path_segs = try col.DynBuf.[ast.IdentSpan].init(self.alloc, 4_usize);
+        errdefer path_segs.destroy(self.alloc);
+        let is_path = try extract_expr_path_into(self.alloc, arena, expr_id, &mut path_segs);
+        var res: ?u32 = null;
+        let ps = path_segs.as_slice();
+        if is_path && ps.len >= 2_usize {
+            let first = ps[0_usize];
+            if let _ = self.lookup_var(first.sym) {
+            } else if let ent = self.prog.lookup_in_module(self.mod_id, first.sym) {
+                if ent.kind == .Module {
+                    if let target = try types.resolve_path_segments(
+                        self.alloc, ps, self.mod_id,
+                        self.prog, self.interner, self.diags,
+                    ) {
+                        if target.kind == .Def {
+                            res = target.target_id;
+                        }
+                    }
+                }
+            }
+        }
+        path_segs.destroy(self.alloc);
+        return res;
+    }
+
+    @recursive
+    fn compile_field_expr(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        expr_id: u32,
+        e: *ast.ExprNode,
+    ) -> u32 ! OutOfMemory {
+        if let be = arena.get_expr(e.a) {
+            if be.kind == .Ident {
+                if let _ = self.lookup_var(be.a) {
+                } else {
+                    if let cval = try self.try_prim_assoc_const(be.a, e.ident.sym) {
+                        let r = self.alloc_reg();
+                        try self.emit_load_const(r, cval, e.span);
+                        return r;
+                    }
+                }
+            }
+        }
+        if let def_id = try self.try_resolve_mod_const_def(arena, expr_id) {
+            return try self.load_const_def_val(def_id, e.span);
+        }
+
+        let br = try self.compile_expr(arena, e.a, types.TY_NONE);
+        let dst = self.alloc_reg();
+        var op = ct_op_zero(.FieldLoad, e.span);
+        op.dst = dst;
+        op.a = br;
+        op.b = e.ident.sym;
+        _ = try self.emit(op);
+        return dst;
+    }
+
+    fn try_resolve_struct_lit_ty(self: *mut Self, arena: *ast.AstArena, path_expr: u32) -> types.TyId ! OutOfMemory {
+        var segs = try col.DynBuf.[ast.IdentSpan].init(self.alloc, 4_usize);
+        errdefer segs.destroy(self.alloc);
+        var out_ty = types.TY_ERROR;
+        if try extract_expr_path_into(self.alloc, arena, path_expr, &mut segs) {
+            let saved = self.diags.count();
+            if let t = try types.resolve_path_segments(
+                self.alloc, segs.as_slice(), self.mod_id, self.prog, self.interner, self.diags,
+            ) {
+                if t.kind == .Def {
+                    if let found = self.env.find_struct_empty(t.target_id) {
+                        out_ty = found;
+                    }
+                }
+            }
+            self.diags.truncate(saved);
+        }
+        segs.destroy(self.alloc);
+        return out_ty;
+    }
+
+    @recursive
+    fn push_struct_lit_fields(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        list: ast.IdRange,
+    ) -> ast.IdRange ! OutOfMemory {
+        let fis = arena.field_inits_range(list);
+        var fregs = try col.DynBuf.[CtFieldReg].init(self.alloc, fis.len +% 1_usize);
+        errdefer fregs.destroy(self.alloc);
+        var i: usize = 0_usize;
+        while i < fis.len {
+            let fi = fis[i];
+            if ast.ident_is_some(fi.name) {
+                let vr = try self.compile_expr(arena, fi.value, types.TY_NONE);
+                try fregs.push(self.alloc, CtFieldReg.{ name_sym: fi.name.sym, reg: vr });
+            }
+            i = i +% 1_usize;
+        }
+        let start = self.st.code.field_args.len().trunc.[u32]();
+        let cnt = fregs.len().trunc.[u32]();
+        try self.st.code.field_args.push_slice(self.alloc, fregs.as_slice());
+        fregs.destroy(self.alloc);
+        return ast.range_new(start, cnt);
+    }
+
+    @recursive
+    fn compile_struct_lit(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        e: *ast.ExprNode,
+        expected_ty: types.TyId,
+    ) -> u32 ! OutOfMemory {
+        var st_ty = if expected_ty != types.TY_NONE { expected_ty } else { types.TY_ERROR };
+        if st_ty == types.TY_ERROR && e.kind == .NamedStructLit && e.a != ast.NONE_ID {
+            st_ty = try self.try_resolve_struct_lit_ty(arena, e.a);
+        }
+        let range = try self.push_struct_lit_fields(arena, e.list);
+        let dst = self.alloc_reg();
+        var op = ct_op_zero(.StructInit, e.span);
+        op.dst = dst;
+        op.ty = st_ty;
+        op.range = range;
+        _ = try self.emit(op);
+        return dst;
+    }
+
+    fn resolve_direct_fn_def(self: *mut Self, arena: *ast.AstArena, callee_id: u32) -> u32 ! OutOfMemory {
+        var segs = try col.DynBuf.[ast.IdentSpan].init(self.alloc, 4_usize);
+        errdefer segs.destroy(self.alloc);
+        let is_path = try extract_expr_path_into(self.alloc, arena, callee_id, &mut segs);
+        var fn_def: u32 = resolve.DEF_NONE;
+        if is_path && segs.len() > 0_usize {
+            if let target = try types.resolve_path_segments(
+                self.alloc, segs.as_slice(), self.mod_id, self.prog, self.interner, self.diags,
+            ) {
+                if target.kind == .Def {
+                    if let td = self.prog.get_def(target.target_id) {
+                        if td.kind == .Fn {
+                            fn_def = target.target_id;
+                        }
+                    }
+                }
+            }
+        }
+        segs.destroy(self.alloc);
+        return fn_def;
+    }
+
+    @recursive
+    fn push_expr_regs(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        list: ast.IdRange,
+        elem_ty: types.TyId,
+    ) -> ast.IdRange ! OutOfMemory {
+        let items = arena.expr_list_range(list);
+        var regs = try col.DynBuf.[u32].init(self.alloc, items.len +% 1_usize);
+        errdefer regs.destroy(self.alloc);
+        var i: usize = 0_usize;
+        while i < items.len {
+            let r = try self.compile_expr(arena, items[i], elem_ty);
+            try regs.push(self.alloc, r);
+            i = i +% 1_usize;
+        }
+        let start = self.st.code.reg_args.len().trunc.[u32]();
+        let cnt = regs.len().trunc.[u32]();
+        try self.st.code.reg_args.push_slice(self.alloc, regs.as_slice());
+        regs.destroy(self.alloc);
+        return ast.range_new(start, cnt);
+    }
+
+    @recursive
+    fn compile_call_expr(self: *mut Self, arena: *ast.AstArena, e: *ast.ExprNode) -> u32 ! OutOfMemory {
+        let callee = arena.get_expr(e.a) orelse {
+            return try self.emit_void(e.span);
+        };
+        let args = arena.expr_list_range(e.list);
+
+        if callee.kind == .GenericApply {
+            if let fe = arena.get_expr(callee.a) {
+                if fe.kind == .Field {
+                    if let ck = resolve_cast_method_kind(self.interner.get(fe.ident.sym)) {
+                        let gargs = arena.generic_args_range(callee.list);
+                        if gargs.len > 0_usize {
+                            let to_ty = try self.resolve_generic_ty_arg(arena, gargs[0_usize]);
+                            let sr = try self.compile_expr(arena, fe.a, types.TY_NONE);
+                            let dst = self.alloc_reg();
+                            var op = ct_op_zero(.Cast, e.span);
+                            op.dst = dst;
+                            op.ckind = ck;
+                            op.a = sr;
+                            op.ty = to_ty;
+                            _ = try self.emit(op);
+                            return dst;
+                        }
+                    }
+                }
+            }
+        }
+
+        if callee.kind == .Field && args.len == 0_usize {
+            if str.bytes_eq(self.interner.get(callee.ident.sym), "len".as_bytes()) {
+                let br = try self.compile_expr(arena, callee.a, types.TY_NONE);
+                let dst = self.alloc_reg();
+                let lsym = try self.interner.intern_str(self.alloc, "len");
+                var op = ct_op_zero(.FieldLoad, e.span);
+                op.dst = dst;
+                op.a = br;
+                op.b = lsym;
+                _ = try self.emit(op);
+                return dst;
+            }
+        }
+
+        let fn_def = try self.resolve_direct_fn_def(arena, e.a);
+        if fn_def != resolve.DEF_NONE {
+            let range = try self.push_expr_regs(arena, e.list, types.TY_NONE);
+            let dst = self.alloc_reg();
+            var op = ct_op_zero(.CallFn, e.span);
+            op.dst = dst;
+            op.a = fn_def;
+            op.range = range;
+            _ = try self.emit(op);
+            return dst;
+        }
+
+        _ = try self.diags.emit_error(
+            self.alloc, diag.E0520, e.span, "call target is not allowed or unsupported in `comptime`",
+        );
+        self.st.failed = true;
+        return try self.emit_void(e.span);
+    }
+
+    @recursive
+    fn compile_builtin(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        sym: u32,
+        args_range: ast.IdRange,
+        sp: span.Span,
+    ) -> u32 ! OutOfMemory {
+        let args = arena.generic_args_range(args_range);
+        let dst = self.alloc_reg();
+        let bname = self.interner.get(sym);
+
+        if str.bytes_eq(bname, "size_of".as_bytes()) || str.bytes_eq(bname, "align_of".as_bytes()) {
+            let is_size = str.bytes_eq(bname, "size_of".as_bytes());
+            var ty = types.TY_ERROR;
+            if args.len > 0_usize {
+                ty = try self.resolve_generic_ty_arg(arena, args[0_usize]);
+            }
+            let lay = self.env.eon_layout(ty);
+            let v = if is_size { lay.size } else { lay.align };
+            let vid = try self.ct.add_int(self.alloc, types.int_val_from_u64(v), types.TY_USIZE);
+            try self.emit_load_const(dst, vid, sp);
+            return dst;
+        }
+        if str.bytes_eq(bname, "type_info".as_bytes()) {
+            var ty = types.TY_ERROR;
+            if args.len > 0_usize {
+                ty = try self.resolve_generic_ty_arg(arena, args[0_usize]);
+            }
+            let info_id = try make_type_info_val(self.alloc, self.ct, ty, self.env, self.interner);
+            try self.emit_load_const(dst, info_id, sp);
+            return dst;
+        }
+        if str.bytes_eq(bname, "target_arch".as_bytes()) {
+            let asym = try target_arch_sym(self.alloc, self.interner);
+            let vid = try self.ct.add_enum_sym(self.alloc, asym, types.int_val_zero());
+            try self.emit_load_const(dst, vid, sp);
+            return dst;
+        }
+        if str.bytes_eq(bname, "target_os".as_bytes()) {
+            let osym = try target_os_sym(self.alloc, self.interner);
+            let vid = try self.ct.add_enum_sym(self.alloc, osym, types.int_val_zero());
+            try self.emit_load_const(dst, vid, sp);
+            return dst;
+        }
+        if str.bytes_eq(bname, "comptime_budget".as_bytes()) {
+            if args.len > 0_usize && args[0_usize].kind == .Expr {
+                let lim_r = try self.compile_expr(arena, args[0_usize].node_id, types.TY_U64);
+                var op = ct_op_zero(.SetBudget, sp);
+                op.a = lim_r;
+                _ = try self.emit(op);
+            }
+            let vv = try self.ct.add_void(self.alloc);
+            try self.emit_load_const(dst, vv, sp);
+            return dst;
+        }
+        if str.bytes_eq(bname, "compile_error".as_bytes()) {
+            var msg_r: u32 = 0_u32;
+            if args.len > 0_usize && args[0_usize].kind == .Expr {
+                msg_r = try self.compile_expr(arena, args[0_usize].node_id, types.TY_NONE);
+            } else {
+                msg_r = self.alloc_reg();
+                let sv = try self.ct.add_str_lit(self.alloc, "@compile_error triggered");
+                try self.emit_load_const(msg_r, sv, sp);
+            }
+            var op = ct_op_zero(.CompileError, sp);
+            op.a = msg_r;
+            _ = try self.emit(op);
+            let vv = try self.ct.add_void(self.alloc);
+            try self.emit_load_const(dst, vv, sp);
+            return dst;
+        }
+
+        try emit_e0520_fmt2(
+            self.alloc, self.diags, sp, "builtin `@", bname, "` is not supported in `comptime`",
+        );
+        self.st.failed = true;
+        let vv = try self.ct.add_void(self.alloc);
+        try self.emit_load_const(dst, vv, sp);
+        return dst;
+    }
+
+    @recursive
+    fn compile_array_or_tuple(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        e: *ast.ExprNode,
+        expected_ty: types.TyId,
+    ) -> u32 ! OutOfMemory {
+        if e.kind == .ArrayLit {
+            var elem_ty = types.TY_COMPTIME_INT;
+            if expected_ty != types.TY_NONE {
+                let tn = self.env.get(expected_ty);
+                if tn.kind == .Array {
+                    elem_ty = tn.primary;
+                }
+            }
+            let range = try self.push_expr_regs(arena, e.list, elem_ty);
+            let dst = self.alloc_reg();
+            var op = ct_op_zero(.ArrayInit, e.span);
+            op.dst = dst;
+            op.ty = elem_ty;
+            op.range = range;
+            _ = try self.emit(op);
+            return dst;
+        }
+        if e.kind == .ArrayRepeat {
+            var elem_ty = types.TY_COMPTIME_INT;
+            if expected_ty != types.TY_NONE {
+                let tn = self.env.get(expected_ty);
+                if tn.kind == .Array {
+                    elem_ty = tn.primary;
+                }
+            }
+            let vr = try self.compile_expr(arena, e.a, elem_ty);
+            var cnt_u32: u32 = 0_u32;
+            if let iv = try types.eval_const_int(
+                self.alloc, e.b, self.mod_id, self.ctx,
+                arena, self.prog, self.env, self.interner, self.diags,
+            ) {
+                if let u = types.int_val_to_u64(iv) {
+                    cnt_u32 = if u > (MAX_ARRAY_REPEAT +% 1_u32).widen.[u64]() {
+                        MAX_ARRAY_REPEAT +% 1_u32
+                    } else {
+                        u.trunc.[u32]()
+                    };
+                }
+            }
+            let dst = self.alloc_reg();
+            var op = ct_op_zero(.ArrayRepeat, e.span);
+            op.dst = dst;
+            op.a = vr;
+            op.b = cnt_u32;
+            op.ty = elem_ty;
+            _ = try self.emit(op);
+            return dst;
+        }
+        let range = try self.push_expr_regs(arena, e.list, types.TY_NONE);
+        let dst = self.alloc_reg();
+        var op = ct_op_zero(.TupleInit, e.span);
+        op.dst = dst;
+        op.range = range;
+        _ = try self.emit(op);
+        return dst;
+    }
+
+    @recursive
+    fn compile_expr(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        expr_id: u32,
+        expected_ty: types.TyId,
+    ) -> u32 ! OutOfMemory {
+        let e = arena.get_expr(expr_id) orelse {
+            return try self.emit_void(span.span_dummy());
+        };
+        if let lr = try self.compile_expr_lit(arena, e, expected_ty) {
+            return lr;
+        }
+        match e.kind {
+            .Paren => { return try self.compile_expr(arena, e.a, expected_ty); }
+            .ComptimeExpr => { return try self.compile_expr(arena, e.a, expected_ty); }
+            .ComptimeBlock => { return try self.compile_block(arena, e.a, expected_ty); }
+            .Ident => { return try self.compile_ident_expr(e); }
+            .Unary => {
+                if e.unary_op == .Neg {
+                    if let inn = arena.get_expr(e.a) {
+                        if inn.kind == .IntLit {
+                            let iv = parse_int_lit_signed(self.interner.get(inn.a), true);
+                            var ty = types.TY_COMPTIME_INT;
+                            if inn.b != ast.NONE_ID {
+                                let sty = resolve_int_suffix_bytes(self.interner.get(inn.b));
+                                if sty != types.TY_NONE {
+                                    ty = sty;
+                                }
+                            } else if expected_ty != types.TY_NONE && self.env.is_integer(expected_ty) {
+                                ty = expected_ty;
+                            }
+                            let r = self.alloc_reg();
+                            let vid = try self.ct.add_int(self.alloc, iv, ty);
+                            try self.emit_load_const(r, vid, e.span);
+                            return r;
+                        }
+                    }
+                }
+                let sr = try self.compile_expr(arena, e.a, expected_ty);
+                let dst = self.alloc_reg();
+                var op = ct_op_zero(.Unary, e.span);
+                op.dst = dst;
+                op.uop = e.unary_op;
+                op.a = sr;
+                _ = try self.emit(op);
+                return dst;
+            }
+            .Binary => { return try self.compile_binary_expr(arena, e, expected_ty); }
+            .ArrayLit => { return try self.compile_array_or_tuple(arena, e, expected_ty); }
+            .ArrayRepeat => { return try self.compile_array_or_tuple(arena, e, expected_ty); }
+            .Tuple => { return try self.compile_array_or_tuple(arena, e, expected_ty); }
+            .Index => {
+                let ar = try self.compile_expr(arena, e.a, types.TY_NONE);
+                let ir = try self.compile_expr(arena, e.b, types.TY_USIZE);
+                let dst = self.alloc_reg();
+                var op = ct_op_zero(.ArrayLoad, e.span);
+                op.dst = dst;
+                op.a = ar;
+                op.b = ir;
+                _ = try self.emit(op);
+                return dst;
+            }
+            .Field => { return try self.compile_field_expr(arena, expr_id, e); }
+            .AnonStructLit => { return try self.compile_struct_lit(arena, e, expected_ty); }
+            .NamedStructLit => { return try self.compile_struct_lit(arena, e, expected_ty); }
+            .If => { return try self.compile_if(arena, e.a, expected_ty); }
+            .Match => { return try self.compile_match(arena, e.a, e.list, expected_ty); }
+            .Loop => {
+                let loop_start = self.st.code.ops.len().trunc.[u32]();
+                let out_r = try self.emit_void(e.span);
+                let li = self.st.loops.len().trunc.[u32]();
+                try self.st.loops.push(self.alloc, LoopEntry.{
+                    has_label: ast.ident_is_some(e.ident),
+                    label_sym: e.ident.sym,
+                    has_break_dst: true,
+                    break_dst: out_r,
+                });
+                _ = try self.compile_block(arena, e.a, types.TY_NONE);
+                _ = try self.emit_jump(loop_start, e.span);
+                let after = self.st.code.ops.len().trunc.[u32]();
+                _ = self.st.loops.pop();
+                self.patch_loop_jumps(li, loop_start, after);
+                return out_r;
+            }
+            .Call => { return try self.compile_call_expr(arena, e); }
+            .Builtin => { return try self.compile_builtin(arena, e.ident.sym, e.list, e.span); }
+            _ => {
+                _ = try self.diags.emit_error(
+                    self.alloc, diag.E0520, e.span, "unsupported expression in `comptime`",
+                );
+                self.st.failed = true;
+                return try self.emit_void(e.span);
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Section 6: Comptime Bytecode VM (CtVm)
+// ===========================================================================
+
+view struct CtVm {
+    alloc: *mut AllocCap;
+    ct: *mut CtArena;
+    prog: *mut resolve.ResolvedProgram;
+    env: *mut types.TypeEnv;
+    interner: *mut span.SymInterner;
+    diags: *mut diag.DiagBag;
+    steps: u64;
+    fuel_limit: u64;
+    call_depth: u32;
+}
+
+impl CtVm {
+    fn emit_err(self: *mut Self, sp: span.Span, msg: *str) -> !OutOfMemory {
+        _ = try self.diags.emit_error(self.alloc, diag.E0520, sp, msg);
+        return;
+    }
+
+    fn emit_oob_err(
+        self: *mut Self,
+        sp: span.Span,
+        prefix: *str,
+        idx: types.IntVal,
+        len: u64,
+    ) -> !OutOfMemory {
+        var buf = try str.StrBuf.init(self.alloc, 96_usize);
+        errdefer buf.destroy(self.alloc);
+        try buf.push_str_grow(self.alloc, prefix);
+        try types.push_int_val_grow(self.alloc, idx, &mut buf);
+        try buf.push_str_grow(self.alloc, " out of bounds (len = ");
+        try buf.push_u64_grow(self.alloc, len);
+        try buf.push_byte_grow(self.alloc, b')');
+        _ = try self.diags.emit_error_bytes(self.alloc, diag.E0520, sp, buf.as_bytes());
+        buf.destroy(self.alloc);
+        return;
+    }
+
+    fn check_int_range(self: *mut Self, v: types.IntVal, ty: types.TyId, sp: span.Span) -> bool ! OutOfMemory {
+        let b = types.int_bounds(self.env.get(ty));
+        if b.valid && (types.int_val_cmp(v, b.min) < 0_i32 || (b.has_max && types.int_val_cmp(v, b.max) > 0_i32)) {
+            var buf = try str.StrBuf.init(self.alloc, 128_usize);
+            errdefer buf.destroy(self.alloc);
+            try buf.push_str_grow(self.alloc, "comptime integer value ");
+            try types.push_int_val_grow(self.alloc, v, &mut buf);
+            try buf.push_str_grow(self.alloc, " out of range [");
+            try types.push_int_val_grow(self.alloc, b.min, &mut buf);
+            try buf.push_str_grow(self.alloc, "..=");
+            try types.push_int_val_grow(self.alloc, b.max, &mut buf);
+            try buf.push_str_grow(self.alloc, "] for `");
+            try self.env.format_ty_short(self.alloc, ty, self.interner, &mut buf);
+            try buf.push_byte_grow(self.alloc, b'`');
+            _ = try self.diags.emit_error_bytes(self.alloc, diag.E0520, sp, buf.as_bytes());
+            buf.destroy(self.alloc);
+            return false;
+        }
+        return true;
+    }
+
+    fn eval_unary(self: *mut Self, op: ast.UnaryOp, val_id: u32, sp: span.Span) -> ?u32 ! OutOfMemory {
+        let n = self.ct.get_val(val_id);
+        if op == .Not && n.kind == .Bool {
+            return try self.ct.add_bool(self.alloc, n.i_lo == 0_u64);
+        }
+        if op == .Neg && n.kind == .Int {
+            let v = types.IntVal.{ lo: n.i_lo, hi: n.i_hi.bitcast.[i64]() };
+            let neg = types.int_val_checked_neg(v) orelse {
+                try self.emit_err(sp, "comptime integer negation overflow");
+                return null;
+            };
+            if !(try self.check_int_range(neg, n.ty, sp)) {
+                return null;
+            }
+            return try self.ct.add_int(self.alloc, neg, n.ty);
+        }
+        if op == .Neg && n.kind == .Float {
+            let f = n.i_lo.bitcast.[f64]();
+            return try self.ct.add_float(self.alloc, -f, n.ty);
+        }
+        if op == .BitNot && n.kind == .Int {
+            let v = types.IntVal.{ lo: n.i_lo, hi: n.i_hi.bitcast.[i64]() };
+            let res = wrap_int(int_val_bitnot(v), self.env, n.ty);
+            return try self.ct.add_int(self.alloc, res, n.ty);
+        }
+        try self.emit_err(sp, "invalid unary operation in comptime");
+        return null;
+    }
+
+    fn eval_binary_float(
+        self: *mut Self,
+        op: ast.BinaryOp,
+        a: f64,
+        b: f64,
+        ty: types.TyId,
+        sp: span.Span,
+    ) -> ?u32 ! OutOfMemory {
+        match op {
+            .Add => { return try self.ct.add_float(self.alloc, a + b, ty); }
+            .Sub => { return try self.ct.add_float(self.alloc, a - b, ty); }
+            .Mul => { return try self.ct.add_float(self.alloc, a * b, ty); }
+            .Div => { return try self.ct.add_float(self.alloc, a / b, ty); }
+            .Eq => { return try self.ct.add_bool(self.alloc, a == b); }
+            .NotEq => { return try self.ct.add_bool(self.alloc, a != b); }
+            .Lt => { return try self.ct.add_bool(self.alloc, a < b); }
+            .LtEq => { return try self.ct.add_bool(self.alloc, a <= b); }
+            .Gt => { return try self.ct.add_bool(self.alloc, a > b); }
+            .GtEq => { return try self.ct.add_bool(self.alloc, a >= b); }
+            _ => {
+                try self.emit_err(sp, "invalid float op in comptime");
+                return null;
+            }
+        }
+    }
+
+    fn eval_binary_int_arith(
+        self: *mut Self,
+        op: ast.BinaryOp,
+        a: types.IntVal,
+        b: types.IntVal,
+        ty: types.TyId,
+        sp: span.Span,
+    ) -> ?u32 ! OutOfMemory {
+        match op {
+            .Add => {
+                let res = types.int_val_checked_add(a, b) orelse {
+                    try self.emit_err(sp, "comptime integer addition overflow");
+                    return null;
+                };
+                if !(try self.check_int_range(res, ty, sp)) { return null; }
+                return try self.ct.add_int(self.alloc, res, ty);
+            }
+            .Sub => {
+                let res = types.int_val_checked_sub(a, b) orelse {
+                    try self.emit_err(sp, "comptime integer subtraction overflow");
+                    return null;
+                };
+                if !(try self.check_int_range(res, ty, sp)) { return null; }
+                return try self.ct.add_int(self.alloc, res, ty);
+            }
+            .Mul => {
+                let res = types.int_val_checked_mul(a, b) orelse {
+                    try self.emit_err(sp, "comptime integer multiplication overflow");
+                    return null;
+                };
+                if !(try self.check_int_range(res, ty, sp)) { return null; }
+                return try self.ct.add_int(self.alloc, res, ty);
+            }
+            .Div => {
+                if types.int_val_is_zero(b) {
+                    try self.emit_err(sp, "comptime division by zero");
+                    return null;
+                }
+                let res = types.int_val_checked_div(a, b) orelse {
+                    try self.emit_err(sp, "comptime division overflow");
+                    return null;
+                };
+                if !(try self.check_int_range(res, ty, sp)) { return null; }
+                return try self.ct.add_int(self.alloc, res, ty);
+            }
+            .Mod => {
+                if types.int_val_is_zero(b) {
+                    try self.emit_err(sp, "comptime modulo by zero");
+                    return null;
+                }
+                let res = types.int_val_checked_rem(a, b) orelse {
+                    try self.emit_err(sp, "comptime modulo overflow");
+                    return null;
+                };
+                if !(try self.check_int_range(res, ty, sp)) { return null; }
+                return try self.ct.add_int(self.alloc, res, ty);
+            }
+            .AddWrap => { return try self.ct.add_int(self.alloc, wrap_int(int_val_wrap_add(a, b), self.env, ty), ty); }
+            .SubWrap => { return try self.ct.add_int(self.alloc, wrap_int(int_val_wrap_sub(a, b), self.env, ty), ty); }
+            .MulWrap => { return try self.ct.add_int(self.alloc, wrap_int(int_val_wrap_mul(a, b), self.env, ty), ty); }
+            .AddSat => { return try self.ct.add_int(self.alloc, sat_int(int_val_sat_add(a, b), self.env, ty), ty); }
+            .SubSat => { return try self.ct.add_int(self.alloc, sat_int(int_val_sat_sub(a, b), self.env, ty), ty); }
+            .MulSat => { return try self.ct.add_int(self.alloc, sat_int(int_val_sat_mul(a, b), self.env, ty), ty); }
+            _ => {
+                try self.emit_err(sp, "unsupported binary op in comptime");
+                return null;
+            }
+        }
+    }
+
+    fn emit_shift_err(self: *mut Self, sp: span.Span, dir: *str, b: types.IntVal, bits: u32) -> !OutOfMemory {
+        var buf = try str.StrBuf.init(self.alloc, 80_usize);
+        errdefer buf.destroy(self.alloc);
+        try buf.push_str_grow(self.alloc, dir);
+        try types.push_int_val_grow(self.alloc, b, &mut buf);
+        try buf.push_str_grow(self.alloc, " >= bitwidth ");
+        try buf.push_u64_grow(self.alloc, bits.widen.[u64]());
+        _ = try self.diags.emit_error_bytes(self.alloc, diag.E0520, sp, buf.as_bytes());
+        buf.destroy(self.alloc);
+        return;
+    }
+
+    fn eval_binary_int(
+        self: *mut Self,
+        op: ast.BinaryOp,
+        a: types.IntVal,
+        lt: types.TyId,
+        b: types.IntVal,
+        rt: types.TyId,
+        sp: span.Span,
+    ) -> ?u32 ! OutOfMemory {
+        let ty = if lt != types.TY_COMPTIME_INT { lt } else { rt };
+        let bits = int_bitwidth(self.env, ty);
+        let cmp = types.int_val_cmp(a, b);
+        match op {
+            .Eq => { return try self.ct.add_bool(self.alloc, cmp == 0_i32); }
+            .NotEq => { return try self.ct.add_bool(self.alloc, cmp != 0_i32); }
+            .Lt => { return try self.ct.add_bool(self.alloc, cmp < 0_i32); }
+            .LtEq => { return try self.ct.add_bool(self.alloc, cmp <= 0_i32); }
+            .Gt => { return try self.ct.add_bool(self.alloc, cmp > 0_i32); }
+            .GtEq => { return try self.ct.add_bool(self.alloc, cmp >= 0_i32); }
+            .BitAnd => { return try self.ct.add_int(self.alloc, wrap_int(int_val_bitand(a, b), self.env, ty), ty); }
+            .BitOr => { return try self.ct.add_int(self.alloc, wrap_int(int_val_bitor(a, b), self.env, ty), ty); }
+            .BitXor => { return try self.ct.add_int(self.alloc, wrap_int(int_val_bitxor(a, b), self.env, ty), ty); }
+            .Shl => {
+                let bu = types.int_val_to_u64(b) orelse {
+                    try self.emit_shift_err(sp, "comptime left shift amount ", b, bits);
+                    return null;
+                };
+                if bu >= bits.widen.[u64]() {
+                    try self.emit_shift_err(sp, "comptime left shift amount ", b, bits);
+                    return null;
+                }
+                let res = wrap_int(types.int_val_shl(a, bu.trunc.[u32]()), self.env, ty);
+                return try self.ct.add_int(self.alloc, res, ty);
+            }
+            .ShlWrap => {
+                let mask = bits -% 1_u32;
+                let sh = b.lo.trunc.[u32]() & mask;
+                let res = wrap_int(types.int_val_shl(a, sh), self.env, ty);
+                return try self.ct.add_int(self.alloc, res, ty);
+            }
+            .Shr => {
+                let bu = types.int_val_to_u64(b) orelse {
+                    try self.emit_shift_err(sp, "comptime right shift amount ", b, bits);
+                    return null;
+                };
+                if bu >= bits.widen.[u64]() {
+                    try self.emit_shift_err(sp, "comptime right shift amount ", b, bits);
+                    return null;
+                }
+                let sh = bu.trunc.[u32]();
+                let is_signed = self.env.is_signed_int(ty);
+                let res = if is_signed {
+                    types.int_val_shr(a, sh)
+                } else {
+                    let mask = u128_bitmask(bits);
+                    let u = types.U128Val.{ lo: a.lo & mask.lo, hi: a.hi.bitcast.[u64]() & mask.hi };
+                    u128_as_int_val(u128_shr(u, sh))
+                };
+                return try self.ct.add_int(self.alloc, res, ty);
+            }
+            _ => {
+                return try self.eval_binary_int_arith(op, a, b, ty, sp);
+            }
+        }
+    }
+
+    fn eval_binary(
+        self: *mut Self,
+        op: ast.BinaryOp,
+        l_id: u32,
+        r_id: u32,
+        sp: span.Span,
+    ) -> ?u32 ! OutOfMemory {
+        let ln = self.ct.get_val(l_id);
+        let rn = self.ct.get_val(r_id);
+        if ln.kind == .Bool && rn.kind == .Bool {
+            let a = ln.i_lo != 0_u64;
+            let b = rn.i_lo != 0_u64;
+            match op {
+                .Eq => { return try self.ct.add_bool(self.alloc, a == b); }
+                .NotEq => { return try self.ct.add_bool(self.alloc, a != b); }
+                .And => { return try self.ct.add_bool(self.alloc, a && b); }
+                .Or => { return try self.ct.add_bool(self.alloc, a || b); }
+                _ => {
+                    try self.emit_err(sp, "invalid bool binary op in comptime");
+                    return null;
+                }
+            }
+        }
+        if ln.kind == .Char && rn.kind == .Char {
+            match op {
+                .Eq => { return try self.ct.add_bool(self.alloc, ln.i_lo == rn.i_lo); }
+                .NotEq => { return try self.ct.add_bool(self.alloc, ln.i_lo != rn.i_lo); }
+                .Lt => { return try self.ct.add_bool(self.alloc, ln.i_lo < rn.i_lo); }
+                .LtEq => { return try self.ct.add_bool(self.alloc, ln.i_lo <= rn.i_lo); }
+                .Gt => { return try self.ct.add_bool(self.alloc, ln.i_lo > rn.i_lo); }
+                .GtEq => { return try self.ct.add_bool(self.alloc, ln.i_lo >= rn.i_lo); }
+                _ => {
+                    try self.emit_err(sp, "unsupported binary op in comptime");
+                    return null;
+                }
+            }
+        }
+        if ln.kind == .EnumSym && rn.kind == .EnumSym {
+            match op {
+                .Eq => { return try self.ct.add_bool(self.alloc, ln.sym == rn.sym); }
+                .NotEq => { return try self.ct.add_bool(self.alloc, ln.sym != rn.sym); }
+                _ => {
+                    try self.emit_err(sp, "invalid enum binary op in comptime");
+                    return null;
+                }
+            }
+        }
+        if ln.kind == .Str && rn.kind == .Str {
+            let eq = str.bytes_eq(self.ct.str_slice(l_id), self.ct.str_slice(r_id));
+            match op {
+                .Eq => { return try self.ct.add_bool(self.alloc, eq); }
+                .NotEq => { return try self.ct.add_bool(self.alloc, !eq); }
+                _ => {
+                    try self.emit_err(sp, "invalid string binary op in comptime");
+                    return null;
+                }
+            }
+        }
+        if ln.kind == .Float && rn.kind == .Float {
+            return try self.eval_binary_float(
+                op, ln.i_lo.bitcast.[f64](), rn.i_lo.bitcast.[f64](), ln.ty, sp,
+            );
+        }
+        if ln.kind == .Int && rn.kind == .Int {
+            let a = types.IntVal.{ lo: ln.i_lo, hi: ln.i_hi.bitcast.[i64]() };
+            let b = types.IntVal.{ lo: rn.i_lo, hi: rn.i_hi.bitcast.[i64]() };
+            return try self.eval_binary_int(op, a, ln.ty, b, rn.ty, sp);
+        }
+        try self.emit_err(sp, "type mismatch in comptime binary op");
+        return null;
+    }
+
+    fn eval_cast(
+        self: *mut Self,
+        kind: CtCastKind,
+        val_id: u32,
+        to_ty: types.TyId,
+        sp: span.Span,
+    ) -> ?u32 ! OutOfMemory {
+        let n = self.ct.get_val(val_id);
+        let to_kind = self.env.get(to_ty).kind;
+        let to_bits = self.env.get(to_ty).u8_val;
+        match kind {
+            .Widen => {
+                if n.kind == .Int {
+                    let v = types.IntVal.{ lo: n.i_lo, hi: n.i_hi.bitcast.[i64]() };
+                    return try self.ct.add_int(self.alloc, v, to_ty);
+                }
+                if n.kind == .Float {
+                    return try self.ct.add_float_bits(self.alloc, n.i_lo, to_ty);
+                }
+                try self.emit_err(sp, "invalid comptime .widen()");
+                return null;
+            }
+            .Trunc => {
+                if n.kind == .Int {
+                    let v = types.IntVal.{ lo: n.i_lo, hi: n.i_hi.bitcast.[i64]() };
+                    return try self.ct.add_int(self.alloc, wrap_int(v, self.env, to_ty), to_ty);
+                }
+                try self.emit_err(sp, "invalid comptime .trunc()");
+                return null;
+            }
+            .Clamp => {
+                if n.kind == .Int {
+                    let v = types.IntVal.{ lo: n.i_lo, hi: n.i_hi.bitcast.[i64]() };
+                    return try self.ct.add_int(self.alloc, sat_int(v, self.env, to_ty), to_ty);
+                }
+                try self.emit_err(sp, "invalid comptime .clamp()");
+                return null;
+            }
+            .ToFloat => {
+                if n.kind == .Int {
+                    let v = types.IntVal.{ lo: n.i_lo, hi: n.i_hi.bitcast.[i64]() };
+                    return try self.ct.add_float(self.alloc, int_val_to_f64(v), to_ty);
+                }
+                if n.kind == .Float {
+                    return try self.ct.add_float_bits(self.alloc, n.i_lo, to_ty);
+                }
+                return null;
+            }
+            .TruncToInt => {
+                if n.kind == .Float {
+                    let iv = sat_int(f64_to_int_val_sat(n.i_lo.bitcast.[f64]()), self.env, to_ty);
+                    return try self.ct.add_int(self.alloc, iv, to_ty);
+                }
+                return null;
+            }
+            .Bitcast => {
+                if n.kind == .Int {
+                    if to_kind == .Float {
+                        if to_bits == 32_u8 {
+                            let f32v = n.i_lo.trunc.[u32]().bitcast.[f32]();
+                            return try self.ct.add_float(self.alloc, f32v.widen.[f64](), to_ty);
+                        }
+                        return try self.ct.add_float_bits(self.alloc, n.i_lo, to_ty);
+                    }
+                    let v = types.IntVal.{ lo: n.i_lo, hi: n.i_hi.bitcast.[i64]() };
+                    return try self.ct.add_int(self.alloc, wrap_int(v, self.env, to_ty), to_ty);
+                }
+                if n.kind == .Float && to_kind == .Int {
+                    let bw = int_bitwidth(self.env, to_ty);
+                    let raw_u64 = if bw == 32_u32 {
+                        f64_bits_to_f32_bits(n.i_lo).widen.[u64]()
+                    } else {
+                        n.i_lo
+                    };
+                    let v = wrap_int(types.int_val_from_u64(raw_u64), self.env, to_ty);
+                    return try self.ct.add_int(self.alloc, v, to_ty);
+                }
+                return try self.ct.clone_val(self.alloc, val_id);
+            }
+        }
+    }
+
+    fn exec_array_load(
+        self: *mut Self,
+        arr_id: u32,
+        idx_id: u32,
+        sp: span.Span,
+    ) -> ?u32 ! OutOfMemory {
+        let iv = self.ct.as_i128(idx_id) orelse {
+            try self.emit_err(sp, "comptime array index is not an integer");
+            return null;
+        };
+        let an = self.ct.get_val(arr_id);
+        let alen = an.range.len.widen.[u64]();
+        if an.kind == .Array {
+            let iu = types.int_val_to_u64(iv) orelse {
+                try self.emit_oob_err(sp, "comptime array index ", iv, alen);
+                return null;
+            };
+            if iu >= alen {
+                try self.emit_oob_err(sp, "comptime array index ", iv, alen);
+                return null;
+            }
+            let elem_id = self.ct.get_elem(an.range, iu.trunc.[usize]());
+            return try self.ct.clone_val(self.alloc, elem_id);
+        }
+        if an.kind == .Str {
+            let iu = types.int_val_to_u64(iv) orelse {
+                try self.emit_oob_err(sp, "comptime string index ", iv, alen);
+                return null;
+            };
+            if iu >= alen {
+                try self.emit_oob_err(sp, "comptime string index ", iv, alen);
+                return null;
+            }
+            let bval = self.ct.get_str_byte(arr_id, iu.trunc.[usize]()).widen.[u64]();
+            return try self.ct.add_int(self.alloc, types.int_val_from_u64(bval), types.TY_U8);
+        }
+        try self.emit_err(sp, "comptime indexing non-array value");
+        return null;
+    }
+
+    fn exec_array_store(
+        self: *mut Self,
+        arr_id: u32,
+        idx_id: u32,
+        val_id: u32,
+        sp: span.Span,
+    ) -> bool ! OutOfMemory {
+        let iv = self.ct.as_i128(idx_id) orelse {
+            try self.emit_err(sp, "comptime array index is not an integer");
+            return false;
+        };
+        let an = self.ct.get_val(arr_id);
+        if an.kind != .Array {
+            try self.emit_err(sp, "comptime array store on non-array value");
+            return false;
+        }
+        let alen = an.range.len.widen.[u64]();
+        let iu = types.int_val_to_u64(iv) orelse {
+            try self.emit_oob_err(sp, "comptime array store index ", iv, alen);
+            return false;
+        };
+        if iu >= alen {
+            try self.emit_oob_err(sp, "comptime array store index ", iv, alen);
+            return false;
+        }
+        let vn = self.ct.get_val(val_id);
+        let stored = if vn.kind == .Int && vn.ty == types.TY_COMPTIME_INT && self.env.is_integer(an.ty) {
+            try self.ct.add_int(
+                self.alloc,
+                types.IntVal.{ lo: vn.i_lo, hi: vn.i_hi.bitcast.[i64]() },
+                an.ty,
+            )
+        } else {
+            try self.ct.clone_val(self.alloc, val_id)
+        };
+        _ = self.ct.set_array_elem(arr_id, iu.trunc.[usize](), stored);
+        return true;
+    }
+
+    fn exec_field_load(
+        self: *mut Self,
+        base_id: u32,
+        field_sym: u32,
+        sp: span.Span,
+    ) -> ?u32 ! OutOfMemory {
+        let fname = self.interner.get(field_sym);
+        let bn = self.ct.get_val(base_id);
+        if bn.kind == .Array && str.bytes_eq(fname, "len".as_bytes()) {
+            return try self.ct.add_int(
+                self.alloc,
+                types.int_val_from_u64(bn.range.len.widen.[u64]()),
+                types.TY_USIZE,
+            );
+        }
+        if bn.kind == .Str && str.bytes_eq(fname, "len".as_bytes()) {
+            return try self.ct.add_int(
+                self.alloc,
+                types.int_val_from_u64(bn.range.len.widen.[u64]()),
+                types.TY_USIZE,
+            );
+        }
+        if bn.kind == .Struct {
+            if let fval = self.ct.get_struct_field(base_id, field_sym) {
+                return try self.ct.clone_val(self.alloc, fval);
+            }
+            try emit_e0520_fmt2(self.alloc, self.diags, sp, "comptime struct has no field `", fname, "`");
+            return null;
+        }
+        if bn.kind == .Tuple {
+            let idx_u64 = str.parse_u64(fname) catch {
+                try self.emit_err(sp, "invalid comptime tuple field");
+                return null;
+            };
+            if idx_u64 < bn.range.len.widen.[u64]() {
+                let elem_id = self.ct.get_elem(bn.range, idx_u64.trunc.[usize]());
+                return try self.ct.clone_val(self.alloc, elem_id);
+            }
+            try self.emit_err(sp, "invalid comptime tuple field");
+            return null;
+        }
+        try emit_e0520_fmt2(self.alloc, self.diags, sp, "cannot access field `", fname, "` in comptime");
+        return null;
+    }
+
+    fn exec_struct_init(
+        self: *mut Self,
+        code: *CtCode,
+        regs: *[u32],
+        op: *CtOp,
+    ) -> u32 ! OutOfMemory {
+        let fargs = slice_range.[CtFieldReg](code.field_args.as_slice(), op.range);
+        var flds = try col.DynBuf.[CtField].init(self.alloc, fargs.len +% 1_usize);
+        errdefer flds.destroy(self.alloc);
+        var i: usize = 0_usize;
+        while i < fargs.len {
+            let fr = fargs[i];
+            let ridx = fr.reg.widen.[usize]();
+            let raw_v = if ridx < regs.len { regs[ridx] } else { CT_NONE };
+            let cv = try self.ct.clone_val(self.alloc, raw_v);
+            var replaced = false;
+            let fm = flds.as_mut_slice();
+            var k: usize = 0_usize;
+            while k < fm.len {
+                if fm[k].name_sym == fr.name_sym {
+                    fm[k].val_id = cv;
+                    replaced = true;
+                    break;
+                }
+                k = k +% 1_usize;
+            }
+            if !replaced {
+                try flds.push(self.alloc, CtField.{ name_sym: fr.name_sym, val_id: cv });
+            }
+            i = i +% 1_usize;
+        }
+        let st_id = try self.ct.add_struct(self.alloc, op.ty, flds.as_slice());
+        flds.destroy(self.alloc);
+        return st_id;
+    }
+
+    fn exec_array_or_tuple_init(
+        self: *mut Self,
+        code: *CtCode,
+        regs: *[u32],
+        op: *CtOp,
+    ) -> u32 ! OutOfMemory {
+        let rargs = slice_range.[u32](code.reg_args.as_slice(), op.range);
+        var tmp = try col.DynBuf.[u32].init(self.alloc, rargs.len +% 1_usize);
+        errdefer tmp.destroy(self.alloc);
+        var i: usize = 0_usize;
+        while i < rargs.len {
+            let ridx = rargs[i].widen.[usize]();
+            let raw_v = if ridx < regs.len { regs[ridx] } else { CT_NONE };
+            let cv = try self.ct.clone_val(self.alloc, raw_v);
+            try tmp.push(self.alloc, cv);
+            i = i +% 1_usize;
+        }
+        let id = if op.kind == .ArrayInit {
+            try self.ct.add_array(self.alloc, tmp.as_slice(), op.ty)
+        } else {
+            try self.ct.add_tuple(self.alloc, tmp.as_slice())
+        };
+        tmp.destroy(self.alloc);
+        return id;
+    }
+
+    fn exec_array_repeat(
+        self: *mut Self,
+        val_id: u32,
+        count: u32,
+        elem_ty: types.TyId,
+        sp: span.Span,
+    ) -> ?u32 ! OutOfMemory {
+        if count > MAX_ARRAY_REPEAT {
+            try self.emit_err(sp, "comptime array repeat size exceeds maximum limit (1M elements)");
+            return null;
+        }
+        let cnt = count.widen.[usize]();
+        var tmp = try col.DynBuf.[u32].init(self.alloc, if cnt < 4_usize { 4_usize } else { cnt });
+        errdefer tmp.destroy(self.alloc);
+        let is_agg = is_aggregate_kind(self.ct.get_val(val_id).kind);
+        var i: usize = 0_usize;
+        while i < cnt {
+            let item = if is_agg { try self.ct.clone_val(self.alloc, val_id) } else { val_id };
+            try tmp.push(self.alloc, item);
+            i = i +% 1_usize;
+        }
+        let id = try self.ct.add_array(self.alloc, tmp.as_slice(), elem_ty);
+        tmp.destroy(self.alloc);
+        return id;
+    }
+
+    @recursive
+    fn eval_fn_call(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        def_id: u32,
+        arg_vals: *[u32],
+        sp: span.Span,
+    ) -> ?u32 ! OutOfMemory {
+        var def_kind: resolve.TopDefKind = .Const;
+        var fn_mod: u32 = resolve.MODULE_NONE;
+        var decl_id: u32 = ast.NONE_ID;
+        var found_def = false;
+        if let def_info = self.prog.get_def(def_id) {
+            found_def = true;
+            def_kind = def_info.kind;
+            fn_mod = def_info.module_id;
+            decl_id = def_info.decl_id;
+        }
+        if !found_def || def_kind != .Fn {
+            try self.emit_err(sp, "cannot call non-function in comptime");
+            return null;
+        }
+        var has_unit = false;
+        if let mod_info = self.prog.get_module(fn_mod) {
+            has_unit = mod_info.unit_id != resolve.UNIT_NONE;
+        }
+        if !has_unit {
+            try self.emit_err(sp, "cannot call virtual builtin in comptime");
+            return null;
+        }
+        let decl = arena.get_decl(decl_id) orelse { return null; };
+        if decl.kind != .Fn {
+            return null;
+        }
+        let fdecl = arena.get_fn_decl(decl.payload) orelse { return null; };
+        var ret_exp = types.TY_NONE;
+        if let sig = self.env.get_fn(def_id) {
+            if sig.ret != types.TY_VOID && sig.ret != types.TY_ERROR {
+                ret_exp = sig.ret;
+            }
+        }
+
+        let gctx = try types.GenericCtx.init(self.alloc);
+        errdefer gctx.destroy(self.alloc);
+        var st = try CtCompState.init(self.alloc, ret_exp);
+        errdefer st.destroy(self.alloc);
+
+        var comp = CtComp.{
+            alloc: self.alloc,
+            ct: self.ct,
+            mod_id: fn_mod,
+            ctx: &gctx,
+            prog: self.prog,
+            env: self.env,
+            interner: self.interner,
+            diags: self.diags,
+            st: &mut st,
+        };
+        let params = arena.params_range(fdecl.params);
+        var pi: usize = 0_usize;
+        while pi < params.len && pi < arg_vals.len {
+            let pr = comp.alloc_reg();
+            try comp.emit_load_const(pr, arg_vals[pi], params[pi].span);
+            try comp.bind_var(params[pi].name.sym, pr);
+            pi = pi +% 1_usize;
+        }
+        let ret_r = try comp.compile_block(arena, fdecl.body, ret_exp);
+        var res: ?u32 = null;
+        if !st.failed {
+            self.call_depth = self.call_depth +% 1_u32;
+            res = try self.exec(arena, &st.code, ret_r, sp);
+            self.call_depth = self.call_depth -% 1_u32;
+        }
+        st.destroy(self.alloc);
+        gctx.destroy(self.alloc);
+        return res;
+    }
+
+    @recursive
+    fn exec(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        code: *CtCode,
+        ret_reg: u32,
+        root_span: span.Span,
+    ) -> ?u32 ! OutOfMemory {
+        let nregs = code.num_regs.widen.[usize]();
+        var regs = try col.DynBuf.[u32].init(self.alloc, if nregs < 4_usize { 4_usize } else { nregs });
+        errdefer regs.destroy(self.alloc);
+        let void_id = try self.ct.add_void(self.alloc);
+        var ri: usize = 0_usize;
+        while ri < nregs {
+            try regs.push(self.alloc, void_id);
+            ri = ri +% 1_usize;
+        }
+        let res = try self.exec_loop(arena, code, &mut regs, ret_reg, root_span);
+        regs.destroy(self.alloc);
+        return res;
+    }
+
+    @recursive
+    fn exec_loop(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        code: *CtCode,
+        regs: *mut col.DynBuf[u32],
+        ret_reg: u32,
+        root_span: span.Span,
+    ) -> ?u32 ! OutOfMemory {
+        let ops = code.ops.as_slice();
+        var pc: usize = 0_usize;
+        while pc < ops.len {
+            self.steps = self.steps +% 1_u64;
+            if self.steps > self.fuel_limit {
+                var buf = try str.StrBuf.init(self.alloc, 128_usize);
+                errdefer buf.destroy(self.alloc);
+                try buf.push_str_grow(self.alloc, "comptime VM exceeded instruction budget of ");
+                try buf.push_u64_grow(self.alloc, self.fuel_limit);
+                try buf.push_str_grow(
+                    self.alloc,
+                    " steps (possible infinite loop; increase with `@comptime_budget(...)`)",
+                );
+                _ = try self.diags.emit_error_bytes(self.alloc, diag.E0520, root_span, buf.as_bytes());
+                buf.destroy(self.alloc);
+                return null;
+            }
+            let op_ref = &ops[pc];
+            let next = try self.exec_step(arena, code, regs, op_ref, pc);
+            if next.done {
+                return next.ret_val;
+            }
+            if !next.ok {
+                return null;
+            }
+            pc = next.next_pc;
+        }
+        let rs = regs.as_slice();
+        let ridx = ret_reg.widen.[usize]();
+        if ridx < rs.len {
+            return rs[ridx];
+        }
+        return try self.ct.add_void(self.alloc);
+    }
+
+    @recursive
+    fn exec_step(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        code: *CtCode,
+        regs: *mut col.DynBuf[u32],
+        op: *CtOp,
+        pc: usize,
+    ) -> StepRes ! OutOfMemory {
+        let get_r = fn_read_reg(regs.as_slice(), op.a);
+        let get_b = fn_read_reg(regs.as_slice(), op.b);
+        match op.kind {
+            .LoadConst => {
+                let cv = try self.ct.clone_val(self.alloc, op.a);
+                fn_write_reg(regs.as_mut_slice(), op.dst, cv);
+                return step_cont(pc +% 1_usize);
+            }
+            .Mov => {
+                let cv = try self.ct.clone_val(self.alloc, get_r);
+                fn_write_reg(regs.as_mut_slice(), op.dst, cv);
+                return step_cont(pc +% 1_usize);
+            }
+            .Unary => {
+                let v = try self.eval_unary(op.uop, get_r, op.span) orelse { return step_err(); };
+                fn_write_reg(regs.as_mut_slice(), op.dst, v);
+                return step_cont(pc +% 1_usize);
+            }
+            .Binary => {
+                let v = try self.eval_binary(op.bop, get_r, get_b, op.span) orelse { return step_err(); };
+                fn_write_reg(regs.as_mut_slice(), op.dst, v);
+                return step_cont(pc +% 1_usize);
+            }
+            .Cast => {
+                let v = try self.eval_cast(op.ckind, get_r, op.ty, op.span) orelse { return step_err(); };
+                fn_write_reg(regs.as_mut_slice(), op.dst, v);
+                return step_cont(pc +% 1_usize);
+            }
+            .ArrayInit => {
+                let v = try self.exec_array_or_tuple_init(code, regs.as_slice(), op);
+                fn_write_reg(regs.as_mut_slice(), op.dst, v);
+                return step_cont(pc +% 1_usize);
+            }
+            .TupleInit => {
+                let v = try self.exec_array_or_tuple_init(code, regs.as_slice(), op);
+                fn_write_reg(regs.as_mut_slice(), op.dst, v);
+                return step_cont(pc +% 1_usize);
+            }
+            .ArrayRepeat => {
+                let v = try self.exec_array_repeat(get_r, op.b, op.ty, op.span) orelse { return step_err(); };
+                fn_write_reg(regs.as_mut_slice(), op.dst, v);
+                return step_cont(pc +% 1_usize);
+            }
+            .ArrayLoad => {
+                let v = try self.exec_array_load(get_r, get_b, op.span) orelse { return step_err(); };
+                fn_write_reg(regs.as_mut_slice(), op.dst, v);
+                return step_cont(pc +% 1_usize);
+            }
+            .ArrayStore => {
+                let v_id = fn_read_reg(regs.as_slice(), op.dst);
+                if !(try self.exec_array_store(get_r, get_b, v_id, op.span)) {
+                    return step_err();
+                }
+                return step_cont(pc +% 1_usize);
+            }
+            _ => {
+                return try self.exec_step_ctrl(arena, code, regs, op, pc);
+            }
+        }
+    }
+
+    @recursive
+    fn exec_step_ctrl(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        code: *CtCode,
+        regs: *mut col.DynBuf[u32],
+        op: *CtOp,
+        pc: usize,
+    ) -> StepRes ! OutOfMemory {
+        let get_r = fn_read_reg(regs.as_slice(), op.a);
+        match op.kind {
+            .FieldLoad => {
+                let v = try self.exec_field_load(get_r, op.b, op.span) orelse { return step_err(); };
+                fn_write_reg(regs.as_mut_slice(), op.dst, v);
+                return step_cont(pc +% 1_usize);
+            }
+            .FieldStore => {
+                let v_id = fn_read_reg(regs.as_slice(), op.dst);
+                let nv = try self.ct.clone_val(self.alloc, v_id);
+                if !(try self.ct.set_struct_field(self.alloc, get_r, op.b, nv)) {
+                    try self.emit_err(op.span, "comptime field store on non-struct");
+                    return step_err();
+                }
+                return step_cont(pc +% 1_usize);
+            }
+            .StructInit => {
+                let v = try self.exec_struct_init(code, regs.as_slice(), op);
+                fn_write_reg(regs.as_mut_slice(), op.dst, v);
+                return step_cont(pc +% 1_usize);
+            }
+            .Jump => { return step_cont(op.a.widen.[usize]()); }
+            .JumpIfFalse => {
+                let cond = self.ct.as_bool(get_r) orelse false;
+                return step_cont(if !cond { op.b.widen.[usize]() } else { pc +% 1_usize });
+            }
+            .JumpIfTrue => {
+                let cond = self.ct.as_bool(get_r) orelse false;
+                return step_cont(if cond { op.b.widen.[usize]() } else { pc +% 1_usize });
+            }
+            .CallFn => {
+                if self.call_depth >= MAX_CALL_DEPTH {
+                    try self.emit_err(op.span, "comptime VM recursion depth exceeded (max 64)");
+                    return step_err();
+                }
+                let rargs = slice_range.[u32](code.reg_args.as_slice(), op.range);
+                var avals = try col.DynBuf.[u32].init(self.alloc, rargs.len +% 1_usize);
+                errdefer avals.destroy(self.alloc);
+                var i: usize = 0_usize;
+                while i < rargs.len {
+                    let raw_v = fn_read_reg(regs.as_slice(), rargs[i]);
+                    try avals.push(self.alloc, try self.ct.clone_val(self.alloc, raw_v));
+                    i = i +% 1_usize;
+                }
+                let res_opt = try self.eval_fn_call(arena, op.a, avals.as_slice(), op.span);
+                avals.destroy(self.alloc);
+                let rv = res_opt orelse { return step_err(); };
+                fn_write_reg(regs.as_mut_slice(), op.dst, rv);
+                return step_cont(pc +% 1_usize);
+            }
+            .SetBudget => {
+                if let iv = self.ct.as_i128(get_r) {
+                    if !types.int_val_is_neg(iv) && !types.int_val_is_zero(iv) {
+                        if let u = types.int_val_to_u64(iv) {
+                            self.fuel_limit = u;
+                            return step_cont(pc +% 1_usize);
+                        }
+                    }
+                }
+                try self.emit_err(op.span, "`@comptime_budget` expects a positive integer");
+                return step_err();
+            }
+            .CompileError => {
+                let mn = self.ct.get_val(get_r);
+                if mn.kind == .Str {
+                    _ = try self.diags.emit_error_bytes(
+                        self.alloc, diag.E0520, op.span, self.ct.str_slice(get_r),
+                    );
+                } else {
+                    try self.emit_err(op.span, "@compile_error triggered");
+                }
+                return step_err();
+            }
+            .Ret => {
+                let rv = if op.b != 0_u32 { get_r } else { try self.ct.add_void(self.alloc) };
+                return StepRes.{ ok: true, done: true, next_pc: pc, ret_val: rv };
+            }
+            _ => { return step_err(); }
+        }
+    }
+}
+
+struct StepRes {
+    ok: bool;
+    done: bool;
+    next_pc: usize;
+    ret_val: u32;
+}
+
+fn step_cont(next_pc: usize) -> StepRes {
+    return StepRes.{ ok: true, done: false, next_pc: next_pc, ret_val: CT_NONE };
+}
+
+fn step_err() -> StepRes {
+    return StepRes.{ ok: false, done: false, next_pc: 0_usize, ret_val: CT_NONE };
+}
+
+fn fn_read_reg(rs: *[u32], reg: u32) -> u32 {
+    let idx = reg.widen.[usize]();
+    if idx < rs.len {
+        return rs[idx];
+    }
+    return CT_NONE;
+}
+
+fn fn_write_reg(rs: *mut [u32], reg: u32, val_id: u32) {
+    let idx = reg.widen.[usize]();
+    if idx < rs.len {
+        rs[idx] = val_id;
+    }
+}
+
+// ===========================================================================
+// Section 7: Public Evaluation Entrypoints
+// ===========================================================================
+
+pub fn eval_expr_in_ctx(
+    alloc: *mut AllocCap,
+    ct: *mut CtArena,
+    expr_id: u32,
+    expected_ty: types.TyId,
+    mod_id: u32,
+    ctx: *types.GenericCtx,
+    arena: *ast.AstArena,
+    prog: *mut resolve.ResolvedProgram,
+    env: *mut types.TypeEnv,
+    interner: *mut span.SymInterner,
+    diags: *mut diag.DiagBag,
+    fuel: u64,
+) -> ?u32 ! OutOfMemory {
+    var root_span = span.span_dummy();
+    if let e = arena.get_expr(expr_id) {
+        root_span = e.span;
+    }
+    var st = try CtCompState.init(alloc, expected_ty);
+    errdefer st.destroy(alloc);
+    var comp = CtComp.{
+        alloc: alloc,
+        ct: ct,
+        mod_id: mod_id,
+        ctx: ctx,
+        prog: prog,
+        env: env,
+        interner: interner,
+        diags: diags,
+        st: &mut st,
+    };
+    let ret_r = try comp.compile_expr(arena, expr_id, expected_ty);
+    var res: ?u32 = null;
+    if !st.failed {
+        var vm = CtVm.{
+            alloc: alloc,
+            ct: ct,
+            prog: prog,
+            env: env,
+            interner: interner,
+            diags: diags,
+            steps: 0_u64,
+            fuel_limit: fuel,
+            call_depth: 0_u32,
+        };
+        res = try vm.exec(arena, &st.code, ret_r, root_span);
+    }
+    st.destroy(alloc);
+    return res;
+}
+
+pub fn eval_expr(
+    alloc: *mut AllocCap,
+    ct: *mut CtArena,
+    expr_id: u32,
+    mod_id: u32,
+    arena: *ast.AstArena,
+    prog: *mut resolve.ResolvedProgram,
+    env: *mut types.TypeEnv,
+    interner: *mut span.SymInterner,
+    diags: *mut diag.DiagBag,
+    fuel: u64,
+) -> ?u32 ! OutOfMemory {
+    let gctx = try types.GenericCtx.init(alloc);
+    errdefer gctx.destroy(alloc);
+    let res = try eval_expr_in_ctx(
+        alloc, ct, expr_id, types.TY_NONE, mod_id, &gctx, arena, prog, env, interner, diags, fuel,
+    );
+    gctx.destroy(alloc);
+    return res;
+}
+
+pub fn eval_const_bool_in_ctx(
+    alloc: *mut AllocCap,
+    ct: *mut CtArena,
+    expr_id: u32,
+    mod_id: u32,
+    ctx: *types.GenericCtx,
+    arena: *ast.AstArena,
+    prog: *mut resolve.ResolvedProgram,
+    env: *mut types.TypeEnv,
+    interner: *mut span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> ?bool ! OutOfMemory {
+    let vid = try eval_expr_in_ctx(
+        alloc, ct, expr_id, types.TY_BOOL, mod_id, ctx, arena, prog, env, interner, diags,
+        DEFAULT_COMPTIME_FUEL,
+    ) orelse {
+        return null;
+    };
+    return ct.as_bool(vid);
+}
+
+pub fn eval_const_bool(
+    alloc: *mut AllocCap,
+    ct: *mut CtArena,
+    expr_id: u32,
+    mod_id: u32,
+    arena: *ast.AstArena,
+    prog: *mut resolve.ResolvedProgram,
+    env: *mut types.TypeEnv,
+    interner: *mut span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> ?bool ! OutOfMemory {
+    let gctx = try types.GenericCtx.init(alloc);
+    errdefer gctx.destroy(alloc);
+    let res = try eval_const_bool_in_ctx(
+        alloc, ct, expr_id, mod_id, &gctx, arena, prog, env, interner, diags,
+    );
+    gctx.destroy(alloc);
+    return res;
+}
+
+pub fn eval_const_decl(
+    alloc: *mut AllocCap,
+    ct: *mut CtArena,
+    expr_id: u32,
+    ty: types.TyId,
+    mod_id: u32,
+    ctx: *types.GenericCtx,
+    arena: *ast.AstArena,
+    prog: *mut resolve.ResolvedProgram,
+    env: *mut types.TypeEnv,
+    interner: *mut span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> ?u32 ! OutOfMemory {
+    return try eval_expr_in_ctx(
+        alloc, ct, expr_id, ty, mod_id, ctx, arena, prog, env, interner, diags,
+        DEFAULT_COMPTIME_FUEL,
+    );
+}
+
+fn expr_needs_vm(arena: *ast.AstArena, expr_id: u32) -> bool {
+    let e = arena.get_expr(expr_id) orelse { return false; };
+    let kind = e.kind;
+    if kind == .Binary {
+        return e.bin_op == .AddWrap
+            || e.bin_op == .SubWrap
+            || e.bin_op == .MulWrap
+            || e.bin_op == .AddSat
+            || e.bin_op == .SubSat
+            || e.bin_op == .MulSat
+            || e.bin_op == .ShlWrap;
+    }
+    return kind == .ComptimeBlock
+        || kind == .ComptimeExpr
+        || kind == .ArrayLit
+        || kind == .ArrayRepeat
+        || kind == .AnonStructLit
+        || kind == .NamedStructLit
+        || kind == .Builtin
+        || kind == .Call
+        || kind == .Tuple
+        || kind == .If
+        || kind == .Match
+        || kind == .Loop;
+}
+
+pub fn eval_all_consts(
+    alloc: *mut AllocCap,
+    ct: *mut CtArena,
+    arena: *ast.AstArena,
+    prog: *mut resolve.ResolvedProgram,
+    env: *mut types.TypeEnv,
+    interner: *mut span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    let gctx = try types.GenericCtx.init(alloc);
+    errdefer gctx.destroy(alloc);
+    let def_cnt = prog.def_count();
+    var di: u32 = 0_u32;
+    while di < def_cnt {
+        var is_const = false;
+        var def_mod: u32 = resolve.MODULE_NONE;
+        var decl_id: u32 = ast.NONE_ID;
+        if let td = prog.get_def(di) {
+            if td.kind == .Const {
+                is_const = true;
+                def_mod = td.module_id;
+                decl_id = td.decl_id;
+            }
+        }
+        if is_const {
+            var has_unit = false;
+            if let mi = prog.get_module(def_mod) {
+                has_unit = mi.unit_id != resolve.UNIT_NONE;
+            }
+            if has_unit {
+                var val_expr: u32 = ast.NONE_ID;
+                if let decl = arena.get_decl(decl_id) {
+                    if decl.kind == .Const {
+                        if let cd = arena.get_const_decl(decl.payload) {
+                            val_expr = cd.value;
+                        }
+                    }
+                }
+                if val_expr != ast.NONE_ID {
+                    var cm_found = false;
+                    var cm_ty = types.TY_ERROR;
+                    var cm_has_int = false;
+                    if let cm = env.get_const(di) {
+                        cm_found = true;
+                        cm_ty = cm.ty;
+                        cm_has_int = cm.has_int_val;
+                    }
+                    if cm_found && (!cm_has_int || expr_needs_vm(arena, val_expr)) {
+                        if let cv_id = try eval_const_decl(
+                            alloc, ct, val_expr, cm_ty, def_mod, &gctx,
+                            arena, prog, env, interner, diags,
+                        ) {
+                            try ct.set_const_val(alloc, di, cv_id);
+                            if let iv = ct.as_i128(cv_id) {
+                                if let cidx = env.index.const_by_def.get(di.widen.[u64]()) {
+                                    if let cmut = env.decls.consts.get_mut(cidx.widen.[usize]()) {
+                                        cmut.has_int_val = true;
+                                        cmut.int_val = iv;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        di = di +% 1_u32;
+    }
+    gctx.destroy(alloc);
+    return;
+}
+
+// ===========================================================================
+// Section 8: Little-Endian Constant Byte Encoding (for interp & mach_x64)
+// ===========================================================================
+
+fn push_zero_bytes(alloc: *mut AllocCap, out: *mut col.DynBuf[u8], count: usize) -> !OutOfMemory {
+    try out.reserve(alloc, count);
+    var i: usize = 0_usize;
+    while i < count {
+        try out.push(alloc, 0_u8);
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+fn copy_bytes_at(dst: *mut [u8], off: usize, src: *[u8]) {
+    var i: usize = 0_usize;
+    while i < src.len {
+        let pos = off +% i;
+        if pos < dst.len {
+            dst[pos] = src[i];
+        }
+        i = i +% 1_usize;
+    }
+}
+
+fn truncate_u8_buf(buf: *mut col.DynBuf[u8], target_len: usize) {
+    while buf.len() > target_len {
+        _ = buf.pop();
+    }
+}
+
+fn encode_int_le_bytes(
+    alloc: *mut AllocCap,
+    lo: u64,
+    hi: u64,
+    sz: usize,
+    out: *mut col.DynBuf[u8],
+) -> !OutOfMemory {
+    var bs: [16]u8 = [0_u8; 16];
+    var i: usize = 0_usize;
+    while i < 8_usize {
+        let sh = (i *% 8_usize).trunc.[u64]() & 63_u64;
+        bs[i] = ((lo >> sh) & 0xFF_u64).trunc.[u8]();
+        bs[i +% 8_usize] = ((hi >> sh) & 0xFF_u64).trunc.[u8]();
+        i = i +% 1_usize;
+    }
+    let k = if sz < 16_usize { sz } else { 16_usize };
+    try out.push_slice(alloc, bs[0_usize..k]);
+    if sz > k {
+        try push_zero_bytes(alloc, out, sz -% k);
+    }
+    return;
+}
+
+fn encode_float_le_bytes(
+    alloc: *mut AllocCap,
+    f64_bits: u64,
+    sz: usize,
+    out: *mut col.DynBuf[u8],
+) -> !OutOfMemory {
+    if sz == 2_usize {
+        let h = f32_bits_to_f16_bits(f64_bits_to_f32_bits(f64_bits));
+        let bs: [2]u8 = [(h & 0xFF_u16).trunc.[u8](), ((h >> 8_u16) & 0xFF_u16).trunc.[u8]()];
+        try out.push_slice(alloc, bs[0_usize..2_usize]);
+        return;
+    }
+    if sz == 4_usize {
+        let f = f64_bits_to_f32_bits(f64_bits);
+        let bs: [4]u8 = [
+            (f & 0xFF_u32).trunc.[u8](),
+            ((f >> 8_u32) & 0xFF_u32).trunc.[u8](),
+            ((f >> 16_u32) & 0xFF_u32).trunc.[u8](),
+            ((f >> 24_u32) & 0xFF_u32).trunc.[u8](),
+        ];
+        try out.push_slice(alloc, bs[0_usize..4_usize]);
+        return;
+    }
+    var bs: [8]u8 = [0_u8; 8];
+    var i: usize = 0_usize;
+    while i < 8_usize {
+        let sh = (i *% 8_usize).trunc.[u64]() & 63_u64;
+        bs[i] = ((f64_bits >> sh) & 0xFF_u64).trunc.[u8]();
+        i = i +% 1_usize;
+    }
+    let k = if sz < 8_usize { sz } else { 8_usize };
+    try out.push_slice(alloc, bs[0_usize..k]);
+    if sz > k {
+        try push_zero_bytes(alloc, out, sz -% k);
+    }
+    return;
+}
+
+@recursive
+fn encode_struct_bytes(
+    alloc: *mut AllocCap,
+    ct: *CtArena,
+    val_id: u32,
+    sty_in: types.TyId,
+    fallback_ty: types.TyId,
+    sz: usize,
+    env: *types.TypeEnv,
+    out: *mut col.DynBuf[u8],
+) -> bool ! OutOfMemory {
+    var sty = if sty_in != types.TY_ERROR && sty_in != types.TY_NONE { sty_in } else { fallback_ty };
+    var sn = env.get(sty);
+    if sn.kind != .Struct && sn.kind != .AnonStruct {
+        sty = fallback_ty;
+        sn = env.get(sty);
+    }
+    let base_off = out.len();
+    if sn.kind == .Struct {
+        let meta = env.get_struct(sn.primary) orelse { return false; };
+        try push_zero_bytes(alloc, out, sz);
+        let fs = env.struct_fields_range(meta.fields);
+        var eb = try col.DynBuf.[u8].init(alloc, 16_usize);
+        errdefer eb.destroy(alloc);
+        var ok = true;
+        var i: usize = 0_usize;
+        while i < fs.len {
+            let fo = env.struct_field_offset(sty, i);
+            if let fv = ct.get_struct_field(val_id, fs[i].name) {
+                eb.clear();
+                if !(try encode_ct_val_bytes(alloc, ct, fv, fo.ty, env, &mut eb)) {
+                    ok = false;
+                    break;
+                }
+                if fo.offset +% eb.len() <= sz {
+                    copy_bytes_at(out.as_mut_slice(), base_off +% fo.offset, eb.as_slice());
+                }
+            }
+            i = i +% 1_usize;
+        }
+        eb.destroy(alloc);
+        if !ok {
+            truncate_u8_buf(out, base_off);
+        }
+        return ok;
+    }
+    if sn.kind == .AnonStruct {
+        try push_zero_bytes(alloc, out, sz);
+        let fs = env.node_anon_fields(&sn);
+        var eb = try col.DynBuf.[u8].init(alloc, 16_usize);
+        errdefer eb.destroy(alloc);
+        var ok = true;
+        var i: usize = 0_usize;
+        while i < fs.len {
+            let fo = env.struct_field_offset(sty, i);
+            if let fv = ct.get_struct_field(val_id, fs[i].name) {
+                eb.clear();
+                if !(try encode_ct_val_bytes(alloc, ct, fv, fo.ty, env, &mut eb)) {
+                    ok = false;
+                    break;
+                }
+                if fo.offset +% eb.len() <= sz {
+                    copy_bytes_at(out.as_mut_slice(), base_off +% fo.offset, eb.as_slice());
+                }
+            }
+            i = i +% 1_usize;
+        }
+        eb.destroy(alloc);
+        if !ok {
+            truncate_u8_buf(out, base_off);
+        }
+        return ok;
+    }
+    return false;
+}
+
+@recursive
+pub fn encode_ct_val_bytes(
+    alloc: *mut AllocCap,
+    ct: *CtArena,
+    val_id: u32,
+    ty: types.TyId,
+    env: *types.TypeEnv,
+    out: *mut col.DynBuf[u8],
+) -> bool ! OutOfMemory {
+    let sz = env.x64_layout(ty).size;
+    if sz == 0_usize {
+        return true;
+    }
+    let n = ct.get_val(val_id);
+    match n.kind {
+        .Void => {
+            try push_zero_bytes(alloc, out, sz);
+            return true;
+        }
+        .Bool => {
+            try out.push(alloc, if n.i_lo != 0_u64 { 1_u8 } else { 0_u8 });
+            if sz > 1_usize {
+                try push_zero_bytes(alloc, out, sz -% 1_usize);
+            }
+            return true;
+        }
+        .Char => {
+            let c = n.i_lo.trunc.[u32]();
+            let cb: [4]u8 = [
+                (c & 0xFF_u32).trunc.[u8](),
+                ((c >> 8_u32) & 0xFF_u32).trunc.[u8](),
+                ((c >> 16_u32) & 0xFF_u32).trunc.[u8](),
+                ((c >> 24_u32) & 0xFF_u32).trunc.[u8](),
+            ];
+            let k = if sz < 4_usize { sz } else { 4_usize };
+            try out.push_slice(alloc, cb[0_usize..k]);
+            if sz > k {
+                try push_zero_bytes(alloc, out, sz -% k);
+            }
+            return true;
+        }
+        .Int => {
+            try encode_int_le_bytes(alloc, n.i_lo, n.i_hi, sz, out);
+            return true;
+        }
+        .EnumSym => {
+            try encode_int_le_bytes(alloc, n.i_lo, n.i_hi, sz, out);
+            return true;
+        }
+        .Float => {
+            try encode_float_le_bytes(alloc, n.i_lo, sz, out);
+            return true;
+        }
+        .Array => {
+            let tn = env.get(ty);
+            let elem_ty = if tn.kind == .Array || tn.kind == .Vec { tn.primary } else { n.ty };
+            let esz_raw = env.x64_layout(elem_ty).size;
+            let esz = if esz_raw < 1_usize { 1_usize } else { esz_raw };
+            let base_off = out.len();
+            try push_zero_bytes(alloc, out, sz);
+            let elems = ct.elems_slice(n.range);
+            var eb = try col.DynBuf.[u8].init(alloc, esz);
+            errdefer eb.destroy(alloc);
+            var ok = true;
+            var i: usize = 0_usize;
+            while i < elems.len {
+                eb.clear();
+                if !(try encode_ct_val_bytes(alloc, ct, elems[i], elem_ty, env, &mut eb)) {
+                    ok = false;
+                    break;
+                }
+                let start = i *% esz;
+                if start +% eb.len() <= sz {
+                    copy_bytes_at(out.as_mut_slice(), base_off +% start, eb.as_slice());
+                }
+                i = i +% 1_usize;
+            }
+            eb.destroy(alloc);
+            if !ok {
+                truncate_u8_buf(out, base_off);
+            }
+            return ok;
+        }
+        .Tuple => {
+            let base_off = out.len();
+            try push_zero_bytes(alloc, out, sz);
+            let elems = ct.elems_slice(n.range);
+            var eb = try col.DynBuf.[u8].init(alloc, 16_usize);
+            errdefer eb.destroy(alloc);
+            var ok = true;
+            var i: usize = 0_usize;
+            while i < elems.len {
+                let fo = env.struct_field_offset(ty, i);
+                eb.clear();
+                if !(try encode_ct_val_bytes(alloc, ct, elems[i], fo.ty, env, &mut eb)) {
+                    ok = false;
+                    break;
+                }
+                if fo.offset +% eb.len() <= sz {
+                    copy_bytes_at(out.as_mut_slice(), base_off +% fo.offset, eb.as_slice());
+                }
+                i = i +% 1_usize;
+            }
+            eb.destroy(alloc);
+            if !ok {
+                truncate_u8_buf(out, base_off);
+            }
+            return ok;
+        }
+        .Struct => {
+            return try encode_struct_bytes(alloc, ct, val_id, n.ty, ty, sz, env, out);
+        }
+        .Str => { return false; }
+        .TypeVal => { return false; }
+    }
+}

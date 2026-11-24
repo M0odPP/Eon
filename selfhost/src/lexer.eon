@@ -1,0 +1,1613 @@
+module eonc.lexer;
+
+import core.col;
+import core.str;
+import eonc.span;
+import eonc.diag;
+import eonc.tok;
+
+/// Owned output produced by lexing a single source file.
+pub linear struct LexOutput {
+    pub tokens: col.DynBuf[tok.Token];
+    pub num_lits: col.DynBuf[tok.NumLitData];
+    pub str_lits: col.DynBuf[u32];
+    pub str_bytes: col.DynBuf[u8];
+    pub byte_lits: col.DynBuf[u32];
+    pub byte_bytes: col.DynBuf[u8];
+    pub docs: col.DynBuf[tok.DocComment];
+}
+
+impl LexOutput {
+    pub fn init(alloc: *mut AllocCap, est_tokens: usize) -> LexOutput ! OutOfMemory {
+        let tokens = try col.DynBuf.[tok.Token].init(alloc, est_tokens);
+        errdefer tokens.destroy(alloc);
+        let num_lits = try col.DynBuf.[tok.NumLitData].init(alloc, 16_usize);
+        errdefer num_lits.destroy(alloc);
+        let str_lits = try col.DynBuf.[u32].init(alloc, 16_usize);
+        errdefer str_lits.destroy(alloc);
+        let str_bytes = try col.DynBuf.[u8].init(alloc, 128_usize);
+        errdefer str_bytes.destroy(alloc);
+        let byte_lits = try col.DynBuf.[u32].init(alloc, 8_usize);
+        errdefer byte_lits.destroy(alloc);
+        let byte_bytes = try col.DynBuf.[u8].init(alloc, 64_usize);
+        errdefer byte_bytes.destroy(alloc);
+        let docs = try col.DynBuf.[tok.DocComment].init(alloc, 8_usize);
+        errdefer docs.destroy(alloc);
+        return LexOutput.{
+            tokens: tokens,
+            num_lits: num_lits,
+            str_lits: str_lits,
+            str_bytes: str_bytes,
+            byte_lits: byte_lits,
+            byte_bytes: byte_bytes,
+            docs: docs,
+        };
+    }
+
+    pub fn str_lit_count(self: *Self) -> u32 {
+        return (self.str_lits.len() >> 1_usize).trunc.[u32]();
+    }
+
+    pub view fn str_lit(self: *Self, id: u32) -> *[u8] {
+        let empty: *str = "";
+        let idx = id.widen.[usize]() <<% 1_usize;
+        let idx1 = idx +% 1_usize;
+        let meta = self.str_lits.as_slice();
+        if idx < meta.len && idx1 < meta.len {
+            let off = meta[idx].widen.[usize]();
+            let n = meta[idx1].widen.[usize]();
+            let s = self.str_bytes.as_slice().sub(off, off +% n) catch {
+                return empty.as_bytes();
+            };
+            return s;
+        }
+        return empty.as_bytes();
+    }
+
+    pub fn byte_lit_count(self: *Self) -> u32 {
+        return (self.byte_lits.len() >> 1_usize).trunc.[u32]();
+    }
+
+    pub view fn byte_lit(self: *Self, id: u32) -> *[u8] {
+        let empty: *str = "";
+        let idx = id.widen.[usize]() <<% 1_usize;
+        let idx1 = idx +% 1_usize;
+        let meta = self.byte_lits.as_slice();
+        if idx < meta.len && idx1 < meta.len {
+            let off = meta[idx].widen.[usize]();
+            let n = meta[idx1].widen.[usize]();
+            let s = self.byte_bytes.as_slice().sub(off, off +% n) catch {
+                return empty.as_bytes();
+            };
+            return s;
+        }
+        return empty.as_bytes();
+    }
+
+    pub fn num_lit(self: *Self, id: u32) -> ?tok.NumLitData {
+        let idx = id.widen.[usize]();
+        let nums = self.num_lits.as_slice();
+        if idx < nums.len {
+            return nums[idx];
+        }
+        return null;
+    }
+
+    pub fn destroy(self: LexOutput, alloc: *mut AllocCap) {
+        let LexOutput.{
+            tokens,
+            num_lits,
+            str_lits,
+            str_bytes,
+            byte_lits,
+            byte_bytes,
+            docs,
+        } = self;
+        tokens.destroy(alloc);
+        num_lits.destroy(alloc);
+        str_lits.destroy(alloc);
+        str_bytes.destroy(alloc);
+        byte_lits.destroy(alloc);
+        byte_bytes.destroy(alloc);
+        docs.destroy(alloc);
+    }
+}
+
+pub view fn num_raw_slice(src: *[u8], d: tok.NumLitData) -> *[u8] {
+    let empty: *str = "";
+    let s = src.sub(d.raw_start.widen.[usize](), d.raw_end.widen.[usize]()) catch {
+        return empty.as_bytes();
+    };
+    return s;
+}
+
+pub view fn num_suffix_slice(src: *[u8], d: tok.NumLitData) -> ?*[u8] {
+    if d.has_suffix {
+        let s = src.sub(d.suffix_start.widen.[usize](), d.suffix_end.widen.[usize]()) catch {
+            return null;
+        };
+        return s;
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Character classification, numeric suffix checks, and formatting helpers
+// ---------------------------------------------------------------------------
+
+fn is_ascii_alpha(b: u8) -> bool {
+    return (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z');
+}
+
+fn is_ascii_digit(b: u8) -> bool {
+    return b >= b'0' && b <= b'9';
+}
+
+fn is_ascii_alnum(b: u8) -> bool {
+    return is_ascii_alpha(b) || is_ascii_digit(b);
+}
+
+fn is_ascii_ident_cont(b: u8) -> bool {
+    return is_ascii_alnum(b) || b == b'_';
+}
+
+fn is_forbidden_ascii_ctrl(b: u8) -> bool {
+    if b <= 0x08_u8 || b == 0x0B_u8 || b == 0x0C_u8 {
+        return true;
+    }
+    if (b >= 0x0E_u8 && b <= 0x1F_u8) || b == 0x7F_u8 {
+        return true;
+    }
+    return false;
+}
+
+fn is_bidi_control(cp: u32) -> bool {
+    return (cp >= 0x202A_u32 && cp <= 0x202E_u32) || (cp >= 0x2066_u32 && cp <= 0x2069_u32);
+}
+
+fn hex_digit(b: u8) -> ?u8 {
+    if b >= b'0' && b <= b'9' {
+        return b - b'0';
+    }
+    if b >= b'a' && b <= b'f' {
+        return (b - b'a') +% 10_u8;
+    }
+    if b >= b'A' && b <= b'F' {
+        return (b - b'A') +% 10_u8;
+    }
+    return null;
+}
+
+fn is_digit_in_radix(b: u8, radix: u32) -> bool {
+    if radix == 2_u32 {
+        return b == b'0' || b == b'1';
+    }
+    if radix == 8_u32 {
+        return b >= b'0' && b <= b'7';
+    }
+    if radix == 10_u32 {
+        return b >= b'0' && b <= b'9';
+    }
+    if radix == 16_u32 {
+        return (b >= b'0' && b <= b'9')
+            || (b >= b'a' && b <= b'f')
+            || (b >= b'A' && b <= b'F');
+    }
+    return false;
+}
+
+fn is_valid_float_suffix(s: *[u8]) -> bool {
+    return str.bytes_eq(s, "f16".as_bytes())
+        || str.bytes_eq(s, "f32".as_bytes())
+        || str.bytes_eq(s, "f64".as_bytes());
+}
+
+fn is_valid_int_suffix(s: *[u8]) -> bool {
+    if str.bytes_eq(s, "i8".as_bytes())
+        || str.bytes_eq(s, "i16".as_bytes())
+        || str.bytes_eq(s, "i32".as_bytes())
+        || str.bytes_eq(s, "i64".as_bytes())
+        || str.bytes_eq(s, "i128".as_bytes())
+        || str.bytes_eq(s, "isize".as_bytes())
+        || str.bytes_eq(s, "u128".as_bytes())
+        || str.bytes_eq(s, "usize".as_bytes())
+    {
+        return true;
+    }
+    if s.len >= 2_usize && (s[0_usize] == b'u' || s[0_usize] == b'i') {
+        let rest = s.sub(1_usize, s.len) catch {
+            return false;
+        };
+        let bits = str.parse_u64(rest) catch {
+            return false;
+        };
+        return bits >= 1_u64 && bits <= 64_u64;
+    }
+    return false;
+}
+
+fn hex_upper_char(nib: u8) -> u8 {
+    let n = nib & 0x0F_u8;
+    if n < 10_u8 {
+        return b'0' +% n;
+    }
+    return b'A' +% (n -% 10_u8);
+}
+
+fn push_hex_u8_upper2(alloc: *mut AllocCap, out: *mut str.StrBuf, b: u8) -> !OutOfMemory {
+    try out.push_byte_grow(alloc, hex_upper_char(b >> 4_u8));
+    try out.push_byte_grow(alloc, hex_upper_char(b & 0x0F_u8));
+    return;
+}
+
+fn push_hex_u32_upper(alloc: *mut AllocCap, out: *mut str.StrBuf, val: u32) -> !OutOfMemory {
+    if val == 0_u32 {
+        try out.push_byte_grow(alloc, b'0');
+        return;
+    }
+    var digits: [8]u8 = [0_u8; 8];
+    var count: usize = 0_usize;
+    var cur = val;
+    while cur > 0_u32 && count < 8_usize {
+        digits[count] = hex_upper_char((cur & 0x0F_u32).trunc.[u8]());
+        cur = cur >> 4_u32;
+        count = count +% 1_usize;
+    }
+    var idx = count;
+    while idx > 0_usize {
+        idx = idx - 1_usize;
+        if idx < 8_usize {
+            try out.push_byte_grow(alloc, digits[idx]);
+        }
+    }
+    return;
+}
+
+fn push_utf8_scalar_str(alloc: *mut AllocCap, out: *mut str.StrBuf, cp: u32) -> !OutOfMemory {
+    if cp < 0x80_u32 {
+        try out.push_byte_grow(alloc, cp.trunc.[u8]());
+        return;
+    }
+    if cp < 0x800_u32 {
+        try out.push_byte_grow(alloc, 0xC0_u8 | (cp >> 6_u32).trunc.[u8]());
+        try out.push_byte_grow(alloc, 0x80_u8 | (cp & 0x3F_u32).trunc.[u8]());
+        return;
+    }
+    if cp < 0x10000_u32 {
+        try out.push_byte_grow(alloc, 0xE0_u8 | (cp >> 12_u32).trunc.[u8]());
+        try out.push_byte_grow(alloc, 0x80_u8 | ((cp >> 6_u32) & 0x3F_u32).trunc.[u8]());
+        try out.push_byte_grow(alloc, 0x80_u8 | (cp & 0x3F_u32).trunc.[u8]());
+        return;
+    }
+    if cp <= 0x10FFFF_u32 {
+        try out.push_byte_grow(alloc, 0xF0_u8 | (cp >> 18_u32).trunc.[u8]());
+        try out.push_byte_grow(alloc, 0x80_u8 | ((cp >> 12_u32) & 0x3F_u32).trunc.[u8]());
+        try out.push_byte_grow(alloc, 0x80_u8 | ((cp >> 6_u32) & 0x3F_u32).trunc.[u8]());
+        try out.push_byte_grow(alloc, 0x80_u8 | (cp & 0x3F_u32).trunc.[u8]());
+    }
+    return;
+}
+
+fn push_utf8_scalar_dyn(alloc: *mut AllocCap, out: *mut col.DynBuf[u8], cp: u32) -> !OutOfMemory {
+    if cp < 0x80_u32 {
+        try out.push(alloc, cp.trunc.[u8]());
+        return;
+    }
+    if cp < 0x800_u32 {
+        try out.push(alloc, 0xC0_u8 | (cp >> 6_u32).trunc.[u8]());
+        try out.push(alloc, 0x80_u8 | (cp & 0x3F_u32).trunc.[u8]());
+        return;
+    }
+    if cp < 0x10000_u32 {
+        try out.push(alloc, 0xE0_u8 | (cp >> 12_u32).trunc.[u8]());
+        try out.push(alloc, 0x80_u8 | ((cp >> 6_u32) & 0x3F_u32).trunc.[u8]());
+        try out.push(alloc, 0x80_u8 | (cp & 0x3F_u32).trunc.[u8]());
+        return;
+    }
+    if cp <= 0x10FFFF_u32 {
+        try out.push(alloc, 0xF0_u8 | (cp >> 18_u32).trunc.[u8]());
+        try out.push(alloc, 0x80_u8 | ((cp >> 12_u32) & 0x3F_u32).trunc.[u8]());
+        try out.push(alloc, 0x80_u8 | ((cp >> 6_u32) & 0x3F_u32).trunc.[u8]());
+        try out.push(alloc, 0x80_u8 | (cp & 0x3F_u32).trunc.[u8]());
+    }
+    return;
+}
+
+fn load_u8x16(bytes: *[u8], base: usize) -> u8x16 {
+    if base < bytes.len {
+        let end = base + 15_usize;
+        if end < bytes.len {
+            let v: u8x16 = .{
+                bytes[base],
+                bytes[base + 1_usize],
+                bytes[base + 2_usize],
+                bytes[base + 3_usize],
+                bytes[base + 4_usize],
+                bytes[base + 5_usize],
+                bytes[base + 6_usize],
+                bytes[base + 7_usize],
+                bytes[base + 8_usize],
+                bytes[base + 9_usize],
+                bytes[base + 10_usize],
+                bytes[base + 11_usize],
+                bytes[base + 12_usize],
+                bytes[base + 13_usize],
+                bytes[base + 14_usize],
+                bytes[end],
+            };
+            return v;
+        }
+    }
+    return u8x16.splat(0_u8);
+}
+
+// ---------------------------------------------------------------------------
+// Lexer state (second-class `view struct`, passed by `*mut Lexer`)
+// ---------------------------------------------------------------------------
+
+view struct Lexer {
+    alloc: *mut AllocCap;
+    fid: u32;
+    bytes: *[u8];
+    pos: usize;
+    interner: *mut span.SymInterner;
+    diags: *mut diag.DiagBag;
+    out: *mut LexOutput;
+    msg_buf: *mut str.StrBuf;
+}
+
+impl Lexer {
+    fn span_of(self: *Self, start: usize, end: usize) -> span.Span {
+        return span.span_new(self.fid, start.trunc.[u32](), end.trunc.[u32]());
+    }
+
+    fn peek(self: *Self) -> ?u8 {
+        if self.pos < self.bytes.len {
+            return self.bytes[self.pos];
+        }
+        return null;
+    }
+
+    fn peek_at(self: *Self, off: usize) -> ?u8 {
+        if off < self.bytes.len && self.pos < self.bytes.len - off {
+            return self.bytes[self.pos + off];
+        }
+        return null;
+    }
+
+    fn peek_is(self: *Self, off: usize, expected: u8) -> bool {
+        if let b = self.peek_at(off) {
+            return b == expected;
+        }
+        return false;
+    }
+
+    fn next_char(self: *mut Self) -> u32 {
+        let d = str.decode_utf8_char(self.bytes, self.pos);
+        if d.len > 0_usize {
+            self.pos = self.pos +% d.len;
+            return d.cp;
+        }
+        if self.pos < self.bytes.len {
+            self.pos = self.pos +% 1_usize;
+        }
+        return 0_u32;
+    }
+
+    fn push_tok(self: *mut Self, t: tok.Token) -> !OutOfMemory {
+        try self.out.tokens.push(self.alloc, t);
+        return;
+    }
+
+    fn push_punct(self: *mut Self, kind: tok.TokenKind, len: usize) -> !OutOfMemory {
+        let start = self.pos;
+        self.pos = self.pos +% len;
+        try self.push_tok(tok.Token.simple(kind, start.trunc.[u32](), self.pos.trunc.[u32]()));
+        return;
+    }
+
+    fn emit_err(self: *mut Self, code: u32, start: usize, end: usize, msg: *str) -> !OutOfMemory {
+        _ = try self.diags.emit_error(self.alloc, code, self.span_of(start, end), msg);
+        return;
+    }
+
+    fn emit_msg_buf(self: *mut Self, code: u32, start: usize, end: usize) -> !OutOfMemory {
+        let sp = self.span_of(start, end);
+        _ = try self.diags.emit_error_bytes(self.alloc, code, sp, self.msg_buf.as_bytes());
+        return;
+    }
+
+    fn emit_ctrl_err(self: *mut Self, start: usize, end: usize, b: u8, suffix: *str) -> !OutOfMemory {
+        self.msg_buf.clear();
+        try self.msg_buf.push_str_grow(self.alloc, "forbidden ASCII control byte `0x");
+        try push_hex_u8_upper2(self.alloc, self.msg_buf, b);
+        try self.msg_buf.push_byte_grow(self.alloc, b'`');
+        try self.msg_buf.push_str_grow(self.alloc, suffix);
+        try self.emit_msg_buf(diag.E0002, start, end);
+        return;
+    }
+
+    fn emit_unknown_escape(self: *mut Self, esc_start: usize, b: u8) -> !OutOfMemory {
+        self.msg_buf.clear();
+        try self.msg_buf.push_str_grow(self.alloc, "unknown escape sequence `\\");
+        try push_utf8_scalar_str(self.alloc, self.msg_buf, b.widen.[u32]());
+        try self.msg_buf.push_byte_grow(self.alloc, b'`');
+        try self.emit_msg_buf(diag.E0004, esc_start, self.pos);
+        return;
+    }
+
+    fn emit_invalid_unicode_esc(self: *mut Self, esc_start: usize, val: u32) -> !OutOfMemory {
+        self.msg_buf.clear();
+        try self.msg_buf.push_str_grow(self.alloc, "`\\u{");
+        try push_hex_u32_upper(self.alloc, self.msg_buf, val);
+        try self.msg_buf.push_str_grow(self.alloc, "}` is not a valid Unicode scalar value");
+        try self.emit_msg_buf(diag.E0004, esc_start, self.pos);
+        return;
+    }
+
+    fn emit_bad_suffix(
+        self: *mut Self,
+        s_start: usize,
+        s_end: usize,
+        is_float: bool,
+    ) -> !OutOfMemory {
+        let suffix = self.bytes.sub(s_start, s_end) catch {
+            return;
+        };
+        self.msg_buf.clear();
+        if is_float {
+            try self.msg_buf.push_str_grow(self.alloc, "invalid floating-point type suffix `");
+        } else {
+            try self.msg_buf.push_str_grow(self.alloc, "invalid integer type suffix `");
+        }
+        try self.msg_buf.push_bytes_grow(self.alloc, suffix);
+        try self.msg_buf.push_byte_grow(self.alloc, b'`');
+        try self.emit_msg_buf(diag.E0004, s_start, s_end);
+        return;
+    }
+
+    fn emit_unexpected_char(self: *mut Self, start: usize, end: usize) -> !OutOfMemory {
+        let ch_bytes = self.bytes.sub(start, end) catch {
+            return;
+        };
+        self.msg_buf.clear();
+        try self.msg_buf.push_str_grow(self.alloc, "unexpected character `");
+        try self.msg_buf.push_bytes_grow(self.alloc, ch_bytes);
+        try self.msg_buf.push_str_grow(self.alloc, "` (identifiers must be ASCII)");
+        try self.emit_msg_buf(diag.E0004, start, end);
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // SIMD-accelerated Trojan Source scan, whitespace & comment skipping
+    // -----------------------------------------------------------------------
+
+    fn check_trojan_source(self: *mut Self) -> !OutOfMemory {
+        let bytes = self.bytes;
+        if bytes.len < 3_usize {
+            return;
+        }
+        let limit = bytes.len - 2_usize;
+        let e2_vec = u8x16.splat(0xE2_u8);
+        var i: usize = 0_usize;
+        while i < limit {
+            while bytes.len >= 16_usize && i <= bytes.len - 16_usize {
+                let v = load_u8x16(bytes, i);
+                let m = v.cmpeq(e2_vec).bitmask();
+                if m == 0_u64 {
+                    i = i +% 16_usize;
+                } else {
+                    i = i +% (@tzcnt(m) & 15_u64).trunc.[usize]();
+                    break;
+                }
+            }
+            if i >= limit {
+                break;
+            }
+            if bytes[i] == 0xE2_u8 {
+                let b1 = bytes[i + 1_usize];
+                let b2 = bytes[i + 2_usize];
+                let is_bidi = (b1 == 0x80_u8 && b2 >= 0xAA_u8 && b2 <= 0xAE_u8)
+                    || (b1 == 0x81_u8 && b2 >= 0xA6_u8 && b2 <= 0xA9_u8);
+                if is_bidi {
+                    try self.emit_err(
+                        diag.E0003,
+                        i,
+                        i +% 3_usize,
+                        "forbidden Unicode bidirectional control character (Trojan Source)",
+                    );
+                    i = i +% 3_usize;
+                    continue;
+                }
+            }
+            i = i +% 1_usize;
+        }
+        return;
+    }
+
+    fn skip_whitespace(self: *mut Self) {
+        let bytes = self.bytes;
+        if self.pos >= bytes.len {
+            return;
+        }
+        let b0 = bytes[self.pos];
+        if b0 != b' ' && b0 != b'\t' && b0 != b'\n' && b0 != b'\r' {
+            return;
+        }
+        self.pos = self.pos +% 1_usize;
+        if self.pos >= bytes.len {
+            return;
+        }
+        let b1 = bytes[self.pos];
+        if b1 != b' ' && b1 != b'\t' && b1 != b'\n' && b1 != b'\r' {
+            return;
+        }
+        let sp_vec = u8x16.splat(b' ');
+        let tab_vec = u8x16.splat(b'\t');
+        let nl_vec = u8x16.splat(b'\n');
+        let cr_vec = u8x16.splat(b'\r');
+        while bytes.len >= 16_usize && self.pos <= bytes.len - 16_usize {
+            let v = load_u8x16(bytes, self.pos);
+            let m = v.cmpeq(sp_vec).bitmask()
+                | v.cmpeq(tab_vec).bitmask()
+                | v.cmpeq(nl_vec).bitmask()
+                | v.cmpeq(cr_vec).bitmask();
+            let non_ws = (~m) & 0xFFFF_u64;
+            if non_ws == 0_u64 {
+                self.pos = self.pos +% 16_usize;
+            } else {
+                self.pos = self.pos +% (@tzcnt(non_ws) & 15_u64).trunc.[usize]();
+                return;
+            }
+        }
+        while self.pos < bytes.len {
+            let b = bytes[self.pos];
+            if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+                self.pos = self.pos +% 1_usize;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn skip_line_comment(self: *mut Self) -> !OutOfMemory {
+        let bytes = self.bytes;
+        let start = self.pos;
+        let is_doc_outer = self.peek_is(2_usize, b'/') && !self.peek_is(3_usize, b'/');
+        let is_doc_inner = self.peek_is(2_usize, b'!');
+        self.pos = self.pos +% 2_usize;
+        let mask_e0 = u8x16.splat(0xE0_u8);
+        let zero_vec = u8x16.splat(0_u8);
+        let del_vec = u8x16.splat(0x7F_u8);
+        while self.pos < bytes.len {
+            while bytes.len >= 16_usize && self.pos <= bytes.len - 16_usize {
+                let v = load_u8x16(bytes, self.pos);
+                let special = (v & mask_e0).cmpeq(zero_vec).bitmask()
+                    | v.cmpeq(del_vec).bitmask();
+                if special == 0_u64 {
+                    self.pos = self.pos +% 16_usize;
+                } else {
+                    self.pos = self.pos +% (@tzcnt(special) & 15_u64).trunc.[usize]();
+                    break;
+                }
+            }
+            if self.pos >= bytes.len {
+                break;
+            }
+            let b = bytes[self.pos];
+            if b == b'\n' {
+                break;
+            }
+            if is_forbidden_ascii_ctrl(b) && b != b'\r' {
+                let cstart = self.pos;
+                self.pos = self.pos +% 1_usize;
+                try self.emit_ctrl_err(cstart, self.pos, b, " in comment");
+            } else {
+                self.pos = self.pos +% 1_usize;
+            }
+        }
+        if is_doc_outer || is_doc_inner {
+            try self.out.docs.push(
+                self.alloc,
+                tok.DocComment.{
+                    is_module_doc: is_doc_inner,
+                    start: start.trunc.[u32](),
+                    end: self.pos.trunc.[u32](),
+                },
+            );
+        }
+        return;
+    }
+
+    fn skip_block_comment(self: *mut Self) -> !OutOfMemory {
+        let bytes = self.bytes;
+        let start = self.pos;
+        self.pos = self.pos +% 2_usize;
+        var depth: usize = 1_usize;
+        while self.pos < bytes.len && depth > 0_usize {
+            let b = bytes[self.pos];
+            if b == b'/' && self.peek_is(1_usize, b'*') {
+                depth = depth +% 1_usize;
+                self.pos = self.pos +% 2_usize;
+            } else if b == b'*' && self.peek_is(1_usize, b'/') {
+                depth = depth - 1_usize;
+                self.pos = self.pos +% 2_usize;
+            } else if is_forbidden_ascii_ctrl(b) && b != b'\r' {
+                let cstart = self.pos;
+                self.pos = self.pos +% 1_usize;
+                try self.emit_ctrl_err(cstart, self.pos, b, " in comment");
+            } else {
+                self.pos = self.pos +% 1_usize;
+            }
+        }
+        if depth > 0_usize {
+            try self.emit_err(diag.E0004, start, self.pos, "unterminated block comment `/*`");
+        }
+        return;
+    }
+
+    fn skip_whitespace_and_comments(self: *mut Self) -> !OutOfMemory {
+        while self.pos < self.bytes.len {
+            let b = self.bytes[self.pos];
+            if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+                self.skip_whitespace();
+            } else if b == b'/' && self.peek_is(1_usize, b'/') {
+                try self.skip_line_comment();
+            } else if b == b'/' && self.peek_is(1_usize, b'*') {
+                try self.skip_block_comment();
+            } else {
+                break;
+            }
+        }
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Identifiers, keywords, characters, labels, and strings
+    // -----------------------------------------------------------------------
+
+    fn lex_ident_or_keyword(self: *mut Self, start: usize) -> !OutOfMemory {
+        self.pos = self.pos +% 1_usize;
+        while self.pos < self.bytes.len {
+            if is_ascii_ident_cont(self.bytes[self.pos]) {
+                self.pos = self.pos +% 1_usize;
+            } else {
+                break;
+            }
+        }
+        let end = self.pos;
+        let text = self.bytes.sub(start, end) catch {
+            return;
+        };
+        if text.len == 1_usize && text[0_usize] == b'_' {
+            try self.push_tok(tok.Token.simple(.Underscore, start.trunc.[u32](), end.trunc.[u32]()));
+            return;
+        }
+        if let kw = tok.keyword_kind(text) {
+            try self.push_tok(tok.Token.simple(kw, start.trunc.[u32](), end.trunc.[u32]()));
+            return;
+        }
+        let sym = try self.interner.intern(self.alloc, text);
+        try self.push_tok(tok.Token.with_payload(.Ident, sym, start.trunc.[u32](), end.trunc.[u32]()));
+        return;
+    }
+
+    fn read_hex_byte(self: *mut Self, esc_start: usize) -> ?u8 ! OutOfMemory {
+        let b0 = self.peek() orelse {
+            try self.emit_err(
+                diag.E0004,
+                esc_start,
+                self.pos,
+                "`\\x` escape requires exactly two hexadecimal digits",
+            );
+            return null;
+        };
+        let b1 = self.peek_at(1_usize) orelse {
+            try self.emit_err(
+                diag.E0004,
+                esc_start,
+                self.pos,
+                "`\\x` escape requires exactly two hexadecimal digits",
+            );
+            return null;
+        };
+        let h1 = hex_digit(b0) orelse {
+            try self.emit_err(
+                diag.E0004,
+                esc_start,
+                self.pos,
+                "`\\x` escape requires exactly two hexadecimal digits",
+            );
+            return null;
+        };
+        let h2 = hex_digit(b1) orelse {
+            try self.emit_err(
+                diag.E0004,
+                esc_start,
+                self.pos,
+                "`\\x` escape requires exactly two hexadecimal digits",
+            );
+            return null;
+        };
+        self.pos = self.pos +% 2_usize;
+        return (h1 <<% 4_u8) | h2;
+    }
+
+    fn lex_unicode_escape(self: *mut Self, esc_start: usize) -> ?u32 ! OutOfMemory {
+        if !self.peek_is(0_usize, b'{') {
+            try self.emit_err(diag.E0004, esc_start, self.pos, "expected `{` after `\\u`");
+            return null;
+        }
+        self.pos = self.pos +% 1_usize;
+        let hex_start = self.pos;
+        var val: u32 = 0_u32;
+        var count: u32 = 0_u32;
+        while self.pos < self.bytes.len {
+            let c = self.bytes[self.pos];
+            if c == b'}' {
+                break;
+            }
+            if let d = hex_digit(c) {
+                if count < 6_u32 {
+                    val = (val <<% 4_u32) | d.widen.[u32]();
+                }
+                count = count +% 1_u32;
+                self.pos = self.pos +% 1_usize;
+            } else {
+                break;
+            }
+        }
+        if !self.peek_is(0_usize, b'}') || count == 0_u32 || count > 6_u32 {
+            let err_end = if self.pos > hex_start { self.pos } else { hex_start };
+            try self.emit_err(
+                diag.E0004,
+                esc_start,
+                err_end,
+                "invalid `\\u{...}` Unicode escape (expected 1 to 6 hex digits)",
+            );
+            return null;
+        }
+        self.pos = self.pos +% 1_usize;
+        if val <= 0x10FFFF_u32 && !(val >= 0xD800_u32 && val <= 0xDFFF_u32) {
+            return val;
+        }
+        try self.emit_invalid_unicode_esc(esc_start, val);
+        return null;
+    }
+
+    fn lex_escape_char(self: *mut Self, lit_start: usize) -> ?u32 ! OutOfMemory {
+        let esc_start = self.pos;
+        self.pos = self.pos +% 1_usize;
+        let b = self.peek() orelse {
+            try self.emit_err(diag.E0004, lit_start, self.pos, "unterminated escape sequence");
+            return null;
+        };
+        self.pos = self.pos +% 1_usize;
+        if b == b'n' { return 10_u32; }
+        if b == b'r' { return 13_u32; }
+        if b == b't' { return 9_u32; }
+        if b == b'\\' { return 92_u32; }
+        if b == b'"' { return 34_u32; }
+        if b == b'\'' { return 39_u32; }
+        if b == b'0' { return 0_u32; }
+        if b == b'x' {
+            let val = (try self.read_hex_byte(esc_start)) orelse {
+                return null;
+            };
+            if val > 0x7F_u8 {
+                try self.emit_err(
+                    diag.E0004,
+                    esc_start,
+                    self.pos,
+                    "`\\xHH` escape in UTF-8 literal must be ASCII `0x00..=0x7F`; use `\\u{...}`",
+                );
+                return null;
+            }
+            return val.widen.[u32]();
+        }
+        if b == b'u' {
+            return try self.lex_unicode_escape(esc_start);
+        }
+        try self.emit_unknown_escape(esc_start, b);
+        return null;
+    }
+
+    fn lex_escape_byte(self: *mut Self, lit_start: usize) -> ?u8 ! OutOfMemory {
+        let esc_start = self.pos;
+        self.pos = self.pos +% 1_usize;
+        let b = self.peek() orelse {
+            try self.emit_err(diag.E0004, lit_start, self.pos, "unterminated escape sequence");
+            return null;
+        };
+        self.pos = self.pos +% 1_usize;
+        if b == b'n' { return 10_u8; }
+        if b == b'r' { return 13_u8; }
+        if b == b't' { return 9_u8; }
+        if b == b'\\' { return 92_u8; }
+        if b == b'"' { return 34_u8; }
+        if b == b'\'' { return 39_u8; }
+        if b == b'0' { return 0_u8; }
+        if b == b'x' {
+            return try self.read_hex_byte(esc_start);
+        }
+        if b == b'u' {
+            try self.emit_err(
+                diag.E0004,
+                esc_start,
+                self.pos,
+                "`\\u{...}` escapes are not allowed in byte literals; use `\\xHH`",
+            );
+            return null;
+        }
+        try self.emit_unknown_escape(esc_start, b);
+        return null;
+    }
+
+    fn lex_char_or_label(self: *mut Self, start: usize) -> !OutOfMemory {
+        self.pos = self.pos +% 1_usize;
+        if self.pos >= self.bytes.len {
+            try self.emit_err(diag.E0004, start, self.pos, "unterminated character literal or loop label");
+            return;
+        }
+        let cur = self.bytes[self.pos];
+        if cur == b'\n' || cur == b'\r' {
+            try self.emit_err(diag.E0004, start, self.pos, "unterminated character literal or loop label");
+            return;
+        }
+        if cur == b'\'' {
+            self.pos = self.pos +% 1_usize;
+            try self.emit_err(diag.E0004, start, self.pos, "empty character literal `''`");
+            try self.push_tok(tok.Token.with_payload(.CharLit, 0_u32, start.trunc.[u32](), self.pos.trunc.[u32]()));
+            return;
+        }
+        if cur == b'\\' {
+            let ch = try self.lex_escape_char(start);
+            if self.peek_is(0_usize, b'\'') {
+                self.pos = self.pos +% 1_usize;
+                let cp = ch orelse 0_u32;
+                try self.push_tok(tok.Token.with_payload(.CharLit, cp, start.trunc.[u32](), self.pos.trunc.[u32]()));
+            } else {
+                try self.emit_err(diag.E0004, start, self.pos, "unterminated character literal");
+            }
+            return;
+        }
+        let first = self.next_char();
+        if self.peek_is(0_usize, b'\'') {
+            self.pos = self.pos +% 1_usize;
+            try self.push_tok(tok.Token.with_payload(.CharLit, first, start.trunc.[u32](), self.pos.trunc.[u32]()));
+            return;
+        }
+        if first < 0x80_u32 && (is_ascii_alpha(first.trunc.[u8]()) || first == 95_u32) {
+            while self.pos < self.bytes.len {
+                if is_ascii_ident_cont(self.bytes[self.pos]) {
+                    self.pos = self.pos +% 1_usize;
+                } else {
+                    break;
+                }
+            }
+            if self.peek_is(0_usize, b'\'') {
+                self.pos = self.pos +% 1_usize;
+                try self.emit_err(
+                    diag.E0004,
+                    start,
+                    self.pos,
+                    "character literal may contain only one Unicode scalar; use `\"...\"` for strings",
+                );
+                try self.push_tok(tok.Token.with_payload(.CharLit, 0_u32, start.trunc.[u32](), self.pos.trunc.[u32]()));
+                return;
+            }
+            let end = self.pos;
+            var sym: u32 = 0_u32;
+            let text = self.bytes.sub(start, end) catch {
+                try self.push_tok(tok.Token.with_payload(.Label, 0_u32, start.trunc.[u32](), end.trunc.[u32]()));
+                return;
+            };
+            sym = try self.interner.intern(self.alloc, text);
+            try self.push_tok(tok.Token.with_payload(.Label, sym, start.trunc.[u32](), end.trunc.[u32]()));
+            return;
+        }
+        try self.emit_err(diag.E0004, start, self.pos, "unterminated character literal");
+        return;
+    }
+
+    fn lex_byte_char(self: *mut Self, start: usize) -> !OutOfMemory {
+        self.pos = self.pos +% 2_usize;
+        if self.pos >= self.bytes.len {
+            try self.emit_err(diag.E0004, start, self.pos, "unterminated byte character literal");
+            return;
+        }
+        let cur = self.bytes[self.pos];
+        if cur == b'\n' || cur == b'\r' {
+            try self.emit_err(diag.E0004, start, self.pos, "unterminated byte character literal");
+            return;
+        }
+        if cur == b'\'' {
+            self.pos = self.pos +% 1_usize;
+            try self.emit_err(diag.E0004, start, self.pos, "empty byte character literal `b''`");
+            return;
+        }
+        var val: ?u8 = null;
+        if cur == b'\\' {
+            val = try self.lex_escape_byte(start);
+        } else if cur >= 0x80_u8 {
+            _ = self.next_char();
+            try self.emit_err(
+                diag.E0004,
+                start,
+                self.pos,
+                "non-ASCII character in byte literal `b'...'`; use `\\xHH`",
+            );
+        } else {
+            if is_forbidden_ascii_ctrl(cur) {
+                try self.emit_err(
+                    diag.E0002,
+                    self.pos,
+                    self.pos +% 1_usize,
+                    "forbidden ASCII control character in byte literal",
+                );
+            }
+            self.pos = self.pos +% 1_usize;
+            val = cur;
+        }
+        if self.peek_is(0_usize, b'\'') {
+            self.pos = self.pos +% 1_usize;
+            let bv = val orelse 0_u8;
+            try self.push_tok(
+                tok.Token.with_payload(.ByteCharLit, bv.widen.[u32](), start.trunc.[u32](), self.pos.trunc.[u32]()),
+            );
+        } else {
+            try self.emit_err(diag.E0004, start, self.pos, "unterminated byte character literal");
+        }
+        return;
+    }
+
+    fn lex_string(self: *mut Self, start: usize) -> !OutOfMemory {
+        self.pos = self.pos +% 1_usize;
+        let out_start = self.out.str_bytes.len();
+        loop {
+            if self.pos >= self.bytes.len {
+                try self.emit_err(diag.E0004, start, self.pos, "unterminated string literal");
+                break;
+            }
+            let b = self.bytes[self.pos];
+            if b == b'"' {
+                self.pos = self.pos +% 1_usize;
+                break;
+            }
+            if b == b'\n' || b == b'\r' {
+                try self.emit_err(
+                    diag.E0004,
+                    start,
+                    self.pos,
+                    "unterminated string literal before end of line; use `\\\\` for multiline strings",
+                );
+                break;
+            }
+            if b == b'\\' {
+                if let cp = try self.lex_escape_char(start) {
+                    try push_utf8_scalar_dyn(self.alloc, &mut self.out.str_bytes, cp);
+                }
+            } else if is_forbidden_ascii_ctrl(b) {
+                try self.emit_ctrl_err(self.pos, self.pos +% 1_usize, b, " in string literal");
+                self.pos = self.pos +% 1_usize;
+            } else if b <= 0x7F_u8 {
+                try self.out.str_bytes.push(self.alloc, b);
+                self.pos = self.pos +% 1_usize;
+            } else {
+                let cstart = self.pos;
+                _ = self.next_char();
+                let ch_slice = self.bytes.sub(cstart, self.pos) catch {
+                    continue;
+                };
+                try self.out.str_bytes.push_slice(self.alloc, ch_slice);
+            }
+        }
+        let id = self.out.str_lit_count();
+        let out_len = self.out.str_bytes.len() -% out_start;
+        try self.out.str_lits.push(self.alloc, out_start.trunc.[u32]());
+        try self.out.str_lits.push(self.alloc, out_len.trunc.[u32]());
+        try self.push_tok(tok.Token.with_payload(.StringLit, id, start.trunc.[u32](), self.pos.trunc.[u32]()));
+        return;
+    }
+
+    fn lex_byte_string(self: *mut Self, start: usize) -> !OutOfMemory {
+        self.pos = self.pos +% 2_usize;
+        let out_start = self.out.byte_bytes.len();
+        loop {
+            if self.pos >= self.bytes.len {
+                try self.emit_err(diag.E0004, start, self.pos, "unterminated byte string literal");
+                break;
+            }
+            let b = self.bytes[self.pos];
+            if b == b'"' {
+                self.pos = self.pos +% 1_usize;
+                break;
+            }
+            if b == b'\n' || b == b'\r' {
+                try self.emit_err(
+                    diag.E0004,
+                    start,
+                    self.pos,
+                    "unterminated byte string literal before end of line",
+                );
+                break;
+            }
+            if b == b'\\' {
+                if let eb = try self.lex_escape_byte(start) {
+                    try self.out.byte_bytes.push(self.alloc, eb);
+                }
+            } else if is_forbidden_ascii_ctrl(b) {
+                try self.emit_ctrl_err(self.pos, self.pos +% 1_usize, b, " in byte string");
+                self.pos = self.pos +% 1_usize;
+            } else if b <= 0x7F_u8 {
+                try self.out.byte_bytes.push(self.alloc, b);
+                self.pos = self.pos +% 1_usize;
+            } else {
+                let cstart = self.pos;
+                _ = self.next_char();
+                try self.emit_err(
+                    diag.E0004,
+                    cstart,
+                    self.pos,
+                    "non-ASCII character in byte string literal `b\"...\"`; use `\\xHH`",
+                );
+            }
+        }
+        let id = self.out.byte_lit_count();
+        let out_len = self.out.byte_bytes.len() -% out_start;
+        try self.out.byte_lits.push(self.alloc, out_start.trunc.[u32]());
+        try self.out.byte_lits.push(self.alloc, out_len.trunc.[u32]());
+        try self.push_tok(
+            tok.Token.with_payload(.ByteStringLit, id, start.trunc.[u32](), self.pos.trunc.[u32]()),
+        );
+        return;
+    }
+
+    fn lex_raw_string(self: *mut Self, start: usize) -> !OutOfMemory {
+        let out_start = self.out.str_bytes.len();
+        var first_line = true;
+        loop {
+            self.pos = self.pos +% 2_usize;
+            if !first_line {
+                try self.out.str_bytes.push(self.alloc, b'\n');
+            }
+            first_line = false;
+            let line_start = self.pos;
+            while self.pos < self.bytes.len && self.bytes[self.pos] != b'\n' {
+                let b = self.bytes[self.pos];
+                if is_forbidden_ascii_ctrl(b) && b != b'\r' {
+                    try self.emit_ctrl_err(self.pos, self.pos +% 1_usize, b, " in raw string");
+                }
+                self.pos = self.pos +% 1_usize;
+            }
+            var line_end = self.pos;
+            if line_end > line_start && line_end <= self.bytes.len {
+                if self.bytes[line_end - 1_usize] == b'\r' {
+                    line_end = line_end - 1_usize;
+                }
+            }
+            if line_end > line_start {
+                let seg = self.bytes.sub(line_start, line_end) catch {
+                    break;
+                };
+                try self.out.str_bytes.push_slice(self.alloc, seg);
+            }
+            if self.pos < self.bytes.len && self.bytes[self.pos] == b'\n' {
+                var look = self.pos +% 1_usize;
+                while look < self.bytes.len {
+                    let lb = self.bytes[look];
+                    if lb == b' ' || lb == b'\t' {
+                        look = look +% 1_usize;
+                    } else {
+                        break;
+                    }
+                }
+                if look +% 1_usize < self.bytes.len
+                    && self.bytes[look] == b'\\'
+                    && self.bytes[look +% 1_usize] == b'\\'
+                {
+                    self.pos = look;
+                    continue;
+                }
+            }
+            break;
+        }
+        let end = self.pos;
+        let id = self.out.str_lit_count();
+        let out_len = self.out.str_bytes.len() -% out_start;
+        try self.out.str_lits.push(self.alloc, out_start.trunc.[u32]());
+        try self.out.str_lits.push(self.alloc, out_len.trunc.[u32]());
+        try self.push_tok(
+            tok.Token.with_payload(.RawStringLit, id, start.trunc.[u32](), end.trunc.[u32]()),
+        );
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Numeric literals
+    // -----------------------------------------------------------------------
+
+    fn consume_digits(self: *mut Self, radix: u32) -> usize {
+        var count: usize = 0_usize;
+        while self.pos < self.bytes.len {
+            let b = self.bytes[self.pos];
+            if is_digit_in_radix(b, radix) {
+                count = count +% 1_usize;
+                self.pos = self.pos +% 1_usize;
+            } else if b == b'_' {
+                if let next = self.peek_at(1_usize) {
+                    if is_digit_in_radix(next, radix) || next == b'_' {
+                        self.pos = self.pos +% 1_usize;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        return count;
+    }
+
+    fn lex_number_suffix(
+        self: *mut Self,
+        start: usize,
+        raw_end: usize,
+        is_float: bool,
+    ) -> tok.NumLitData ! OutOfMemory {
+        var has_suffix = false;
+        var suffix_start = self.pos;
+        var suffix_end = self.pos;
+
+        var starts_suffix = false;
+        if let sb = self.peek() {
+            starts_suffix = sb == b'_' || is_ascii_alpha(sb);
+        }
+        if starts_suffix {
+            if self.peek_is(0_usize, b'_') {
+                self.pos = self.pos +% 1_usize;
+            }
+            suffix_start = self.pos;
+            while self.pos < self.bytes.len {
+                if is_ascii_ident_cont(self.bytes[self.pos]) {
+                    self.pos = self.pos +% 1_usize;
+                } else {
+                    break;
+                }
+            }
+            suffix_end = self.pos;
+            if suffix_end == suffix_start {
+                try self.emit_err(
+                    diag.E0004,
+                    start,
+                    self.pos,
+                    "trailing `_` at end of numeric literal",
+                );
+            } else {
+                var valid = false;
+                let s_slice = self.bytes.sub(suffix_start, suffix_end) catch {
+                    valid = false;
+                    "".as_bytes()
+                };
+                if is_float {
+                    valid = is_valid_float_suffix(s_slice);
+                } else {
+                    valid = is_valid_int_suffix(s_slice);
+                }
+                if valid {
+                    has_suffix = true;
+                } else {
+                    try self.emit_bad_suffix(suffix_start, suffix_end, is_float);
+                }
+            }
+        }
+
+        return tok.NumLitData.{
+            raw_start: start.trunc.[u32](),
+            raw_end: raw_end.trunc.[u32](),
+            suffix_start: suffix_start.trunc.[u32](),
+            suffix_end: suffix_end.trunc.[u32](),
+            has_suffix: has_suffix,
+        };
+    }
+
+    fn lex_number(self: *mut Self, start: usize) -> !OutOfMemory {
+        var is_float = false;
+        var radix: u32 = 10_u32;
+        if self.pos < self.bytes.len && self.bytes[self.pos] == b'0' {
+            if let p1 = self.peek_at(1_usize) {
+                if p1 == b'x' {
+                    radix = 16_u32;
+                    self.pos = self.pos +% 2_usize;
+                } else if p1 == b'b' {
+                    radix = 2_u32;
+                    self.pos = self.pos +% 2_usize;
+                } else if p1 == b'o' {
+                    radix = 8_u32;
+                    self.pos = self.pos +% 2_usize;
+                }
+            }
+        }
+
+        let digits_start = self.pos;
+        let digit_count = self.consume_digits(radix);
+        if digit_count == 0_usize {
+            try self.emit_err(
+                diag.E0004,
+                start,
+                self.pos,
+                "numeric literal has no digits after base prefix",
+            );
+        } else if digits_start < self.bytes.len && self.bytes[digits_start] == b'_' {
+            try self.emit_err(
+                diag.E0004,
+                start,
+                self.pos,
+                "leading `_` immediately after base prefix is not allowed",
+            );
+        }
+
+        if (radix == 10_u32 || radix == 16_u32)
+            && self.peek_is(0_usize, b'.')
+            && !self.peek_is(1_usize, b'.')
+        {
+            var has_frac_digit = false;
+            if let next = self.peek_at(1_usize) {
+                has_frac_digit = is_digit_in_radix(next, radix);
+            }
+            if has_frac_digit {
+                is_float = true;
+                self.pos = self.pos +% 1_usize;
+                let frac_count = self.consume_digits(radix);
+                if frac_count == 0_usize {
+                    try self.emit_err(
+                        diag.E0004,
+                        start,
+                        self.pos,
+                        "missing digits after decimal point",
+                    );
+                }
+            } else {
+                self.pos = self.pos +% 1_usize;
+                try self.emit_err(
+                    diag.E0004,
+                    start,
+                    self.pos,
+                    "trailing `.` in numeric literal is forbidden; write e.g. `5.0`",
+                );
+            }
+        }
+
+        var exp_match = false;
+        if let pb = self.peek() {
+            if radix == 10_u32 && (pb == b'e' || pb == b'E') {
+                exp_match = true;
+            } else if radix == 16_u32 && (pb == b'p' || pb == b'P') {
+                exp_match = true;
+            }
+        }
+        if exp_match {
+            is_float = true;
+            self.pos = self.pos +% 1_usize;
+            if self.peek_is(0_usize, b'+') || self.peek_is(0_usize, b'-') {
+                self.pos = self.pos +% 1_usize;
+            }
+            let exp_digits = self.consume_digits(10_u32);
+            if exp_digits == 0_usize {
+                try self.emit_err(
+                    diag.E0004,
+                    start,
+                    self.pos,
+                    "missing exponent digits in floating-point literal",
+                );
+            }
+        } else if radix == 16_u32 && is_float {
+            try self.emit_err(
+                diag.E0004,
+                start,
+                self.pos,
+                "hexadecimal floating-point literal requires a binary exponent (`p+...`)",
+            );
+        }
+
+        let raw_end = self.pos;
+        let data = try self.lex_number_suffix(start, raw_end, is_float);
+        let id = self.out.num_lits.len().trunc.[u32]();
+        try self.out.num_lits.push(self.alloc, data);
+        let kind: tok.TokenKind = if is_float { .FloatLit } else { .IntLit };
+        try self.push_tok(tok.Token.with_payload(kind, id, start.trunc.[u32](), self.pos.trunc.[u32]()));
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Delimiters & maximal-munch operators
+    // -----------------------------------------------------------------------
+
+    fn lex_dot(self: *mut Self, start: usize) -> !OutOfMemory {
+        if self.peek_is(1_usize, b'.') {
+            if self.peek_is(2_usize, b'=') {
+                try self.push_punct(.DotDotEq, 3_usize);
+            } else {
+                try self.push_punct(.DotDot, 2_usize);
+            }
+            return;
+        }
+        if self.peek_is(1_usize, b'*') {
+            try self.push_punct(.DotStar, 2_usize);
+            return;
+        }
+        if let p1 = self.peek_at(1_usize) {
+            if is_ascii_digit(p1) {
+                self.pos = self.pos +% 1_usize;
+                while self.pos < self.bytes.len {
+                    let nb = self.bytes[self.pos];
+                    if is_ascii_digit(nb) || nb == b'_' {
+                        self.pos = self.pos +% 1_usize;
+                    } else {
+                        break;
+                    }
+                }
+                try self.emit_err(
+                    diag.E0004,
+                    start,
+                    self.pos,
+                    "float literal cannot start with `.`; add a leading zero like `0.5`",
+                );
+                try self.push_tok(tok.Token.simple(.Error, start.trunc.[u32](), self.pos.trunc.[u32]()));
+                return;
+            }
+        }
+        try self.push_punct(.Dot, 1_usize);
+        return;
+    }
+
+    fn lex_arith_op(self: *mut Self, b: u8) -> bool ! OutOfMemory {
+        if b == b'+' {
+            if self.peek_is(1_usize, b'%') {
+                if self.peek_is(2_usize, b'=') { try self.push_punct(.PlusWrapEq, 3_usize); }
+                else { try self.push_punct(.PlusWrap, 2_usize); }
+            } else if self.peek_is(1_usize, b'|') {
+                if self.peek_is(2_usize, b'=') { try self.push_punct(.PlusSatEq, 3_usize); }
+                else { try self.push_punct(.PlusSat, 2_usize); }
+            } else if self.peek_is(1_usize, b'?') {
+                try self.push_punct(.PlusCheck, 2_usize);
+            } else if self.peek_is(1_usize, b'=') {
+                try self.push_punct(.PlusEq, 2_usize);
+            } else {
+                try self.push_punct(.Plus, 1_usize);
+            }
+            return true;
+        }
+        if b == b'-' {
+            if self.peek_is(1_usize, b'>') {
+                try self.push_punct(.Arrow, 2_usize);
+            } else if self.peek_is(1_usize, b'%') {
+                if self.peek_is(2_usize, b'=') { try self.push_punct(.MinusWrapEq, 3_usize); }
+                else { try self.push_punct(.MinusWrap, 2_usize); }
+            } else if self.peek_is(1_usize, b'|') {
+                if self.peek_is(2_usize, b'=') { try self.push_punct(.MinusSatEq, 3_usize); }
+                else { try self.push_punct(.MinusSat, 2_usize); }
+            } else if self.peek_is(1_usize, b'?') {
+                try self.push_punct(.MinusCheck, 2_usize);
+            } else if self.peek_is(1_usize, b'=') {
+                try self.push_punct(.MinusEq, 2_usize);
+            } else {
+                try self.push_punct(.Minus, 1_usize);
+            }
+            return true;
+        }
+        if b == b'*' {
+            if self.peek_is(1_usize, b'%') {
+                if self.peek_is(2_usize, b'=') { try self.push_punct(.StarWrapEq, 3_usize); }
+                else { try self.push_punct(.StarWrap, 2_usize); }
+            } else if self.peek_is(1_usize, b'|') {
+                if self.peek_is(2_usize, b'=') { try self.push_punct(.StarSatEq, 3_usize); }
+                else { try self.push_punct(.StarSat, 2_usize); }
+            } else if self.peek_is(1_usize, b'?') {
+                try self.push_punct(.StarCheck, 2_usize);
+            } else if self.peek_is(1_usize, b'=') {
+                try self.push_punct(.StarEq, 2_usize);
+            } else {
+                try self.push_punct(.Star, 1_usize);
+            }
+            return true;
+        }
+        if b == b'/' {
+            if self.peek_is(1_usize, b'?') { try self.push_punct(.SlashCheck, 2_usize); }
+            else { try self.push_punct(.Slash, 1_usize); }
+            return true;
+        }
+        if b == b'%' {
+            if self.peek_is(1_usize, b'?') { try self.push_punct(.PercentCheck, 2_usize); }
+            else { try self.push_punct(.Percent, 1_usize); }
+            return true;
+        }
+        return false;
+    }
+
+    fn lex_cmp_bit_op(self: *mut Self, b: u8) -> bool ! OutOfMemory {
+        if b == b'<' {
+            if self.peek_is(1_usize, b'<') {
+                if self.peek_is(2_usize, b'%') { try self.push_punct(.ShlWrap, 3_usize); }
+                else if self.peek_is(2_usize, b'=') { try self.push_punct(.ShlEq, 3_usize); }
+                else { try self.push_punct(.Shl, 2_usize); }
+            } else if self.peek_is(1_usize, b'=') {
+                try self.push_punct(.LtEq, 2_usize);
+            } else {
+                try self.push_punct(.Lt, 1_usize);
+            }
+            return true;
+        }
+        if b == b'>' {
+            if self.peek_is(1_usize, b'>') {
+                if self.peek_is(2_usize, b'=') { try self.push_punct(.ShrEq, 3_usize); }
+                else { try self.push_punct(.Shr, 2_usize); }
+            } else if self.peek_is(1_usize, b'=') {
+                try self.push_punct(.GtEq, 2_usize);
+            } else {
+                try self.push_punct(.Gt, 1_usize);
+            }
+            return true;
+        }
+        if b == b'=' {
+            if self.peek_is(1_usize, b'=') { try self.push_punct(.EqEq, 2_usize); }
+            else if self.peek_is(1_usize, b'>') { try self.push_punct(.FatArrow, 2_usize); }
+            else { try self.push_punct(.Eq, 1_usize); }
+            return true;
+        }
+        if b == b'!' {
+            if self.peek_is(1_usize, b'=') { try self.push_punct(.NotEq, 2_usize); }
+            else { try self.push_punct(.Bang, 1_usize); }
+            return true;
+        }
+        if b == b'&' {
+            if self.peek_is(1_usize, b'&') { try self.push_punct(.AndAnd, 2_usize); }
+            else if self.peek_is(1_usize, b'=') { try self.push_punct(.AmpEq, 2_usize); }
+            else { try self.push_punct(.Amp, 1_usize); }
+            return true;
+        }
+        if b == b'|' {
+            if self.peek_is(1_usize, b'|') { try self.push_punct(.OrOr, 2_usize); }
+            else if self.peek_is(1_usize, b'=') { try self.push_punct(.PipeEq, 2_usize); }
+            else { try self.push_punct(.Pipe, 1_usize); }
+            return true;
+        }
+        if b == b'^' {
+            if self.peek_is(1_usize, b'=') { try self.push_punct(.CaretEq, 2_usize); }
+            else { try self.push_punct(.Caret, 1_usize); }
+            return true;
+        }
+        return false;
+    }
+
+    fn lex_single_punct(self: *mut Self, b: u8) -> bool ! OutOfMemory {
+        if b == b'(' { try self.push_punct(.LParen, 1_usize); return true; }
+        if b == b')' { try self.push_punct(.RParen, 1_usize); return true; }
+        if b == b'[' { try self.push_punct(.LBracket, 1_usize); return true; }
+        if b == b']' { try self.push_punct(.RBracket, 1_usize); return true; }
+        if b == b'{' { try self.push_punct(.LBrace, 1_usize); return true; }
+        if b == b'}' { try self.push_punct(.RBrace, 1_usize); return true; }
+        if b == b';' { try self.push_punct(.Semi, 1_usize); return true; }
+        if b == b':' { try self.push_punct(.Colon, 1_usize); return true; }
+        if b == b',' { try self.push_punct(.Comma, 1_usize); return true; }
+        if b == b'@' { try self.push_punct(.At, 1_usize); return true; }
+        if b == b'?' { try self.push_punct(.Question, 1_usize); return true; }
+        if b == b'~' { try self.push_punct(.Tilde, 1_usize); return true; }
+        return false;
+    }
+
+    fn lex_all(self: *mut Self) -> !OutOfMemory {
+        while self.pos < self.bytes.len {
+            try self.skip_whitespace_and_comments();
+            if self.pos >= self.bytes.len {
+                break;
+            }
+            let start = self.pos;
+            let b = self.bytes[self.pos];
+            if b == b'b' && self.peek_is(1_usize, b'"') {
+                try self.lex_byte_string(start);
+            } else if b == b'b' && self.peek_is(1_usize, b'\'') {
+                try self.lex_byte_char(start);
+            } else if is_ascii_alpha(b) || b == b'_' {
+                try self.lex_ident_or_keyword(start);
+            } else if is_ascii_digit(b) {
+                try self.lex_number(start);
+            } else if b == b'"' {
+                try self.lex_string(start);
+            } else if b == b'\'' {
+                try self.lex_char_or_label(start);
+            } else if b == b'\\' {
+                if self.peek_is(1_usize, b'\\') {
+                    try self.lex_raw_string(start);
+                } else {
+                    self.pos = self.pos +% 1_usize;
+                    try self.emit_err(
+                        diag.E0004,
+                        start,
+                        self.pos,
+                        "unexpected `\\`; raw multiline strings start with `\\\\`",
+                    );
+                    try self.push_tok(tok.Token.simple(.Error, start.trunc.[u32](), self.pos.trunc.[u32]()));
+                }
+            } else if b == b'.' {
+                try self.lex_dot(start);
+            } else if try self.lex_single_punct(b) {
+                // handled
+            } else if try self.lex_arith_op(b) {
+                // handled
+            } else if try self.lex_cmp_bit_op(b) {
+                // handled
+            } else if is_forbidden_ascii_ctrl(b) {
+                self.pos = self.pos +% 1_usize;
+                try self.emit_ctrl_err(start, self.pos, b, " in source code");
+            } else {
+                let cp = self.next_char();
+                let end = self.pos;
+                if !is_bidi_control(cp) {
+                    try self.emit_unexpected_char(start, end);
+                    try self.push_tok(tok.Token.simple(.Error, start.trunc.[u32](), end.trunc.[u32]()));
+                }
+            }
+        }
+        let eof_pos = self.bytes.len.trunc.[u32]();
+        try self.push_tok(tok.Token.simple(.Eof, eof_pos, eof_pos));
+        return;
+    }
+}
+
+/// Lexes source file `fid` in `sm`, recording tokens, literals, doc comments, and diagnostics.
+pub fn lex_file(
+    alloc: *mut AllocCap,
+    sm: *span.SourceMap,
+    fid: u32,
+    interner: *mut span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> LexOutput ! OutOfMemory {
+    let issues = sm.file_issues(fid);
+    var ii: usize = 0_usize;
+    while ii < issues.len {
+        let iss = issues[ii];
+        let sp = span.span_new(fid, iss.start, iss.end);
+        if iss.is_bom {
+            _ = try diags.emit_error(
+                alloc,
+                diag.E0001,
+                sp,
+                "UTF-8 BOM (EF BB BF) is forbidden in Eon source files",
+            );
+        } else {
+            _ = try diags.emit_error(
+                alloc,
+                diag.E0001,
+                sp,
+                "source file is not valid UTF-8",
+            );
+        }
+        ii = ii +% 1_usize;
+    }
+
+    let bytes = sm.file_text(fid);
+    let est_tokens = (bytes.len / 6_usize) +% 16_usize;
+    var out = try LexOutput.init(alloc, est_tokens);
+    errdefer out.destroy(alloc);
+    var msg_buf = try str.StrBuf.init(alloc, 128_usize);
+    errdefer msg_buf.destroy(alloc);
+
+    var lx = Lexer.{
+        alloc: alloc,
+        fid: fid,
+        bytes: bytes,
+        pos: 0_usize,
+        interner: interner,
+        diags: diags,
+        out: &mut out,
+        msg_buf: &mut msg_buf,
+    };
+    try lx.check_trojan_source();
+    try lx.lex_all();
+
+    msg_buf.destroy(alloc);
+    return out;
+}

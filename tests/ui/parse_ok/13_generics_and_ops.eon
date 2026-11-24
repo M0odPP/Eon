@@ -1,0 +1,21 @@
+module tests.generics_and_where;
+
+pub union ResultBox[T, E] where @size_of(T) > 0_usize {
+    Ok: T,
+    Err: E,
+}
+
+impl[T: Ord + Eq] Boxed[T] where @align_of(T) <= 16_usize {
+    pub fn check_bounds(mut n: u32, from a: *Self) -> u32 {
+        n += 1_u32;
+        n +%= 2_u32;
+        n +|= 3_u32;
+        n &= 0xFF_u32;
+        n |= 1_u32;
+        n ^= 2_u32;
+        n <<= 1_u32;
+        n >>= 1_u32;
+        _ = a;
+        return n;
+    }
+}

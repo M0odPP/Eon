@@ -1,0 +1,21 @@
+module mut_slot_invalidation_ok;
+
+fn bump(p: *mut usize) {
+    p.* = 2_usize;
+}
+
+pub fn main() -> i32 {
+    let arr: [4]u8 = [10_u8, 20_u8, 30_u8, 40_u8];
+    var i: usize = 0_usize;
+    var untouched: usize = 1_usize;
+    untouched = 2_usize;
+    bump(&mut i);
+    // untouched was never mutably addressed, so its bound is preserved.
+    let v1 = arr[untouched];
+    // i must be re-checked after &mut i call.
+    if i < arr.len {
+        let v2 = arr[i];
+        return (v1 +% v2).widen.[i32]();
+    }
+    return 0_i32;
+}

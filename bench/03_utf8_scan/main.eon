@@ -1,0 +1,463 @@
+module bench.utf8_scan;
+
+import std.rt;
+
+pub struct RunRes {
+    pub next_i: usize;
+    pub cps: u64;
+}
+
+fn next_u64(state: *mut u64) -> u64 {
+    var x = state.*;
+    x = x ^ (x <<% 13_u64);
+    x = x ^ (x >> 7_u64);
+    x = x ^ (x <<% 17_u64);
+    state.* = x;
+    return x;
+}
+
+fn push_ascii_prose(out: *mut Buf[u8], idx: u64) -> !OutOfMemory {
+    if idx == 0_u64 {
+        try out.push_slice("Linear ownership and capability-based APIs eliminate hidden global state in systems code. ".as_bytes());
+    } else if idx == 1_u64 {
+        try out.push_slice("Structure-of-arrays pools align hot columns on cache lines for predictable traversal speed. ".as_bytes());
+    } else if idx == 2_u64 {
+        try out.push_slice("Explicit wrapping arithmetic and static bounds proofs prevent silent integer wrap bugs. ".as_bytes());
+    } else if idx == 3_u64 {
+        try out.push_slice("Deterministic benchmarks validate checksums across safe Rust and safe Eon implementations. ".as_bytes());
+    } else if idx == 4_u64 {
+        try out.push_slice("Compile-time relational verification removes redundant bounds checks inside tight loops. ".as_bytes());
+    } else if idx == 5_u64 {
+        try out.push_slice("Arena allocators reclaim entire parse trees in constant time with a single pointer reset. ".as_bytes());
+    } else if idx == 6_u64 {
+        try out.push_slice("Vectorized byte scanning accelerates UTF-8 validation and substring search on x86_64 CPUs. ".as_bytes());
+    } else {
+        try out.push_slice("Zero-copy byte slices keep memory traffic low while parsing structured text documents. ".as_bytes());
+    }
+    return;
+}
+
+fn generate_utf8_buffer(alloc: *mut AllocCap, target_len: usize) -> Buf[u8] ! OutOfMemory {
+    var out = try Buf.[u8].init(alloc, target_len);
+    errdefer out.destroy(alloc);
+    var rng: u64 = 0x9E3779B97F4A7C15_u64;
+
+    let needle0: [12]u8 = [
+        b'E', b'o', b'n', b'_', b'S', b'I', b'M', b'D', b'_', b'v', b'0', b'2',
+    ];
+    let needle1: [15]u8 = [
+        b'c', b'a', b'f', 0xC3_u8, 0xA9_u8, 0xE2_u8, 0x80_u8, 0x94_u8, 0xCF_u8, 0x80_u8,
+        b'=', b'3', b'.', b'1', b'4',
+    ];
+    let needle2: [11]u8 = [
+        0xF0_u8, 0x9F_u8, 0x9A_u8, 0x80_u8, b'l', b'a', b'u', b'n', b'c', b'h', b'!',
+    ];
+    let utf8_2b: [33]u8 = [
+        b' ', b'r', 0xC3_u8, 0xA9_u8, b's', b'u', b'm', 0xC3_u8, 0xA9_u8, b' ', b'n', b'a',
+        0xC3_u8, 0xAF_u8, b'v', b'e', b' ', b'c', b'a', b'f', 0xC3_u8, 0xA9_u8, b' ',
+        0xCE_u8, 0x94_u8, 0xCE_u8, 0xA9_u8, b' ', 0xD0_u8, 0x94_u8, 0xD0_u8, 0x96_u8, b' ',
+    ];
+    let utf8_3b: [38]u8 = [
+        b' ', 0xE6_u8, 0xBC_u8, 0xA2_u8, 0xE5_u8, 0xAD_u8, 0x97_u8, 0xE3_u8, 0x83_u8, 0x87_u8,
+        0xE3_u8, 0x83_u8, 0xBC_u8, 0xE3_u8, 0x82_u8, 0xBF_u8, b' ', 0xE2_u8, 0x82_u8, 0xAC_u8,
+        b'1', b'0', b'0', b' ', 0xE2_u8, 0x80_u8, 0x94_u8, b' ', 0xE6_u8, 0x97_u8, 0xA5_u8,
+        0xE6_u8, 0x9C_u8, 0xAC_u8, 0xE8_u8, 0xAA_u8, 0x9E_u8, b' ',
+    ];
+    let utf8_4b: [30]u8 = [
+        b' ', 0xF0_u8, 0x9F_u8, 0x9A_u8, 0x80_u8, 0xF0_u8, 0x9F_u8, 0xA6_u8, 0x80_u8,
+        0xF0_u8, 0x9D_u8, 0x84_u8, 0x9E_u8, b' ', b's', b'y', b's', b't', b'e', b'm', b's', b' ',
+        0xF0_u8, 0x9F_u8, 0x94_u8, 0xA5_u8, 0xE2_u8, 0x9C_u8, 0xA8_u8, b' ',
+    ];
+    let decoys: [30]u8 = [
+        b' ', b'E', b'o', b'n', b'_', b'S', b'I', b'M', b'X', b' ', b'c', b'a', b'f',
+        0xC3_u8, 0xA9_u8, 0xE2_u8, 0x80_u8, 0x94_u8, b'X', b' ',
+        0xF0_u8, 0x9F_u8, 0x9A_u8, 0x80_u8, b'l', b'a', b'n', b'd', b'!', b' ',
+    ];
+
+    let stop_at = target_len -% 128_usize;
+    while out.len() <= stop_at {
+        let r = next_u64(&mut rng) % 100_u64;
+        if r < 70_u64 {
+            let idx = next_u64(&mut rng) & 7_u64;
+            try push_ascii_prose(&mut out, idx);
+        } else if r < 81_u64 {
+            try out.push_slice(&utf8_2b);
+        } else if r < 90_u64 {
+            try out.push_slice(&utf8_3b);
+        } else if r < 96_u64 {
+            try out.push_slice(&utf8_4b);
+        } else if r == 96_u64 {
+            try out.push_slice(&decoys);
+        } else if r == 97_u64 {
+            try out.push(b'[');
+            try out.push_slice(&needle0);
+            try out.push_slice("] ".as_bytes());
+        } else if r == 98_u64 {
+            try out.push(b'<');
+            try out.push_slice(&needle1);
+            try out.push_slice("> ".as_bytes());
+        } else {
+            try out.push(b'(');
+            try out.push_slice(&needle2);
+            try out.push_slice(") ".as_bytes());
+        }
+    }
+    while out.len() < target_len {
+        try out.push(b' ');
+    }
+    return out;
+}
+
+/// Strict RFC 3629 UTF-8 validation over a run of non-ASCII bytes (or final tail).
+/// Absorbs short ASCII gaps (< 16 bytes) inline to avoid SIMD call/vzeroupper ping-pong.
+fn validate_utf8_scalar(bytes: *[u8], i0: usize, stop_at_ascii: bool) -> RunRes ! Utf8Error {
+    var i = i0;
+    var cps: u64 = 0_u64;
+    var ascii_run: usize = 0_usize;
+    while i < bytes.len {
+        let b0 = bytes[i];
+        if b0 < 0x80_u8 {
+            i = i + 1_usize;
+            cps = cps +% 1_u64;
+            if stop_at_ascii {
+                ascii_run = ascii_run +% 1_usize;
+                if ascii_run >= 16_usize {
+                    break;
+                }
+            }
+            continue;
+        }
+        ascii_run = 0_usize;
+        if b0 >= 0xC2_u8 && b0 <= 0xDF_u8 {
+            let i1 = i + 1_usize;
+            if i1 >= bytes.len {
+                return .UnexpectedEof;
+            }
+            if (bytes[i1] & 0xC0_u8) != 0x80_u8 {
+                return .InvalidUtf8;
+            }
+            i = i1 + 1_usize;
+            cps = cps +% 1_u64;
+            continue;
+        }
+        if b0 >= 0xE0_u8 && b0 <= 0xEF_u8 {
+            let i1 = i + 1_usize;
+            if i1 >= bytes.len {
+                return .UnexpectedEof;
+            }
+            let i2 = i1 + 1_usize;
+            if i2 >= bytes.len {
+                return .UnexpectedEof;
+            }
+            let b1 = bytes[i1];
+            let b2 = bytes[i2];
+            if (b1 & 0xC0_u8) != 0x80_u8 || (b2 & 0xC0_u8) != 0x80_u8 {
+                return .InvalidUtf8;
+            }
+            if (b0 == 0xE0_u8 && b1 < 0xA0_u8) || (b0 == 0xED_u8 && b1 >= 0xA0_u8) {
+                return .InvalidUtf8;
+            }
+            i = i2 + 1_usize;
+            cps = cps +% 1_u64;
+            continue;
+        }
+        if b0 >= 0xF0_u8 && b0 <= 0xF4_u8 {
+            let i1 = i + 1_usize;
+            if i1 >= bytes.len {
+                return .UnexpectedEof;
+            }
+            let i2 = i1 + 1_usize;
+            if i2 >= bytes.len {
+                return .UnexpectedEof;
+            }
+            let i3 = i2 + 1_usize;
+            if i3 >= bytes.len {
+                return .UnexpectedEof;
+            }
+            let b1 = bytes[i1];
+            let b2 = bytes[i2];
+            let b3 = bytes[i3];
+            if (b1 & 0xC0_u8) != 0x80_u8
+                || (b2 & 0xC0_u8) != 0x80_u8
+                || (b3 & 0xC0_u8) != 0x80_u8
+            {
+                return .InvalidUtf8;
+            }
+            if (b0 == 0xF0_u8 && b1 < 0x90_u8) || (b0 == 0xF4_u8 && b1 >= 0x90_u8) {
+                return .InvalidUtf8;
+            }
+            i = i3 + 1_usize;
+            cps = cps +% 1_u64;
+            continue;
+        }
+        return .InvalidUtf8;
+    }
+    return RunRes.{ next_i: i, cps: cps };
+}
+
+/// Pure leaf AVX2 ASCII run scanner (zero calls inside => YMM constants stay in registers!).
+/// Checks 64 bytes per iteration (`v0 | v1`) on pure ASCII stretches!
+fn scan_ascii_run_simd(bytes: *[u8], i0: usize) -> usize {
+    let hi_mask = u8x32.splat(0x80_u8);
+    let zero_vec = u8x32.splat(0_u8);
+    var i = i0;
+    while i < bytes.len {
+        let end0 = i + 31_usize;
+        if end0 >= bytes.len {
+            break;
+        }
+        let v0: u8x32 = .{
+            bytes[i], bytes[i + 1_usize], bytes[i + 2_usize], bytes[i + 3_usize],
+            bytes[i + 4_usize], bytes[i + 5_usize], bytes[i + 6_usize], bytes[i + 7_usize],
+            bytes[i + 8_usize], bytes[i + 9_usize], bytes[i + 10_usize], bytes[i + 11_usize],
+            bytes[i + 12_usize], bytes[i + 13_usize], bytes[i + 14_usize], bytes[i + 15_usize],
+            bytes[i + 16_usize], bytes[i + 17_usize], bytes[i + 18_usize], bytes[i + 19_usize],
+            bytes[i + 20_usize], bytes[i + 21_usize], bytes[i + 22_usize], bytes[i + 23_usize],
+            bytes[i + 24_usize], bytes[i + 25_usize], bytes[i + 26_usize], bytes[i + 27_usize],
+            bytes[i + 28_usize], bytes[i + 29_usize], bytes[i + 30_usize], bytes[end0],
+        };
+        let i2 = i + 32_usize;
+        let end64 = i2 + 31_usize;
+        if end64 >= bytes.len {
+            let m0 = (v0 & hi_mask).cmpeq(zero_vec).bitmask();
+            if m0 == 0xFFFFFFFF_u64 {
+                i = i2;
+            } else {
+                let skip = (@tzcnt((~m0) & 0xFFFFFFFF_u64) & 31_u64).trunc.[usize]();
+                return i +% skip;
+            }
+            break;
+        }
+        let v1: u8x32 = .{
+            bytes[i2], bytes[i2 + 1_usize], bytes[i2 + 2_usize], bytes[i2 + 3_usize],
+            bytes[i2 + 4_usize], bytes[i2 + 5_usize], bytes[i2 + 6_usize], bytes[i2 + 7_usize],
+            bytes[i2 + 8_usize], bytes[i2 + 9_usize], bytes[i2 + 10_usize], bytes[i2 + 11_usize],
+            bytes[i2 + 12_usize], bytes[i2 + 13_usize], bytes[i2 + 14_usize], bytes[i2 + 15_usize],
+            bytes[i2 + 16_usize], bytes[i2 + 17_usize], bytes[i2 + 18_usize], bytes[i2 + 19_usize],
+            bytes[i2 + 20_usize], bytes[i2 + 21_usize], bytes[i2 + 22_usize], bytes[i2 + 23_usize],
+            bytes[i2 + 24_usize], bytes[i2 + 25_usize], bytes[i2 + 26_usize], bytes[i2 + 27_usize],
+            bytes[i2 + 28_usize], bytes[i2 + 29_usize], bytes[i2 + 30_usize], bytes[end64],
+        };
+        let both = v0 | v1;
+        if ((both & hi_mask).cmpeq(zero_vec).bitmask()) == 0xFFFFFFFF_u64 {
+            i = i +% 64_usize;
+        } else {
+            let m0 = (v0 & hi_mask).cmpeq(zero_vec).bitmask();
+            if m0 != 0xFFFFFFFF_u64 {
+                let skip = (@tzcnt((~m0) & 0xFFFFFFFF_u64) & 31_u64).trunc.[usize]();
+                return i +% skip;
+            }
+            let m1 = (v1 & hi_mask).cmpeq(zero_vec).bitmask();
+            let skip = (@tzcnt((~m1) & 0xFFFFFFFF_u64) & 31_u64).trunc.[usize]();
+            return i +% 32_usize +% skip;
+        }
+    }
+    return i;
+}
+
+/// Strict RFC 3629 UTF-8 validation + Unicode scalar codepoint count
+/// with `u8x32` AVX2 SIMD ASCII fast-path.
+fn validate_and_count_utf8_simd(bytes: *[u8]) -> u64 ! Utf8Error {
+    var i: usize = 0_usize;
+    var cp_count: u64 = 0_u64;
+
+    while i < bytes.len {
+        if i + 31_usize >= bytes.len {
+            break;
+        }
+        let next_i = scan_ascii_run_simd(bytes, i);
+        cp_count = cp_count +% (next_i -% i).widen.[u64]();
+        i = next_i;
+        if i >= bytes.len || i + 31_usize >= bytes.len {
+            break;
+        }
+        let res = try validate_utf8_scalar(bytes, i, true);
+        i = res.next_i;
+        cp_count = cp_count +% res.cps;
+    }
+
+    if i < bytes.len {
+        let tail = try validate_utf8_scalar(bytes, i, false);
+        cp_count = cp_count +% tail.cps;
+    }
+    return cp_count;
+}
+
+@inline
+fn match_at(haystack: *[u8], pos: usize, needle: *[u8]) -> bool {
+    let nlen = needle.len;
+    if pos > haystack.len || nlen > haystack.len - pos || nlen < 2_usize {
+        return false;
+    }
+    let last_idx = nlen - 1_usize;
+    if haystack[pos + last_idx] != needle[last_idx] {
+        return false;
+    }
+    var k: usize = 1_usize;
+    while k < last_idx {
+        if haystack[pos + k] != needle[k] {
+            return false;
+        }
+        k = k + 1_usize;
+    }
+    return true;
+}
+
+@inline
+fn load_u8x32_at(s: *[u8], p: usize) -> u8x32 {
+    if p < s.len && s.len - p >= 32_usize {
+        return .{
+            s[p], s[p + 1_usize], s[p + 2_usize], s[p + 3_usize],
+            s[p + 4_usize], s[p + 5_usize], s[p + 6_usize], s[p + 7_usize],
+            s[p + 8_usize], s[p + 9_usize], s[p + 10_usize], s[p + 11_usize],
+            s[p + 12_usize], s[p + 13_usize], s[p + 14_usize], s[p + 15_usize],
+            s[p + 16_usize], s[p + 17_usize], s[p + 18_usize], s[p + 19_usize],
+            s[p + 20_usize], s[p + 21_usize], s[p + 22_usize], s[p + 23_usize],
+            s[p + 24_usize], s[p + 25_usize], s[p + 26_usize], s[p + 27_usize],
+            s[p + 28_usize], s[p + 29_usize], s[p + 30_usize], s[p + 31_usize],
+        };
+    }
+    return u8x32.splat(0_u8);
+}
+
+/// Fused single-pass `u8x32` AVX2 SIMD 2-byte (first + last) prefilter scanner for 3 needles.
+fn scan_three_needles_simd(haystack: *[u8], n0: *[u8], n1: *[u8], n2: *[u8]) -> u64 {
+    let prime: u64 = 0x00000100000001B3_u64;
+    if n0.len < 2_usize || n1.len < 2_usize || n2.len < 2_usize {
+        return 0_u64;
+    }
+    let last0 = n0.len - 1_usize;
+    let last1 = n1.len - 1_usize;
+    let last2 = n2.len - 1_usize;
+    var max_last = last0;
+    if last1 > max_last { max_last = last1; }
+    if last2 > max_last { max_last = last2; }
+
+    let f0 = n0[0_usize];
+    let f1 = n1[0_usize];
+    let f2 = n2[0_usize];
+    let l0 = n0[last0];
+    let l1 = n1[last1];
+    let l2 = n2[last2];
+    let fv0 = u8x32.splat(f0);
+    let fv1 = u8x32.splat(f1);
+    let fv2 = u8x32.splat(f2);
+    let lv0 = u8x32.splat(l0);
+    let lv1 = u8x32.splat(l1);
+    let lv2 = u8x32.splat(l2);
+
+    var h0: u64 = 0xCBF29CE484222325_u64;
+    var h1: u64 = 0xCBF29CE484222325_u64;
+    var h2: u64 = 0xCBF29CE484222325_u64;
+    var c0: u64 = 0_u64;
+    var c1: u64 = 0_u64;
+    var c2: u64 = 0_u64;
+    var i: usize = 0_usize;
+
+    let min_tail = max_last +% 32_usize;
+    if haystack.len >= min_tail {
+        let simd_lim = haystack.len - min_tail;
+        while i <= simd_lim {
+            let v = load_u8x32_at(haystack, i);
+            let vl0 = load_u8x32_at(haystack, i +% last0);
+            let vl1 = load_u8x32_at(haystack, i +% last1);
+            let vl2 = load_u8x32_at(haystack, i +% last2);
+            var m0 = v.cmpeq(fv0).bitmask() & vl0.cmpeq(lv0).bitmask();
+            var m1 = v.cmpeq(fv1).bitmask() & vl1.cmpeq(lv1).bitmask();
+            var m2 = v.cmpeq(fv2).bitmask() & vl2.cmpeq(lv2).bitmask();
+            if (m0 | m1 | m2) != 0_u64 {
+                while m0 != 0_u64 {
+                    let pos = i +% (@tzcnt(m0) & 31_u64).trunc.[usize]();
+                    if match_at(haystack, pos, n0) {
+                        h0 = (h0 ^ (pos.widen.[u64]() +% 0x10000001_u64)) *% prime;
+                        c0 = c0 +% 1_u64;
+                    }
+                    m0 = m0 & (m0 -% 1_u64);
+                }
+                while m1 != 0_u64 {
+                    let pos = i +% (@tzcnt(m1) & 31_u64).trunc.[usize]();
+                    if match_at(haystack, pos, n1) {
+                        h1 = (h1 ^ (pos.widen.[u64]() +% 0x20000002_u64)) *% prime;
+                        c1 = c1 +% 1_u64;
+                    }
+                    m1 = m1 & (m1 -% 1_u64);
+                }
+                while m2 != 0_u64 {
+                    let pos = i +% (@tzcnt(m2) & 31_u64).trunc.[usize]();
+                    if match_at(haystack, pos, n2) {
+                        h2 = (h2 ^ (pos.widen.[u64]() +% 0x30000003_u64)) *% prime;
+                        c2 = c2 +% 1_u64;
+                    }
+                    m2 = m2 & (m2 -% 1_u64);
+                }
+            }
+            i = i +% 32_usize;
+        }
+    }
+
+    while i < haystack.len {
+        let b = haystack[i];
+        if b == f0 && match_at(haystack, i, n0) {
+            h0 = (h0 ^ (i.widen.[u64]() +% 0x10000001_u64)) *% prime;
+            c0 = c0 +% 1_u64;
+        }
+        if b == f1 && match_at(haystack, i, n1) {
+            h1 = (h1 ^ (i.widen.[u64]() +% 0x20000002_u64)) *% prime;
+            c1 = c1 +% 1_u64;
+        }
+        if b == f2 && match_at(haystack, i, n2) {
+            h2 = (h2 ^ (i.widen.[u64]() +% 0x30000003_u64)) *% prime;
+            c2 = c2 +% 1_u64;
+        }
+        i = i + 1_usize;
+    }
+
+    var h = (h0 ^ c0) *% prime;
+    h = (((h ^ h1) *% prime) ^ c1) *% prime;
+    h = (((h ^ h2) *% prime) ^ c2) *% prime;
+    return h;
+}
+
+pub fn main(env: *mut Env) -> i32 ! OutOfMemory | Utf8Error {
+    let alloc = &mut env.alloc;
+    let clock = &env.clock;
+    let target_len: usize = 16_usize *% 1024_usize *% 1024_usize;
+    let iters: usize = 8_usize;
+    let prime: u64 = 0x00000100000001B3_u64;
+
+    let buf = try generate_utf8_buffer(alloc, target_len);
+    errdefer buf.destroy(alloc);
+    let data = buf.as_slice();
+
+    let needle0: [12]u8 = [
+        b'E', b'o', b'n', b'_', b'S', b'I', b'M', b'D', b'_', b'v', b'0', b'2',
+    ];
+    let needle1: [15]u8 = [
+        b'c', b'a', b'f', 0xC3_u8, 0xA9_u8, 0xE2_u8, 0x80_u8, 0x94_u8, 0xCF_u8, 0x80_u8,
+        b'=', b'3', b'.', b'1', b'4',
+    ];
+    let needle2: [11]u8 = [
+        0xF0_u8, 0x9F_u8, 0x9A_u8, 0x80_u8, b'l', b'a', b'u', b'n', b'c', b'h', b'!',
+    ];
+
+    let t0 = rt.now_ns(clock);
+    var checksum: u64 = 0xCBF29CE484222325_u64;
+    var iter: usize = 0_usize;
+    while iter < iters {
+        let cp_count = try validate_and_count_utf8_simd(data);
+        let scan_h = scan_three_needles_simd(data, &needle0, &needle1, &needle2);
+        let h = (((0xCBF29CE484222325_u64 ^ cp_count) *% prime) ^ scan_h) *% prime;
+        checksum = ((checksum ^ h) *% prime) +% iter.widen.[u64]();
+        iter = iter +% 1_usize;
+    }
+    let elapsed_ns = rt.elapsed_since(clock, t0);
+
+    buf.destroy(alloc);
+
+    rt.print_str("RESULT utf8_scan checksum=");
+    rt.print_u64(checksum);
+    rt.print_str(" elapsed_ns=");
+    rt.print_u64(elapsed_ns);
+    rt.print_nl();
+    return 0_i32;
+}

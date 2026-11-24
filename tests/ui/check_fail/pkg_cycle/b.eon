@@ -1,0 +1,7 @@
+module cycle.b;
+
+import cycle.a; //~ ERROR E0131
+
+pub fn fb() -> i32 {
+    return a.fa();
+}

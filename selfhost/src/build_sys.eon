@@ -1,0 +1,1470 @@
+module eonc.build_sys;
+
+import core.col;
+import core.str;
+import eonc.span;
+import eonc.ast;
+
+// ---------------------------------------------------------------------------
+// Build Target & Plan Data Model
+// ---------------------------------------------------------------------------
+
+pub enum BuildTargetKind : u8 {
+    Exe = 0,
+    SharedLib = 1,
+}
+
+pub struct BuildTarget {
+    pub name_range: ast.IdRange;
+    pub root_range: ast.IdRange;
+    pub kind: BuildTargetKind;
+}
+
+pub linear struct BuildPlan {
+    pub pkg_root_range: ast.IdRange;
+    pub out_dir_range: ast.IdRange;
+    pub targets: col.DynBuf[BuildTarget];
+    pub link_libs: col.DynBuf[ast.IdRange];
+    pub allow_hal: col.DynBuf[ast.IdRange];
+    pub sanitize: bool;
+    pub audit_tcb: bool;
+    pub opt_level: u8;
+    pub str_bytes: col.DynBuf[u8];
+}
+
+// ---------------------------------------------------------------------------
+// Byte Slice & Path Helpers
+// ---------------------------------------------------------------------------
+
+view fn slice_id_range(all: *[u8], r: ast.IdRange) -> *[u8] {
+    let empty: *str = "";
+    let start = r.start.widen.[usize]();
+    let end = start +% r.len.widen.[usize]();
+    let s = all.sub(start, end) catch {
+        return empty.as_bytes();
+    };
+    return s;
+}
+
+fn cmp_bytes_lex(a: *[u8], b: *[u8]) -> i32 {
+    let min_len = if a.len < b.len { a.len } else { b.len };
+    var i: usize = 0_usize;
+    while i < min_len {
+        if a[i] < b[i] {
+            return -1_i32;
+        }
+        if a[i] > b[i] {
+            return 1_i32;
+        }
+        i = i +% 1_usize;
+    }
+    if a.len < b.len {
+        return -1_i32;
+    }
+    if a.len > b.len {
+        return 1_i32;
+    }
+    return 0_i32;
+}
+
+view fn trim_trailing_slashes(path: *[u8]) -> *[u8] {
+    var end = path.len;
+    while end > 1_usize && path[end - 1_usize] == b'/' {
+        end = end - 1_usize;
+    }
+    let s = path.sub(0_usize, end) catch {
+        return path;
+    };
+    return s;
+}
+
+fn is_dotdot_seg(rel: *[u8], start: usize, end: usize) -> bool {
+    if end < start {
+        return false;
+    }
+    if (end -% start) != 2_usize {
+        return false;
+    }
+    let i1 = start +% 1_usize;
+    if start < rel.len && i1 < rel.len {
+        return rel[start] == b'.' && rel[i1] == b'.';
+    }
+    return false;
+}
+
+fn push_escape_err(
+    alloc: *mut AllocCap,
+    rel: *[u8],
+    err_out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    try err_out.push_str_grow(alloc, "build.eon sandbox error: path `");
+    try err_out.push_bytes_grow(alloc, rel);
+    try err_out.push_str_grow(alloc, "` escapes package root via `..`");
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox Path & Target Name Validation
+// ---------------------------------------------------------------------------
+
+pub fn validate_sandbox_rel_path(
+    alloc: *mut AllocCap,
+    rel: *[u8],
+    err_out: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    if rel.len == 0_usize {
+        try err_out.push_str_grow(
+            alloc,
+            "build.eon sandbox error: relative path cannot be empty",
+        );
+        return false;
+    }
+
+    var ni: usize = 0_usize;
+    while ni < rel.len {
+        if rel[ni] == 0_u8 {
+            try err_out.push_str_grow(
+                alloc,
+                "build.eon sandbox error: path contains NUL byte",
+            );
+            return false;
+        }
+        ni = ni +% 1_usize;
+    }
+
+    if rel[0_usize] == b'/' || rel[0_usize] == b'\\' {
+        try err_out.push_str_grow(alloc, "build.eon sandbox error: absolute path `");
+        try err_out.push_bytes_grow(alloc, rel);
+        try err_out.push_str_grow(alloc, "` is forbidden");
+        return false;
+    }
+
+    var ci: usize = 0_usize;
+    while ci < rel.len {
+        let ch = rel[ci];
+        if ch == b'\\' {
+            try err_out.push_str_grow(alloc, "build.eon sandbox error: path `");
+            try err_out.push_bytes_grow(alloc, rel);
+            try err_out.push_str_grow(alloc, "` contains forbidden backslash");
+            return false;
+        }
+        if ch < 0x20_u8 || ch == 0x7F_u8 {
+            try err_out.push_str_grow(alloc, "build.eon sandbox error: path `");
+            try err_out.push_bytes_grow(alloc, rel);
+            try err_out.push_str_grow(alloc, "` contains forbidden control character");
+            return false;
+        }
+        ci = ci +% 1_usize;
+    }
+
+    var seg_start: usize = 0_usize;
+    var si: usize = 0_usize;
+    while si < rel.len {
+        if rel[si] == b'/' {
+            if is_dotdot_seg(rel, seg_start, si) {
+                try push_escape_err(alloc, rel, err_out);
+                return false;
+            }
+            seg_start = si +% 1_usize;
+        }
+        si = si +% 1_usize;
+    }
+    if is_dotdot_seg(rel, seg_start, rel.len) {
+        try push_escape_err(alloc, rel, err_out);
+        return false;
+    }
+    return true;
+}
+
+pub fn validate_target_name(
+    alloc: *mut AllocCap,
+    name: *[u8],
+    err_out: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    var bad = name.len == 0_usize
+        || str.bytes_eq(name, ".".as_bytes())
+        || str.bytes_eq(name, "..".as_bytes());
+    if !bad {
+        var i: usize = 0_usize;
+        while i < name.len {
+            let ch = name[i];
+            if ch == 0_u8 || ch == b'/' || ch == b'\\' || ch < 0x20_u8 || ch == 0x7F_u8 {
+                bad = true;
+                break;
+            }
+            i = i +% 1_usize;
+        }
+    }
+    if bad {
+        try err_out.push_str_grow(alloc, "build.eon sandbox error: invalid target name `");
+        try err_out.push_bytes_grow(alloc, name);
+        try err_out.push_byte_grow(alloc, b'`');
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// BuildPlan Methods
+// ---------------------------------------------------------------------------
+
+impl BuildPlan {
+    pub fn init(alloc: *mut AllocCap, pkg_root: *[u8]) -> BuildPlan ! OutOfMemory {
+        let targets = try col.DynBuf.[BuildTarget].init(alloc, 4_usize);
+        errdefer targets.destroy(alloc);
+        let link_libs = try col.DynBuf.[ast.IdRange].init(alloc, 4_usize);
+        errdefer link_libs.destroy(alloc);
+        let allow_hal = try col.DynBuf.[ast.IdRange].init(alloc, 4_usize);
+        errdefer allow_hal.destroy(alloc);
+        var str_bytes = try col.DynBuf.[u8].init(alloc, 256_usize);
+        errdefer str_bytes.destroy(alloc);
+
+        let root_start = str_bytes.len().trunc.[u32]();
+        try str_bytes.push_slice(alloc, pkg_root);
+        let pkg_root_range = ast.range_new(root_start, pkg_root.len.trunc.[u32]());
+
+        let def_out = "out".as_bytes();
+        let out_start = str_bytes.len().trunc.[u32]();
+        try str_bytes.push_slice(alloc, def_out);
+        let out_dir_range = ast.range_new(out_start, def_out.len.trunc.[u32]());
+
+        return BuildPlan.{
+            pkg_root_range: pkg_root_range,
+            out_dir_range: out_dir_range,
+            targets: targets,
+            link_libs: link_libs,
+            allow_hal: allow_hal,
+            sanitize: false,
+            audit_tcb: false,
+            opt_level: 0_u8,
+            str_bytes: str_bytes,
+        };
+    }
+
+    fn intern_bytes(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        bytes: *[u8],
+    ) -> ast.IdRange ! OutOfMemory {
+        let start = self.str_bytes.len().trunc.[u32]();
+        try self.str_bytes.push_slice(alloc, bytes);
+        return ast.range_new(start, bytes.len.trunc.[u32]());
+    }
+
+    pub fn add_exe(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        name: *[u8],
+        root: *[u8],
+    ) -> !OutOfMemory {
+        let name_range = try self.intern_bytes(alloc, name);
+        let root_range = try self.intern_bytes(alloc, root);
+        try self.targets.push(
+            alloc,
+            BuildTarget.{
+                name_range: name_range,
+                root_range: root_range,
+                kind: .Exe,
+            },
+        );
+        return;
+    }
+
+    pub fn add_shared(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        name: *[u8],
+        root: *[u8],
+    ) -> !OutOfMemory {
+        let name_range = try self.intern_bytes(alloc, name);
+        let root_range = try self.intern_bytes(alloc, root);
+        try self.targets.push(
+            alloc,
+            BuildTarget.{
+                name_range: name_range,
+                root_range: root_range,
+                kind: .SharedLib,
+            },
+        );
+        return;
+    }
+
+    pub fn set_out_dir(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        dir: *[u8],
+    ) -> !OutOfMemory {
+        self.out_dir_range = try self.intern_bytes(alloc, dir);
+        return;
+    }
+
+    pub fn set_sanitize(self: *mut Self, enabled: bool) {
+        self.sanitize = enabled;
+    }
+
+    pub fn set_audit_tcb(self: *mut Self, enabled: bool) {
+        self.audit_tcb = enabled;
+    }
+
+    pub fn set_opt_level(self: *mut Self, level: u8) {
+        self.opt_level = level;
+    }
+
+    pub fn add_link_lib(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        lib: *[u8],
+    ) -> !OutOfMemory {
+        let r = try self.intern_bytes(alloc, lib);
+        try self.link_libs.push(alloc, r);
+        return;
+    }
+
+    pub fn add_allow_hal(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        mod_name: *[u8],
+    ) -> !OutOfMemory {
+        let count = self.allow_hal.len();
+        var ins_idx = count;
+        var i: usize = 0_usize;
+        while i < count {
+            let cur = self.allow_hal_at(i);
+            let cmp = cmp_bytes_lex(cur, mod_name);
+            if cmp == 0_i32 {
+                return;
+            }
+            if cmp > 0_i32 {
+                ins_idx = i;
+                break;
+            }
+            i = i +% 1_usize;
+        }
+        let r = try self.intern_bytes(alloc, mod_name);
+        try self.allow_hal.push(alloc, r);
+        let hs = self.allow_hal.as_mut_slice();
+        if hs.len > 0_usize {
+            var j = hs.len - 1_usize;
+            while j > ins_idx {
+                let prev = j - 1_usize;
+                if prev < hs.len && j < hs.len {
+                    hs[j] = hs[prev];
+                }
+                j = prev;
+            }
+            if ins_idx < hs.len {
+                hs[ins_idx] = r;
+            }
+        }
+        return;
+    }
+
+    pub fn target_count(self: *Self) -> usize {
+        return self.targets.len();
+    }
+
+    pub fn link_lib_count(self: *Self) -> usize {
+        return self.link_libs.len();
+    }
+
+    pub fn allow_hal_count(self: *Self) -> usize {
+        return self.allow_hal.len();
+    }
+
+    pub view fn pkg_root(self: *Self) -> *[u8] {
+        return slice_id_range(self.str_bytes.as_slice(), self.pkg_root_range);
+    }
+
+    pub view fn out_dir(self: *Self) -> *[u8] {
+        return slice_id_range(self.str_bytes.as_slice(), self.out_dir_range);
+    }
+
+    pub view fn target_name(self: *Self, idx: usize) -> *[u8] {
+        let empty: *str = "";
+        let ts = self.targets.as_slice();
+        if idx < ts.len {
+            return slice_id_range(self.str_bytes.as_slice(), ts[idx].name_range);
+        }
+        return empty.as_bytes();
+    }
+
+    pub view fn target_root(self: *Self, idx: usize) -> *[u8] {
+        let empty: *str = "";
+        let ts = self.targets.as_slice();
+        if idx < ts.len {
+            return slice_id_range(self.str_bytes.as_slice(), ts[idx].root_range);
+        }
+        return empty.as_bytes();
+    }
+
+    pub view fn link_lib_at(self: *Self, idx: usize) -> *[u8] {
+        let empty: *str = "";
+        let ls = self.link_libs.as_slice();
+        if idx < ls.len {
+            return slice_id_range(self.str_bytes.as_slice(), ls[idx]);
+        }
+        return empty.as_bytes();
+    }
+
+    pub view fn allow_hal_at(self: *Self, idx: usize) -> *[u8] {
+        let empty: *str = "";
+        let hs = self.allow_hal.as_slice();
+        if idx < hs.len {
+            return slice_id_range(self.str_bytes.as_slice(), hs[idx]);
+        }
+        return empty.as_bytes();
+    }
+
+    pub fn out_path_buf(
+        self: *Self,
+        alloc: *mut AllocCap,
+        rel: *[u8],
+        out: *mut str.StrBuf,
+        err_out: *mut str.StrBuf,
+    ) -> bool ! OutOfMemory {
+        let rel_ok = try validate_sandbox_rel_path(alloc, rel, err_out);
+        if !rel_ok {
+            return false;
+        }
+        let raw_out = self.out_dir();
+        let eff_out = if raw_out.len == 0_usize {
+            "out".as_bytes()
+        } else {
+            raw_out
+        };
+        let out_ok = try validate_sandbox_rel_path(alloc, eff_out, err_out);
+        if !out_ok {
+            return false;
+        }
+        let root_trim = trim_trailing_slashes(self.pkg_root());
+        let out_trim = trim_trailing_slashes(eff_out);
+        if root_trim.len > 0_usize {
+            try out.push_bytes_grow(alloc, root_trim);
+            if root_trim[root_trim.len - 1_usize] != b'/' {
+                try out.push_byte_grow(alloc, b'/');
+            }
+        }
+        try out.push_bytes_grow(alloc, out_trim);
+        if out_trim.len > 0_usize && out_trim[out_trim.len - 1_usize] != b'/' {
+            try out.push_byte_grow(alloc, b'/');
+        }
+        try out.push_bytes_grow(alloc, rel);
+        return true;
+    }
+
+    pub fn destroy(self: BuildPlan, alloc: *mut AllocCap) {
+        let BuildPlan.{
+            pkg_root_range: _,
+            out_dir_range: _,
+            targets,
+            link_libs,
+            allow_hal,
+            sanitize: _,
+            audit_tcb: _,
+            opt_level: _,
+            str_bytes,
+        } = self;
+        targets.destroy(alloc);
+        link_libs.destroy(alloc);
+        allow_hal.destroy(alloc);
+        str_bytes.destroy(alloc);
+    }
+}
+
+pub fn validate_plan_paths(
+    alloc: *mut AllocCap,
+    plan: *BuildPlan,
+    err_out: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    let raw_out = plan.out_dir();
+    let eff_out = if raw_out.len == 0_usize {
+        "out".as_bytes()
+    } else {
+        raw_out
+    };
+    let out_ok = try validate_sandbox_rel_path(alloc, eff_out, err_out);
+    if !out_ok {
+        return false;
+    }
+    let count = plan.targets.len();
+    var i: usize = 0_usize;
+    while i < count {
+        let name_ok = try validate_target_name(alloc, plan.target_name(i), err_out);
+        if !name_ok {
+            return false;
+        }
+        let root_ok = try validate_sandbox_rel_path(alloc, plan.target_root(i), err_out);
+        if !root_ok {
+            return false;
+        }
+        i = i +% 1_usize;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Strict Safe-Profile AST Scanner for `build.eon`
+// ---------------------------------------------------------------------------
+
+struct BuildProfileScan {
+    has_raw: bool;
+    has_asm: bool;
+    has_hal_attr: bool;
+    has_extern_c: bool;
+}
+
+fn attr_name_is_hal(sm: *span.SourceMap, sp: span.Span) -> bool {
+    if sp.file == span.FILE_DUMMY {
+        return false;
+    }
+    let text = sm.file_text(sp.file);
+    let s = sp.start.widen.[usize]();
+    let e = sp.end.widen.[usize]();
+    if s > e || e > text.len {
+        return false;
+    }
+    let name_bytes = text.sub(s, e) catch {
+        return false;
+    };
+    return str.bytes_eq(name_bytes, "hal".as_bytes());
+}
+
+@recursive
+fn scan_attrs(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    r: ast.IdRange,
+    scan: *mut BuildProfileScan,
+) {
+    let attrs = arena.attrs_range(r);
+    var i: usize = 0_usize;
+    while i < attrs.len {
+        let attr = attrs[i];
+        if attr_name_is_hal(sm, attr.name.span) {
+            scan.has_hal_attr = true;
+        }
+        let args = arena.attr_args_range(attr.args);
+        var j: usize = 0_usize;
+        while j < args.len {
+            scan_expr(sm, arena, args[j].value, scan);
+            j = j +% 1_usize;
+        }
+        i = i +% 1_usize;
+    }
+}
+
+@recursive
+fn scan_generic_params(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    r: ast.IdRange,
+    scan: *mut BuildProfileScan,
+) {
+    let gps = arena.generic_params_range(r);
+    var i: usize = 0_usize;
+    while i < gps.len {
+        let gp = gps[i];
+        if gp.comptime_ty != ast.NONE_ID {
+            scan_type(sm, arena, gp.comptime_ty, scan);
+        }
+        scan_type_list(sm, arena, gp.bounds, scan);
+        i = i +% 1_usize;
+    }
+}
+
+@recursive
+fn scan_generic_args(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    r: ast.IdRange,
+    scan: *mut BuildProfileScan,
+) {
+    let gas = arena.generic_args_range(r);
+    var i: usize = 0_usize;
+    while i < gas.len {
+        let ga = gas[i];
+        match ga.kind {
+            .Type => { scan_type(sm, arena, ga.node_id, scan); }
+            .Expr => { scan_expr(sm, arena, ga.node_id, scan); }
+            .TypeOrConst => {}
+        }
+        i = i +% 1_usize;
+    }
+}
+
+@recursive
+fn scan_params(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    r: ast.IdRange,
+    scan: *mut BuildProfileScan,
+) {
+    let ps = arena.params_range(r);
+    var i: usize = 0_usize;
+    while i < ps.len {
+        scan_attrs(sm, arena, ps[i].attrs, scan);
+        scan_type(sm, arena, ps[i].ty, scan);
+        i = i +% 1_usize;
+    }
+}
+
+@recursive
+fn scan_sys_params(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    r: ast.IdRange,
+    scan: *mut BuildProfileScan,
+) {
+    let ps = arena.sys_params_range(r);
+    var i: usize = 0_usize;
+    while i < ps.len {
+        scan_attrs(sm, arena, ps[i].attrs, scan);
+        scan_type(sm, arena, ps[i].ty, scan);
+        i = i +% 1_usize;
+    }
+}
+
+@recursive
+fn scan_fields(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    r: ast.IdRange,
+    scan: *mut BuildProfileScan,
+) {
+    let fs = arena.fields_range(r);
+    var i: usize = 0_usize;
+    while i < fs.len {
+        scan_attrs(sm, arena, fs[i].attrs, scan);
+        scan_type(sm, arena, fs[i].ty, scan);
+        if fs[i].default != ast.NONE_ID {
+            scan_expr(sm, arena, fs[i].default, scan);
+        }
+        i = i +% 1_usize;
+    }
+}
+
+@recursive
+fn scan_expr_list(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    r: ast.IdRange,
+    scan: *mut BuildProfileScan,
+) {
+    let es = arena.expr_list_range(r);
+    var i: usize = 0_usize;
+    while i < es.len {
+        scan_expr(sm, arena, es[i], scan);
+        i = i +% 1_usize;
+    }
+}
+
+@recursive
+fn scan_type_list(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    r: ast.IdRange,
+    scan: *mut BuildProfileScan,
+) {
+    let ts = arena.type_list_range(r);
+    var i: usize = 0_usize;
+    while i < ts.len {
+        scan_type(sm, arena, ts[i], scan);
+        i = i +% 1_usize;
+    }
+}
+
+@recursive
+fn scan_type(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    type_id: u32,
+    scan: *mut BuildProfileScan,
+) {
+    let ty = arena.get_type(type_id) orelse { return; };
+    match ty.kind {
+        .ErrorUnion => {
+            if ty.primary != ast.NONE_ID {
+                scan_type(sm, arena, ty.primary, scan);
+            }
+            scan_type_list(sm, arena, ty.list, scan);
+        }
+        .Optional => {
+            scan_type(sm, arena, ty.primary, scan);
+        }
+        .Borrow => {
+            match ty.borrow_target {
+                .Single => { scan_type(sm, arena, ty.primary, scan); }
+                .Slice => { scan_type(sm, arena, ty.primary, scan); }
+                .Str => {}
+            }
+        }
+        .Array => {
+            scan_expr(sm, arena, ty.aux, scan);
+            scan_type(sm, arena, ty.primary, scan);
+        }
+        .Dyn => {
+            scan_generic_args(sm, arena, ty.list2, scan);
+        }
+        .Path => {
+            scan_generic_args(sm, arena, ty.list2, scan);
+        }
+        .FnPtr => {
+            scan_type_list(sm, arena, ty.list, scan);
+            if ty.primary != ast.NONE_ID {
+                scan_type(sm, arena, ty.primary, scan);
+            }
+            scan_attrs(sm, arena, ty.list2, scan);
+        }
+        .InlineStruct => {
+            scan_fields(sm, arena, ty.list, scan);
+        }
+        .Tuple => {
+            scan_type_list(sm, arena, ty.list, scan);
+        }
+        _ => {}
+    }
+}
+
+@recursive
+fn scan_pat(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    pat_id: u32,
+    scan: *mut BuildProfileScan,
+) {
+    let pat = arena.get_pat(pat_id) orelse { return; };
+    match pat.kind {
+        .Variant => {
+            let ps = arena.pat_list_range(pat.list);
+            var i: usize = 0_usize;
+            while i < ps.len {
+                scan_pat(sm, arena, ps[i], scan);
+                i = i +% 1_usize;
+            }
+        }
+        .Tuple => {
+            let ps = arena.pat_list_range(pat.list);
+            var i: usize = 0_usize;
+            while i < ps.len {
+                scan_pat(sm, arena, ps[i], scan);
+                i = i +% 1_usize;
+            }
+        }
+        .Struct => {
+            if pat.flag {
+                scan_generic_args(sm, arena, pat.path_gens, scan);
+            }
+            let fps = arena.pat_fields_range(pat.list);
+            var i: usize = 0_usize;
+            while i < fps.len {
+                if fps[i].pat != ast.NONE_ID {
+                    scan_pat(sm, arena, fps[i].pat, scan);
+                }
+                i = i +% 1_usize;
+            }
+        }
+        _ => {}
+    }
+}
+
+@recursive
+fn scan_jump(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    jump_id: u32,
+    scan: *mut BuildProfileScan,
+) {
+    let j = arena.get_jump(jump_id) orelse { return; };
+    match j.kind {
+        .Return => {
+            if j.value != ast.NONE_ID {
+                scan_expr(sm, arena, j.value, scan);
+            }
+        }
+        .Break => {
+            if j.value != ast.NONE_ID {
+                scan_expr(sm, arena, j.value, scan);
+            }
+        }
+        _ => {}
+    }
+}
+
+@recursive
+fn scan_body(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    kind: ast.BodyKind,
+    id: u32,
+    scan: *mut BuildProfileScan,
+) {
+    match kind {
+        .Block => { scan_block(sm, arena, id, scan); }
+        .Expr => { scan_expr(sm, arena, id, scan); }
+        .Jump => { scan_jump(sm, arena, id, scan); }
+    }
+}
+
+@recursive
+fn scan_if(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    if_id: u32,
+    scan: *mut BuildProfileScan,
+) {
+    let node = arena.get_if(if_id) orelse { return; };
+    match node.cond_kind {
+        .Expr => { scan_expr(sm, arena, node.cond_expr, scan); }
+        .Let => {
+            scan_pat(sm, arena, node.cond_pat, scan);
+            scan_expr(sm, arena, node.cond_expr, scan);
+        }
+    }
+    scan_block(sm, arena, node.then_block, scan);
+    match node.else_kind {
+        .None => {}
+        .Block => { scan_block(sm, arena, node.else_id, scan); }
+        .If => { scan_if(sm, arena, node.else_id, scan); }
+    }
+}
+
+@recursive
+fn scan_match_arms(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    r: ast.IdRange,
+    scan: *mut BuildProfileScan,
+) {
+    let arms = arena.match_arms_range(r);
+    var i: usize = 0_usize;
+    while i < arms.len {
+        let arm = arms[i];
+        scan_pat(sm, arena, arm.pat, scan);
+        if arm.guard != ast.NONE_ID {
+            scan_expr(sm, arena, arm.guard, scan);
+        }
+        scan_body(sm, arena, arm.body_kind, arm.body_id, scan);
+        i = i +% 1_usize;
+    }
+}
+
+@recursive
+fn scan_block(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    block_id: u32,
+    scan: *mut BuildProfileScan,
+) {
+    let b = arena.get_block(block_id) orelse { return; };
+    let stmts = arena.stmt_list_range(b.stmts);
+    var i: usize = 0_usize;
+    while i < stmts.len {
+        scan_stmt(sm, arena, stmts[i], scan);
+        i = i +% 1_usize;
+    }
+    if b.tail_expr != ast.NONE_ID {
+        scan_expr(sm, arena, b.tail_expr, scan);
+    }
+}
+
+@recursive
+fn scan_stmt_loops(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    s: *ast.StmtNode,
+    scan: *mut BuildProfileScan,
+) {
+    match s.kind {
+        .While => {
+            scan_expr(sm, arena, s.a, scan);
+            scan_expr_list(sm, arena, s.list, scan);
+            scan_block(sm, arena, s.b, scan);
+        }
+        .For => {
+            scan_pat(sm, arena, s.a, scan);
+            scan_expr(sm, arena, s.c, scan);
+            if s.has_range {
+                scan_expr(sm, arena, s.d, scan);
+            }
+            scan_block(sm, arena, s.b, scan);
+        }
+        .ParFor => {
+            scan_pat(sm, arena, s.a, scan);
+            scan_expr(sm, arena, s.c, scan);
+            if s.has_range {
+                scan_expr(sm, arena, s.d, scan);
+            }
+            scan_block(sm, arena, s.b, scan);
+        }
+        .Loop => {
+            scan_block(sm, arena, s.a, scan);
+        }
+        .ComptimeBlock => {
+            scan_block(sm, arena, s.a, scan);
+        }
+        .RawBlock => {
+            scan.has_raw = true;
+            scan_block(sm, arena, s.a, scan);
+        }
+        .Assign => {
+            scan_expr(sm, arena, s.a, scan);
+            scan_expr(sm, arena, s.b, scan);
+        }
+        .Discard => {
+            scan_expr(sm, arena, s.a, scan);
+        }
+        .Expr => {
+            scan_expr(sm, arena, s.a, scan);
+        }
+        _ => {}
+    }
+}
+
+@recursive
+fn scan_stmt(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    stmt_id: u32,
+    scan: *mut BuildProfileScan,
+) {
+    let s = arena.get_stmt(stmt_id) orelse { return; };
+    match s.kind {
+        .Let => {
+            scan_attrs(sm, arena, s.list, scan);
+            scan_pat(sm, arena, s.a, scan);
+            if s.b != ast.NONE_ID {
+                scan_type(sm, arena, s.b, scan);
+            }
+            scan_expr(sm, arena, s.c, scan);
+        }
+        .Var => {
+            scan_attrs(sm, arena, s.list, scan);
+            if s.b != ast.NONE_ID {
+                scan_type(sm, arena, s.b, scan);
+            }
+            scan_expr(sm, arena, s.c, scan);
+        }
+        .Const => {
+            if let c = arena.get_const_decl(s.a) {
+                scan_type(sm, arena, c.ty, scan);
+                scan_expr(sm, arena, c.value, scan);
+            }
+        }
+        .Defer => {
+            scan_body(sm, arena, s.body_kind, s.a, scan);
+        }
+        .Errdefer => {
+            scan_body(sm, arena, s.body_kind, s.a, scan);
+        }
+        .Jump => {
+            scan_jump(sm, arena, s.a, scan);
+        }
+        .If => {
+            scan_if(sm, arena, s.a, scan);
+        }
+        .Match => {
+            scan_expr(sm, arena, s.a, scan);
+            scan_match_arms(sm, arena, s.list, scan);
+        }
+        _ => {
+            scan_stmt_loops(sm, arena, s, scan);
+        }
+    }
+}
+
+@recursive
+fn scan_expr_ops(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    e: *ast.ExprNode,
+    scan: *mut BuildProfileScan,
+) {
+    match e.kind {
+        .Binary => {
+            scan_expr(sm, arena, e.a, scan);
+            scan_expr(sm, arena, e.b, scan);
+        }
+        .Is => {
+            scan_expr(sm, arena, e.a, scan);
+            scan_pat(sm, arena, e.b, scan);
+        }
+        .Orelse => {
+            scan_expr(sm, arena, e.a, scan);
+            scan_body(sm, arena, e.body_kind, e.b, scan);
+        }
+        .Catch => {
+            scan_expr(sm, arena, e.a, scan);
+            scan_body(sm, arena, e.body_kind, e.b, scan);
+        }
+        .Field => {
+            scan_expr(sm, arena, e.a, scan);
+        }
+        .GenericApply => {
+            scan_expr(sm, arena, e.a, scan);
+            scan_generic_args(sm, arena, e.list, scan);
+        }
+        .Call => {
+            scan_expr(sm, arena, e.a, scan);
+            scan_expr_list(sm, arena, e.list, scan);
+        }
+        .Index => {
+            scan_expr(sm, arena, e.a, scan);
+            scan_expr(sm, arena, e.b, scan);
+        }
+        .Slice => {
+            scan_expr(sm, arena, e.a, scan);
+            if e.b != ast.NONE_ID {
+                scan_expr(sm, arena, e.b, scan);
+            }
+            if e.c != ast.NONE_ID {
+                scan_expr(sm, arena, e.c, scan);
+            }
+        }
+        _ => {}
+    }
+}
+
+@recursive
+fn scan_expr(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    expr_id: u32,
+    scan: *mut BuildProfileScan,
+) {
+    let e = arena.get_expr(expr_id) orelse { return; };
+    match e.kind {
+        .AnonStructLit => {
+            let fis = arena.field_inits_range(e.list);
+            var i: usize = 0_usize;
+            while i < fis.len {
+                scan_expr(sm, arena, fis[i].value, scan);
+                i = i +% 1_usize;
+            }
+        }
+        .NamedStructLit => {
+            scan_expr(sm, arena, e.a, scan);
+            let fis = arena.field_inits_range(e.list);
+            var i: usize = 0_usize;
+            while i < fis.len {
+                scan_expr(sm, arena, fis[i].value, scan);
+                i = i +% 1_usize;
+            }
+        }
+        .ArrayLit => { scan_expr_list(sm, arena, e.list, scan); }
+        .Tuple => { scan_expr_list(sm, arena, e.list, scan); }
+        .ArrayRepeat => {
+            scan_expr(sm, arena, e.a, scan);
+            scan_expr(sm, arena, e.b, scan);
+        }
+        .Paren => { scan_expr(sm, arena, e.a, scan); }
+        .ComptimeExpr => { scan_expr(sm, arena, e.a, scan); }
+        .Deref => { scan_expr(sm, arena, e.a, scan); }
+        .Unary => { scan_expr(sm, arena, e.a, scan); }
+        .Closure => {
+            scan_params(sm, arena, e.list, scan);
+            scan_block(sm, arena, e.a, scan);
+        }
+        .If => { scan_if(sm, arena, e.a, scan); }
+        .Match => {
+            scan_expr(sm, arena, e.a, scan);
+            scan_match_arms(sm, arena, e.list, scan);
+        }
+        .Loop => { scan_block(sm, arena, e.a, scan); }
+        .ComptimeBlock => { scan_block(sm, arena, e.a, scan); }
+        .Builtin => { scan_generic_args(sm, arena, e.list, scan); }
+        .Asm => {
+            scan.has_asm = true;
+            let ops = arena.asm_ops_range(e.list2);
+            var i: usize = 0_usize;
+            while i < ops.len {
+                let op = ops[i];
+                scan_expr(sm, arena, op.expr, scan);
+                if op.kind == .Named && op.arg != ast.NONE_ID {
+                    scan_expr(sm, arena, op.arg, scan);
+                }
+                i = i +% 1_usize;
+            }
+        }
+        _ => {
+            scan_expr_ops(sm, arena, e, scan);
+        }
+    }
+}
+
+@recursive
+fn scan_decl_types(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    d: *ast.DeclNode,
+    scan: *mut BuildProfileScan,
+) {
+    match d.kind {
+        .Enum => {
+            let e = arena.get_enum_decl(d.payload) orelse { return; };
+            let vs = arena.enum_variants_range(e.variants);
+            var i: usize = 0_usize;
+            while i < vs.len {
+                if vs[i].value != ast.NONE_ID {
+                    scan_expr(sm, arena, vs[i].value, scan);
+                }
+                i = i +% 1_usize;
+            }
+        }
+        .Union => {
+            let u = arena.get_union_decl(d.payload) orelse { return; };
+            scan_generic_params(sm, arena, u.generics, scan);
+            scan_expr_list(sm, arena, u.where_clauses, scan);
+            let vs = arena.union_variants_range(u.variants);
+            var i: usize = 0_usize;
+            while i < vs.len {
+                if vs[i].ty != ast.NONE_ID {
+                    scan_type(sm, arena, vs[i].ty, scan);
+                }
+                i = i +% 1_usize;
+            }
+        }
+        .Bitfield => {
+            let b = arena.get_bitfield_decl(d.payload) orelse { return; };
+            let ms = arena.bitfield_members_range(b.members);
+            var i: usize = 0_usize;
+            while i < ms.len {
+                if ms[i].has_bits {
+                    scan_expr(sm, arena, ms[i].bits_lo, scan);
+                    scan_expr(sm, arena, ms[i].bits_hi, scan);
+                }
+                i = i +% 1_usize;
+            }
+        }
+        .Iface => {
+            let ic = arena.get_iface_decl(d.payload) orelse { return; };
+            scan_generic_params(sm, arena, ic.generics, scan);
+            let ms = arena.iface_methods_range(ic.methods);
+            var i: usize = 0_usize;
+            while i < ms.len {
+                let m = ms[i];
+                scan_attrs(sm, arena, m.attrs, scan);
+                scan_attrs(sm, arena, m.effects, scan);
+                scan_generic_params(sm, arena, m.generics, scan);
+                scan_params(sm, arena, m.params, scan);
+                if m.ret_type != ast.NONE_ID {
+                    scan_type(sm, arena, m.ret_type, scan);
+                }
+                scan_expr_list(sm, arena, m.where_clauses, scan);
+                scan_expr_list(sm, arena, m.ensures_clauses, scan);
+                i = i +% 1_usize;
+            }
+        }
+        .TypeAlias => {
+            let t = arena.get_type_decl(d.payload) orelse { return; };
+            scan_generic_params(sm, arena, t.generics, scan);
+            scan_expr_list(sm, arena, t.where_clauses, scan);
+            scan_type(sm, arena, t.ty, scan);
+        }
+        .Const => {
+            let c = arena.get_const_decl(d.payload) orelse { return; };
+            scan_type(sm, arena, c.ty, scan);
+            scan_expr(sm, arena, c.value, scan);
+        }
+        .ExternFn => {
+            scan.has_extern_c = true;
+            let ex = arena.get_extern_decl(d.payload) orelse { return; };
+            scan_params(sm, arena, ex.params, scan);
+            if ex.ret_type != ast.NONE_ID {
+                scan_type(sm, arena, ex.ret_type, scan);
+            }
+        }
+        .ExternStruct => {
+            scan.has_extern_c = true;
+            let ex = arena.get_extern_decl(d.payload) orelse { return; };
+            scan_fields(sm, arena, ex.fields, scan);
+        }
+        .ExternUnion => {
+            scan.has_extern_c = true;
+            let ex = arena.get_extern_decl(d.payload) orelse { return; };
+            scan_fields(sm, arena, ex.fields, scan);
+        }
+        _ => {}
+    }
+}
+
+@recursive
+fn scan_decl(
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    decl_id: u32,
+    scan: *mut BuildProfileScan,
+) {
+    let d = arena.get_decl(decl_id) orelse { return; };
+    scan_attrs(sm, arena, d.attrs, scan);
+    match d.kind {
+        .Fn => {
+            let f = arena.get_fn_decl(d.payload) orelse { return; };
+            scan_attrs(sm, arena, f.effects, scan);
+            scan_generic_params(sm, arena, f.generics, scan);
+            scan_params(sm, arena, f.params, scan);
+            if f.ret_type != ast.NONE_ID {
+                scan_type(sm, arena, f.ret_type, scan);
+            }
+            scan_expr_list(sm, arena, f.where_clauses, scan);
+            scan_expr_list(sm, arena, f.ensures_clauses, scan);
+            scan_block(sm, arena, f.body, scan);
+        }
+        .Sys => {
+            let s = arena.get_sys_decl(d.payload) orelse { return; };
+            scan_attrs(sm, arena, s.effects, scan);
+            scan_generic_params(sm, arena, s.generics, scan);
+            scan_sys_params(sm, arena, s.params, scan);
+            if s.ret_type != ast.NONE_ID {
+                scan_type(sm, arena, s.ret_type, scan);
+            }
+            scan_expr_list(sm, arena, s.where_clauses, scan);
+            scan_expr_list(sm, arena, s.ensures_clauses, scan);
+            scan_block(sm, arena, s.body, scan);
+        }
+        .Struct => {
+            let s = arena.get_struct_decl(d.payload) orelse { return; };
+            scan_generic_params(sm, arena, s.generics, scan);
+            scan_expr_list(sm, arena, s.where_clauses, scan);
+            scan_fields(sm, arena, s.fields, scan);
+        }
+        .Pool => {
+            let p = arena.get_struct_decl(d.payload) orelse { return; };
+            scan_generic_params(sm, arena, p.generics, scan);
+            scan_expr_list(sm, arena, p.where_clauses, scan);
+            scan_fields(sm, arena, p.fields, scan);
+        }
+        .Impl => {
+            let im = arena.get_impl_decl(d.payload) orelse { return; };
+            scan_generic_params(sm, arena, im.generics, scan);
+            if im.iface_type != ast.NONE_ID {
+                scan_type(sm, arena, im.iface_type, scan);
+            }
+            scan_type(sm, arena, im.target_type, scan);
+            scan_expr_list(sm, arena, im.where_clauses, scan);
+            let subs = arena.decl_list_range(im.decls);
+            var i: usize = 0_usize;
+            while i < subs.len {
+                scan_decl(sm, arena, subs[i], scan);
+                i = i +% 1_usize;
+            }
+        }
+        _ => {
+            scan_decl_types(sm, arena, d, scan);
+        }
+    }
+}
+
+pub fn validate_build_unit_profile(
+    alloc: *mut AllocCap,
+    sm: *span.SourceMap,
+    arena: *ast.AstArena,
+    unit_id: u32,
+    err_out: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    let u = arena.get_unit(unit_id) orelse {
+        try err_out.push_str_grow(
+            alloc,
+            "build.eon sandbox error: invalid compilation unit",
+        );
+        return false;
+    };
+
+    let fname = sm.file_name(u.file);
+    if str.ends_with(fname, ".hal.eon".as_bytes())
+        || span.profile_from_path(fname) == .Hal
+        || sm.file_profile(u.file) == .Hal
+        || u.profile == .Hal
+        || u.is_hal
+    {
+        try err_out.push_str_grow(
+            alloc,
+            "build.eon sandbox error: @hal/raw/asm is forbidden in build scripts",
+        );
+        return false;
+    }
+
+    var scan = BuildProfileScan.{
+        has_raw: false,
+        has_asm: false,
+        has_hal_attr: false,
+        has_extern_c: false,
+    };
+    let decls = arena.decl_list_range(u.decls);
+    var i: usize = 0_usize;
+    while i < decls.len {
+        scan_decl(sm, arena, decls[i], &mut scan);
+        i = i +% 1_usize;
+    }
+
+    if scan.has_raw || scan.has_asm || scan.has_hal_attr {
+        try err_out.push_str_grow(
+            alloc,
+            "build.eon sandbox error: @hal/raw/asm is forbidden in build scripts",
+        );
+        return false;
+    }
+    if scan.has_extern_c {
+        try err_out.push_str_grow(
+            alloc,
+            "build.eon sandbox error: extern C/FFI declarations are forbidden in build scripts",
+        );
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Build Entry Point Lookup (`fn build(b: *mut BuildCap)` / `fn main(...)`)
+// ---------------------------------------------------------------------------
+
+fn is_mut_build_cap_type(
+    arena: *ast.AstArena,
+    type_id: u32,
+    interner: *span.SymInterner,
+) -> bool {
+    let ty = arena.get_type(type_id) orelse { return false; };
+    if ty.kind != .Borrow || !ty.is_mut || ty.borrow_target != .Single {
+        return false;
+    }
+    let inner = arena.get_type(ty.primary) orelse { return false; };
+    if inner.kind != .Path || inner.list2.len != 0_u32 {
+        return false;
+    }
+    let segs = arena.idents_range(inner.list);
+    if segs.len != 1_usize {
+        return false;
+    }
+    return str.bytes_eq(interner.get(segs[0_usize].sym), "BuildCap".as_bytes());
+}
+
+fn is_valid_build_entry_fn(
+    arena: *ast.AstArena,
+    f: *ast.FnDeclNode,
+    interner: *span.SymInterner,
+) -> bool {
+    if f.generics.len != 0_u32 {
+        return false;
+    }
+    let ps = arena.params_range(f.params);
+    if ps.len != 1_usize {
+        return false;
+    }
+    let p = ps[0_usize];
+    if p.is_self {
+        return false;
+    }
+    return is_mut_build_cap_type(arena, p.ty, interner);
+}
+
+pub fn find_build_entry(
+    arena: *ast.AstArena,
+    unit_id: u32,
+    interner: *span.SymInterner,
+) -> ?u32 {
+    let u = arena.get_unit(unit_id) orelse { return null; };
+    let decls = arena.decl_list_range(u.decls);
+    var main_decl: ?u32 = null;
+
+    var i: usize = 0_usize;
+    while i < decls.len {
+        let decl_id = decls[i];
+        if let d = arena.get_decl(decl_id) {
+            if d.kind == .Fn {
+                if let f = arena.get_fn_decl(d.payload) {
+                    let name = interner.get(f.name.sym);
+                    if str.bytes_eq(name, "build".as_bytes()) {
+                        if is_valid_build_entry_fn(arena, f, interner) {
+                            return decl_id;
+                        }
+                    } else if str.bytes_eq(name, "main".as_bytes()) {
+                        if main_decl == null && is_valid_build_entry_fn(arena, f, interner) {
+                            main_decl = decl_id;
+                        }
+                    }
+                }
+            }
+        }
+        i = i +% 1_usize;
+    }
+    return main_decl;
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic Build Summary Formatter (matches `build_sys.rs` byte-for-byte)
+// ---------------------------------------------------------------------------
+
+pub fn format_build_summary(
+    alloc: *mut AllocCap,
+    plan: *BuildPlan,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    try out.push_str_grow(alloc, "EON BUILD PLAN\n");
+    try out.push_str_grow(alloc, "  out_dir: ");
+    try out.push_bytes_grow(alloc, plan.out_dir());
+    try out.push_byte_grow(alloc, b'\n');
+
+    try out.push_str_grow(alloc, "  sanitize: ");
+    if plan.sanitize {
+        try out.push_str_grow(alloc, "true\n");
+    } else {
+        try out.push_str_grow(alloc, "false\n");
+    }
+
+    try out.push_str_grow(alloc, "  audit_tcb: ");
+    if plan.audit_tcb {
+        try out.push_str_grow(alloc, "true\n");
+    } else {
+        try out.push_str_grow(alloc, "false\n");
+    }
+
+    let n_libs = plan.link_libs.len();
+    if n_libs == 0_usize {
+        try out.push_str_grow(alloc, "  needed_libs: none\n");
+    } else {
+        try out.push_str_grow(alloc, "  needed_libs: [");
+        var li: usize = 0_usize;
+        while li < n_libs {
+            if li > 0_usize {
+                try out.push_str_grow(alloc, ", ");
+            }
+            try out.push_bytes_grow(alloc, plan.link_lib_at(li));
+            li = li +% 1_usize;
+        }
+        try out.push_str_grow(alloc, "]\n");
+    }
+
+    let n_hal = plan.allow_hal.len();
+    if n_hal == 0_usize {
+        try out.push_str_grow(alloc, "  allow_hal: none\n");
+    } else {
+        try out.push_str_grow(alloc, "  allow_hal: [");
+        var hi: usize = 0_usize;
+        while hi < n_hal {
+            if hi > 0_usize {
+                try out.push_str_grow(alloc, ", ");
+            }
+            try out.push_bytes_grow(alloc, plan.allow_hal_at(hi));
+            hi = hi +% 1_usize;
+        }
+        try out.push_str_grow(alloc, "]\n");
+    }
+
+    let ts = plan.targets.as_slice();
+    try out.push_str_grow(alloc, "  targets: ");
+    try out.push_u64_grow(alloc, ts.len.widen.[u64]());
+    try out.push_byte_grow(alloc, b'\n');
+
+    var ti: usize = 0_usize;
+    while ti < ts.len {
+        try out.push_str_grow(alloc, "    - ");
+        try out.push_bytes_grow(alloc, plan.target_name(ti));
+        match ts[ti].kind {
+            .Exe => { try out.push_str_grow(alloc, " (exe) -> "); }
+            .SharedLib => { try out.push_str_grow(alloc, " (shared) -> "); }
+        }
+        try out.push_bytes_grow(alloc, plan.target_root(ti));
+        try out.push_byte_grow(alloc, b'\n');
+        ti = ti +% 1_usize;
+    }
+    return;
+}

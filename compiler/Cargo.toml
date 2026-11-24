@@ -1,0 +1,13 @@
+[package]
+name = "eonc"
+version = "0.2.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

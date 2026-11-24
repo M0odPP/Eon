@@ -1,0 +1,265 @@
+module bench.matmul_f32;
+
+import std.rt;
+
+fn matmul_row_tile_f32x4(
+    a_row: *[f32],
+    b: *[f32x4],
+    c_tile: *mut [f32x4],
+    kb: usize,
+    k_end: usize,
+    jb: usize,
+    j_end: usize,
+    n_vec: usize,
+) -> !BoundsError {
+    var k = kb;
+    while k < k_end {
+        if k < a_row.len {
+            let aik = f32x4.splat(a_row[k]);
+            let b_base = k *% n_vec;
+            let b_tile = try b.sub(b_base +% jb, b_base +% j_end);
+            if c_tile.len <= b_tile.len {
+                var j: usize = 0_usize;
+                while j < c_tile.len {
+                    c_tile[j] = aik.fma(b_tile[j], c_tile[j]);
+                    j = j + 1_usize;
+                }
+            }
+        }
+        k = k + 1_usize;
+    }
+    return;
+}
+
+fn matmul_add_tiled_f32x4(
+    a: *[f32],
+    b: *[f32x4],
+    c: *mut [f32x4],
+    n: usize,
+    n_vec: usize,
+) -> !BoundsError {
+    let bi: usize = 32_usize;
+    let bk: usize = 32_usize;
+    let bj_vec: usize = 64_usize;
+
+    var ib: usize = 0_usize;
+    while ib < n {
+        let i_end = if ib +% bi < n { ib +% bi } else { n };
+        var kb: usize = 0_usize;
+        while kb < n {
+            let k_end = if kb +% bk < n { kb +% bk } else { n };
+            var jb: usize = 0_usize;
+            while jb < n_vec {
+                let j_end = if jb +% bj_vec < n_vec { jb +% bj_vec } else { n_vec };
+                var i = ib;
+                while i < i_end {
+                    let a_base = i *% n;
+                    let a_row = try a.sub(a_base, a_base +% n);
+                    let c_base = i *% n_vec;
+                    let c_tile = try c.sub_mut(c_base +% jb, c_base +% j_end);
+                    try matmul_row_tile_f32x4(a_row, b, c_tile, kb, k_end, jb, j_end, n_vec);
+                    i = i + 1_usize;
+                }
+                jb = jb +% bj_vec;
+            }
+            kb = kb +% bk;
+        }
+        ib = ib +% bi;
+    }
+    return;
+}
+
+fn dot_f32x8(u: *[f32x8], v: *[f32x8]) -> f32 {
+    if u.len > v.len {
+        return 0.0_f32;
+    }
+    var acc0 = f32x8.splat(0.0_f32);
+    var acc1 = f32x8.splat(0.0_f32);
+    var i: usize = 0_usize;
+    while i +% 1_usize < u.len {
+        let j = i + 1_usize;
+        if j >= u.len || j >= v.len {
+            break;
+        }
+        acc0 = u[i].fma(v[i], acc0);
+        acc1 = u[j].fma(v[j], acc1);
+        i = i + 2_usize;
+    }
+    if i < u.len && i < v.len {
+        acc0 = u[i].fma(v[i], acc0);
+    }
+    let s = acc0 + acc1;
+    let lo = (s[0_usize] + s[1_usize]) + (s[2_usize] + s[3_usize]);
+    let hi = (s[4_usize] + s[5_usize]) + (s[6_usize] + s[7_usize]);
+    return lo + hi;
+}
+
+fn quarter_centered(val: usize, mask: usize, bias: i32) -> f32 {
+    let masked = (val & mask).trunc.[i32]();
+    let centered = masked -% bias;
+    return centered.to_float.[f32]() * 0.25_f32;
+}
+
+pub fn main(env: *mut Env) -> i32 ! OutOfMemory | BoundsError {
+    let n: usize = 512_usize;
+    let n_vec: usize = 128_usize;
+    let matmul_reps: usize = 3_usize;
+    let dot_vec: usize = 8192_usize;
+    let dot_u_bank: usize = 16_usize;
+    let dot_v_bank: usize = 32_usize;
+
+    var a_buf = try Buf.[f32].init(&mut env.alloc, n *% n);
+    errdefer a_buf.destroy(&mut env.alloc);
+    var b_buf = try Buf.[f32x4].init(&mut env.alloc, n *% n_vec);
+    errdefer b_buf.destroy(&mut env.alloc);
+    var c_buf = try Buf.[f32x4].init(&mut env.alloc, n *% n_vec);
+    errdefer c_buf.destroy(&mut env.alloc);
+
+    let zero_v = f32x4.splat(0.0_f32);
+    var i: usize = 0_usize;
+    while i < n {
+        var j: usize = 0_usize;
+        while j < n {
+            let av = quarter_centered((i *% 17_usize) +% (j *% 31_usize) +% 3_usize, 15_usize, 8_i32);
+            try a_buf.push(av);
+            j = j + 1_usize;
+        }
+        var jv: usize = 0_usize;
+        while jv < n_vec {
+            let j0 = jv *% 4_usize;
+            let b0 = quarter_centered((i *% 29_usize) +% (j0 *% 13_usize) +% 7_usize, 15_usize, 8_i32);
+            let b1 = quarter_centered((i *% 29_usize) +% ((j0 +% 1_usize) *% 13_usize) +% 7_usize, 15_usize, 8_i32);
+            let b2 = quarter_centered((i *% 29_usize) +% ((j0 +% 2_usize) *% 13_usize) +% 7_usize, 15_usize, 8_i32);
+            let b3 = quarter_centered((i *% 29_usize) +% ((j0 +% 3_usize) *% 13_usize) +% 7_usize, 15_usize, 8_i32);
+            let bv: f32x4 = .{ b0, b1, b2, b3 };
+            try b_buf.push(bv);
+            try c_buf.push(zero_v);
+            jv = jv + 1_usize;
+        }
+        i = i + 1_usize;
+    }
+
+    var u_buf = try Buf.[f32x8].init(&mut env.alloc, dot_u_bank *% dot_vec);
+    errdefer u_buf.destroy(&mut env.alloc);
+    var v_buf = try Buf.[f32x8].init(&mut env.alloc, dot_v_bank *% dot_vec);
+    errdefer v_buf.destroy(&mut env.alloc);
+    var dot_out_buf = try Buf.[f32].init(&mut env.alloc, dot_u_bank *% dot_v_bank);
+    errdefer dot_out_buf.destroy(&mut env.alloc);
+
+    var p: usize = 0_usize;
+    while p < dot_u_bank {
+        var mv: usize = 0_usize;
+        while mv < dot_vec {
+            let m0 = mv *% 8_usize;
+            let uv: f32x8 = .{
+                quarter_centered((p *% 19_usize) +% (m0 *% 7_usize) +% 1_usize, 7_usize, 4_i32),
+                quarter_centered((p *% 19_usize) +% ((m0 +% 1_usize) *% 7_usize) +% 1_usize, 7_usize, 4_i32),
+                quarter_centered((p *% 19_usize) +% ((m0 +% 2_usize) *% 7_usize) +% 1_usize, 7_usize, 4_i32),
+                quarter_centered((p *% 19_usize) +% ((m0 +% 3_usize) *% 7_usize) +% 1_usize, 7_usize, 4_i32),
+                quarter_centered((p *% 19_usize) +% ((m0 +% 4_usize) *% 7_usize) +% 1_usize, 7_usize, 4_i32),
+                quarter_centered((p *% 19_usize) +% ((m0 +% 5_usize) *% 7_usize) +% 1_usize, 7_usize, 4_i32),
+                quarter_centered((p *% 19_usize) +% ((m0 +% 6_usize) *% 7_usize) +% 1_usize, 7_usize, 4_i32),
+                quarter_centered((p *% 19_usize) +% ((m0 +% 7_usize) *% 7_usize) +% 1_usize, 7_usize, 4_i32),
+            };
+            try u_buf.push(uv);
+            mv = mv + 1_usize;
+        }
+        var q: usize = 0_usize;
+        while q < dot_v_bank {
+            try dot_out_buf.push(0.0_f32);
+            q = q + 1_usize;
+        }
+        p = p + 1_usize;
+    }
+
+    var qb: usize = 0_usize;
+    while qb < dot_v_bank {
+        var mv: usize = 0_usize;
+        while mv < dot_vec {
+            let m0 = mv *% 8_usize;
+            let vv: f32x8 = .{
+                quarter_centered((qb *% 23_usize) +% (m0 *% 11_usize) +% 5_usize, 7_usize, 4_i32),
+                quarter_centered((qb *% 23_usize) +% ((m0 +% 1_usize) *% 11_usize) +% 5_usize, 7_usize, 4_i32),
+                quarter_centered((qb *% 23_usize) +% ((m0 +% 2_usize) *% 11_usize) +% 5_usize, 7_usize, 4_i32),
+                quarter_centered((qb *% 23_usize) +% ((m0 +% 3_usize) *% 11_usize) +% 5_usize, 7_usize, 4_i32),
+                quarter_centered((qb *% 23_usize) +% ((m0 +% 4_usize) *% 11_usize) +% 5_usize, 7_usize, 4_i32),
+                quarter_centered((qb *% 23_usize) +% ((m0 +% 5_usize) *% 11_usize) +% 5_usize, 7_usize, 4_i32),
+                quarter_centered((qb *% 23_usize) +% ((m0 +% 6_usize) *% 11_usize) +% 5_usize, 7_usize, 4_i32),
+                quarter_centered((qb *% 23_usize) +% ((m0 +% 7_usize) *% 11_usize) +% 5_usize, 7_usize, 4_i32),
+            };
+            try v_buf.push(vv);
+            mv = mv + 1_usize;
+        }
+        qb = qb + 1_usize;
+    }
+
+    let a_mut = a_buf.as_mut_slice();
+    let b = b_buf.as_slice();
+    let c = c_buf.as_mut_slice();
+    let u_bank = u_buf.as_slice();
+    let v_bank = v_buf.as_slice();
+    let dot_out = dot_out_buf.as_mut_slice();
+
+    let t0 = rt.now_ns(&env.clock);
+    var zi: usize = 0_usize;
+    while zi < c.len {
+        c[zi] = zero_v;
+        zi = zi + 1_usize;
+    }
+    var rep: usize = 0_usize;
+    while rep < matmul_reps {
+        let diag = (rep *% n) +% rep;
+        if diag < a_mut.len {
+            a_mut[diag] = a_mut[diag] + 0.25_f32;
+        }
+        try matmul_add_tiled_f32x4(a_mut, b, c, n, n_vec);
+        rep = rep + 1_usize;
+    }
+    var dp: usize = 0_usize;
+    while dp < dot_u_bank {
+        let u_off = dp *% dot_vec;
+        let u_slice = try u_bank.sub(u_off, u_off +% dot_vec);
+        var dq: usize = 0_usize;
+        while dq < dot_v_bank {
+            let v_off = dq *% dot_vec;
+            let v_slice = try v_bank.sub(v_off, v_off +% dot_vec);
+            let out_idx = (dp *% dot_v_bank) +% dq;
+            if out_idx < dot_out.len {
+                dot_out[out_idx] = dot_f32x8(u_slice, v_slice);
+            }
+            dq = dq + 1_usize;
+        }
+        dp = dp + 1_usize;
+    }
+    let elapsed_ns = rt.elapsed_since(&env.clock, t0);
+
+    var h: u64 = 0xCBF29CE484222325_u64;
+    var ci: usize = 0_usize;
+    while ci < c.len {
+        let cv = c[ci];
+        h = (h ^ cv.x.bitcast.[u32]().widen.[u64]()) *% 0x100000001B3_u64;
+        h = (h ^ cv.y.bitcast.[u32]().widen.[u64]()) *% 0x100000001B3_u64;
+        h = (h ^ cv.z.bitcast.[u32]().widen.[u64]()) *% 0x100000001B3_u64;
+        h = (h ^ cv.w.bitcast.[u32]().widen.[u64]()) *% 0x100000001B3_u64;
+        ci = ci + 1_usize;
+    }
+    var di: usize = 0_usize;
+    while di < dot_out.len {
+        h = (h ^ dot_out[di].bitcast.[u32]().widen.[u64]()) *% 0x100000001B3_u64;
+        di = di + 1_usize;
+    }
+
+    a_buf.destroy(&mut env.alloc);
+    b_buf.destroy(&mut env.alloc);
+    c_buf.destroy(&mut env.alloc);
+    u_buf.destroy(&mut env.alloc);
+    v_buf.destroy(&mut env.alloc);
+    dot_out_buf.destroy(&mut env.alloc);
+
+    rt.print_str("RESULT matmul_f32 checksum=");
+    rt.print_u64(h);
+    rt.print_str(" elapsed_ns=");
+    rt.print_u64(elapsed_ns);
+    rt.print_nl();
+    return 0_i32;
+}

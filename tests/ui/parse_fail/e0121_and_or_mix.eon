@@ -1,0 +1,4 @@
+module fail.logic_mix;
+pub fn f(a: bool, b: bool, c: bool) -> bool {
+    return a && b || c; //~ ERROR E0121
+}

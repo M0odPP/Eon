@@ -1,0 +1,2 @@
+module app.bad_ext;
+extern "C" fn puts(s: *str) -> i32; //~ ERROR E0111

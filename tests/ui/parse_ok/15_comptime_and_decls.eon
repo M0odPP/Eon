@@ -1,0 +1,31 @@
+module tests.comptime_and_decls;
+
+pub error EmptyError {}
+
+pub enum Color : u8 {
+    Red = 0,
+    Green = 1,
+    Blue = 2,
+}
+
+pub fn use_comptime_calls(a: u32) -> usize {
+    let sz = @size_of(u32);
+    let al = @align_of(*mut [8]u8);
+    let ti = @type_info(Color);
+    let c = comptime a +% 1_u32;
+    _ = al;
+    _ = ti;
+    _ = c;
+    return sz;
+}
+
+pub fn defer_forms(alloc: *mut AllocCap) {
+    let buf = alloc.alloc_raw(64_usize);
+    defer alloc.free_raw(buf);
+    defer {
+        _ = buf;
+    }
+    errdefer |err| {
+        _ = err;
+    }
+}

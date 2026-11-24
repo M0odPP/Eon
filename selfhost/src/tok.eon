@@ -1,0 +1,837 @@
+module eonc.tok;
+
+import core.str;
+
+/// Exact 1:1 mirror of `compiler/src/lexer.rs::TokenKind` (133 variants).
+///
+/// Payload-bearing Rust variants store their `u32` payload in `Token.payload`:
+/// - `IntLit`, `FloatLit`: `NumLitId` index
+/// - `StringLit`, `RawStringLit`: `StrLitId` index
+/// - `ByteStringLit`: `ByteStrLitId` index
+/// - `CharLit`: Unicode scalar value (`u32`)
+/// - `ByteCharLit`: byte value (`0..=255`)
+pub enum TokenKind : u16 {
+    // Identifiers & special token `_` (3)
+    Ident = 0,
+    Underscore = 1,
+    Label = 2,
+
+    // Literals (7)
+    IntLit = 3,
+    FloatLit = 4,
+    StringLit = 5,
+    RawStringLit = 6,
+    ByteStringLit = 7,
+    CharLit = 8,
+    ByteCharLit = 9,
+
+    // Keywords: Declarations (21)
+    KwModule = 10,
+    KwImport = 11,
+    KwPub = 12,
+    KwFn = 13,
+    KwSys = 14,
+    KwLet = 15,
+    KwVar = 16,
+    KwConst = 17,
+    KwType = 18,
+    KwStruct = 19,
+    KwLinear = 20,
+    KwPool = 21,
+    KwEnum = 22,
+    KwUnion = 23,
+    KwBitfield = 24,
+    KwIface = 25,
+    KwImpl = 26,
+    KwError = 27,
+    KwExtern = 28,
+    KwComptime = 29,
+    KwView = 30,
+
+    // Keywords: Control flow (16)
+    KwIf = 31,
+    KwElse = 32,
+    KwMatch = 33,
+    KwWhile = 34,
+    KwFor = 35,
+    KwPar = 36,
+    KwLoop = 37,
+    KwBreak = 38,
+    KwContinue = 39,
+    KwReturn = 40,
+    KwDefer = 41,
+    KwErrdefer = 42,
+    KwTry = 43,
+    KwCatch = 44,
+    KwOrelse = 45,
+    KwUnreachable = 46,
+
+    // Keywords: Modifiers & contracts (9)
+    KwMut = 47,
+    KwMove = 48,
+    KwCopy = 49,
+    KwWhere = 50,
+    KwEnsures = 51,
+    KwIn = 52,
+    KwAs = 53,
+    KwIs = 54,
+    KwFrom = 55,
+
+    // Keywords: Literals & special names (8)
+    KwTrue = 56,
+    KwFalse = 57,
+    KwNull = 58,
+    KwVoid = 59,
+    KwNever = 60,
+    KwSelf = 61,
+    KwSelfType = 62,
+    KwDyn = 63,
+
+    // Keywords: HAL-only (3)
+    KwRaw = 64,
+    KwAsm = 65,
+    KwVolatile = 66,
+
+    // Delimiters & punctuation (17)
+    LParen = 67,
+    RParen = 68,
+    LBracket = 69,
+    RBracket = 70,
+    LBrace = 71,
+    RBrace = 72,
+    Semi = 73,
+    Colon = 74,
+    Comma = 75,
+    Dot = 76,
+    DotStar = 77,
+    DotDot = 78,
+    DotDotEq = 79,
+    Arrow = 80,
+    FatArrow = 81,
+    At = 82,
+    Question = 83,
+
+    // Operators (33)
+    Plus = 84,
+    Minus = 85,
+    Star = 86,
+    Slash = 87,
+    Percent = 88,
+    PlusWrap = 89,
+    MinusWrap = 90,
+    StarWrap = 91,
+    PlusSat = 92,
+    MinusSat = 93,
+    StarSat = 94,
+    PlusCheck = 95,
+    MinusCheck = 96,
+    StarCheck = 97,
+    SlashCheck = 98,
+    PercentCheck = 99,
+    Shl = 100,
+    Shr = 101,
+    ShlWrap = 102,
+    Amp = 103,
+    Pipe = 104,
+    Caret = 105,
+    Tilde = 106,
+    Bang = 107,
+    AndAnd = 108,
+    OrOr = 109,
+    Eq = 110,
+    EqEq = 111,
+    NotEq = 112,
+    Lt = 113,
+    LtEq = 114,
+    Gt = 115,
+    GtEq = 116,
+
+    // Compound assignments (14)
+    PlusEq = 117,
+    MinusEq = 118,
+    StarEq = 119,
+    PlusWrapEq = 120,
+    MinusWrapEq = 121,
+    StarWrapEq = 122,
+    PlusSatEq = 123,
+    MinusSatEq = 124,
+    StarSatEq = 125,
+    AmpEq = 126,
+    PipeEq = 127,
+    CaretEq = 128,
+    ShlEq = 129,
+    ShrEq = 130,
+
+    // Special (2)
+    Error = 131,
+    Eof = 132,
+}
+
+/// Numeric literal slice metadata matching `compiler/src/lexer.rs::NumLitData`.
+pub struct NumLitData {
+    pub raw_start: u32;
+    pub raw_end: u32;
+    pub suffix_start: u32;
+    pub suffix_end: u32;
+    pub has_suffix: bool;
+}
+
+/// Documentation comment span metadata matching `compiler/src/lexer.rs::DocComment`.
+pub struct DocComment {
+    pub is_module_doc: bool;
+    pub start: u32;
+    pub end: u32;
+}
+
+/// Compact 16-byte token carrying kind, byte span `[start, end)`, and optional payload.
+pub struct Token {
+    pub kind: TokenKind;
+    pub start: u32;
+    pub end: u32;
+    pub payload: u32;
+}
+
+impl Token {
+    pub fn simple(kind: TokenKind, start: u32, end: u32) -> Token {
+        return Token.{ kind: kind, start: start, end: end, payload: 0_u32 };
+    }
+
+    pub fn with_payload(kind: TokenKind, payload: u32, start: u32, end: u32) -> Token {
+        return Token.{ kind: kind, start: start, end: end, payload: payload };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Keyword lookup (57 keywords, matching `TokenKind::from_keyword`)
+// ---------------------------------------------------------------------------
+
+fn kw_len2(bytes: *[u8]) -> ?TokenKind {
+    if str.bytes_eq(bytes, "fn".as_bytes()) { return .KwFn; }
+    if str.bytes_eq(bytes, "if".as_bytes()) { return .KwIf; }
+    if str.bytes_eq(bytes, "in".as_bytes()) { return .KwIn; }
+    if str.bytes_eq(bytes, "as".as_bytes()) { return .KwAs; }
+    if str.bytes_eq(bytes, "is".as_bytes()) { return .KwIs; }
+    return null;
+}
+
+fn kw_len3(bytes: *[u8]) -> ?TokenKind {
+    if str.bytes_eq(bytes, "pub".as_bytes()) { return .KwPub; }
+    if str.bytes_eq(bytes, "sys".as_bytes()) { return .KwSys; }
+    if str.bytes_eq(bytes, "let".as_bytes()) { return .KwLet; }
+    if str.bytes_eq(bytes, "var".as_bytes()) { return .KwVar; }
+    if str.bytes_eq(bytes, "for".as_bytes()) { return .KwFor; }
+    if str.bytes_eq(bytes, "par".as_bytes()) { return .KwPar; }
+    if str.bytes_eq(bytes, "try".as_bytes()) { return .KwTry; }
+    if str.bytes_eq(bytes, "mut".as_bytes()) { return .KwMut; }
+    if str.bytes_eq(bytes, "dyn".as_bytes()) { return .KwDyn; }
+    if str.bytes_eq(bytes, "raw".as_bytes()) { return .KwRaw; }
+    if str.bytes_eq(bytes, "asm".as_bytes()) { return .KwAsm; }
+    return null;
+}
+
+fn kw_len4(bytes: *[u8]) -> ?TokenKind {
+    if str.bytes_eq(bytes, "type".as_bytes()) { return .KwType; }
+    if str.bytes_eq(bytes, "pool".as_bytes()) { return .KwPool; }
+    if str.bytes_eq(bytes, "enum".as_bytes()) { return .KwEnum; }
+    if str.bytes_eq(bytes, "impl".as_bytes()) { return .KwImpl; }
+    if str.bytes_eq(bytes, "view".as_bytes()) { return .KwView; }
+    if str.bytes_eq(bytes, "else".as_bytes()) { return .KwElse; }
+    if str.bytes_eq(bytes, "loop".as_bytes()) { return .KwLoop; }
+    if str.bytes_eq(bytes, "move".as_bytes()) { return .KwMove; }
+    if str.bytes_eq(bytes, "copy".as_bytes()) { return .KwCopy; }
+    if str.bytes_eq(bytes, "from".as_bytes()) { return .KwFrom; }
+    if str.bytes_eq(bytes, "true".as_bytes()) { return .KwTrue; }
+    if str.bytes_eq(bytes, "null".as_bytes()) { return .KwNull; }
+    if str.bytes_eq(bytes, "void".as_bytes()) { return .KwVoid; }
+    if str.bytes_eq(bytes, "self".as_bytes()) { return .KwSelf; }
+    if str.bytes_eq(bytes, "Self".as_bytes()) { return .KwSelfType; }
+    return null;
+}
+
+fn kw_len5(bytes: *[u8]) -> ?TokenKind {
+    if str.bytes_eq(bytes, "const".as_bytes()) { return .KwConst; }
+    if str.bytes_eq(bytes, "union".as_bytes()) { return .KwUnion; }
+    if str.bytes_eq(bytes, "iface".as_bytes()) { return .KwIface; }
+    if str.bytes_eq(bytes, "error".as_bytes()) { return .KwError; }
+    if str.bytes_eq(bytes, "match".as_bytes()) { return .KwMatch; }
+    if str.bytes_eq(bytes, "while".as_bytes()) { return .KwWhile; }
+    if str.bytes_eq(bytes, "break".as_bytes()) { return .KwBreak; }
+    if str.bytes_eq(bytes, "defer".as_bytes()) { return .KwDefer; }
+    if str.bytes_eq(bytes, "catch".as_bytes()) { return .KwCatch; }
+    if str.bytes_eq(bytes, "where".as_bytes()) { return .KwWhere; }
+    if str.bytes_eq(bytes, "false".as_bytes()) { return .KwFalse; }
+    if str.bytes_eq(bytes, "never".as_bytes()) { return .KwNever; }
+    return null;
+}
+
+fn kw_len6(bytes: *[u8]) -> ?TokenKind {
+    if str.bytes_eq(bytes, "module".as_bytes()) { return .KwModule; }
+    if str.bytes_eq(bytes, "import".as_bytes()) { return .KwImport; }
+    if str.bytes_eq(bytes, "struct".as_bytes()) { return .KwStruct; }
+    if str.bytes_eq(bytes, "linear".as_bytes()) { return .KwLinear; }
+    if str.bytes_eq(bytes, "extern".as_bytes()) { return .KwExtern; }
+    if str.bytes_eq(bytes, "return".as_bytes()) { return .KwReturn; }
+    if str.bytes_eq(bytes, "orelse".as_bytes()) { return .KwOrelse; }
+    return null;
+}
+
+fn kw_len7_plus(bytes: *[u8]) -> ?TokenKind {
+    if bytes.len == 7_usize {
+        if str.bytes_eq(bytes, "ensures".as_bytes()) { return .KwEnsures; }
+        return null;
+    }
+    if bytes.len == 8_usize {
+        if str.bytes_eq(bytes, "bitfield".as_bytes()) { return .KwBitfield; }
+        if str.bytes_eq(bytes, "comptime".as_bytes()) { return .KwComptime; }
+        if str.bytes_eq(bytes, "continue".as_bytes()) { return .KwContinue; }
+        if str.bytes_eq(bytes, "errdefer".as_bytes()) { return .KwErrdefer; }
+        if str.bytes_eq(bytes, "volatile".as_bytes()) { return .KwVolatile; }
+        return null;
+    }
+    if bytes.len == 11_usize {
+        if str.bytes_eq(bytes, "unreachable".as_bytes()) { return .KwUnreachable; }
+        return null;
+    }
+    return null;
+}
+
+/// Maps an identifier byte slice to its `TokenKind` keyword variant, or `null`.
+pub fn keyword_kind(bytes: *[u8]) -> ?TokenKind {
+    if bytes.len == 2_usize { return kw_len2(bytes); }
+    if bytes.len == 3_usize { return kw_len3(bytes); }
+    if bytes.len == 4_usize { return kw_len4(bytes); }
+    if bytes.len == 5_usize { return kw_len5(bytes); }
+    if bytes.len == 6_usize { return kw_len6(bytes); }
+    if bytes.len >= 7_usize && bytes.len <= 11_usize {
+        return kw_len7_plus(bytes);
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Rust `{char:?}` and `{str:?}` debug escaping
+// ---------------------------------------------------------------------------
+
+fn is_rust_debug_printable(cp: u32) -> bool {
+    if cp < 0x80_u32 {
+        return cp >= 0x20_u32 && cp <= 0x7E_u32;
+    }
+    if cp <= 0x00A0_u32 || cp == 0x00AD_u32 {
+        return false;
+    }
+    if cp >= 0x0300_u32 && cp <= 0x036F_u32 {
+        return false;
+    }
+    if cp == 0x034F_u32 || cp == 0x061C_u32 || cp == 0x1680_u32 || cp == 0x180E_u32 {
+        return false;
+    }
+    if (cp >= 0x2000_u32 && cp <= 0x200F_u32) || (cp >= 0x2028_u32 && cp <= 0x202F_u32) {
+        return false;
+    }
+    if (cp >= 0x205F_u32 && cp <= 0x206F_u32) || cp == 0x3000_u32 {
+        return false;
+    }
+    if cp >= 0xD800_u32 && cp <= 0xF8FF_u32 {
+        return false;
+    }
+    if cp == 0xFEFF_u32 || (cp >= 0xFFF9_u32 && cp <= 0xFFFB_u32) {
+        return false;
+    }
+    if cp == 0xFFFE_u32 || cp == 0xFFFF_u32 || cp >= 0xE0000_u32 {
+        return false;
+    }
+    return true;
+}
+
+fn write_utf8_scalar(alloc: *mut AllocCap, cp: u32, out: *mut str.StrBuf) -> !OutOfMemory {
+    if cp < 0x80_u32 {
+        try out.push_byte_grow(alloc, cp.trunc.[u8]());
+        return;
+    }
+    if cp < 0x800_u32 {
+        let b0 = 0xC0_u8 | (cp >> 6_u32).trunc.[u8]();
+        let b1 = 0x80_u8 | (cp & 0x3F_u32).trunc.[u8]();
+        try out.push_byte_grow(alloc, b0);
+        try out.push_byte_grow(alloc, b1);
+        return;
+    }
+    if cp < 0x10000_u32 {
+        let b0 = 0xE0_u8 | (cp >> 12_u32).trunc.[u8]();
+        let b1 = 0x80_u8 | ((cp >> 6_u32) & 0x3F_u32).trunc.[u8]();
+        let b2 = 0x80_u8 | (cp & 0x3F_u32).trunc.[u8]();
+        try out.push_byte_grow(alloc, b0);
+        try out.push_byte_grow(alloc, b1);
+        try out.push_byte_grow(alloc, b2);
+        return;
+    }
+    if cp <= 0x10FFFF_u32 {
+        let b0 = 0xF0_u8 | (cp >> 18_u32).trunc.[u8]();
+        let b1 = 0x80_u8 | ((cp >> 12_u32) & 0x3F_u32).trunc.[u8]();
+        let b2 = 0x80_u8 | ((cp >> 6_u32) & 0x3F_u32).trunc.[u8]();
+        let b3 = 0x80_u8 | (cp & 0x3F_u32).trunc.[u8]();
+        try out.push_byte_grow(alloc, b0);
+        try out.push_byte_grow(alloc, b1);
+        try out.push_byte_grow(alloc, b2);
+        try out.push_byte_grow(alloc, b3);
+        return;
+    }
+    try out.push_str_grow(alloc, "\\u{");
+    try out.push_hex_u64_grow(alloc, cp.widen.[u64]());
+    try out.push_byte_grow(alloc, b'}');
+    return;
+}
+
+fn write_escaped_scalar(
+    alloc: *mut AllocCap,
+    cp: u32,
+    escape_single: bool,
+    escape_double: bool,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    if cp == 0x00_u32 {
+        try out.push_str_grow(alloc, "\\0");
+        return;
+    }
+    if cp == 0x09_u32 {
+        try out.push_str_grow(alloc, "\\t");
+        return;
+    }
+    if cp == 0x0A_u32 {
+        try out.push_str_grow(alloc, "\\n");
+        return;
+    }
+    if cp == 0x0D_u32 {
+        try out.push_str_grow(alloc, "\\r");
+        return;
+    }
+    if cp == 0x5C_u32 {
+        try out.push_str_grow(alloc, "\\\\");
+        return;
+    }
+    if cp == 0x27_u32 {
+        if escape_single {
+            try out.push_str_grow(alloc, "\\'");
+        } else {
+            try out.push_byte_grow(alloc, b'\'');
+        }
+        return;
+    }
+    if cp == 0x22_u32 {
+        if escape_double {
+            try out.push_str_grow(alloc, "\\\"");
+        } else {
+            try out.push_byte_grow(alloc, b'"');
+        }
+        return;
+    }
+    if is_rust_debug_printable(cp) {
+        try write_utf8_scalar(alloc, cp, out);
+        return;
+    }
+    try out.push_str_grow(alloc, "\\u{");
+    try out.push_hex_u64_grow(alloc, cp.widen.[u64]());
+    try out.push_byte_grow(alloc, b'}');
+    return;
+}
+
+/// Formats a Unicode scalar value identically to Rust `format!("{c:?}")`.
+pub fn write_rust_char_debug(alloc: *mut AllocCap, cp: u32, out: *mut str.StrBuf) -> !OutOfMemory {
+    try out.push_byte_grow(alloc, b'\'');
+    try write_escaped_scalar(alloc, cp, true, false, out);
+    try out.push_byte_grow(alloc, b'\'');
+    return;
+}
+
+/// Formats a UTF-8 byte slice identically to Rust `format!("{text:?}")`.
+pub fn write_rust_str_debug(alloc: *mut AllocCap, bytes: *[u8], out: *mut str.StrBuf) -> !OutOfMemory {
+    try out.push_byte_grow(alloc, b'"');
+    var pos: usize = 0_usize;
+    while pos < bytes.len {
+        let d = str.decode_utf8_char(bytes, pos);
+        if d.len == 0_usize {
+            break;
+        }
+        try write_escaped_scalar(alloc, d.cp, false, true, out);
+        pos = pos +% d.len;
+    }
+    try out.push_byte_grow(alloc, b'"');
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// Exact Rust `{tok.kind:?}` formatting
+// ---------------------------------------------------------------------------
+
+fn write_kind_name_part1(alloc: *mut AllocCap, kind: TokenKind, out: *mut str.StrBuf) -> bool ! OutOfMemory {
+    match kind {
+        .Ident => { try out.push_str_grow(alloc, "Ident"); return true; }
+        .Underscore => { try out.push_str_grow(alloc, "Underscore"); return true; }
+        .Label => { try out.push_str_grow(alloc, "Label"); return true; }
+        .KwModule => { try out.push_str_grow(alloc, "KwModule"); return true; }
+        .KwImport => { try out.push_str_grow(alloc, "KwImport"); return true; }
+        .KwPub => { try out.push_str_grow(alloc, "KwPub"); return true; }
+        .KwFn => { try out.push_str_grow(alloc, "KwFn"); return true; }
+        .KwSys => { try out.push_str_grow(alloc, "KwSys"); return true; }
+        .KwLet => { try out.push_str_grow(alloc, "KwLet"); return true; }
+        .KwVar => { try out.push_str_grow(alloc, "KwVar"); return true; }
+        .KwConst => { try out.push_str_grow(alloc, "KwConst"); return true; }
+        .KwType => { try out.push_str_grow(alloc, "KwType"); return true; }
+        .KwStruct => { try out.push_str_grow(alloc, "KwStruct"); return true; }
+        .KwLinear => { try out.push_str_grow(alloc, "KwLinear"); return true; }
+        .KwPool => { try out.push_str_grow(alloc, "KwPool"); return true; }
+        .KwEnum => { try out.push_str_grow(alloc, "KwEnum"); return true; }
+        .KwUnion => { try out.push_str_grow(alloc, "KwUnion"); return true; }
+        .KwBitfield => { try out.push_str_grow(alloc, "KwBitfield"); return true; }
+        .KwIface => { try out.push_str_grow(alloc, "KwIface"); return true; }
+        .KwImpl => { try out.push_str_grow(alloc, "KwImpl"); return true; }
+        .KwError => { try out.push_str_grow(alloc, "KwError"); return true; }
+        .KwExtern => { try out.push_str_grow(alloc, "KwExtern"); return true; }
+        .KwComptime => { try out.push_str_grow(alloc, "KwComptime"); return true; }
+        .KwView => { try out.push_str_grow(alloc, "KwView"); return true; }
+        .KwIf => { try out.push_str_grow(alloc, "KwIf"); return true; }
+        .KwElse => { try out.push_str_grow(alloc, "KwElse"); return true; }
+        .KwMatch => { try out.push_str_grow(alloc, "KwMatch"); return true; }
+        .KwWhile => { try out.push_str_grow(alloc, "KwWhile"); return true; }
+        .KwFor => { try out.push_str_grow(alloc, "KwFor"); return true; }
+        .KwPar => { try out.push_str_grow(alloc, "KwPar"); return true; }
+        .KwLoop => { try out.push_str_grow(alloc, "KwLoop"); return true; }
+        .KwBreak => { try out.push_str_grow(alloc, "KwBreak"); return true; }
+        _ => { return false; }
+    }
+}
+
+fn write_kind_name_part2(alloc: *mut AllocCap, kind: TokenKind, out: *mut str.StrBuf) -> bool ! OutOfMemory {
+    match kind {
+        .KwContinue => { try out.push_str_grow(alloc, "KwContinue"); return true; }
+        .KwReturn => { try out.push_str_grow(alloc, "KwReturn"); return true; }
+        .KwDefer => { try out.push_str_grow(alloc, "KwDefer"); return true; }
+        .KwErrdefer => { try out.push_str_grow(alloc, "KwErrdefer"); return true; }
+        .KwTry => { try out.push_str_grow(alloc, "KwTry"); return true; }
+        .KwCatch => { try out.push_str_grow(alloc, "KwCatch"); return true; }
+        .KwOrelse => { try out.push_str_grow(alloc, "KwOrelse"); return true; }
+        .KwUnreachable => { try out.push_str_grow(alloc, "KwUnreachable"); return true; }
+        .KwMut => { try out.push_str_grow(alloc, "KwMut"); return true; }
+        .KwMove => { try out.push_str_grow(alloc, "KwMove"); return true; }
+        .KwCopy => { try out.push_str_grow(alloc, "KwCopy"); return true; }
+        .KwWhere => { try out.push_str_grow(alloc, "KwWhere"); return true; }
+        .KwEnsures => { try out.push_str_grow(alloc, "KwEnsures"); return true; }
+        .KwIn => { try out.push_str_grow(alloc, "KwIn"); return true; }
+        .KwAs => { try out.push_str_grow(alloc, "KwAs"); return true; }
+        .KwIs => { try out.push_str_grow(alloc, "KwIs"); return true; }
+        .KwFrom => { try out.push_str_grow(alloc, "KwFrom"); return true; }
+        .KwTrue => { try out.push_str_grow(alloc, "KwTrue"); return true; }
+        .KwFalse => { try out.push_str_grow(alloc, "KwFalse"); return true; }
+        .KwNull => { try out.push_str_grow(alloc, "KwNull"); return true; }
+        .KwVoid => { try out.push_str_grow(alloc, "KwVoid"); return true; }
+        .KwNever => { try out.push_str_grow(alloc, "KwNever"); return true; }
+        .KwSelf => { try out.push_str_grow(alloc, "KwSelf"); return true; }
+        .KwSelfType => { try out.push_str_grow(alloc, "KwSelfType"); return true; }
+        .KwDyn => { try out.push_str_grow(alloc, "KwDyn"); return true; }
+        .KwRaw => { try out.push_str_grow(alloc, "KwRaw"); return true; }
+        .KwAsm => { try out.push_str_grow(alloc, "KwAsm"); return true; }
+        .KwVolatile => { try out.push_str_grow(alloc, "KwVolatile"); return true; }
+        .LParen => { try out.push_str_grow(alloc, "LParen"); return true; }
+        .RParen => { try out.push_str_grow(alloc, "RParen"); return true; }
+        .LBracket => { try out.push_str_grow(alloc, "LBracket"); return true; }
+        .RBracket => { try out.push_str_grow(alloc, "RBracket"); return true; }
+        _ => { return false; }
+    }
+}
+
+fn write_kind_name_part3(alloc: *mut AllocCap, kind: TokenKind, out: *mut str.StrBuf) -> bool ! OutOfMemory {
+    match kind {
+        .LBrace => { try out.push_str_grow(alloc, "LBrace"); return true; }
+        .RBrace => { try out.push_str_grow(alloc, "RBrace"); return true; }
+        .Semi => { try out.push_str_grow(alloc, "Semi"); return true; }
+        .Colon => { try out.push_str_grow(alloc, "Colon"); return true; }
+        .Comma => { try out.push_str_grow(alloc, "Comma"); return true; }
+        .Dot => { try out.push_str_grow(alloc, "Dot"); return true; }
+        .DotStar => { try out.push_str_grow(alloc, "DotStar"); return true; }
+        .DotDot => { try out.push_str_grow(alloc, "DotDot"); return true; }
+        .DotDotEq => { try out.push_str_grow(alloc, "DotDotEq"); return true; }
+        .Arrow => { try out.push_str_grow(alloc, "Arrow"); return true; }
+        .FatArrow => { try out.push_str_grow(alloc, "FatArrow"); return true; }
+        .At => { try out.push_str_grow(alloc, "At"); return true; }
+        .Question => { try out.push_str_grow(alloc, "Question"); return true; }
+        .Plus => { try out.push_str_grow(alloc, "Plus"); return true; }
+        .Minus => { try out.push_str_grow(alloc, "Minus"); return true; }
+        .Star => { try out.push_str_grow(alloc, "Star"); return true; }
+        .Slash => { try out.push_str_grow(alloc, "Slash"); return true; }
+        .Percent => { try out.push_str_grow(alloc, "Percent"); return true; }
+        .PlusWrap => { try out.push_str_grow(alloc, "PlusWrap"); return true; }
+        .MinusWrap => { try out.push_str_grow(alloc, "MinusWrap"); return true; }
+        .StarWrap => { try out.push_str_grow(alloc, "StarWrap"); return true; }
+        .PlusSat => { try out.push_str_grow(alloc, "PlusSat"); return true; }
+        .MinusSat => { try out.push_str_grow(alloc, "MinusSat"); return true; }
+        .StarSat => { try out.push_str_grow(alloc, "StarSat"); return true; }
+        .PlusCheck => { try out.push_str_grow(alloc, "PlusCheck"); return true; }
+        .MinusCheck => { try out.push_str_grow(alloc, "MinusCheck"); return true; }
+        .StarCheck => { try out.push_str_grow(alloc, "StarCheck"); return true; }
+        .SlashCheck => { try out.push_str_grow(alloc, "SlashCheck"); return true; }
+        .PercentCheck => { try out.push_str_grow(alloc, "PercentCheck"); return true; }
+        .Shl => { try out.push_str_grow(alloc, "Shl"); return true; }
+        .Shr => { try out.push_str_grow(alloc, "Shr"); return true; }
+        .ShlWrap => { try out.push_str_grow(alloc, "ShlWrap"); return true; }
+        _ => { return false; }
+    }
+}
+
+fn write_kind_name_part4(alloc: *mut AllocCap, kind: TokenKind, out: *mut str.StrBuf) -> bool ! OutOfMemory {
+    match kind {
+        .Amp => { try out.push_str_grow(alloc, "Amp"); return true; }
+        .Pipe => { try out.push_str_grow(alloc, "Pipe"); return true; }
+        .Caret => { try out.push_str_grow(alloc, "Caret"); return true; }
+        .Tilde => { try out.push_str_grow(alloc, "Tilde"); return true; }
+        .Bang => { try out.push_str_grow(alloc, "Bang"); return true; }
+        .AndAnd => { try out.push_str_grow(alloc, "AndAnd"); return true; }
+        .OrOr => { try out.push_str_grow(alloc, "OrOr"); return true; }
+        .Eq => { try out.push_str_grow(alloc, "Eq"); return true; }
+        .EqEq => { try out.push_str_grow(alloc, "EqEq"); return true; }
+        .NotEq => { try out.push_str_grow(alloc, "NotEq"); return true; }
+        .Lt => { try out.push_str_grow(alloc, "Lt"); return true; }
+        .LtEq => { try out.push_str_grow(alloc, "LtEq"); return true; }
+        .Gt => { try out.push_str_grow(alloc, "Gt"); return true; }
+        .GtEq => { try out.push_str_grow(alloc, "GtEq"); return true; }
+        .PlusEq => { try out.push_str_grow(alloc, "PlusEq"); return true; }
+        .MinusEq => { try out.push_str_grow(alloc, "MinusEq"); return true; }
+        .StarEq => { try out.push_str_grow(alloc, "StarEq"); return true; }
+        .PlusWrapEq => { try out.push_str_grow(alloc, "PlusWrapEq"); return true; }
+        .MinusWrapEq => { try out.push_str_grow(alloc, "MinusWrapEq"); return true; }
+        .StarWrapEq => { try out.push_str_grow(alloc, "StarWrapEq"); return true; }
+        .PlusSatEq => { try out.push_str_grow(alloc, "PlusSatEq"); return true; }
+        .MinusSatEq => { try out.push_str_grow(alloc, "MinusSatEq"); return true; }
+        .StarSatEq => { try out.push_str_grow(alloc, "StarSatEq"); return true; }
+        .AmpEq => { try out.push_str_grow(alloc, "AmpEq"); return true; }
+        .PipeEq => { try out.push_str_grow(alloc, "PipeEq"); return true; }
+        .CaretEq => { try out.push_str_grow(alloc, "CaretEq"); return true; }
+        .ShlEq => { try out.push_str_grow(alloc, "ShlEq"); return true; }
+        .ShrEq => { try out.push_str_grow(alloc, "ShrEq"); return true; }
+        .Error => { try out.push_str_grow(alloc, "Error"); return true; }
+        .Eof => { try out.push_str_grow(alloc, "Eof"); return true; }
+        _ => { return false; }
+    }
+}
+
+/// Formats `tok.kind` (plus its payload) identically to Rust `format!("{:?}", tok.kind)`.
+pub fn write_token_kind_debug(alloc: *mut AllocCap, tok: *Token, out: *mut str.StrBuf) -> !OutOfMemory {
+    match tok.kind {
+        .IntLit => {
+            try out.push_str_grow(alloc, "IntLit(NumLitId(");
+            try out.push_u64_grow(alloc, tok.payload.widen.[u64]());
+            try out.push_str_grow(alloc, "))");
+            return;
+        }
+        .FloatLit => {
+            try out.push_str_grow(alloc, "FloatLit(NumLitId(");
+            try out.push_u64_grow(alloc, tok.payload.widen.[u64]());
+            try out.push_str_grow(alloc, "))");
+            return;
+        }
+        .StringLit => {
+            try out.push_str_grow(alloc, "StringLit(StrLitId(");
+            try out.push_u64_grow(alloc, tok.payload.widen.[u64]());
+            try out.push_str_grow(alloc, "))");
+            return;
+        }
+        .RawStringLit => {
+            try out.push_str_grow(alloc, "RawStringLit(StrLitId(");
+            try out.push_u64_grow(alloc, tok.payload.widen.[u64]());
+            try out.push_str_grow(alloc, "))");
+            return;
+        }
+        .ByteStringLit => {
+            try out.push_str_grow(alloc, "ByteStringLit(ByteStrLitId(");
+            try out.push_u64_grow(alloc, tok.payload.widen.[u64]());
+            try out.push_str_grow(alloc, "))");
+            return;
+        }
+        .CharLit => {
+            try out.push_str_grow(alloc, "CharLit(");
+            try write_rust_char_debug(alloc, tok.payload, out);
+            try out.push_byte_grow(alloc, b')');
+            return;
+        }
+        .ByteCharLit => {
+            try out.push_str_grow(alloc, "ByteCharLit(");
+            try out.push_u64_grow(alloc, (tok.payload & 0xFF_u32).widen.[u64]());
+            try out.push_byte_grow(alloc, b')');
+            return;
+        }
+        _ => {}
+    }
+    if try write_kind_name_part1(alloc, tok.kind, out) { return; }
+    if try write_kind_name_part2(alloc, tok.kind, out) { return; }
+    if try write_kind_name_part3(alloc, tok.kind, out) { return; }
+    if try write_kind_name_part4(alloc, tok.kind, out) { return; }
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// Human-readable descriptions (matching `TokenKind::description`)
+// ---------------------------------------------------------------------------
+
+fn write_kind_desc_part1(alloc: *mut AllocCap, kind: TokenKind, out: *mut str.StrBuf) -> bool ! OutOfMemory {
+    match kind {
+        .Ident => { try out.push_str_grow(alloc, "identifier"); return true; }
+        .Underscore => { try out.push_str_grow(alloc, "`_`"); return true; }
+        .Label => { try out.push_str_grow(alloc, "loop label"); return true; }
+        .IntLit => { try out.push_str_grow(alloc, "integer literal"); return true; }
+        .FloatLit => { try out.push_str_grow(alloc, "float literal"); return true; }
+        .StringLit => { try out.push_str_grow(alloc, "string literal"); return true; }
+        .RawStringLit => { try out.push_str_grow(alloc, "raw string literal"); return true; }
+        .ByteStringLit => { try out.push_str_grow(alloc, "byte string literal"); return true; }
+        .CharLit => { try out.push_str_grow(alloc, "character literal"); return true; }
+        .ByteCharLit => { try out.push_str_grow(alloc, "byte character literal"); return true; }
+        .KwModule => { try out.push_str_grow(alloc, "`module`"); return true; }
+        .KwImport => { try out.push_str_grow(alloc, "`import`"); return true; }
+        .KwPub => { try out.push_str_grow(alloc, "`pub`"); return true; }
+        .KwFn => { try out.push_str_grow(alloc, "`fn`"); return true; }
+        .KwSys => { try out.push_str_grow(alloc, "`sys`"); return true; }
+        .KwLet => { try out.push_str_grow(alloc, "`let`"); return true; }
+        .KwVar => { try out.push_str_grow(alloc, "`var`"); return true; }
+        .KwConst => { try out.push_str_grow(alloc, "`const`"); return true; }
+        .KwType => { try out.push_str_grow(alloc, "`type`"); return true; }
+        .KwStruct => { try out.push_str_grow(alloc, "`struct`"); return true; }
+        .KwLinear => { try out.push_str_grow(alloc, "`linear`"); return true; }
+        .KwPool => { try out.push_str_grow(alloc, "`pool`"); return true; }
+        .KwEnum => { try out.push_str_grow(alloc, "`enum`"); return true; }
+        .KwUnion => { try out.push_str_grow(alloc, "`union`"); return true; }
+        .KwBitfield => { try out.push_str_grow(alloc, "`bitfield`"); return true; }
+        .KwIface => { try out.push_str_grow(alloc, "`iface`"); return true; }
+        .KwImpl => { try out.push_str_grow(alloc, "`impl`"); return true; }
+        .KwError => { try out.push_str_grow(alloc, "`error`"); return true; }
+        .KwExtern => { try out.push_str_grow(alloc, "`extern`"); return true; }
+        .KwComptime => { try out.push_str_grow(alloc, "`comptime`"); return true; }
+        .KwView => { try out.push_str_grow(alloc, "`view`"); return true; }
+        .KwIf => { try out.push_str_grow(alloc, "`if`"); return true; }
+        .KwElse => { try out.push_str_grow(alloc, "`else`"); return true; }
+        .KwMatch => { try out.push_str_grow(alloc, "`match`"); return true; }
+        _ => { return false; }
+    }
+}
+
+fn write_kind_desc_part2(alloc: *mut AllocCap, kind: TokenKind, out: *mut str.StrBuf) -> bool ! OutOfMemory {
+    match kind {
+        .KwWhile => { try out.push_str_grow(alloc, "`while`"); return true; }
+        .KwFor => { try out.push_str_grow(alloc, "`for`"); return true; }
+        .KwPar => { try out.push_str_grow(alloc, "`par`"); return true; }
+        .KwLoop => { try out.push_str_grow(alloc, "`loop`"); return true; }
+        .KwBreak => { try out.push_str_grow(alloc, "`break`"); return true; }
+        .KwContinue => { try out.push_str_grow(alloc, "`continue`"); return true; }
+        .KwReturn => { try out.push_str_grow(alloc, "`return`"); return true; }
+        .KwDefer => { try out.push_str_grow(alloc, "`defer`"); return true; }
+        .KwErrdefer => { try out.push_str_grow(alloc, "`errdefer`"); return true; }
+        .KwTry => { try out.push_str_grow(alloc, "`try`"); return true; }
+        .KwCatch => { try out.push_str_grow(alloc, "`catch`"); return true; }
+        .KwOrelse => { try out.push_str_grow(alloc, "`orelse`"); return true; }
+        .KwUnreachable => { try out.push_str_grow(alloc, "`unreachable`"); return true; }
+        .KwMut => { try out.push_str_grow(alloc, "`mut`"); return true; }
+        .KwMove => { try out.push_str_grow(alloc, "`move`"); return true; }
+        .KwCopy => { try out.push_str_grow(alloc, "`copy`"); return true; }
+        .KwWhere => { try out.push_str_grow(alloc, "`where`"); return true; }
+        .KwEnsures => { try out.push_str_grow(alloc, "`ensures`"); return true; }
+        .KwIn => { try out.push_str_grow(alloc, "`in`"); return true; }
+        .KwAs => { try out.push_str_grow(alloc, "`as`"); return true; }
+        .KwIs => { try out.push_str_grow(alloc, "`is`"); return true; }
+        .KwFrom => { try out.push_str_grow(alloc, "`from`"); return true; }
+        .KwTrue => { try out.push_str_grow(alloc, "`true`"); return true; }
+        .KwFalse => { try out.push_str_grow(alloc, "`false`"); return true; }
+        .KwNull => { try out.push_str_grow(alloc, "`null`"); return true; }
+        .KwVoid => { try out.push_str_grow(alloc, "`void`"); return true; }
+        .KwNever => { try out.push_str_grow(alloc, "`never`"); return true; }
+        .KwSelf => { try out.push_str_grow(alloc, "`self`"); return true; }
+        .KwSelfType => { try out.push_str_grow(alloc, "`Self`"); return true; }
+        .KwDyn => { try out.push_str_grow(alloc, "`dyn`"); return true; }
+        .KwRaw => { try out.push_str_grow(alloc, "`raw`"); return true; }
+        .KwAsm => { try out.push_str_grow(alloc, "`asm`"); return true; }
+        .KwVolatile => { try out.push_str_grow(alloc, "`volatile`"); return true; }
+        _ => { return false; }
+    }
+}
+
+fn write_kind_desc_part3(alloc: *mut AllocCap, kind: TokenKind, out: *mut str.StrBuf) -> bool ! OutOfMemory {
+    match kind {
+        .LParen => { try out.push_str_grow(alloc, "`(`"); return true; }
+        .RParen => { try out.push_str_grow(alloc, "`)`"); return true; }
+        .LBracket => { try out.push_str_grow(alloc, "`[`"); return true; }
+        .RBracket => { try out.push_str_grow(alloc, "`]`"); return true; }
+        .LBrace => { try out.push_str_grow(alloc, "`{`"); return true; }
+        .RBrace => { try out.push_str_grow(alloc, "`}`"); return true; }
+        .Semi => { try out.push_str_grow(alloc, "`;`"); return true; }
+        .Colon => { try out.push_str_grow(alloc, "`:`"); return true; }
+        .Comma => { try out.push_str_grow(alloc, "`,`"); return true; }
+        .Dot => { try out.push_str_grow(alloc, "`.`"); return true; }
+        .DotStar => { try out.push_str_grow(alloc, "`.*`"); return true; }
+        .DotDot => { try out.push_str_grow(alloc, "`..`"); return true; }
+        .DotDotEq => { try out.push_str_grow(alloc, "`..=`"); return true; }
+        .Arrow => { try out.push_str_grow(alloc, "`->`"); return true; }
+        .FatArrow => { try out.push_str_grow(alloc, "`=>`"); return true; }
+        .At => { try out.push_str_grow(alloc, "`@`"); return true; }
+        .Question => { try out.push_str_grow(alloc, "`?`"); return true; }
+        .Plus => { try out.push_str_grow(alloc, "`+`"); return true; }
+        .Minus => { try out.push_str_grow(alloc, "`-`"); return true; }
+        .Star => { try out.push_str_grow(alloc, "`*`"); return true; }
+        .Slash => { try out.push_str_grow(alloc, "`/`"); return true; }
+        .Percent => { try out.push_str_grow(alloc, "`%`"); return true; }
+        .PlusWrap => { try out.push_str_grow(alloc, "`+%`"); return true; }
+        .MinusWrap => { try out.push_str_grow(alloc, "`-%`"); return true; }
+        .StarWrap => { try out.push_str_grow(alloc, "`*%`"); return true; }
+        .PlusSat => { try out.push_str_grow(alloc, "`+|`"); return true; }
+        .MinusSat => { try out.push_str_grow(alloc, "`-|`"); return true; }
+        .StarSat => { try out.push_str_grow(alloc, "`*|`"); return true; }
+        .PlusCheck => { try out.push_str_grow(alloc, "`+?`"); return true; }
+        .MinusCheck => { try out.push_str_grow(alloc, "`-?`"); return true; }
+        .StarCheck => { try out.push_str_grow(alloc, "`*?`"); return true; }
+        .SlashCheck => { try out.push_str_grow(alloc, "`/?`"); return true; }
+        .PercentCheck => { try out.push_str_grow(alloc, "`%?`"); return true; }
+        _ => { return false; }
+    }
+}
+
+fn write_kind_desc_part4(alloc: *mut AllocCap, kind: TokenKind, out: *mut str.StrBuf) -> bool ! OutOfMemory {
+    match kind {
+        .Shl => { try out.push_str_grow(alloc, "`<<`"); return true; }
+        .Shr => { try out.push_str_grow(alloc, "`>>`"); return true; }
+        .ShlWrap => { try out.push_str_grow(alloc, "`<<%`"); return true; }
+        .Amp => { try out.push_str_grow(alloc, "`&`"); return true; }
+        .Pipe => { try out.push_str_grow(alloc, "`|`"); return true; }
+        .Caret => { try out.push_str_grow(alloc, "`^`"); return true; }
+        .Tilde => { try out.push_str_grow(alloc, "`~`"); return true; }
+        .Bang => { try out.push_str_grow(alloc, "`!`"); return true; }
+        .AndAnd => { try out.push_str_grow(alloc, "`&&`"); return true; }
+        .OrOr => { try out.push_str_grow(alloc, "`||`"); return true; }
+        .Eq => { try out.push_str_grow(alloc, "`=`"); return true; }
+        .EqEq => { try out.push_str_grow(alloc, "`==`"); return true; }
+        .NotEq => { try out.push_str_grow(alloc, "`!=`"); return true; }
+        .Lt => { try out.push_str_grow(alloc, "`<`"); return true; }
+        .LtEq => { try out.push_str_grow(alloc, "`<=`"); return true; }
+        .Gt => { try out.push_str_grow(alloc, "`>`"); return true; }
+        .GtEq => { try out.push_str_grow(alloc, "`>=`"); return true; }
+        .PlusEq => { try out.push_str_grow(alloc, "`+=`"); return true; }
+        .MinusEq => { try out.push_str_grow(alloc, "`-=`"); return true; }
+        .StarEq => { try out.push_str_grow(alloc, "`*=`"); return true; }
+        .PlusWrapEq => { try out.push_str_grow(alloc, "`+%=`"); return true; }
+        .MinusWrapEq => { try out.push_str_grow(alloc, "`-%=`"); return true; }
+        .StarWrapEq => { try out.push_str_grow(alloc, "`*%=`"); return true; }
+        .PlusSatEq => { try out.push_str_grow(alloc, "`+|=`"); return true; }
+        .MinusSatEq => { try out.push_str_grow(alloc, "`-|=`"); return true; }
+        .StarSatEq => { try out.push_str_grow(alloc, "`*|=`"); return true; }
+        .AmpEq => { try out.push_str_grow(alloc, "`&=`"); return true; }
+        .PipeEq => { try out.push_str_grow(alloc, "`|=`"); return true; }
+        .CaretEq => { try out.push_str_grow(alloc, "`^=`"); return true; }
+        .ShlEq => { try out.push_str_grow(alloc, "`<<=`"); return true; }
+        .ShrEq => { try out.push_str_grow(alloc, "`>>=`"); return true; }
+        .Error => { try out.push_str_grow(alloc, "invalid token"); return true; }
+        .Eof => { try out.push_str_grow(alloc, "end of file"); return true; }
+        _ => { return false; }
+    }
+}
+
+/// Writes the diagnostic display string matching `compiler/src/lexer.rs::TokenKind::description`.
+pub fn write_token_kind_description(alloc: *mut AllocCap, kind: TokenKind, out: *mut str.StrBuf) -> !OutOfMemory {
+    if try write_kind_desc_part1(alloc, kind, out) { return; }
+    if try write_kind_desc_part2(alloc, kind, out) { return; }
+    if try write_kind_desc_part3(alloc, kind, out) { return; }
+    if try write_kind_desc_part4(alloc, kind, out) { return; }
+    return;
+}

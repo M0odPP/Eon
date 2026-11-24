@@ -1,0 +1,951 @@
+module core.math;
+
+// ---------------------------------------------------------------------------
+// Compiler-intrinsic math and bit-manipulation wrappers
+// ---------------------------------------------------------------------------
+
+pub fn sqrt_f64(x: f64) -> f64 {
+    return @sqrt(x);
+}
+
+pub fn sqrt_f32(x: f32) -> f32 {
+    return @sqrt(x);
+}
+
+pub fn fma_f64(a: f64, b: f64, c: f64) -> f64 {
+    return @fma(a, b, c);
+}
+
+pub fn fma_f32(a: f32, b: f32, c: f32) -> f32 {
+    return @fma(a, b, c);
+}
+
+pub fn lzcnt_u64(x: u64) -> u64 {
+    return @lzcnt(x);
+}
+
+pub fn lzcnt_u32(x: u32) -> u32 {
+    return @lzcnt(x);
+}
+
+pub fn tzcnt_u64(x: u64) -> u64 {
+    return @tzcnt(x);
+}
+
+pub fn tzcnt_u32(x: u32) -> u32 {
+    return @tzcnt(x);
+}
+
+pub fn popcnt_u64(x: u64) -> u64 {
+    return @popcnt(x);
+}
+
+pub fn popcnt_u32(x: u32) -> u32 {
+    return @popcnt(x);
+}
+
+pub fn bswap_u64(x: u64) -> u64 {
+    return @bswap(x);
+}
+
+pub fn bswap_u32(x: u32) -> u32 {
+    return @bswap(x);
+}
+
+pub fn bswap_u16(x: u16) -> u16 {
+    return @bswap(x);
+}
+
+// ---------------------------------------------------------------------------
+// IEEE-754 bit-level helpers & rounding primitives
+// ---------------------------------------------------------------------------
+
+pub fn f64_to_bits(x: f64) -> u64 {
+    return x.bitcast.[u64]();
+}
+
+pub fn bits_to_f64(b: u64) -> f64 {
+    return b.bitcast.[f64]();
+}
+
+pub fn f32_to_bits(x: f32) -> u32 {
+    return x.bitcast.[u32]();
+}
+
+pub fn bits_to_f32(b: u32) -> f32 {
+    return b.bitcast.[f32]();
+}
+
+pub fn abs_f64(x: f64) -> f64 {
+    return bits_to_f64(f64_to_bits(x) & 0x7FFFFFFFFFFFFFFF_u64);
+}
+
+pub fn abs_f32(x: f32) -> f32 {
+    return bits_to_f32(f32_to_bits(x) & 0x7FFFFFFF_u32);
+}
+
+pub fn copysign_f64(mag: f64, sgn: f64) -> f64 {
+    let mb = f64_to_bits(mag) & 0x7FFFFFFFFFFFFFFF_u64;
+    let sb = f64_to_bits(sgn) & 0x8000000000000000_u64;
+    return bits_to_f64(mb | sb);
+}
+
+pub fn is_nan_f64(x: f64) -> bool {
+    return (f64_to_bits(x) & 0x7FFFFFFFFFFFFFFF_u64) > 0x7FF0000000000000_u64;
+}
+
+pub fn is_inf_f64(x: f64) -> bool {
+    return (f64_to_bits(x) & 0x7FFFFFFFFFFFFFFF_u64) == 0x7FF0000000000000_u64;
+}
+
+pub fn is_finite_f64(x: f64) -> bool {
+    return (f64_to_bits(x) & 0x7FF0000000000000_u64) != 0x7FF0000000000000_u64;
+}
+
+pub fn trunc_f64(x: f64) -> f64 {
+    let b = f64_to_bits(x);
+    let abs_b = b & 0x7FFFFFFFFFFFFFFF_u64;
+    let sign = b & 0x8000000000000000_u64;
+    let exp = abs_b >> 52_u64;
+    if exp >= 1075_u64 {
+        return x;
+    }
+    if exp < 1023_u64 {
+        return bits_to_f64(sign);
+    }
+    let frac_bits = 1075_u64 -% exp;
+    let frac_mask = (1_u64 <<% frac_bits) -% 1_u64;
+    return bits_to_f64(b & (~frac_mask));
+}
+
+pub fn floor_f64(x: f64) -> f64 {
+    let b = f64_to_bits(x);
+    let abs_b = b & 0x7FFFFFFFFFFFFFFF_u64;
+    let sign = b & 0x8000000000000000_u64;
+    let exp = abs_b >> 52_u64;
+    if exp >= 1075_u64 {
+        return x;
+    }
+    if exp < 1023_u64 {
+        if abs_b == 0_u64 {
+            return x;
+        }
+        if sign == 0_u64 {
+            return 0.0_f64;
+        }
+        return -1.0_f64;
+    }
+    let frac_bits = 1075_u64 -% exp;
+    let frac_mask = (1_u64 <<% frac_bits) -% 1_u64;
+    let trunc_b = b & (~frac_mask);
+    if sign != 0_u64 && (b & frac_mask) != 0_u64 {
+        return bits_to_f64(trunc_b +% (1_u64 <<% frac_bits));
+    }
+    return bits_to_f64(trunc_b);
+}
+
+pub fn ceil_f64(x: f64) -> f64 {
+    let neg_x = bits_to_f64(f64_to_bits(x) ^ 0x8000000000000000_u64);
+    let fl = floor_f64(neg_x);
+    return bits_to_f64(f64_to_bits(fl) ^ 0x8000000000000000_u64);
+}
+
+pub fn round_even_f64(x: f64) -> f64 {
+    let b = f64_to_bits(x);
+    let abs_b = b & 0x7FFFFFFFFFFFFFFF_u64;
+    let sign = b & 0x8000000000000000_u64;
+    let exp = abs_b >> 52_u64;
+    if exp >= 1075_u64 {
+        return x;
+    }
+    if exp < 1022_u64 {
+        return bits_to_f64(sign);
+    }
+    if exp == 1022_u64 {
+        if (abs_b & 0x000FFFFFFFFFFFFF_u64) == 0_u64 {
+            return bits_to_f64(sign);
+        }
+        return bits_to_f64(sign | 0x3FF0000000000000_u64);
+    }
+    let frac_bits = 1075_u64 -% exp;
+    let half_bit = 1_u64 <<% (frac_bits -% 1_u64);
+    let frac_mask = (1_u64 <<% frac_bits) -% 1_u64;
+    let int_lsb_bit = 1_u64 <<% frac_bits;
+    let frac = b & frac_mask;
+    let trunc_b = b & (~frac_mask);
+    if frac > half_bit || (frac == half_bit && (trunc_b & int_lsb_bit) != 0_u64) {
+        return bits_to_f64(trunc_b +% int_lsb_bit);
+    }
+    return bits_to_f64(trunc_b);
+}
+
+pub fn ldexp_f64(x: f64, exp: i32) -> f64 {
+    let b = f64_to_bits(x);
+    let abs_b = b & 0x7FFFFFFFFFFFFFFF_u64;
+    if abs_b == 0_u64 || abs_b >= 0x7FF0000000000000_u64 {
+        return x;
+    }
+    var cur = x;
+    var kk = exp.widen.[i64]();
+    if (abs_b >> 52_u64) == 0_u64 {
+        // Normalize subnormal by multiplying by 2^54.
+        cur = cur * bits_to_f64(0x4350000000000000_u64);
+        kk = kk -% 54_i64;
+    }
+    let cb = f64_to_bits(cur);
+    let cur_exp = ((cb >> 52_u64) & 0x7FF_u64).bitcast.[i64]();
+    if kk > 3000_i64 {
+        kk = 3000_i64;
+    } else if kk < -3000_i64 {
+        kk = -3000_i64;
+    }
+    let new_exp = cur_exp +% kk;
+    if new_exp >= 2047_i64 {
+        let huge = bits_to_f64(0x7FE0000000000000_u64);
+        return copysign_f64(huge * huge, x);
+    }
+    if new_exp > 0_i64 {
+        let out_b = (cb & 0x800FFFFFFFFFFFFF_u64) | ((new_exp.bitcast.[u64]()) <<% 52_u64);
+        return bits_to_f64(out_b);
+    }
+    if new_exp <= -54_i64 {
+        return copysign_f64(0.0_f64, x);
+    }
+    let shifted_exp = (new_exp +% 54_i64).bitcast.[u64]();
+    let sub_b = (cb & 0x800FFFFFFFFFFFFF_u64) | (shifted_exp <<% 52_u64);
+    return bits_to_f64(sub_b) * bits_to_f64(0x3C90000000000000_u64);
+}
+
+// ---------------------------------------------------------------------------
+// Double-double arithmetic primitives using hardware/IEEE-754 `@fma`
+// ---------------------------------------------------------------------------
+
+struct Dd {
+    hi: f64;
+    lo: f64;
+}
+
+fn dd_make(hi: f64, lo: f64) -> Dd {
+    return Dd.{ hi: hi, lo: lo };
+}
+
+fn two_sum(a: f64, b: f64) -> Dd {
+    let s = a + b;
+    let v = s - a;
+    let e = (a - (s - v)) + (b - v);
+    return Dd.{ hi: s, lo: e };
+}
+
+fn quick_two_sum(a: f64, b: f64) -> Dd {
+    let s = a + b;
+    let e = b - (s - a);
+    return Dd.{ hi: s, lo: e };
+}
+
+fn two_prod(a: f64, b: f64) -> Dd {
+    let p = a * b;
+    let e = fma_f64(a, b, -p);
+    return Dd.{ hi: p, lo: e };
+}
+
+fn dd_add(a: Dd, b: Dd) -> Dd {
+    let s = two_sum(a.hi, b.hi);
+    let t = two_sum(a.lo, b.lo);
+    let v = quick_two_sum(s.hi, s.lo + t.hi);
+    return quick_two_sum(v.hi, v.lo + t.lo);
+}
+
+fn dd_add_d(a: Dd, b: f64) -> Dd {
+    let s = two_sum(a.hi, b);
+    return quick_two_sum(s.hi, s.lo + a.lo);
+}
+
+fn dd_neg(a: Dd) -> Dd {
+    return Dd.{ hi: -a.hi, lo: -a.lo };
+}
+
+fn dd_mul(a: Dd, b: Dd) -> Dd {
+    let p = two_prod(a.hi, b.hi);
+    let t = fma_f64(a.hi, b.lo, fma_f64(a.lo, b.hi, p.lo));
+    return quick_two_sum(p.hi, t);
+}
+
+fn dd_mul_d(a: Dd, b: f64) -> Dd {
+    let p = two_prod(a.hi, b);
+    let t = fma_f64(a.lo, b, p.lo);
+    return quick_two_sum(p.hi, t);
+}
+
+fn dd_div(a: Dd, b: Dd) -> Dd {
+    let q1 = a.hi / b.hi;
+    let p1 = dd_mul_d(b, q1);
+    let r1 = dd_add(a, dd_neg(p1));
+    let q2 = r1.hi / b.hi;
+    let p2 = dd_mul_d(b, q2);
+    let r2 = dd_add(r1, dd_neg(p2));
+    let q3 = r2.hi / b.hi;
+    return dd_add_d(quick_two_sum(q1, q2), q3);
+}
+
+// ---------------------------------------------------------------------------
+// Internal double-double exp / log / trig kernels
+// ---------------------------------------------------------------------------
+
+fn exp_dd_core(r: Dd) -> Dd {
+    // Evaluates exp(r) for |r| <= ln(2)/2 using 106-bit Taylor-Horner series.
+    let c20 = bits_to_f64(0x3C1E542BA4020225_u64);
+    let c19 = bits_to_f64(0x3C62F49B46814157_u64);
+    let c18 = bits_to_f64(0x3CA6827863B97D97_u64);
+    let c17 = bits_to_f64(0x3CE952C77030AD4A_u64);
+    let c16 = bits_to_f64(0x3D2AE7F3E733B81F_u64);
+    let c15 = bits_to_f64(0x3D6AE7F3E733B81F_u64);
+    let c14 = bits_to_f64(0x3DA93974A8C07C9D_u64);
+    let c13 = bits_to_f64(0x3DE6124613A86D09_u64);
+
+    var poly = fma_f64(c20, r.hi, c19);
+    poly = fma_f64(poly, r.hi, c18);
+    poly = fma_f64(poly, r.hi, c17);
+    poly = fma_f64(poly, r.hi, c16);
+    poly = fma_f64(poly, r.hi, c15);
+    poly = fma_f64(poly, r.hi, c14);
+    poly = fma_f64(poly, r.hi, c13);
+
+    var acc = dd_make(poly, 0.0_f64);
+    acc = dd_add(dd_mul(r, acc), dd_make(bits_to_f64(0x3E21EED8EFF8D898_u64), bits_to_f64(0xBAC2AEC959E14C06_u64)));
+    acc = dd_add(dd_mul(r, acc), dd_make(bits_to_f64(0x3E5AE64567F544E4_u64), bits_to_f64(0xBAFC062E06D1F209_u64)));
+    acc = dd_add(dd_mul(r, acc), dd_make(bits_to_f64(0x3E927E4FB7789F5C_u64), bits_to_f64(0x3B3CBBC05B4FA99A_u64)));
+    acc = dd_add(dd_mul(r, acc), dd_make(bits_to_f64(0x3EC71DE3A556C734_u64), bits_to_f64(0xBB6C154F8DDC6C00_u64)));
+    acc = dd_add(dd_mul(r, acc), dd_make(bits_to_f64(0x3EFA01A01A01A01A_u64), bits_to_f64(0x3B3A01A01A01A01A_u64)));
+    acc = dd_add(dd_mul(r, acc), dd_make(bits_to_f64(0x3F2A01A01A01A01A_u64), bits_to_f64(0x3B6A01A01A01A01A_u64)));
+    acc = dd_add(dd_mul(r, acc), dd_make(bits_to_f64(0x3F56C16C16C16C17_u64), bits_to_f64(0xBBEF49F49F49F49F_u64)));
+    acc = dd_add(dd_mul(r, acc), dd_make(bits_to_f64(0x3F81111111111111_u64), bits_to_f64(0x3C01111111111111_u64)));
+    acc = dd_add(dd_mul(r, acc), dd_make(bits_to_f64(0x3FA5555555555555_u64), bits_to_f64(0x3C45555555555555_u64)));
+    acc = dd_add(dd_mul(r, acc), dd_make(bits_to_f64(0x3FC5555555555555_u64), bits_to_f64(0x3C65555555555555_u64)));
+    acc = dd_add(dd_mul(r, acc), dd_make(bits_to_f64(0x3FE0000000000000_u64), 0.0_f64));
+
+    let r2 = dd_mul(r, r);
+    return dd_add(dd_make(1.0_f64, 0.0_f64), dd_add(r, dd_mul(r2, acc)));
+}
+
+fn exp_from_dd(p: Dd) -> f64 {
+    if p.hi > bits_to_f64(0x40862E42FEFA39EF_u64) {
+        let huge = bits_to_f64(0x7FE0000000000000_u64);
+        return huge * huge;
+    }
+    if p.hi < bits_to_f64(0xC0874910D52D3051_u64) {
+        let tiny = bits_to_f64(0x0010000000000000_u64);
+        return tiny * tiny;
+    }
+    let invln2 = bits_to_f64(0x3FF71547652B82FE_u64);
+    let ln2_hi = bits_to_f64(0x3FE62E42FEFA39EF_u64);
+    let ln2_lo = bits_to_f64(0x3C7ABC9E3B39803F_u64);
+    let ln2_tail = bits_to_f64(0x3907B57A079A1934_u64);
+
+    let kf = round_even_f64(p.hi * invln2);
+    let k = kf.trunc_to_int.[i32]();
+
+    let t1 = two_prod(kf, ln2_hi);
+    let t2 = two_prod(kf, ln2_lo);
+    let t3 = kf * ln2_tail;
+    let kl = dd_add(t1, dd_add_d(t2, t3));
+    let r = dd_add(p, dd_neg(kl));
+    let e = exp_dd_core(r);
+    return ldexp_f64(e.hi + e.lo, k);
+}
+
+fn log_dd(x: f64) -> Dd {
+    // Assumes finite x > 0.
+    var cur = x;
+    var k: i64 = 0_i64;
+    var b = f64_to_bits(cur);
+    if (b >> 52_u64) == 0_u64 {
+        cur = cur * bits_to_f64(0x4350000000000000_u64);
+        k = -54_i64;
+        b = f64_to_bits(cur);
+    }
+    k = k +% (((b >> 52_u64) & 0x7FF_u64).bitcast.[i64]() -% 1023_i64);
+    let mant = b & 0x000FFFFFFFFFFFFF_u64;
+    var x_norm = 0.0_f64;
+    if mant > 0x0006A09E667F3BCD_u64 {
+        k = k +% 1_i64;
+        x_norm = bits_to_f64(mant | 0x3FE0000000000000_u64);
+    } else {
+        x_norm = bits_to_f64(mant | 0x3FF0000000000000_u64);
+    }
+    let f = x_norm - 1.0_f64;
+    let q = two_sum(2.0_f64, f);
+    let s0 = f / q.hi;
+    let p = dd_mul_d(q, s0);
+    let r = dd_add_d(dd_neg(p), f);
+    let s1 = r.hi / q.hi;
+    let s = quick_two_sum(s0, s1);
+    let s2 = dd_mul(s, s);
+
+    var poly = bits_to_f64(0x3FA47AE147AE147B_u64); // 1/25
+    poly = fma_f64(poly, s2.hi, bits_to_f64(0x3FA642C8590B2164_u64)); // 1/23
+    poly = fma_f64(poly, s2.hi, bits_to_f64(0x3FA8618618618618_u64)); // 1/21
+    poly = fma_f64(poly, s2.hi, bits_to_f64(0x3FAAF286BCA1AF28_u64)); // 1/19
+    poly = fma_f64(poly, s2.hi, bits_to_f64(0x3FAE1E1E1E1E1E1E_u64)); // 1/17
+    poly = fma_f64(poly, s2.hi, bits_to_f64(0x3FB1111111111111_u64)); // 1/15
+    poly = fma_f64(poly, s2.hi, bits_to_f64(0x3FB3B13B13B13B14_u64)); // 1/13
+    poly = fma_f64(poly, s2.hi, bits_to_f64(0x3FB745D1745D1746_u64)); // 1/11
+
+    var acc = dd_make(poly, 0.0_f64);
+    acc = dd_add(dd_mul(s2, acc), dd_make(bits_to_f64(0x3FBC71C71C71C71C_u64), bits_to_f64(0x3C5C71C71C71C71C_u64))); // 1/9
+    acc = dd_add(dd_mul(s2, acc), dd_make(bits_to_f64(0x3FC2492492492492_u64), bits_to_f64(0x3C62492492492492_u64))); // 1/7
+    acc = dd_add(dd_mul(s2, acc), dd_make(bits_to_f64(0x3FC999999999999A_u64), bits_to_f64(0xBC6999999999999A_u64))); // 1/5
+    acc = dd_add(dd_mul(s2, acc), dd_make(bits_to_f64(0x3FD5555555555555_u64), bits_to_f64(0x3C75555555555555_u64))); // 1/3
+    acc = dd_add(dd_mul(s2, acc), dd_make(1.0_f64, 0.0_f64));
+
+    let ln1pf = dd_mul(dd_mul_d(s, 2.0_f64), acc);
+    let ln2 = dd_make(bits_to_f64(0x3FE62E42FEFA39EF_u64), bits_to_f64(0x3C7ABC9E3B39803F_u64));
+    let k_ln2 = dd_mul_d(ln2, k.to_float.[f64]());
+    return dd_add(k_ln2, ln1pf);
+}
+
+struct TrigRed {
+    q: u64;
+    y: Dd;
+}
+
+fn payne_hanek(x: f64) -> TrigRed {
+    let chunks: [52]u64 = [
+        0xA2F983_u64, 0x6E4E44_u64, 0x1529FC_u64, 0x2757D1_u64, 0xF534DD_u64, 0xC0DB62_u64,
+        0x95993C_u64, 0x439041_u64, 0xFE5163_u64, 0xABDEBB_u64, 0xC561B7_u64, 0x246E3A_u64,
+        0x424DD2_u64, 0xE00649_u64, 0x2EEA09_u64, 0xD1921C_u64, 0xFE1DEB_u64, 0x1CB129_u64,
+        0xA73EE8_u64, 0x8235F5_u64, 0x2EBB44_u64, 0x84E99C_u64, 0x7026B4_u64, 0x5F7E41_u64,
+        0x3991D6_u64, 0x398353_u64, 0x39F49C_u64, 0x845F8B_u64, 0xBDF928_u64, 0x3B1FF8_u64,
+        0x97FFDE_u64, 0x05980F_u64, 0xEF2F11_u64, 0x8B5A0A_u64, 0x6D1F6D_u64, 0x367ECF_u64,
+        0x27CB09_u64, 0xB74F46_u64, 0x3F669E_u64, 0x5FEA2D_u64, 0x7527BA_u64, 0xC7EBE5_u64,
+        0xF17B3D_u64, 0x0739F7_u64, 0x8A5292_u64, 0xEA6BFB_u64, 0x5FB11F_u64, 0x8D5D08_u64,
+        0x560330_u64, 0x46FC7B_u64, 0x6BABF0_u64, 0xCFBC20_u64,
+    ];
+    let bx = f64_to_bits(x);
+    let neg = (bx >> 63_u64) != 0_u64;
+    let exp = ((bx >> 52_u64) & 0x7FF_u64).bitcast.[i64]() -% 1023_i64;
+    let mant = (bx & 0x000FFFFFFFFFFFFF_u64) | 0x0010000000000000_u64;
+    let m_lo = mant & 0xFFFFFFFF_u64;
+    let m_hi = mant >> 32_u64;
+    let e0 = exp -% 52_i64;
+    let j0: usize = if e0 < 25_i64 {
+        0_usize
+    } else {
+        ((e0 -% 25_i64) / 24_i64).trunc.[usize]()
+    };
+
+    var limbs: [12]u64 = [0_u64; 12];
+    var idx: usize = 0_usize;
+    while idx < 9_usize {
+        let j = j0 +% idx;
+        let c: u64 = if j < 52_usize { chunks[j] } else { 0_u64 };
+        let k = 8_usize - idx;
+        let p0 = m_lo *% c;
+        let p1 = (m_hi *% c) <<% 8_u64;
+        limbs[k] = limbs[k] +% (p0 & 0xFFFFFF_u64);
+        limbs[k + 1_usize] = limbs[k + 1_usize] +% ((p0 >> 24_u64) & 0xFFFFFF_u64) +% (p1 & 0xFFFFFF_u64);
+        limbs[k + 2_usize] = limbs[k + 2_usize] +% (p0 >> 48_u64) +% ((p1 >> 24_u64) & 0xFFFFFF_u64);
+        limbs[k + 3_usize] = limbs[k + 3_usize] +% (p1 >> 48_u64);
+        idx = idx + 1_usize;
+    }
+
+    var carry: u64 = 0_u64;
+    var ci: usize = 0_usize;
+    while ci < 12_usize {
+        let v = limbs[ci] +% carry;
+        limbs[ci] = v & 0xFFFFFF_u64;
+        carry = v >> 24_u64;
+        ci = ci + 1_usize;
+    }
+
+    let shift: usize = (24_i64 *% ((j0.trunc.[i64]()) +% 9_i64) -% e0).trunc.[usize]();
+    let qlimb = shift / 24_usize;
+    let qbit = (shift % 24_usize).trunc.[u64]();
+    let ql_val: u64 = if qlimb < 12_usize { limbs[qlimb] } else { 0_u64 };
+    let ql_next: u64 = if qlimb +% 1_usize < 12_usize { limbs[qlimb +% 1_usize] } else { 0_u64 };
+    let w_q = ql_val | (ql_next <<% 24_u64);
+    var q = (w_q >> qbit) & 3_u64;
+
+    if qlimb < 12_usize {
+        limbs[qlimb] = limbs[qlimb] & ((1_u64 <<% qbit) -% 1_u64);
+    }
+    var zi = qlimb +% 1_usize;
+    while zi < 12_usize {
+        limbs[zi] = 0_u64;
+        zi = zi + 1_usize;
+    }
+
+    let sm1 = if shift > 0_usize { shift - 1_usize } else { 0_usize };
+    let hl = sm1 / 24_usize;
+    let hb = (sm1 % 24_usize).trunc.[u64]();
+    let h_val: u64 = if hl < 12_usize { limbs[hl] } else { 0_u64 };
+    var fneg = false;
+    if ((h_val >> hb) & 1_u64) != 0_u64 {
+        q = (q +% 1_u64) & 3_u64;
+        var ni: usize = 0_usize;
+        while ni < qlimb && ni < 12_usize {
+            limbs[ni] = (~limbs[ni]) & 0xFFFFFF_u64;
+            ni = ni + 1_usize;
+        }
+        if qlimb < 12_usize {
+            limbs[qlimb] = (~limbs[qlimb]) & ((1_u64 <<% qbit) -% 1_u64);
+        }
+        var c2: u64 = 1_u64;
+        var ai: usize = 0_usize;
+        while ai <= qlimb && ai < 12_usize {
+            let v2 = limbs[ai] +% c2;
+            limbs[ai] = v2 & 0xFFFFFF_u64;
+            c2 = v2 >> 24_u64;
+            ai = ai + 1_usize;
+        }
+        fneg = true;
+    }
+
+    var top_i: usize = if qlimb < 12_usize { qlimb } else { 11_usize };
+    while top_i > 0_usize {
+        if limbs[top_i] != 0_u64 {
+            break;
+        }
+        top_i = top_i - 1_usize;
+    }
+    let top_v: u64 = limbs[top_i];
+    if top_v == 0_u64 {
+        let fq: u64 = if neg { (4_u64 -% q) & 3_u64 } else { q };
+        return TrigRed.{ q: fq, y: dd_make(0.0_f64, 0.0_f64) };
+    }
+
+    let l0: u64 = limbs[top_i];
+    let l1: u64 = if top_i >= 1_usize && (top_i - 1_usize) < 12_usize { limbs[top_i - 1_usize] } else { 0_u64 };
+    let l2: u64 = if top_i >= 2_usize && (top_i - 2_usize) < 12_usize { limbs[top_i - 2_usize] } else { 0_u64 };
+    let l3: u64 = if top_i >= 3_usize && (top_i - 3_usize) < 12_usize { limbs[top_i - 3_usize] } else { 0_u64 };
+
+    let hi48 = (l0 <<% 24_u64) | l1;
+    let lo48 = (l2 <<% 24_u64) | l3;
+    let shift_i32 = shift.trunc.[i32]();
+    let top_i32 = top_i.trunc.[i32]();
+    let exp_hi = 24_i32 *% (top_i32 -% 1_i32) -% shift_i32;
+    let exp_lo = 24_i32 *% (top_i32 -% 3_i32) -% shift_i32;
+
+    let f_hi_raw = ldexp_f64(hi48.to_float.[f64](), exp_hi);
+    let f_lo_raw = ldexp_f64(lo48.to_float.[f64](), exp_lo);
+    var f_dd = quick_two_sum(f_hi_raw, f_lo_raw);
+    if fneg {
+        f_dd = dd_neg(f_dd);
+    }
+    var out_q = q;
+    if neg {
+        out_q = (4_u64 -% q) & 3_u64;
+        f_dd = dd_neg(f_dd);
+    }
+    let pio2 = dd_make(bits_to_f64(0x3FF921FB54442D18_u64), bits_to_f64(0x3C91A62633145C07_u64));
+    return TrigRed.{ q: out_q, y: dd_mul(f_dd, pio2) };
+}
+
+fn reduce_pio2(x: f64) -> TrigRed {
+    let ax = abs_f64(x);
+    if ax <= bits_to_f64(0x3FE921FB54442D18_u64) {
+        return TrigRed.{ q: 0_u64, y: dd_make(x, 0.0_f64) };
+    }
+    if ax < bits_to_f64(0x41B0000000000000_u64) {
+        let inv_pio2 = bits_to_f64(0x3FE45F306DC9C883_u64);
+        let pio2_1 = bits_to_f64(0x3FF921FB54442D18_u64);
+        let pio2_2 = bits_to_f64(0x3C91A62633145C07_u64);
+        let pio2_3 = bits_to_f64(0xB91F1976B7ED8FBC_u64);
+        let kf = round_even_f64(x * inv_pio2);
+        let k_i64 = kf.trunc_to_int.[i64]();
+        let q = (k_i64.bitcast.[u64]()) & 3_u64;
+        let t1 = two_prod(kf, pio2_1);
+        let t2 = two_prod(kf, pio2_2);
+        let t3 = kf * pio2_3;
+        // Subtract t1.hi first so Sterbenz cancellation is exact before adding tail bits.
+        var r = two_sum(x, -t1.hi);
+        r = dd_add_d(r, -t1.lo);
+        r = dd_add(r, dd_neg(t2));
+        r = dd_add_d(r, -t3);
+        return TrigRed.{ q: q, y: r };
+    }
+    return payne_hanek(x);
+}
+
+struct SinCosDd {
+    s: Dd;
+    c: Dd;
+}
+
+fn sin_cos_dd(y: Dd) -> SinCosDd {
+    let y2 = dd_mul(y, y);
+
+    var sp = bits_to_f64(0x398259F98B4358AD_u64); // 1/29!
+    sp = fma_f64(sp, y2.hi, bits_to_f64(0xBA1D1AB1C2DCCEA3_u64)); // -1/27!
+    sp = fma_f64(sp, y2.hi, bits_to_f64(0x3AB3F3CCDD165FA9_u64)); // 1/25!
+    sp = fma_f64(sp, y2.hi, bits_to_f64(0xBB4761B41316381A_u64)); // -1/23!
+    sp = fma_f64(sp, y2.hi, bits_to_f64(0x3BD71B8EF6DCF572_u64)); // 1/21!
+    sp = fma_f64(sp, y2.hi, bits_to_f64(0xBC62F49B46814157_u64)); // -1/19!
+
+    var sacc = dd_make(sp, 0.0_f64);
+    sacc = dd_add(dd_mul(y2, sacc), dd_make(bits_to_f64(0x3CE952C77030AD4A_u64), bits_to_f64(0x398AC981465DDC6C_u64)));
+    sacc = dd_add(dd_mul(y2, sacc), dd_make(bits_to_f64(0xBD6AE7F3E733B81F_u64), bits_to_f64(0xB9E1D8656B0EE8CB_u64)));
+    sacc = dd_add(dd_mul(y2, sacc), dd_make(bits_to_f64(0x3DE6124613A86D09_u64), bits_to_f64(0x3A8F28E0CC748EBE_u64)));
+    sacc = dd_add(dd_mul(y2, sacc), dd_make(bits_to_f64(0xBE5AE64567F544E4_u64), bits_to_f64(0x3AFC062E06D1F209_u64)));
+    sacc = dd_add(dd_mul(y2, sacc), dd_make(bits_to_f64(0x3EC71DE3A556C734_u64), bits_to_f64(0xBB6C154F8DDC6C00_u64)));
+    sacc = dd_add(dd_mul(y2, sacc), dd_make(bits_to_f64(0xBF2A01A01A01A01A_u64), bits_to_f64(0xBB6A01A01A01A01A_u64)));
+    sacc = dd_add(dd_mul(y2, sacc), dd_make(bits_to_f64(0x3F81111111111111_u64), bits_to_f64(0x3C01111111111111_u64)));
+    sacc = dd_add(dd_mul(y2, sacc), dd_make(bits_to_f64(0xBFC5555555555555_u64), bits_to_f64(0xBC65555555555555_u64)));
+    let sin_y = dd_add(y, dd_mul(dd_mul(y, y2), sacc));
+
+    var cp = bits_to_f64(0x39D0A18A2635085D_u64); // 1/28!
+    cp = fma_f64(cp, y2.hi, bits_to_f64(0xBA688E85FC6A4E5A_u64)); // -1/26!
+    cp = fma_f64(cp, y2.hi, bits_to_f64(0x3AFF2CF01972F578_u64)); // 1/24!
+    cp = fma_f64(cp, y2.hi, bits_to_f64(0xBB90CE396DB7F853_u64)); // -1/22!
+    cp = fma_f64(cp, y2.hi, bits_to_f64(0x3C1E542BA4020225_u64)); // 1/20!
+    cp = fma_f64(cp, y2.hi, bits_to_f64(0xBCA6827863B97D97_u64)); // -1/18!
+
+    var cacc = dd_make(cp, 0.0_f64);
+    cacc = dd_add(dd_mul(y2, cacc), dd_make(bits_to_f64(0x3D2AE7F3E733B81F_u64), bits_to_f64(0x39A1D8656B0EE8CB_u64)));
+    cacc = dd_add(dd_mul(y2, cacc), dd_make(bits_to_f64(0xBDA93974A8C07C9D_u64), bits_to_f64(0xBA305D6F8A2EFD1F_u64)));
+    cacc = dd_add(dd_mul(y2, cacc), dd_make(bits_to_f64(0x3E21EED8EFF8D898_u64), bits_to_f64(0xBAC2AEC959E14C06_u64)));
+    cacc = dd_add(dd_mul(y2, cacc), dd_make(bits_to_f64(0xBE927E4FB7789F5C_u64), bits_to_f64(0xBB3CBBC05B4FA99A_u64)));
+    cacc = dd_add(dd_mul(y2, cacc), dd_make(bits_to_f64(0x3EFA01A01A01A01A_u64), bits_to_f64(0x3B3A01A01A01A01A_u64)));
+    cacc = dd_add(dd_mul(y2, cacc), dd_make(bits_to_f64(0xBF56C16C16C16C17_u64), bits_to_f64(0x3BEF49F49F49F49F_u64)));
+    cacc = dd_add(dd_mul(y2, cacc), dd_make(bits_to_f64(0x3FA5555555555555_u64), bits_to_f64(0x3C45555555555555_u64)));
+    cacc = dd_add(dd_mul(y2, cacc), dd_make(bits_to_f64(0xBFE0000000000000_u64), 0.0_f64));
+    let cos_y = dd_add(dd_make(1.0_f64, 0.0_f64), dd_mul(y2, cacc));
+
+    return SinCosDd.{ s: sin_y, c: cos_y };
+}
+
+// ---------------------------------------------------------------------------
+// Public <= 1 ULP IEEE-754 transcendental functions
+// ---------------------------------------------------------------------------
+
+pub fn exp(x: f64) -> f64 {
+    if is_nan_f64(x) {
+        return x + x;
+    }
+    let abs_b = f64_to_bits(x) & 0x7FFFFFFFFFFFFFFF_u64;
+    if abs_b < 0x3E30000000000000_u64 {
+        return 1.0_f64 + x;
+    }
+    if is_inf_f64(x) {
+        if x > 0.0_f64 {
+            return x;
+        }
+        return 0.0_f64;
+    }
+    return exp_from_dd(dd_make(x, 0.0_f64));
+}
+
+pub fn log(x: f64) -> f64 {
+    if is_nan_f64(x) {
+        return x + x;
+    }
+    let b = f64_to_bits(x);
+    let abs_b = b & 0x7FFFFFFFFFFFFFFF_u64;
+    if abs_b == 0_u64 {
+        return bits_to_f64(0xFFF0000000000000_u64);
+    }
+    if b == 0x7FF0000000000000_u64 {
+        return x;
+    }
+    if (b & 0x8000000000000000_u64) != 0_u64 {
+        return bits_to_f64(0x7FF8000000000000_u64);
+    }
+    if b == 0x3FF0000000000000_u64 {
+        return 0.0_f64;
+    }
+    let res = log_dd(x);
+    return res.hi + res.lo;
+}
+
+pub fn sin(x: f64) -> f64 {
+    if !is_finite_f64(x) {
+        return x - x;
+    }
+    let abs_b = f64_to_bits(x) & 0x7FFFFFFFFFFFFFFF_u64;
+    if abs_b < 0x3E40000000000000_u64 {
+        return x;
+    }
+    let red = reduce_pio2(x);
+    let sc = sin_cos_dd(red.y);
+    if red.q == 0_u64 {
+        return sc.s.hi + sc.s.lo;
+    }
+    if red.q == 1_u64 {
+        return sc.c.hi + sc.c.lo;
+    }
+    if red.q == 2_u64 {
+        return -(sc.s.hi + sc.s.lo);
+    }
+    return -(sc.c.hi + sc.c.lo);
+}
+
+pub fn cos(x: f64) -> f64 {
+    if !is_finite_f64(x) {
+        return x - x;
+    }
+    let abs_b = f64_to_bits(x) & 0x7FFFFFFFFFFFFFFF_u64;
+    if abs_b < 0x3E40000000000000_u64 {
+        return 1.0_f64;
+    }
+    let red = reduce_pio2(x);
+    let sc = sin_cos_dd(red.y);
+    if red.q == 0_u64 {
+        return sc.c.hi + sc.c.lo;
+    }
+    if red.q == 1_u64 {
+        return -(sc.s.hi + sc.s.lo);
+    }
+    if red.q == 2_u64 {
+        return -(sc.c.hi + sc.c.lo);
+    }
+    return sc.s.hi + sc.s.lo;
+}
+
+pub fn tan(x: f64) -> f64 {
+    if !is_finite_f64(x) {
+        return x - x;
+    }
+    let abs_b = f64_to_bits(x) & 0x7FFFFFFFFFFFFFFF_u64;
+    if abs_b < 0x3E40000000000000_u64 {
+        return x;
+    }
+    let red = reduce_pio2(x);
+    let sc = sin_cos_dd(red.y);
+    if (red.q & 1_u64) == 0_u64 {
+        let qv = dd_div(sc.s, sc.c);
+        return qv.hi + qv.lo;
+    }
+    let qv = dd_div(sc.c, sc.s);
+    return -(qv.hi + qv.lo);
+}
+
+pub fn atan(x: f64) -> f64 {
+    if is_nan_f64(x) {
+        return x + x;
+    }
+    let ax = abs_f64(x);
+    let b = f64_to_bits(ax);
+    let pio2_hi = bits_to_f64(0x3FF921FB54442D18_u64);
+    let pio2_lo = bits_to_f64(0x3C91A62633145C07_u64);
+    if b >= 0x4410000000000000_u64 {
+        return copysign_f64(pio2_hi + pio2_lo, x);
+    }
+    if b < 0x3E40000000000000_u64 {
+        return x;
+    }
+
+    var id: i32 = -1_i32;
+    var t = ax;
+    var atan_hi = 0.0_f64;
+    var atan_lo = 0.0_f64;
+    if b >= 0x3FDC000000000000_u64 {
+        if b < 0x3FF3000000000000_u64 {
+            if b < 0x3FE6000000000000_u64 {
+                id = 0_i32;
+                t = (2.0_f64 * ax - 1.0_f64) / (2.0_f64 + ax);
+                atan_hi = bits_to_f64(0x3FDDAC670561BB4F_u64);
+                atan_lo = bits_to_f64(0x3C7A2B7F222F65E2_u64);
+            } else {
+                id = 1_i32;
+                t = (ax - 1.0_f64) / (ax + 1.0_f64);
+                atan_hi = bits_to_f64(0x3FE921FB54442D18_u64);
+                atan_lo = bits_to_f64(0x3C81A62633145C07_u64);
+            }
+        } else if b < 0x4003800000000000_u64 {
+            id = 2_i32;
+            t = (ax - 1.5_f64) / (1.0_f64 + 1.5_f64 * ax);
+            atan_hi = bits_to_f64(0x3FEF730BD281F69B_u64);
+            atan_lo = bits_to_f64(0x3C7007887AF0CBBD_u64);
+        } else {
+            id = 3_i32;
+            t = -1.0_f64 / ax;
+            atan_hi = pio2_hi;
+            atan_lo = pio2_lo;
+        }
+    }
+
+    let aT0 = bits_to_f64(0x3FD555555555550D_u64);
+    let aT1 = bits_to_f64(0xBFC999999998EBC4_u64);
+    let aT2 = bits_to_f64(0x3FC24924920083FF_u64);
+    let aT3 = bits_to_f64(0xBFBC71C6FE231671_u64);
+    let aT4 = bits_to_f64(0x3FB745CDC54C206E_u64);
+    let aT5 = bits_to_f64(0xBFB3B0F2AF749A6D_u64);
+    let aT6 = bits_to_f64(0x3FB10D66A0D03D51_u64);
+    let aT7 = bits_to_f64(0xBFADDE2D52DEFD9A_u64);
+    let aT8 = bits_to_f64(0x3FA97B4B24760DEB_u64);
+    let aT9 = bits_to_f64(0xBFA2B4442C6A6C2F_u64);
+    let aT10 = bits_to_f64(0x3F90AD3AE322DA11_u64);
+
+    let z = t * t;
+    let w = z * z;
+    let s1 = z * fma_f64(w, fma_f64(w, fma_f64(w, fma_f64(w, fma_f64(w, aT10, aT8), aT6), aT4), aT2), aT0);
+    let s2 = w * fma_f64(w, fma_f64(w, fma_f64(w, fma_f64(w, aT9, aT7), aT5), aT3), aT1);
+    let r: f64 = if id < 0_i32 {
+        ax - t * (s1 + s2)
+    } else {
+        atan_hi - ((t * (s1 + s2) - atan_lo) - t)
+    };
+    return copysign_f64(r, x);
+}
+
+pub fn atan2(y: f64, x: f64) -> f64 {
+    if is_nan_f64(x) || is_nan_f64(y) {
+        return x + y;
+    }
+    let bx = f64_to_bits(x);
+    let by = f64_to_bits(y);
+    if bx == 0x3FF0000000000000_u64 {
+        return atan(y);
+    }
+
+    let pi_hi = bits_to_f64(0x400921FB54442D18_u64);
+    let pi_lo = bits_to_f64(0x3CA1A62633145C07_u64);
+    let pio2_hi = bits_to_f64(0x3FF921FB54442D18_u64);
+    let pio2_lo = bits_to_f64(0x3C91A62633145C07_u64);
+    let pio4 = bits_to_f64(0x3FE921FB54442D18_u64);
+    let three_pio4 = bits_to_f64(0x4002D97C7F3321D2_u64);
+
+    let x_neg = (bx >> 63_u64) != 0_u64;
+    let abs_bx = bx & 0x7FFFFFFFFFFFFFFF_u64;
+    let abs_by = by & 0x7FFFFFFFFFFFFFFF_u64;
+
+    if abs_by == 0_u64 {
+        if x_neg {
+            return copysign_f64(pi_hi + pi_lo, y);
+        }
+        return y;
+    }
+    if abs_bx == 0_u64 {
+        return copysign_f64(pio2_hi + pio2_lo, y);
+    }
+
+    if is_inf_f64(x) {
+        if is_inf_f64(y) {
+            if x_neg {
+                return copysign_f64(three_pio4, y);
+            }
+            return copysign_f64(pio4, y);
+        }
+        if x_neg {
+            return copysign_f64(pi_hi + pi_lo, y);
+        }
+        return copysign_f64(0.0_f64, y);
+    }
+    if is_inf_f64(y) {
+        return copysign_f64(pio2_hi + pio2_lo, y);
+    }
+
+    var ay = abs_f64(y);
+    var ax = abs_f64(x);
+    let exp_y = ((abs_by >> 52_u64) & 0x7FF_u64).bitcast.[i64]();
+    let exp_x = ((abs_bx >> 52_u64) & 0x7FF_u64).bitcast.[i64]();
+    let k = exp_y -% exp_x;
+    var z = 0.0_f64;
+    if k > 60_i64 {
+        z = pio2_hi + 0.5_f64 * pi_lo;
+    } else if x_neg && k < -60_i64 {
+        z = 0.0_f64;
+    } else {
+        // Rescale subnormal or extreme values to avoid overflow/underflow in ay / ax.
+        if exp_y == 0_i64 || exp_x == 0_i64 || exp_y > 1900_i64 || exp_x > 1900_i64 {
+            let scale: i32 = if exp_y < 200_i64 || exp_x < 200_i64 {
+                500_i32
+            } else {
+                -500_i32
+            };
+            ay = ldexp_f64(ay, scale);
+            ax = ldexp_f64(ax, scale);
+        }
+        z = atan(ay / ax);
+    }
+
+    if !x_neg {
+        return copysign_f64(z, y);
+    }
+    return copysign_f64(pi_hi - (z - pi_lo), y);
+}
+
+pub fn pow(x: f64, y: f64) -> f64 {
+    let by = f64_to_bits(y);
+    if (by & 0x7FFFFFFFFFFFFFFF_u64) == 0_u64 {
+        return 1.0_f64;
+    }
+    if x == 1.0_f64 {
+        return 1.0_f64;
+    }
+    if is_nan_f64(x) || is_nan_f64(y) {
+        return x + y;
+    }
+
+    let ax = abs_f64(x);
+    let ay = abs_f64(y);
+    let two52 = bits_to_f64(0x4330000000000000_u64);
+    let two53 = bits_to_f64(0x4340000000000000_u64);
+    let y_is_int = ay >= two52 || floor_f64(y) == y;
+    var y_is_odd = false;
+    if y_is_int && ay < two53 {
+        let yi = y.trunc_to_int.[i64]();
+        y_is_odd = (yi & 1_i64) != 0_i64;
+    }
+
+    let bx = f64_to_bits(x);
+    if (bx & 0x7FFFFFFFFFFFFFFF_u64) == 0_u64 {
+        if y < 0.0_f64 {
+            let huge = bits_to_f64(0x7FE0000000000000_u64);
+            let inf_v = huge * huge;
+            return if y_is_odd { copysign_f64(inf_v, x) } else { inf_v };
+        }
+        return if y_is_odd { copysign_f64(0.0_f64, x) } else { 0.0_f64 };
+    }
+
+    if is_inf_f64(y) {
+        if ax == 1.0_f64 {
+            return 1.0_f64;
+        }
+        let huge = bits_to_f64(0x7FE0000000000000_u64);
+        let inf_v = huge * huge;
+        if y > 0.0_f64 {
+            return if ax > 1.0_f64 { inf_v } else { 0.0_f64 };
+        }
+        return if ax > 1.0_f64 { 0.0_f64 } else { inf_v };
+    }
+
+    if is_inf_f64(x) {
+        let huge = bits_to_f64(0x7FE0000000000000_u64);
+        let inf_v = huge * huge;
+        if y > 0.0_f64 {
+            return if y_is_odd { copysign_f64(inf_v, x) } else { inf_v };
+        }
+        return if y_is_odd { copysign_f64(0.0_f64, x) } else { 0.0_f64 };
+    }
+
+    if x < 0.0_f64 && !y_is_int {
+        return bits_to_f64(0x7FF8000000000000_u64);
+    }
+
+    let sgn: f64 = if x < 0.0_f64 && y_is_odd { -1.0_f64 } else { 1.0_f64 };
+    if y == 1.0_f64 {
+        return x;
+    }
+    if y == 2.0_f64 {
+        return x * x;
+    }
+    if y == -1.0_f64 {
+        return 1.0_f64 / x;
+    }
+    if y == 0.5_f64 && x > 0.0_f64 {
+        return sqrt_f64(x);
+    }
+
+    let ln_ax = log_dd(ax);
+    let rough = ln_ax.hi * y;
+    if rough > 710.0_f64 {
+        let huge = bits_to_f64(0x7FE0000000000000_u64);
+        return copysign_f64(huge * huge, sgn);
+    }
+    if rough < -746.0_f64 {
+        let tiny = bits_to_f64(0x0010000000000000_u64);
+        return copysign_f64(tiny * tiny, sgn);
+    }
+    let prod = dd_mul_d(ln_ax, y);
+    return copysign_f64(exp_from_dd(prod), sgn);
+}

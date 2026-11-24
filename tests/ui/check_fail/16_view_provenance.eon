@@ -1,0 +1,44 @@
+module fail.view_provenance;
+
+pub struct Record {
+    pub value: u32;
+}
+
+pub view fn wrong_source(from src: *u32, other: *u32) -> *u32 {
+    let _ = src.*;
+    return other; //~ ERROR E0310
+}
+
+pub view fn wrong_alias(from src: *u32, other: *u32) -> *u32 {
+    let _ = src.*;
+    let alias = other;
+    return alias; //~ ERROR E0310
+}
+
+pub view fn mixed_sources(from src: *u32, other: *u32, first: bool) -> *u32 {
+    return if first { src } else { other }; //~ ERROR E0310
+}
+
+impl Record {
+    pub view fn wrong_receiver(self: *Self, from other: *u32) -> *u32 {
+        let _ = self.value;
+        return other; //~ ERROR E0310
+    }
+}
+
+pub view fn reassigned(from src: *u32, other: *u32, first: bool) -> *u32 {
+    var choice = src;
+    if first {
+        choice = other;
+    }
+    return choice; //~ ERROR E0310
+}
+
+pub view fn loop_sources(from src: *u32, other: *u32, first: bool) -> *u32 {
+    return 'outer: loop { //~ ERROR E0310
+        if first {
+            break src;
+        }
+        loop { break 'outer other; }
+    };
+}

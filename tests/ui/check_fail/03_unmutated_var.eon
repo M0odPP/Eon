@@ -1,0 +1,6 @@
+module fail.unmutated_var;
+
+pub fn check() -> i32 {
+    var x: i32 = 10_i32; //~ ERROR E0122
+    return x;
+}

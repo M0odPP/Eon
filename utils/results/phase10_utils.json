@@ -1,0 +1,57 @@
+{
+  "sizes_bytes": {
+    "ewc_eon": 55536,
+    "ewc_rust": 1995384,
+    "egrep_eon": 61744,
+    "egrep_rust": 2002904,
+    "ehttpd_eon": 76432,
+    "ehttpd_rust": 2178440
+  },
+  "ewc": {
+    "eon_gbps": 8.226,
+    "rust_gbps": 4.525,
+    "ratio_time": 0.55,
+    "eon_rss_kib": 32768,
+    "rust_rss_kib": 34844,
+    "lines": 358912,
+    "words": 4531264,
+    "bytes": 33558272
+  },
+  "egrep_literal": {
+    "eon_gbps": 11.7,
+    "rust_gbps": 3.3,
+    "ratio_time": 0.282,
+    "eon_rss_kib": 32768,
+    "rust_rss_kib": 34700,
+    "matches": 44864
+  },
+  "egrep_regex": {
+    "eon_gbps": 5.765,
+    "rust_gbps": 1.951,
+    "ratio_time": 0.3384,
+    "matches": 44864
+  },
+  "ehttpd": {
+    "eon": {
+      "reqs": 96000,
+      "errors": 0,
+      "wall_s": 0.2543,
+      "rps": 377551.2,
+      "p50_us": 58.38,
+      "p99_us": 233.02,
+      "rss_kib": 616
+    },
+    "rust": {
+      "reqs": 96000,
+      "errors": 0,
+      "wall_s": 0.2434,
+      "rps": 394483.1,
+      "p50_us": 50.12,
+      "p99_us": 249.4,
+      "rss_kib": 3028
+    },
+    "rps_speedup": 0.957
+  },
+  "sanitize": "PASS",
+  "zero_libc": "PASS"
+}

@@ -1,0 +1,4 @@
+module fail.bit_eq;
+pub fn f(a: u32) -> bool {
+    return a & 1_u32 == 0_u32; //~ ERROR E0120
+}

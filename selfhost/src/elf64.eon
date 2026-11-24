@@ -1,0 +1,4150 @@
+module eonc.elf64;
+
+import core.col;
+import core.str;
+import eonc.span;
+
+// ---------------------------------------------------------------------------
+// Public ELF64 & DWARF5 Data Structures
+// ---------------------------------------------------------------------------
+
+pub enum ElfModeKind : u8 {
+    LinuxPie = 0,
+    LinuxShared = 1,
+    Freestanding = 2,
+}
+
+pub struct ElfMode {
+    pub kind: ElfModeKind;
+    pub load_addr: u64;
+    pub multiboot2: bool;
+    pub soname_off: u32;
+    pub soname_len: u32;
+}
+
+impl ElfMode {
+    pub fn linux_pie() -> ElfMode {
+        return ElfMode.{
+            kind: .LinuxPie,
+            load_addr: 0_u64,
+            multiboot2: false,
+            soname_off: 0_u32,
+            soname_len: 0_u32,
+        };
+    }
+
+    pub fn linux_shared(soname_off: u32, soname_len: u32) -> ElfMode {
+        return ElfMode.{
+            kind: .LinuxShared,
+            load_addr: 0_u64,
+            multiboot2: false,
+            soname_off: soname_off,
+            soname_len: soname_len,
+        };
+    }
+
+    pub fn freestanding(load_addr: u64, multiboot2: bool) -> ElfMode {
+        return ElfMode.{
+            kind: .Freestanding,
+            load_addr: load_addr,
+            multiboot2: multiboot2,
+            soname_off: 0_u32,
+            soname_len: 0_u32,
+        };
+    }
+}
+
+pub enum RelocSection : u8 {
+    Text = 0,
+    Rodata = 1,
+    DataRelRo = 2,
+    Data = 3,
+    Bss = 4,
+    Tdata = 5,
+    Tbss = 6,
+}
+
+pub enum RelocKind : u8 {
+    Rel32 = 0,
+    Abs64 = 1,
+    GotPcRel32 = 2,
+    Plt32 = 3,
+    TpOff32 = 4,
+}
+
+pub struct ElfSymbol {
+    pub name_sym: u32;
+    pub section: RelocSection;
+    pub offset: u64;
+    pub size: u64;
+    pub is_global: bool;
+    pub is_func: bool;
+}
+
+pub struct ElfReloc {
+    pub section: RelocSection;
+    pub offset: u64;
+    pub kind: RelocKind;
+    pub target_sym: u32;
+    pub addend: i64;
+}
+
+pub struct LineEntry {
+    pub code_offset: u32;
+    pub file_idx: u32;
+    pub line: u32;
+    pub col: u32;
+}
+
+pub struct DebugVarEntry {
+    pub fn_sym: u32;
+    pub name_sym: u32;
+    pub rbp_off: i32;
+    pub size_bytes: u8;
+    pub encoding: u8;
+    pub reg_num: u8;
+    pub is_param: bool;
+}
+
+pub linear struct ElfLinkInput {
+    pub mode: ElfMode;
+    pub entry_sym: u32;
+    pub text: col.DynBuf[u8];
+    pub rodata: col.DynBuf[u8];
+    pub data_rel_ro: col.DynBuf[u8];
+    pub data: col.DynBuf[u8];
+    pub bss_size: u64;
+    pub tdata: col.DynBuf[u8];
+    pub tbss_size: u64;
+    pub symbols: col.DynBuf[ElfSymbol];
+    pub relocs: col.DynBuf[ElfReloc];
+    pub needed_libs: col.DynBuf[u32];
+    pub exported_syms: col.DynBuf[u32];
+    pub external_syms: col.DynBuf[u32];
+    pub line_entries: col.DynBuf[LineEntry];
+    pub debug_files: col.DynBuf[u32];
+    pub debug_vars: col.DynBuf[DebugVarEntry];
+    pub emit_debug_line: bool;
+    pub soname_bytes: col.DynBuf[u8];
+}
+
+impl ElfLinkInput {
+    pub fn init(alloc: *mut AllocCap) -> ElfLinkInput ! OutOfMemory {
+        let text = try col.DynBuf.[u8].init(alloc, 64_usize);
+        errdefer text.destroy(alloc);
+        let rodata = try col.DynBuf.[u8].init(alloc, 32_usize);
+        errdefer rodata.destroy(alloc);
+        let data_rel_ro = try col.DynBuf.[u8].init(alloc, 16_usize);
+        errdefer data_rel_ro.destroy(alloc);
+        let data = try col.DynBuf.[u8].init(alloc, 16_usize);
+        errdefer data.destroy(alloc);
+        let tdata = try col.DynBuf.[u8].init(alloc, 8_usize);
+        errdefer tdata.destroy(alloc);
+        let symbols = try col.DynBuf.[ElfSymbol].init(alloc, 16_usize);
+        errdefer symbols.destroy(alloc);
+        let relocs = try col.DynBuf.[ElfReloc].init(alloc, 16_usize);
+        errdefer relocs.destroy(alloc);
+        let needed_libs = try col.DynBuf.[u32].init(alloc, 4_usize);
+        errdefer needed_libs.destroy(alloc);
+        let exported_syms = try col.DynBuf.[u32].init(alloc, 4_usize);
+        errdefer exported_syms.destroy(alloc);
+        let external_syms = try col.DynBuf.[u32].init(alloc, 4_usize);
+        errdefer external_syms.destroy(alloc);
+        let line_entries = try col.DynBuf.[LineEntry].init(alloc, 8_usize);
+        errdefer line_entries.destroy(alloc);
+        let debug_files = try col.DynBuf.[u32].init(alloc, 4_usize);
+        errdefer debug_files.destroy(alloc);
+        let debug_vars = try col.DynBuf.[DebugVarEntry].init(alloc, 8_usize);
+        errdefer debug_vars.destroy(alloc);
+        let soname_bytes = try col.DynBuf.[u8].init(alloc, 8_usize);
+        errdefer soname_bytes.destroy(alloc);
+        return ElfLinkInput.{
+            mode: ElfMode.linux_pie(),
+            entry_sym: span.SYM_EMPTY,
+            text: text,
+            rodata: rodata,
+            data_rel_ro: data_rel_ro,
+            data: data,
+            bss_size: 0_u64,
+            tdata: tdata,
+            tbss_size: 0_u64,
+            symbols: symbols,
+            relocs: relocs,
+            needed_libs: needed_libs,
+            exported_syms: exported_syms,
+            external_syms: external_syms,
+            line_entries: line_entries,
+            debug_files: debug_files,
+            debug_vars: debug_vars,
+            emit_debug_line: false,
+            soname_bytes: soname_bytes,
+        };
+    }
+
+    pub fn set_soname(self: *mut Self, alloc: *mut AllocCap, name: *[u8]) -> !OutOfMemory {
+        let off = self.soname_bytes.len().trunc.[u32]();
+        try self.soname_bytes.push_slice(alloc, name);
+        self.mode.soname_off = off;
+        self.mode.soname_len = name.len.trunc.[u32]();
+        return;
+    }
+
+    pub fn destroy(self: ElfLinkInput, alloc: *mut AllocCap) {
+        let ElfLinkInput.{
+            mode: _,
+            entry_sym: _,
+            text,
+            rodata,
+            data_rel_ro,
+            data,
+            bss_size: _,
+            tdata,
+            tbss_size: _,
+            symbols,
+            relocs,
+            needed_libs,
+            exported_syms,
+            external_syms,
+            line_entries,
+            debug_files,
+            debug_vars,
+            emit_debug_line: _,
+            soname_bytes,
+        } = self;
+        text.destroy(alloc);
+        rodata.destroy(alloc);
+        data_rel_ro.destroy(alloc);
+        data.destroy(alloc);
+        tdata.destroy(alloc);
+        symbols.destroy(alloc);
+        relocs.destroy(alloc);
+        needed_libs.destroy(alloc);
+        exported_syms.destroy(alloc);
+        external_syms.destroy(alloc);
+        line_entries.destroy(alloc);
+        debug_files.destroy(alloc);
+        debug_vars.destroy(alloc);
+        soname_bytes.destroy(alloc);
+    }
+}
+
+pub linear struct LinkedElf {
+    pub bytes: col.DynBuf[u8];
+    pub entry_vaddr: u64;
+    pub text_vaddr: u64;
+    pub rodata_vaddr: u64;
+    pub data_rel_ro_vaddr: u64;
+    pub data_vaddr: u64;
+    pub bss_vaddr: u64;
+    pub tdata_vaddr: u64;
+    pub tls_memsz: u64;
+}
+
+impl LinkedElf {
+    pub fn empty(alloc: *mut AllocCap) -> LinkedElf ! OutOfMemory {
+        let bytes = try col.DynBuf.[u8].init(alloc, 4_usize);
+        return LinkedElf.{
+            bytes: bytes,
+            entry_vaddr: 0_u64,
+            text_vaddr: 0_u64,
+            rodata_vaddr: 0_u64,
+            data_rel_ro_vaddr: 0_u64,
+            data_vaddr: 0_u64,
+            bss_vaddr: 0_u64,
+            tdata_vaddr: 0_u64,
+            tls_memsz: 0_u64,
+        };
+    }
+
+    pub fn destroy(self: LinkedElf, alloc: *mut AllocCap) {
+        let LinkedElf.{
+            bytes,
+            entry_vaddr: _,
+            text_vaddr: _,
+            rodata_vaddr: _,
+            data_rel_ro_vaddr: _,
+            data_vaddr: _,
+            bss_vaddr: _,
+            tdata_vaddr: _,
+            tls_memsz: _,
+        } = self;
+        bytes.destroy(alloc);
+    }
+}
+
+pub linear struct LinkResult {
+    pub ok: bool;
+    pub elf: LinkedElf;
+    pub err_msg: str.StrBuf;
+}
+
+impl LinkResult {
+    pub fn destroy(self: LinkResult, alloc: *mut AllocCap) {
+        let LinkResult.{ ok: _, elf, err_msg } = self;
+        elf.destroy(alloc);
+        err_msg.destroy(alloc);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ELF64 & DWARF5 Constants
+// ---------------------------------------------------------------------------
+
+const PAGE_SIZE: usize = 0x1000_usize;
+const TLS_ALIGN: usize = 64_usize;
+
+const EHDR_SIZE: usize = 64_usize;
+const PHDR_SIZE: usize = 56_usize;
+const SHDR_SIZE: usize = 64_usize;
+const SYM_SIZE: usize = 24_usize;
+const RELA_SIZE: usize = 24_usize;
+const DYN_SIZE: usize = 16_usize;
+
+const ELFCLASS64: u8 = 2_u8;
+const ELFDATA2LSB: u8 = 1_u8;
+const EV_CURRENT: u8 = 1_u8;
+const ET_EXEC: u16 = 2_u16;
+const ET_DYN: u16 = 3_u16;
+const EM_X86_64: u16 = 62_u16;
+
+const PT_LOAD: u32 = 1_u32;
+const PT_DYNAMIC: u32 = 2_u32;
+const PT_INTERP: u32 = 3_u32;
+const PT_NOTE: u32 = 4_u32;
+const PT_PHDR: u32 = 6_u32;
+const PT_TLS: u32 = 7_u32;
+const PT_GNU_STACK: u32 = 0x6474E551_u32;
+const PT_GNU_RELRO: u32 = 0x6474E552_u32;
+
+const PF_X: u32 = 1_u32;
+const PF_W: u32 = 2_u32;
+const PF_R: u32 = 4_u32;
+
+const SHT_NULL: u32 = 0_u32;
+const SHT_PROGBITS: u32 = 1_u32;
+const SHT_SYMTAB: u32 = 2_u32;
+const SHT_STRTAB: u32 = 3_u32;
+const SHT_RELA: u32 = 4_u32;
+const SHT_DYNAMIC: u32 = 6_u32;
+const SHT_NOBITS: u32 = 8_u32;
+const SHT_DYNSYM: u32 = 11_u32;
+const SHT_GNU_HASH: u32 = 0x6FFFFFF6_u32;
+
+const SHF_WRITE: u64 = 0x1_u64;
+const SHF_ALLOC: u64 = 0x2_u64;
+const SHF_EXECINSTR: u64 = 0x4_u64;
+const SHF_INFO_LINK: u64 = 0x40_u64;
+const SHF_TLS: u64 = 0x400_u64;
+
+const STB_LOCAL: u8 = 0_u8;
+const STB_GLOBAL: u8 = 1_u8;
+const STT_NOTYPE: u8 = 0_u8;
+const STT_OBJECT: u8 = 1_u8;
+const STT_FUNC: u8 = 2_u8;
+const STT_TLS: u8 = 6_u8;
+
+const R_X86_64_64: u32 = 1_u32;
+const R_X86_64_GLOB_DAT: u32 = 6_u32;
+const R_X86_64_JUMP_SLOT: u32 = 7_u32;
+const R_X86_64_RELATIVE: u32 = 8_u32;
+
+const DT_NULL: i64 = 0_i64;
+const DT_NEEDED: i64 = 1_i64;
+const DT_PLTRELSZ: i64 = 2_i64;
+const DT_PLTGOT: i64 = 3_i64;
+const DT_STRTAB: i64 = 5_i64;
+const DT_SYMTAB: i64 = 6_i64;
+const DT_RELA: i64 = 7_i64;
+const DT_RELASZ: i64 = 8_i64;
+const DT_RELAENT: i64 = 9_i64;
+const DT_STRSZ: i64 = 10_i64;
+const DT_SYMENT: i64 = 11_i64;
+const DT_SONAME: i64 = 14_i64;
+const DT_PLTREL: i64 = 20_i64;
+const DT_JMPREL: i64 = 23_i64;
+const DT_FLAGS: i64 = 30_i64;
+const DT_GNU_HASH: i64 = 0x6FFFFEF5_i64;
+const DT_RELACOUNT: i64 = 0x6FFFFFF9_i64;
+const DT_FLAGS_1: i64 = 0x6FFFFFFB_i64;
+
+const DT_RELA_VAL: u64 = 7_u64;
+const DF_BIND_NOW: u64 = 0x8_u64;
+const DF_1_NOW: u64 = 0x1_u64;
+const DF_1_PIE: u64 = 0x08000000_u64;
+
+const INTERP_LEN: usize = 28_usize;
+
+// ---------------------------------------------------------------------------
+// Exact 128-bit Signed Arithmetic & Primitive Byte Helpers
+// ---------------------------------------------------------------------------
+
+struct I128 {
+    hi: i64;
+    lo: u64;
+}
+
+fn i128_from_u64(v: u64) -> I128 {
+    return I128.{ hi: 0_i64, lo: v };
+}
+
+fn i128_from_i64(v: i64) -> I128 {
+    let hi: i64 = if v < 0_i64 { -1_i64 } else { 0_i64 };
+    return I128.{ hi: hi, lo: v.bitcast.[u64]() };
+}
+
+fn i128_add(a: I128, b: I128) -> I128 {
+    let lo = a.lo +% b.lo;
+    let carry: i64 = if lo < a.lo { 1_i64 } else { 0_i64 };
+    return I128.{ hi: a.hi +% b.hi +% carry, lo: lo };
+}
+
+fn i128_sub(a: I128, b: I128) -> I128 {
+    let lo = a.lo -% b.lo;
+    let borrow: i64 = if a.lo < b.lo { 1_i64 } else { 0_i64 };
+    return I128.{ hi: a.hi -% b.hi -% borrow, lo: lo };
+}
+
+fn i128_to_i32(v: I128) -> ?i32 {
+    if v.hi == 0_i64 && v.lo <= 0x7FFFFFFF_u64 {
+        return v.lo.trunc.[u32]().bitcast.[i32]();
+    }
+    if v.hi == -1_i64 && v.lo >= 0xFFFFFFFF80000000_u64 {
+        return v.lo.trunc.[u32]().bitcast.[i32]();
+    }
+    return null;
+}
+
+fn align_up(v: usize, a: usize) -> usize {
+    if a <= 1_usize {
+        return v;
+    }
+    let mask = a -% 1_usize;
+    return (v +% mask) & (~mask);
+}
+
+fn next_pow2_u32(v: u32) -> u32 {
+    if v <= 1_u32 {
+        return 1_u32;
+    }
+    var p: u32 = 1_u32;
+    while p < v && p < 0x80000000_u32 {
+        p = p <<% 1_u32;
+    }
+    return p;
+}
+
+fn tls_tbss_align(tdata_len: usize) -> u64 {
+    if tdata_len == 0_usize {
+        return TLS_ALIGN.widen.[u64]();
+    }
+    let tz = @tzcnt(tdata_len.widen.[u64]());
+    let shift = if tz < 6_u64 { tz } else { 6_u64 };
+    return 1_u64 <<% shift;
+}
+
+fn gnu_hash_bytes(name: *[u8]) -> u32 {
+    var h: u32 = 5381_u32;
+    var i: usize = 0_usize;
+    while i < name.len {
+        h = (h *% 33_u32) +% name[i].widen.[u32]();
+        i = i +% 1_usize;
+    }
+    return h;
+}
+
+fn cmp_bytes(a: *[u8], b: *[u8]) -> i32 {
+    let min_len = if a.len < b.len { a.len } else { b.len };
+    var i: usize = 0_usize;
+    while i < min_len {
+        let ca = a[i];
+        let cb = b[i];
+        if ca < cb {
+            return -1_i32;
+        }
+        if ca > cb {
+            return 1_i32;
+        }
+        i = i +% 1_usize;
+    }
+    if a.len < b.len {
+        return -1_i32;
+    }
+    if a.len > b.len {
+        return 1_i32;
+    }
+    return 0_i32;
+}
+
+view fn strip_dot_slash(p: *[u8]) -> *[u8] {
+    if p.len >= 2_usize && p[0_usize] == b'.' && p[1_usize] == b'/' {
+        let s = p.sub(2_usize, p.len) catch {
+            return p;
+        };
+        return s;
+    }
+    return p;
+}
+
+fn push_u16_le(buf: *mut col.DynBuf[u8], alloc: *mut AllocCap, v: u16) -> !OutOfMemory {
+    let b: [2]u8 = [
+        (v & 0xFF_u16).trunc.[u8](),
+        ((v >> 8_u16) & 0xFF_u16).trunc.[u8](),
+    ];
+    try buf.push_slice(alloc, &b);
+    return;
+}
+
+fn push_u32_le(buf: *mut col.DynBuf[u8], alloc: *mut AllocCap, v: u32) -> !OutOfMemory {
+    let b: [4]u8 = [
+        (v & 0xFF_u32).trunc.[u8](),
+        ((v >> 8_u32) & 0xFF_u32).trunc.[u8](),
+        ((v >> 16_u32) & 0xFF_u32).trunc.[u8](),
+        ((v >> 24_u32) & 0xFF_u32).trunc.[u8](),
+    ];
+    try buf.push_slice(alloc, &b);
+    return;
+}
+
+fn push_i32_le(buf: *mut col.DynBuf[u8], alloc: *mut AllocCap, v: i32) -> !OutOfMemory {
+    try push_u32_le(buf, alloc, v.bitcast.[u32]());
+    return;
+}
+
+fn push_u64_le(buf: *mut col.DynBuf[u8], alloc: *mut AllocCap, v: u64) -> !OutOfMemory {
+    let b: [8]u8 = [
+        (v & 0xFF_u64).trunc.[u8](),
+        ((v >> 8_u64) & 0xFF_u64).trunc.[u8](),
+        ((v >> 16_u64) & 0xFF_u64).trunc.[u8](),
+        ((v >> 24_u64) & 0xFF_u64).trunc.[u8](),
+        ((v >> 32_u64) & 0xFF_u64).trunc.[u8](),
+        ((v >> 40_u64) & 0xFF_u64).trunc.[u8](),
+        ((v >> 48_u64) & 0xFF_u64).trunc.[u8](),
+        ((v >> 56_u64) & 0xFF_u64).trunc.[u8](),
+    ];
+    try buf.push_slice(alloc, &b);
+    return;
+}
+
+fn push_i64_le(buf: *mut col.DynBuf[u8], alloc: *mut AllocCap, v: i64) -> !OutOfMemory {
+    try push_u64_le(buf, alloc, v.bitcast.[u64]());
+    return;
+}
+
+fn push_zeros(buf: *mut col.DynBuf[u8], alloc: *mut AllocCap, count: usize) -> !OutOfMemory {
+    if count == 0_usize {
+        return;
+    }
+    try buf.reserve(alloc, count);
+    let zeros: [64]u8 = [0_u8; 64];
+    var rem = count;
+    while rem >= 64_usize {
+        try buf.push_slice(alloc, &zeros);
+        rem = rem - 64_usize;
+    }
+    var i: usize = 0_usize;
+    while i < rem {
+        try buf.push(alloc, 0_u8);
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+fn pad_to(buf: *mut col.DynBuf[u8], alloc: *mut AllocCap, align: usize) -> !OutOfMemory {
+    let cur = buf.len();
+    let target = align_up(cur, align);
+    if target > cur {
+        try push_zeros(buf, alloc, target - cur);
+    }
+    return;
+}
+
+fn push_cstr(buf: *mut col.DynBuf[u8], alloc: *mut AllocCap, s: *[u8]) -> usize ! OutOfMemory {
+    let off = buf.len();
+    try buf.push_slice(alloc, s);
+    try buf.push(alloc, 0_u8);
+    return off;
+}
+
+fn write_i32_le_at(dst: *mut [u8], off: usize, v: i32) {
+    let u = v.bitcast.[u32]();
+    if off < dst.len && (dst.len - off) >= 4_usize {
+        dst[off] = (u & 0xFF_u32).trunc.[u8]();
+        dst[off + 1_usize] = ((u >> 8_u32) & 0xFF_u32).trunc.[u8]();
+        dst[off + 2_usize] = ((u >> 16_u32) & 0xFF_u32).trunc.[u8]();
+        dst[off + 3_usize] = ((u >> 24_u32) & 0xFF_u32).trunc.[u8]();
+    }
+}
+
+fn write_u64_le_at(dst: *mut [u8], off: usize, v: u64) {
+    if off < dst.len && (dst.len - off) >= 8_usize {
+        dst[off] = (v & 0xFF_u64).trunc.[u8]();
+        dst[off + 1_usize] = ((v >> 8_u64) & 0xFF_u64).trunc.[u8]();
+        dst[off + 2_usize] = ((v >> 16_u64) & 0xFF_u64).trunc.[u8]();
+        dst[off + 3_usize] = ((v >> 24_u64) & 0xFF_u64).trunc.[u8]();
+        dst[off + 4_usize] = ((v >> 32_u64) & 0xFF_u64).trunc.[u8]();
+        dst[off + 5_usize] = ((v >> 40_u64) & 0xFF_u64).trunc.[u8]();
+        dst[off + 6_usize] = ((v >> 48_u64) & 0xFF_u64).trunc.[u8]();
+        dst[off + 7_usize] = ((v >> 56_u64) & 0xFF_u64).trunc.[u8]();
+    }
+}
+
+fn copy_into(dst: *mut [u8], off: usize, src: *[u8]) {
+    if src.len == 0_usize {
+        return;
+    }
+    var i: usize = 0_usize;
+    while i < src.len {
+        let di = off +% i;
+        if di < dst.len {
+            dst[di] = src[i];
+        }
+        i = i +% 1_usize;
+    }
+}
+
+fn write_uleb128(out: *mut col.DynBuf[u8], alloc: *mut AllocCap, val_in: u64) -> !OutOfMemory {
+    var val = val_in;
+    loop {
+        var byte = (val & 0x7F_u64).trunc.[u8]();
+        val = val >> 7_u64;
+        if val != 0_u64 {
+            byte = byte | 0x80_u8;
+        }
+        try out.push(alloc, byte);
+        if val == 0_u64 {
+            break;
+        }
+    }
+    return;
+}
+
+fn write_sleb128(out: *mut col.DynBuf[u8], alloc: *mut AllocCap, val_in: i64) -> !OutOfMemory {
+    var val = val_in;
+    loop {
+        let byte = (val.bitcast.[u64]() & 0x7F_u64).trunc.[u8]();
+        val = val >> 7_i64;
+        let sign_bit = (byte & 0x40_u8) != 0_u8;
+        let done = (val == 0_i64 && !sign_bit) || (val == -1_i64 && sign_bit);
+        if done {
+            try out.push(alloc, byte);
+            break;
+        }
+        try out.push(alloc, byte | 0x80_u8);
+    }
+    return;
+}
+
+fn set_err(
+    err_msg: *mut str.StrBuf,
+    alloc: *mut AllocCap,
+    msg: *str,
+) -> !OutOfMemory {
+    err_msg.clear();
+    try err_msg.push_str_grow(alloc, msg);
+    return;
+}
+
+fn set_err_sym(
+    err_msg: *mut str.StrBuf,
+    alloc: *mut AllocCap,
+    prefix: *str,
+    sym_bytes: *[u8],
+    suffix: *str,
+) -> !OutOfMemory {
+    err_msg.clear();
+    try err_msg.push_str_grow(alloc, prefix);
+    try err_msg.push_bytes_grow(alloc, sym_bytes);
+    try err_msg.push_str_grow(alloc, suffix);
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// ELF64 Header, Program Header, Section Header, Symtab, Rela, Dynamic Writers
+// ---------------------------------------------------------------------------
+
+struct Shdr {
+    name: u32;
+    kind: u32;
+    flags: u64;
+    addr: u64;
+    offset: u64;
+    size: u64;
+    link: u32;
+    info: u32;
+    addralign: u64;
+    entsize: u64;
+}
+
+fn shdr_null() -> Shdr {
+    return Shdr.{
+        name: 0_u32,
+        kind: SHT_NULL,
+        flags: 0_u64,
+        addr: 0_u64,
+        offset: 0_u64,
+        size: 0_u64,
+        link: 0_u32,
+        info: 0_u32,
+        addralign: 0_u64,
+        entsize: 0_u64,
+    };
+}
+
+fn write_shdr(out: *mut col.DynBuf[u8], alloc: *mut AllocCap, sh: *Shdr) -> !OutOfMemory {
+    try push_u32_le(out, alloc, sh.name);
+    try push_u32_le(out, alloc, sh.kind);
+    try push_u64_le(out, alloc, sh.flags);
+    try push_u64_le(out, alloc, sh.addr);
+    try push_u64_le(out, alloc, sh.offset);
+    try push_u64_le(out, alloc, sh.size);
+    try push_u32_le(out, alloc, sh.link);
+    try push_u32_le(out, alloc, sh.info);
+    try push_u64_le(out, alloc, sh.addralign);
+    try push_u64_le(out, alloc, sh.entsize);
+    return;
+}
+
+fn build_ehdr(
+    alloc: *mut AllocCap,
+    e_type: u16,
+    e_entry: u64,
+    e_phoff: u64,
+    e_shoff: u64,
+    e_phnum: u16,
+    e_shnum: u16,
+    e_shstrndx: u16,
+) -> col.DynBuf[u8] ! OutOfMemory {
+    var ehdr = try col.DynBuf.[u8].init(alloc, EHDR_SIZE);
+    errdefer ehdr.destroy(alloc);
+    let ident: [16]u8 = [
+        0x7F_u8, b'E', b'L', b'F',
+        ELFCLASS64, ELFDATA2LSB, EV_CURRENT, 0_u8,
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+    ];
+    try ehdr.push_slice(alloc, &ident);
+    try push_u16_le(&mut ehdr, alloc, e_type);
+    try push_u16_le(&mut ehdr, alloc, EM_X86_64);
+    try push_u32_le(&mut ehdr, alloc, EV_CURRENT.widen.[u32]());
+    try push_u64_le(&mut ehdr, alloc, e_entry);
+    try push_u64_le(&mut ehdr, alloc, e_phoff);
+    try push_u64_le(&mut ehdr, alloc, e_shoff);
+    try push_u32_le(&mut ehdr, alloc, 0_u32);
+    try push_u16_le(&mut ehdr, alloc, EHDR_SIZE.trunc.[u16]());
+    try push_u16_le(&mut ehdr, alloc, PHDR_SIZE.trunc.[u16]());
+    try push_u16_le(&mut ehdr, alloc, e_phnum);
+    try push_u16_le(&mut ehdr, alloc, SHDR_SIZE.trunc.[u16]());
+    try push_u16_le(&mut ehdr, alloc, e_shnum);
+    try push_u16_le(&mut ehdr, alloc, e_shstrndx);
+    return ehdr;
+}
+
+fn stamp_ehdr(
+    alloc: *mut AllocCap,
+    out: *mut col.DynBuf[u8],
+    e_type: u16,
+    e_entry: u64,
+    e_phoff: u64,
+    e_shoff: u64,
+    e_phnum: u16,
+    e_shnum: u16,
+    e_shstrndx: u16,
+) -> !OutOfMemory {
+    let ehdr = try build_ehdr(alloc, e_type, e_entry, e_phoff, e_shoff, e_phnum, e_shnum, e_shstrndx);
+    errdefer ehdr.destroy(alloc);
+    copy_into(out.as_mut_slice(), 0_usize, ehdr.as_slice());
+    ehdr.destroy(alloc);
+    return;
+}
+
+fn write_phdr(
+    out: *mut col.DynBuf[u8],
+    alloc: *mut AllocCap,
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_paddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_align: u64,
+) -> !OutOfMemory {
+    try push_u32_le(out, alloc, p_type);
+    try push_u32_le(out, alloc, p_flags);
+    try push_u64_le(out, alloc, p_offset);
+    try push_u64_le(out, alloc, p_vaddr);
+    try push_u64_le(out, alloc, p_paddr);
+    try push_u64_le(out, alloc, p_filesz);
+    try push_u64_le(out, alloc, p_memsz);
+    try push_u64_le(out, alloc, p_align);
+    return;
+}
+
+fn push_elf_sym(
+    symtab: *mut col.DynBuf[u8],
+    alloc: *mut AllocCap,
+    name_off: u32,
+    st_info: u8,
+    shndx: u16,
+    st_value: u64,
+    st_size: u64,
+) -> !OutOfMemory {
+    try push_u32_le(symtab, alloc, name_off);
+    try symtab.push(alloc, st_info);
+    try symtab.push(alloc, 0_u8);
+    try push_u16_le(symtab, alloc, shndx);
+    try push_u64_le(symtab, alloc, st_value);
+    try push_u64_le(symtab, alloc, st_size);
+    return;
+}
+
+fn write_rela(
+    out: *mut col.DynBuf[u8],
+    alloc: *mut AllocCap,
+    r_offset: u64,
+    sym_idx: u32,
+    r_type: u32,
+    r_addend: i64,
+) -> !OutOfMemory {
+    let r_info = (sym_idx.widen.[u64]() <<% 32_u64) | r_type.widen.[u64]();
+    try push_u64_le(out, alloc, r_offset);
+    try push_u64_le(out, alloc, r_info);
+    try push_i64_le(out, alloc, r_addend);
+    return;
+}
+
+fn write_dyn(
+    out: *mut col.DynBuf[u8],
+    alloc: *mut AllocCap,
+    d_tag: i64,
+    d_val: u64,
+) -> !OutOfMemory {
+    try push_i64_le(out, alloc, d_tag);
+    try push_u64_le(out, alloc, d_val);
+    return;
+}
+
+const MB2_BOOT_LEN: usize = 288_usize;
+
+fn build_multiboot2_pvh_boot(
+    alloc: *mut AllocCap,
+    mb2_vaddr: u64,
+    entry_vaddr: u64,
+) -> col.DynBuf[u8] ! OutOfMemory {
+    let magic: u32 = 0xE85250D6_u32;
+    let arch: u32 = 0_u32;
+    let header_len: u32 = 24_u32;
+    let checksum: u32 = 0_u32 -% (magic +% arch +% header_len);
+    var v = try col.DynBuf.[u8].init(alloc, MB2_BOOT_LEN);
+    errdefer v.destroy(alloc);
+    // [0..24]: Multiboot2 header
+    try push_u32_le(&mut v, alloc, magic);
+    try push_u32_le(&mut v, alloc, arch);
+    try push_u32_le(&mut v, alloc, header_len);
+    try push_u32_le(&mut v, alloc, checksum);
+    try push_u16_le(&mut v, alloc, 0_u16);
+    try push_u16_le(&mut v, alloc, 0_u16);
+    try push_u32_le(&mut v, alloc, 8_u32);
+
+    // [24..44]: Xen PVH PT_NOTE (XEN_ELFNOTE_PHYS32_ENTRY = 18)
+    let boot32_vaddr: u32 = (mb2_vaddr +% 48_u64).trunc.[u32]();
+    let gdt_vaddr: u64 = mb2_vaddr +% 240_u64;
+    let gdtr_vaddr: u32 = (mb2_vaddr +% 264_u64).trunc.[u32]();
+    try push_u32_le(&mut v, alloc, 4_u32);
+    try push_u32_le(&mut v, alloc, 4_u32);
+    try push_u32_le(&mut v, alloc, 18_u32);
+    let xen_name: [4]u8 = [b'X', b'e', b'n', 0_u8];
+    try v.push_slice(alloc, &xen_name);
+    try push_u32_le(&mut v, alloc, boot32_vaddr);
+    // [44..48]: 4-byte alignment pad
+    try push_u32_le(&mut v, alloc, 0_u32);
+
+    // [48..203]: 32-bit protected-mode -> 64-bit long-mode trampoline (155 bytes)
+    let p0: [16]u8 = [
+        0xFA_u8, 0xFC_u8,                               // cli; cld
+        0xBF_u8, 0x00_u8, 0x00_u8, 0x08_u8, 0x00_u8,    // mov edi, 0x80000
+        0x31_u8, 0xC0_u8,                               // xor eax, eax
+        0xB9_u8, 0x00_u8, 0x18_u8, 0x00_u8, 0x00_u8,    // mov ecx, 0x1800 (6 pages)
+        0xF3_u8, 0xAB_u8,                               // rep stosd
+    ];
+    try v.push_slice(alloc, &p0);
+    // PML4[0] = 0x81003; PDPT[0..3] = 0x82003..0x85003 (4 GiB 2MiB identity map)
+    let mov_mem_op: [2]u8 = [0xC7_u8, 0x05_u8];
+    try v.push_slice(alloc, &mov_mem_op);
+    try push_u32_le(&mut v, alloc, 0x80000_u32);
+    try push_u32_le(&mut v, alloc, 0x81003_u32);
+    var pdi: u32 = 0_u32;
+    while pdi < 4_u32 {
+        try v.push_slice(alloc, &mov_mem_op);
+        try push_u32_le(&mut v, alloc, 0x81000_u32 +% (pdi *% 8_u32));
+        try push_u32_le(&mut v, alloc, 0x82003_u32 +% (pdi *% 0x1000_u32));
+        pdi = pdi +% 1_u32;
+    }
+    // Fill PD0..PD3 (2048 entries x 2 MiB) + CR3 + CR4 + EFER.LME + CR0
+    let p1: [75]u8 = [
+        0xBF_u8, 0x00_u8, 0x20_u8, 0x08_u8, 0x00_u8,    // mov edi, 0x82000
+        0xB8_u8, 0x83_u8, 0x00_u8, 0x00_u8, 0x00_u8,    // mov eax, 0x83 (P|W|PS)
+        0xB9_u8, 0x00_u8, 0x08_u8, 0x00_u8, 0x00_u8,    // mov ecx, 2048
+        0x89_u8, 0x07_u8,                               // mov [edi], eax
+        0x05_u8, 0x00_u8, 0x00_u8, 0x20_u8, 0x00_u8,    // add eax, 0x200000
+        0x83_u8, 0xC7_u8, 0x08_u8,                      // add edi, 8
+        0x49_u8,                                        // dec ecx
+        0x75_u8, 0xF3_u8,                               // jnz -13
+        0xB8_u8, 0x00_u8, 0x00_u8, 0x08_u8, 0x00_u8,    // mov eax, 0x80000
+        0x0F_u8, 0x22_u8, 0xD8_u8,                      // mov cr3, eax
+        0x0F_u8, 0x20_u8, 0xE0_u8,                      // mov eax, cr4
+        0x0D_u8, 0x20_u8, 0x06_u8, 0x00_u8, 0x00_u8,    // or eax, 0x620 (PAE|OSFXSR|OSXMMEXCPT)
+        0x0F_u8, 0x22_u8, 0xE0_u8,                      // mov cr4, eax
+        0xB9_u8, 0x80_u8, 0x00_u8, 0x00_u8, 0xC0_u8,    // mov ecx, 0xC0000080 (IA32_EFER)
+        0x0F_u8, 0x32_u8,                               // rdmsr
+        0x0D_u8, 0x00_u8, 0x09_u8, 0x00_u8, 0x00_u8,    // or eax, 0x900 (LME | NXE)
+        0x0F_u8, 0x30_u8,                               // wrmsr
+        0x0F_u8, 0x20_u8, 0xC0_u8,                      // mov eax, cr0
+        0x83_u8, 0xE0_u8, 0xFB_u8,                      // and eax, ~4 (clear EM)
+        0x0D_u8, 0x03_u8, 0x00_u8, 0x01_u8, 0x80_u8,    // or eax, 0x80010003 (PG|WP|MP|PE)
+        0x0F_u8, 0x22_u8, 0xC0_u8,                      // mov cr0, eax
+    ];
+    try v.push_slice(alloc, &p1);
+    // lgdt [gdtr_vaddr]
+    let lgdt_op: [3]u8 = [0x0F_u8, 0x01_u8, 0x15_u8];
+    try v.push_slice(alloc, &lgdt_op);
+    try push_u32_le(&mut v, alloc, gdtr_vaddr);
+    // jmp far 0x08:lm64_vaddr
+    let lm64_vaddr: u32 = (mb2_vaddr +% (v.len() +% 7_usize).widen.[u64]()).trunc.[u32]();
+    try v.push(alloc, 0xEA_u8);
+    try push_u32_le(&mut v, alloc, lm64_vaddr);
+    try push_u16_le(&mut v, alloc, 0x0008_u16);
+
+    // [203..240]: 64-bit long-mode landing stub (37 bytes)
+    let p64: [23]u8 = [
+        0x66_u8, 0xB8_u8, 0x10_u8, 0x00_u8,             // mov ax, 0x10
+        0x8E_u8, 0xD8_u8,                               // mov ds, ax
+        0x8E_u8, 0xC0_u8,                               // mov es, ax
+        0x8E_u8, 0xD0_u8,                               // mov ss, ax
+        0x8E_u8, 0xE0_u8,                               // mov fs, ax
+        0x8E_u8, 0xE8_u8,                               // mov gs, ax
+        0x48_u8, 0xC7_u8, 0xC4_u8, 0x00_u8, 0xC0_u8, 0x07_u8, 0x00_u8, // mov rsp, 0x7C000
+        0x48_u8, 0xB8_u8,                               // movabs rax, entry_vaddr
+    ];
+    try v.push_slice(alloc, &p64);
+    try push_u64_le(&mut v, alloc, entry_vaddr);
+    let tail64: [6]u8 = [
+        0xFF_u8, 0xD0_u8,                               // call rax
+        0xFA_u8, 0xF4_u8, 0xEB_u8, 0xFC_u8,             // cli; hlt; jmp -4
+    ];
+    try v.push_slice(alloc, &tail64);
+
+    // Pad up to offset 240 if needed
+    while v.len() < 240_usize {
+        try v.push(alloc, 0_u8);
+    }
+    // [240..264]: 64-bit GDT (null, 0x08 code64, 0x10 data64)
+    try push_u64_le(&mut v, alloc, 0_u64);
+    try push_u64_le(&mut v, alloc, 0x00AF9A000000FFFF_u64);
+    try push_u64_le(&mut v, alloc, 0x00CF92000000FFFF_u64);
+    // [264..274]: GDTR (limit=23, base=gdt_vaddr)
+    try push_u16_le(&mut v, alloc, 23_u16);
+    try push_u64_le(&mut v, alloc, gdt_vaddr);
+    while v.len() < MB2_BOOT_LEN {
+        try v.push(alloc, 0_u8);
+    }
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// DWARF Version 5 `.debug_line`, `.debug_abbrev`, and `.debug_info`
+// ---------------------------------------------------------------------------
+
+fn line_entry_lt(a: LineEntry, b: LineEntry) -> bool {
+    if a.code_offset != b.code_offset {
+        return a.code_offset < b.code_offset;
+    }
+    if a.file_idx != b.file_idx {
+        return a.file_idx < b.file_idx;
+    }
+    if a.line != b.line {
+        return a.line < b.line;
+    }
+    return a.col < b.col;
+}
+
+fn sort_and_dedup_lines(
+    alloc: *mut AllocCap,
+    entries: *[LineEntry],
+) -> col.DynBuf[LineEntry] ! OutOfMemory {
+    var tmp = try col.DynBuf.[LineEntry].init(alloc, if entries.len > 4_usize { entries.len } else { 4_usize });
+    errdefer tmp.destroy(alloc);
+    try tmp.push_slice(alloc, entries);
+
+    let s = tmp.as_mut_slice();
+    let n = s.len;
+    if n > 1_usize {
+        var gap: usize = 1_usize;
+        let third = n / 3_usize;
+        while gap < third {
+            gap = (gap *% 3_usize) +% 1_usize;
+        }
+        while gap > 0_usize {
+            var i = gap;
+            while i < n {
+                let cur = s[i];
+                var j = i;
+                while j >= gap {
+                    let prev = j - gap;
+                    if !line_entry_lt(cur, s[prev]) {
+                        break;
+                    }
+                    s[j] = s[prev];
+                    j = prev;
+                }
+                s[j] = cur;
+                i = i +% 1_usize;
+            }
+            gap = gap / 3_usize;
+        }
+    }
+
+    var deduped = try col.DynBuf.[LineEntry].init(alloc, if n > 4_usize { n } else { 4_usize });
+    errdefer deduped.destroy(alloc);
+    let sorted = tmp.as_slice();
+    var idx: usize = 0_usize;
+    while idx < sorted.len {
+        let e = sorted[idx];
+        if idx == 0_usize || e.code_offset != sorted[idx - 1_usize].code_offset {
+            try deduped.push(alloc, e);
+        }
+        idx = idx +% 1_usize;
+    }
+    tmp.destroy(alloc);
+    return deduped;
+}
+
+fn build_dwarf5_line_hdr(
+    alloc: *mut AllocCap,
+    debug_files: *[u32],
+    interner: *span.SymInterner,
+) -> col.DynBuf[u8] ! OutOfMemory {
+    var hdr = try col.DynBuf.[u8].init(alloc, 128_usize);
+    errdefer hdr.destroy(alloc);
+    let preamble: [18]u8 = [
+        1_u8, 1_u8, 1_u8, 0xFB_u8, 14_u8, 13_u8,
+        0_u8, 1_u8, 1_u8, 1_u8, 1_u8, 0_u8, 0_u8, 0_u8, 1_u8, 0_u8, 0_u8, 1_u8,
+    ];
+    try hdr.push_slice(alloc, &preamble);
+
+    // Directory table: 1 format (DW_LNCT_path=1, DW_FORM_string=8), 1 dir "."
+    try hdr.push(alloc, 1_u8);
+    try write_uleb128(&mut hdr, alloc, 1_u64);
+    try write_uleb128(&mut hdr, alloc, 8_u64);
+    try write_uleb128(&mut hdr, alloc, 1_u64);
+    _ = try push_cstr(&mut hdr, alloc, ".".as_bytes());
+
+    // File name table: 2 formats (DW_LNCT_path + DW_LNCT_directory_index)
+    try hdr.push(alloc, 2_u8);
+    try write_uleb128(&mut hdr, alloc, 1_u64);
+    try write_uleb128(&mut hdr, alloc, 8_u64);
+    try write_uleb128(&mut hdr, alloc, 2_u64);
+    try write_uleb128(&mut hdr, alloc, 15_u64);
+
+    if debug_files.len == 0_usize {
+        try write_uleb128(&mut hdr, alloc, 1_u64);
+        _ = try push_cstr(&mut hdr, alloc, "<eon>".as_bytes());
+        try write_uleb128(&mut hdr, alloc, 0_u64);
+    } else {
+        try write_uleb128(&mut hdr, alloc, debug_files.len.widen.[u64]());
+        var i: usize = 0_usize;
+        while i < debug_files.len {
+            let fname = strip_dot_slash(interner.get(debug_files[i]));
+            _ = try push_cstr(&mut hdr, alloc, fname);
+            try write_uleb128(&mut hdr, alloc, 0_u64);
+            i = i +% 1_usize;
+        }
+    }
+    return hdr;
+}
+
+pub fn build_dwarf5_debug_line(
+    alloc: *mut AllocCap,
+    text_vaddr: u64,
+    text_len: u64,
+    debug_files: *[u32],
+    line_entries: *[LineEntry],
+    interner: *span.SymInterner,
+) -> col.DynBuf[u8] ! OutOfMemory {
+    let hdr = try build_dwarf5_line_hdr(alloc, debug_files, interner);
+    errdefer hdr.destroy(alloc);
+    let sorted = try sort_and_dedup_lines(alloc, line_entries);
+    errdefer sorted.destroy(alloc);
+    var prog = try col.DynBuf.[u8].init(alloc, 64_usize);
+    errdefer prog.destroy(alloc);
+
+    // DW_LNE_set_address(text_vaddr)
+    try prog.push(alloc, 0_u8);
+    try write_uleb128(&mut prog, alloc, 9_u64);
+    try prog.push(alloc, 2_u8);
+    try push_u64_le(&mut prog, alloc, text_vaddr);
+
+    let max_file_idx: u32 = if debug_files.len <= 1_usize {
+        0_u32
+    } else {
+        (debug_files.len - 1_usize).trunc.[u32]()
+    };
+    var cur_pc: u64 = 0_u64;
+    var cur_file: u32 = 1_u32;
+    var cur_line: i64 = 1_i64;
+    var cur_col: u32 = 0_u32;
+
+    let rows = sorted.as_slice();
+    var i: usize = 0_usize;
+    while i < rows.len {
+        let e = rows[i];
+        let target_pc = e.code_offset.widen.[u64]();
+        if target_pc >= cur_pc {
+            let target_file = if e.file_idx < max_file_idx { e.file_idx } else { max_file_idx };
+            if target_file != cur_file {
+                try prog.push(alloc, 4_u8);
+                try write_uleb128(&mut prog, alloc, target_file.widen.[u64]());
+                cur_file = target_file;
+            }
+            if e.col != cur_col {
+                try prog.push(alloc, 5_u8);
+                try write_uleb128(&mut prog, alloc, e.col.widen.[u64]());
+                cur_col = e.col;
+            }
+            let target_line: i64 = if e.line > 1_u32 { e.line.widen.[i64]() } else { 1_i64 };
+            let dline = target_line -% cur_line;
+            if dline != 0_i64 {
+                try prog.push(alloc, 3_u8);
+                try write_sleb128(&mut prog, alloc, dline);
+                cur_line = target_line;
+            }
+            let dpc = target_pc -% cur_pc;
+            if dpc != 0_u64 {
+                try prog.push(alloc, 2_u8);
+                try write_uleb128(&mut prog, alloc, dpc);
+                cur_pc = target_pc;
+            }
+            try prog.push(alloc, 1_u8);
+        }
+        i = i +% 1_usize;
+    }
+
+    if text_len > cur_pc {
+        try prog.push(alloc, 2_u8);
+        try write_uleb128(&mut prog, alloc, text_len -% cur_pc);
+    }
+    let end_seq: [3]u8 = [0_u8, 1_u8, 1_u8];
+    try prog.push_slice(alloc, &end_seq);
+
+    let unit_body_len = 8_usize +% hdr.len() +% prog.len();
+    var out = try col.DynBuf.[u8].init(alloc, 4_usize +% unit_body_len);
+    errdefer out.destroy(alloc);
+    try push_u32_le(&mut out, alloc, unit_body_len.trunc.[u32]());
+    try push_u16_le(&mut out, alloc, 5_u16);
+    try out.push(alloc, 8_u8);
+    try out.push(alloc, 0_u8);
+    try push_u32_le(&mut out, alloc, hdr.len().trunc.[u32]());
+    try out.push_slice(alloc, hdr.as_slice());
+    try out.push_slice(alloc, prog.as_slice());
+
+    prog.destroy(alloc);
+    sorted.destroy(alloc);
+    hdr.destroy(alloc);
+    return out;
+}
+
+pub linear struct DwarfInfoPair {
+    pub abbrev: col.DynBuf[u8];
+    pub info: col.DynBuf[u8];
+}
+
+impl DwarfInfoPair {
+    pub fn destroy(self: DwarfInfoPair, alloc: *mut AllocCap) {
+        let DwarfInfoPair.{ abbrev, info } = self;
+        abbrev.destroy(alloc);
+        info.destroy(alloc);
+    }
+}
+
+view fn dwarf_short_fn_name(full: *[u8]) -> *[u8] {
+    if full.len >= 4_usize && full[0_usize] == b'e' && full[1_usize] == b'o'
+        && full[2_usize] == b'n' && full[3_usize] == b'_'
+    {
+        var last_du: usize = 0_usize;
+        var found = false;
+        var prev_us = false;
+        var i: usize = 0_usize;
+        while i < full.len {
+            let is_us = full[i] == b'_';
+            if is_us && prev_us {
+                last_du = i +% 1_usize;
+                found = true;
+            }
+            prev_us = is_us;
+            i = i +% 1_usize;
+        }
+        if found && last_du < full.len {
+            let sub = full.sub(last_du, full.len) catch { return full; };
+            return sub;
+        }
+    }
+    return full;
+}
+
+fn dwarf_emit_base_type(
+    alloc: *mut AllocCap,
+    die: *mut col.DynBuf[u8],
+    name: *str,
+    encoding: u8,
+    byte_size: u8,
+) -> u32 ! OutOfMemory {
+    // DWARF5 32-bit CU header is 12 bytes (4 len + 2 ver + 1 ut + 1 addr_sz + 4 abbrev_off)
+    let cu_off = 12_u32 +% die.len().trunc.[u32]();
+    try write_uleb128(die, alloc, 2_u64); // Abbrev 2: DW_TAG_base_type
+    _ = try push_cstr(die, alloc, name.as_bytes());
+    try die.push(alloc, encoding);
+    try die.push(alloc, byte_size);
+    return cu_off;
+}
+
+fn dwarf_lookup_base_type_ref(refs: *[12]u32, encoding: u8, size_bytes: u8) -> u32 {
+    if encoding == 0x02_u8 { return refs[0_usize]; } // bool
+    if encoding == 0x07_u8 {
+        if size_bytes == 1_u8 { return refs[1_usize]; } // u8
+        if size_bytes == 2_u8 { return refs[2_usize]; } // u16
+        if size_bytes == 4_u8 { return refs[3_usize]; } // u32
+        return refs[4_usize];                           // u64
+    }
+    if encoding == 0x05_u8 {
+        if size_bytes == 1_u8 { return refs[5_usize]; } // i8
+        if size_bytes == 2_u8 { return refs[6_usize]; } // i16
+        if size_bytes == 4_u8 { return refs[7_usize]; } // i32
+        return refs[8_usize];                           // i64
+    }
+    if encoding == 0x04_u8 {
+        if size_bytes == 4_u8 { return refs[9_usize]; } // f32
+        return refs[10_usize];                          // f64
+    }
+    return refs[11_usize];                              // ptr (DW_ATE_address)
+}
+
+pub fn build_dwarf5_debug_info(
+    alloc: *mut AllocCap,
+    text_vaddr: u64,
+    text_len: u64,
+    primary_file: *[u8],
+    symbols: *[ElfSymbol],
+    debug_vars: *[DebugVarEntry],
+    interner: *span.SymInterner,
+) -> DwarfInfoPair ! OutOfMemory {
+    var abbrev = try col.DynBuf.[u8].init(alloc, 128_usize);
+    errdefer abbrev.destroy(alloc);
+    // Abbrev 1: DW_TAG_compile_unit (0x11), DW_CHILDREN_yes (0x01)
+    let ab1: [19]u8 = [
+        0x01_u8, 0x11_u8, 0x01_u8,
+        0x25_u8, 0x08_u8, // DW_AT_producer, DW_FORM_string
+        0x13_u8, 0x05_u8, // DW_AT_language, DW_FORM_data2
+        0x03_u8, 0x08_u8, // DW_AT_name, DW_FORM_string
+        0x1B_u8, 0x08_u8, // DW_AT_comp_dir, DW_FORM_string
+        0x10_u8, 0x17_u8, // DW_AT_stmt_list, DW_FORM_sec_offset
+        0x11_u8, 0x01_u8, // DW_AT_low_pc, DW_FORM_addr
+        0x12_u8, 0x07_u8, // DW_AT_high_pc, DW_FORM_data8
+        0x00_u8, 0x00_u8,
+    ];
+    try abbrev.push_slice(alloc, &ab1);
+    // Abbrev 2: DW_TAG_base_type (0x24), DW_CHILDREN_no (0x00)
+    let ab2: [11]u8 = [
+        0x02_u8, 0x24_u8, 0x00_u8,
+        0x03_u8, 0x08_u8, // DW_AT_name, DW_FORM_string
+        0x3E_u8, 0x0B_u8, // DW_AT_encoding, DW_FORM_data1
+        0x0B_u8, 0x0B_u8, // DW_AT_byte_size, DW_FORM_data1
+        0x00_u8, 0x00_u8,
+    ];
+    try abbrev.push_slice(alloc, &ab2);
+    // Abbrev 3: DW_TAG_subprogram (0x2E), DW_CHILDREN_yes (0x01)
+    let ab3: [15]u8 = [
+        0x03_u8, 0x2E_u8, 0x01_u8,
+        0x03_u8, 0x08_u8, // DW_AT_name, DW_FORM_string
+        0x3F_u8, 0x19_u8, // DW_AT_external, DW_FORM_flag_present
+        0x11_u8, 0x01_u8, // DW_AT_low_pc, DW_FORM_addr
+        0x12_u8, 0x07_u8, // DW_AT_high_pc, DW_FORM_data8
+        0x40_u8, 0x18_u8, // DW_AT_frame_base, DW_FORM_exprloc
+        0x00_u8, 0x00_u8,
+    ];
+    try abbrev.push_slice(alloc, &ab3);
+    // Abbrev 4: DW_TAG_subprogram (0x2E), DW_CHILDREN_no (0x00)
+    let ab4: [13]u8 = [
+        0x04_u8, 0x2E_u8, 0x00_u8,
+        0x03_u8, 0x08_u8, // DW_AT_name, DW_FORM_string
+        0x3F_u8, 0x19_u8, // DW_AT_external, DW_FORM_flag_present
+        0x11_u8, 0x01_u8, // DW_AT_low_pc, DW_FORM_addr
+        0x12_u8, 0x07_u8, // DW_AT_high_pc, DW_FORM_data8
+        0x00_u8, 0x00_u8,
+    ];
+    try abbrev.push_slice(alloc, &ab4);
+    // Abbrev 5: DW_TAG_variable (0x34), DW_CHILDREN_no (0x00)
+    let ab5: [11]u8 = [
+        0x05_u8, 0x34_u8, 0x00_u8,
+        0x03_u8, 0x08_u8, // DW_AT_name, DW_FORM_string
+        0x49_u8, 0x13_u8, // DW_AT_type, DW_FORM_ref4
+        0x02_u8, 0x18_u8, // DW_AT_location, DW_FORM_exprloc
+        0x00_u8, 0x00_u8,
+    ];
+    try abbrev.push_slice(alloc, &ab5);
+    // Abbrev 6: DW_TAG_formal_parameter (0x05), DW_CHILDREN_no (0x00)
+    let ab6: [12]u8 = [
+        0x06_u8, 0x05_u8, 0x00_u8,
+        0x03_u8, 0x08_u8, // DW_AT_name, DW_FORM_string
+        0x49_u8, 0x13_u8, // DW_AT_type, DW_FORM_ref4
+        0x02_u8, 0x18_u8, // DW_AT_location, DW_FORM_exprloc
+        0x00_u8, 0x00_u8,
+        0x00_u8,          // end of abbrev table
+    ];
+    try abbrev.push_slice(alloc, &ab6);
+
+    var die = try col.DynBuf.[u8].init(alloc, 512_usize);
+    errdefer die.destroy(alloc);
+    try write_uleb128(&mut die, alloc, 1_u64);
+    _ = try push_cstr(&mut die, alloc, "eonc 0.2.0".as_bytes());
+    try push_u16_le(&mut die, alloc, 0x001D_u16); // DW_LANG_C11
+    _ = try push_cstr(&mut die, alloc, primary_file);
+    _ = try push_cstr(&mut die, alloc, ".".as_bytes());
+    try push_u32_le(&mut die, alloc, 0_u32);
+    try push_u64_le(&mut die, alloc, text_vaddr);
+    try push_u64_le(&mut die, alloc, text_len);
+
+    // Emit 12 primitive base types for local/param type references
+    var type_refs: [12]u32 = [0_u32; 12];
+    if debug_vars.len > 0_usize {
+        type_refs[0_usize] = try dwarf_emit_base_type(alloc, &mut die, "bool", 0x02_u8, 1_u8);
+        type_refs[1_usize] = try dwarf_emit_base_type(alloc, &mut die, "u8", 0x07_u8, 1_u8);
+        type_refs[2_usize] = try dwarf_emit_base_type(alloc, &mut die, "u16", 0x07_u8, 2_u8);
+        type_refs[3_usize] = try dwarf_emit_base_type(alloc, &mut die, "u32", 0x07_u8, 4_u8);
+        type_refs[4_usize] = try dwarf_emit_base_type(alloc, &mut die, "u64", 0x07_u8, 8_u8);
+        type_refs[5_usize] = try dwarf_emit_base_type(alloc, &mut die, "i8", 0x05_u8, 1_u8);
+        type_refs[6_usize] = try dwarf_emit_base_type(alloc, &mut die, "i16", 0x05_u8, 2_u8);
+        type_refs[7_usize] = try dwarf_emit_base_type(alloc, &mut die, "i32", 0x05_u8, 4_u8);
+        type_refs[8_usize] = try dwarf_emit_base_type(alloc, &mut die, "i64", 0x05_u8, 8_u8);
+        type_refs[9_usize] = try dwarf_emit_base_type(alloc, &mut die, "f32", 0x04_u8, 4_u8);
+        type_refs[10_usize] = try dwarf_emit_base_type(alloc, &mut die, "f64", 0x04_u8, 8_u8);
+        type_refs[11_usize] = try dwarf_emit_base_type(alloc, &mut die, "ptr", 0x01_u8, 8_u8);
+    }
+
+    // Index debug_vars by fn_sym in O(N) preserving declaration order (reverse insert into singly-linked buckets)
+    var var_heads = try col.HashMap.[u32].init(alloc, if debug_vars.len > 16_usize { debug_vars.len } else { 16_usize });
+    errdefer var_heads.destroy(alloc);
+    var var_next = try col.DynBuf.[u32].init(alloc, if debug_vars.len > 4_usize { debug_vars.len } else { 4_usize });
+    errdefer var_next.destroy(alloc);
+    var vi0: usize = 0_usize;
+    while vi0 < debug_vars.len {
+        try var_next.push(alloc, 0xFFFFFFFF_u32);
+        vi0 = vi0 +% 1_usize;
+    }
+    var vi = debug_vars.len;
+    while vi > 0_usize {
+        vi = vi - 1_usize;
+        let dv = debug_vars[vi];
+        let fk = dv.fn_sym.widen.[u64]();
+        let prev = var_heads.get(fk) orelse 0xFFFFFFFF_u32;
+        let vn_m = var_next.as_mut_slice();
+        if vi < vn_m.len {
+            vn_m[vi] = prev;
+        }
+        try var_heads.insert(alloc, fk, vi.trunc.[u32]());
+    }
+
+    var loc_expr = try col.DynBuf.[u8].init(alloc, 16_usize);
+    errdefer loc_expr.destroy(alloc);
+    let vn_ro = var_next.as_slice();
+    var si: usize = 0_usize;
+    while si < symbols.len {
+        let sym = symbols[si];
+        if sym.section == .Text && sym.is_func && sym.size > 0_u64 {
+            let full_name = interner.get(sym.name_sym);
+            let short_name = dwarf_short_fn_name(full_name);
+            let fk = sym.name_sym.widen.[u64]();
+            if let head_u32 = var_heads.get(fk) {
+                // Abbrev 3: DW_TAG_subprogram with children
+                try write_uleb128(&mut die, alloc, 3_u64);
+                _ = try push_cstr(&mut die, alloc, short_name);
+                try push_u64_le(&mut die, alloc, text_vaddr +% sym.offset);
+                try push_u64_le(&mut die, alloc, sym.size);
+                // DW_AT_frame_base = DW_OP_reg6 (%rbp)
+                try die.push(alloc, 1_u8);
+                try die.push(alloc, 0x56_u8);
+
+                var cur_v = head_u32;
+                while cur_v != 0xFFFFFFFF_u32 {
+                    let cvu = cur_v.widen.[usize]();
+                    if cvu >= debug_vars.len {
+                        break;
+                    }
+                    let dv = debug_vars[cvu];
+                    try write_uleb128(&mut die, alloc, if dv.is_param { 6_u64 } else { 5_u64 });
+                    _ = try push_cstr(&mut die, alloc, interner.get(dv.name_sym));
+                    try push_u32_le(&mut die, alloc, dwarf_lookup_base_type_ref(&type_refs, dv.encoding, dv.size_bytes));
+                    loc_expr.clear();
+                    if dv.reg_num < 16_u8 {
+                        try loc_expr.push(alloc, 0x50_u8 +% dv.reg_num); // DW_OP_regN
+                    } else {
+                        try loc_expr.push(alloc, 0x91_u8); // DW_OP_fbreg
+                        try write_sleb128(&mut loc_expr, alloc, dv.rbp_off.widen.[i64]());
+                    }
+                    try write_uleb128(&mut die, alloc, loc_expr.len().widen.[u64]());
+                    try die.push_slice(alloc, loc_expr.as_slice());
+                    cur_v = if cvu < vn_ro.len { vn_ro[cvu] } else { 0xFFFFFFFF_u32 };
+                }
+                try die.push(alloc, 0_u8); // end children of DW_TAG_subprogram
+            } else {
+                // Abbrev 4: DW_TAG_subprogram without children
+                try write_uleb128(&mut die, alloc, 4_u64);
+                _ = try push_cstr(&mut die, alloc, short_name);
+                try push_u64_le(&mut die, alloc, text_vaddr +% sym.offset);
+                try push_u64_le(&mut die, alloc, sym.size);
+            }
+        }
+        si = si +% 1_usize;
+    }
+
+    try die.push(alloc, 0_u8); // end children of DW_TAG_compile_unit
+
+    let unit_body_len = 8_usize +% die.len();
+    var info = try col.DynBuf.[u8].init(alloc, 4_usize +% unit_body_len);
+    errdefer info.destroy(alloc);
+    try push_u32_le(&mut info, alloc, unit_body_len.trunc.[u32]());
+    try push_u16_le(&mut info, alloc, 5_u16);
+    try info.push(alloc, 1_u8); // DW_UT_compile
+    try info.push(alloc, 8_u8); // address_size
+    try push_u32_le(&mut info, alloc, 0_u32); // debug_abbrev_offset
+    try info.push_slice(alloc, die.as_slice());
+
+    loc_expr.destroy(alloc);
+    var_next.destroy(alloc);
+    var_heads.destroy(alloc);
+    die.destroy(alloc);
+    return DwarfInfoPair.{ abbrev: abbrev, info: info };
+}
+
+// ---------------------------------------------------------------------------
+// Shared Linker Helpers (Section Indices, Addresses, Reloc Scratch, Symtab)
+// ---------------------------------------------------------------------------
+
+struct SectionIndices {
+    text: u16;
+    rodata: u16;
+    data_rel_ro: u16;
+    data: u16;
+    bss: u16;
+    tdata: u16;
+    tbss: u16;
+}
+
+fn section_indices_empty() -> SectionIndices {
+    return SectionIndices.{
+        text: 0_u16,
+        rodata: 0_u16,
+        data_rel_ro: 0_u16,
+        data: 0_u16,
+        bss: 0_u16,
+        tdata: 0_u16,
+        tbss: 0_u16,
+    };
+}
+
+fn sec_indices_get(si: *SectionIndices, sec: RelocSection) -> u16 {
+    match sec {
+        .Text => { return si.text; }
+        .Rodata => { return si.rodata; }
+        .DataRelRo => { return si.data_rel_ro; }
+        .Data => { return si.data; }
+        .Bss => { return si.bss; }
+        .Tdata => { return si.tdata; }
+        .Tbss => { return si.tbss; }
+    }
+}
+
+struct SectionAddrs {
+    text: u64;
+    rodata: u64;
+    data_rel_ro: u64;
+    data: u64;
+    bss: u64;
+    tdata: u64;
+    tbss_tls_offset: u64;
+}
+
+fn sym_vaddr_for(addrs: *SectionAddrs, sec: RelocSection, offset: u64) -> u64 {
+    match sec {
+        .Text => { return addrs.text +% offset; }
+        .Rodata => { return addrs.rodata +% offset; }
+        .DataRelRo => { return addrs.data_rel_ro +% offset; }
+        .Data => { return addrs.data +% offset; }
+        .Bss => { return addrs.bss +% offset; }
+        .Tdata => { return addrs.tdata +% offset; }
+        .Tbss => { return addrs.tdata +% addrs.tbss_tls_offset +% offset; }
+    }
+}
+
+fn tls_offset_for(addrs: *SectionAddrs, sec: RelocSection, offset: u64) -> ?u64 {
+    match sec {
+        .Tdata => { return offset; }
+        .Tbss => { return addrs.tbss_tls_offset +% offset; }
+        _ => { return null; }
+    }
+}
+
+fn has_sym_or_reloc_in(input: *ElfLinkInput, sec: RelocSection) -> bool {
+    let syms = input.symbols.as_slice();
+    var i: usize = 0_usize;
+    while i < syms.len {
+        if syms[i].section == sec {
+            return true;
+        }
+        i = i +% 1_usize;
+    }
+    let rels = input.relocs.as_slice();
+    var j: usize = 0_usize;
+    while j < rels.len {
+        if rels[j].section == sec {
+            return true;
+        }
+        j = j +% 1_usize;
+    }
+    return false;
+}
+
+fn collect_got_symbols(
+    alloc: *mut AllocCap,
+    input: *ElfLinkInput,
+) -> col.DynBuf[u32] ! OutOfMemory {
+    var seen = try col.HashMap.[u32].init(alloc, 16_usize);
+    errdefer seen.destroy(alloc);
+    var out = try col.DynBuf.[u32].init(alloc, 8_usize);
+    errdefer out.destroy(alloc);
+    let rels = input.relocs.as_slice();
+    var i: usize = 0_usize;
+    while i < rels.len {
+        let r = rels[i];
+        if r.kind == .GotPcRel32 {
+            let key = r.target_sym.widen.[u64]();
+            if !seen.contains(key) {
+                try seen.insert(alloc, key, 1_u32);
+                try out.push(alloc, r.target_sym);
+            }
+        }
+        i = i +% 1_usize;
+    }
+    seen.destroy(alloc);
+    return out;
+}
+
+fn is_synthetic_sym(interner: *span.SymInterner, sym: u32) -> bool {
+    let b = interner.get(sym);
+    return str.bytes_eq(b, "__eon_ehdr_start".as_bytes())
+        || str.bytes_eq(b, "__eon_rela_dyn_start".as_bytes())
+        || str.bytes_eq(b, "__eon_rela_dyn_end".as_bytes())
+        || str.bytes_eq(b, "__eon_tdata_start".as_bytes())
+        || str.bytes_eq(b, "__eon_tdata_end".as_bytes());
+}
+
+fn maybe_insert_synthetic(
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    sym_vaddrs: *mut col.HashMap[u64],
+    name: *str,
+    val: u64,
+) -> !OutOfMemory {
+    if let sid = interner.lookup(name.as_bytes()) {
+        let key = sid.widen.[u64]();
+        if !sym_vaddrs.contains(key) {
+            try sym_vaddrs.insert(alloc, key, val);
+        }
+    }
+    return;
+}
+
+fn insert_synthetic_symbols(
+    alloc: *mut AllocCap,
+    interner: *span.SymInterner,
+    sym_vaddrs: *mut col.HashMap[u64],
+    ehdr_start: u64,
+    rela_dyn_start: u64,
+    rela_dyn_end: u64,
+    tdata_start: u64,
+    tdata_len: u64,
+) -> !OutOfMemory {
+    try maybe_insert_synthetic(alloc, interner, sym_vaddrs, "__eon_ehdr_start", ehdr_start);
+    try maybe_insert_synthetic(alloc, interner, sym_vaddrs, "__eon_rela_dyn_start", rela_dyn_start);
+    try maybe_insert_synthetic(alloc, interner, sym_vaddrs, "__eon_rela_dyn_end", rela_dyn_end);
+    try maybe_insert_synthetic(alloc, interner, sym_vaddrs, "__eon_tdata_start", tdata_start);
+    try maybe_insert_synthetic(alloc, interner, sym_vaddrs, "__eon_tdata_end", tdata_start +% tdata_len);
+    return;
+}
+
+fn populate_symbol_maps(
+    alloc: *mut AllocCap,
+    input: *ElfLinkInput,
+    addrs: *SectionAddrs,
+    sym_vaddrs: *mut col.HashMap[u64],
+    tls_offsets: *mut col.HashMap[u64],
+) -> !OutOfMemory {
+    let syms = input.symbols.as_slice();
+    var i: usize = 0_usize;
+    while i < syms.len {
+        let s = syms[i];
+        let key = s.name_sym.widen.[u64]();
+        try sym_vaddrs.insert(alloc, key, sym_vaddr_for(addrs, s.section, s.offset));
+        if let toff = tls_offset_for(addrs, s.section, s.offset) {
+            try tls_offsets.insert(alloc, key, toff);
+        }
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+linear struct RelocScratch {
+    text: col.DynBuf[u8];
+    rodata: col.DynBuf[u8];
+    data_rel_ro: col.DynBuf[u8];
+    data: col.DynBuf[u8];
+    tdata: col.DynBuf[u8];
+}
+
+impl RelocScratch {
+    fn init_from_input(alloc: *mut AllocCap, input: *ElfLinkInput) -> RelocScratch ! OutOfMemory {
+        let tcap = if input.text.len() > 4_usize { input.text.len() } else { 4_usize };
+        var text = try col.DynBuf.[u8].init(alloc, tcap);
+        errdefer text.destroy(alloc);
+        try text.push_slice(alloc, input.text.as_slice());
+
+        let rcap = if input.rodata.len() > 4_usize { input.rodata.len() } else { 4_usize };
+        var rodata = try col.DynBuf.[u8].init(alloc, rcap);
+        errdefer rodata.destroy(alloc);
+        try rodata.push_slice(alloc, input.rodata.as_slice());
+
+        let rrcap = if input.data_rel_ro.len() > 4_usize { input.data_rel_ro.len() } else { 4_usize };
+        var data_rel_ro = try col.DynBuf.[u8].init(alloc, rrcap);
+        errdefer data_rel_ro.destroy(alloc);
+        try data_rel_ro.push_slice(alloc, input.data_rel_ro.as_slice());
+
+        let dcap = if input.data.len() > 4_usize { input.data.len() } else { 4_usize };
+        var data = try col.DynBuf.[u8].init(alloc, dcap);
+        errdefer data.destroy(alloc);
+        try data.push_slice(alloc, input.data.as_slice());
+
+        let tdcap = if input.tdata.len() > 4_usize { input.tdata.len() } else { 4_usize };
+        var tdata = try col.DynBuf.[u8].init(alloc, tdcap);
+        errdefer tdata.destroy(alloc);
+        try tdata.push_slice(alloc, input.tdata.as_slice());
+
+        return RelocScratch.{
+            text: text,
+            rodata: rodata,
+            data_rel_ro: data_rel_ro,
+            data: data,
+            tdata: tdata,
+        };
+    }
+
+    fn destroy(self: RelocScratch, alloc: *mut AllocCap) {
+        let RelocScratch.{ text, rodata, data_rel_ro, data, tdata } = self;
+        text.destroy(alloc);
+        rodata.destroy(alloc);
+        data_rel_ro.destroy(alloc);
+        data.destroy(alloc);
+        tdata.destroy(alloc);
+    }
+}
+
+fn patch_rel32_buf(
+    alloc: *mut AllocCap,
+    buf: *mut [u8],
+    offset: usize,
+    place_vaddr: u64,
+    target_vaddr: u64,
+    addend: i64,
+    sym_bytes: *[u8],
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    if offset +% 4_usize > buf.len {
+        try set_err_sym(err_msg, alloc, "ELF64 linker error: Rel32 offset out of range for `", sym_bytes, "`");
+        return false;
+    }
+    let sum = i128_add(i128_from_u64(target_vaddr), i128_from_i64(addend));
+    let base = i128_add(i128_from_u64(place_vaddr), i128_from_u64(4_u64));
+    let disp = i128_sub(sum, base);
+    if let d32 = i128_to_i32(disp) {
+        write_i32_le_at(buf, offset, d32);
+        return true;
+    }
+    try set_err_sym(err_msg, alloc, "ELF64 linker error: 32-bit PC-relative overflow for `", sym_bytes, "`");
+    return false;
+}
+
+fn patch_tpoff32_buf(
+    alloc: *mut AllocCap,
+    buf: *mut [u8],
+    offset: usize,
+    tls_offsets: *col.HashMap[u64],
+    target_sym: u32,
+    addend: i64,
+    tls_aligned_memsz: u64,
+    interner: *span.SymInterner,
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    let sym_bytes = interner.get(target_sym);
+    if let toff = tls_offsets.get(target_sym.widen.[u64]()) {
+        if offset +% 4_usize > buf.len {
+            try set_err_sym(err_msg, alloc, "ELF64 linker error: TpOff32 offset out of range for `", sym_bytes, "`");
+            return false;
+        }
+        let sum = i128_add(i128_from_u64(toff), i128_from_i64(addend));
+        let disp = i128_sub(sum, i128_from_u64(tls_aligned_memsz));
+        if let d32 = i128_to_i32(disp) {
+            write_i32_le_at(buf, offset, d32);
+            return true;
+        }
+        try set_err_sym(err_msg, alloc, "ELF64 linker error: TpOff32 overflow for `", sym_bytes, "`");
+        return false;
+    }
+    try set_err_sym(err_msg, alloc, "ELF64 linker error: TpOff32 targeting non-TLS or unresolved symbol `", sym_bytes, "`");
+    return false;
+}
+
+fn patch_rel32_sec(
+    alloc: *mut AllocCap,
+    scratch: *mut RelocScratch,
+    addrs: *SectionAddrs,
+    sec: RelocSection,
+    allow_tdata: bool,
+    offset: usize,
+    target_vaddr: u64,
+    addend: i64,
+    sym_bytes: *[u8],
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    let off_u64 = offset.widen.[u64]();
+    match sec {
+        .Text => {
+            return try patch_rel32_buf(alloc, scratch.text.as_mut_slice(), offset, addrs.text +% off_u64, target_vaddr, addend, sym_bytes, err_msg);
+        }
+        .Rodata => {
+            return try patch_rel32_buf(alloc, scratch.rodata.as_mut_slice(), offset, addrs.rodata +% off_u64, target_vaddr, addend, sym_bytes, err_msg);
+        }
+        .DataRelRo => {
+            return try patch_rel32_buf(alloc, scratch.data_rel_ro.as_mut_slice(), offset, addrs.data_rel_ro +% off_u64, target_vaddr, addend, sym_bytes, err_msg);
+        }
+        .Data => {
+            return try patch_rel32_buf(alloc, scratch.data.as_mut_slice(), offset, addrs.data +% off_u64, target_vaddr, addend, sym_bytes, err_msg);
+        }
+        .Tdata => {
+            if !allow_tdata {
+                try set_err(err_msg, alloc, "ELF64 linker error: relocation inside `.tdata` is not supported in PIE/Shared mode");
+                return false;
+            }
+            return try patch_rel32_buf(alloc, scratch.tdata.as_mut_slice(), offset, addrs.tdata +% off_u64, target_vaddr, addend, sym_bytes, err_msg);
+        }
+        .Bss => {
+            try set_err(err_msg, alloc, "ELF64 linker error: cannot apply relocation inside NOBITS section");
+            return false;
+        }
+        .Tbss => {
+            try set_err(err_msg, alloc, "ELF64 linker error: cannot apply relocation inside NOBITS section");
+            return false;
+        }
+    }
+}
+
+fn patch_tpoff32_sec(
+    alloc: *mut AllocCap,
+    scratch: *mut RelocScratch,
+    sec: RelocSection,
+    allow_tdata: bool,
+    offset: usize,
+    tls_offsets: *col.HashMap[u64],
+    target_sym: u32,
+    addend: i64,
+    tls_aligned_memsz: u64,
+    interner: *span.SymInterner,
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    match sec {
+        .Text => {
+            return try patch_tpoff32_buf(alloc, scratch.text.as_mut_slice(), offset, tls_offsets, target_sym, addend, tls_aligned_memsz, interner, err_msg);
+        }
+        .Rodata => {
+            return try patch_tpoff32_buf(alloc, scratch.rodata.as_mut_slice(), offset, tls_offsets, target_sym, addend, tls_aligned_memsz, interner, err_msg);
+        }
+        .DataRelRo => {
+            return try patch_tpoff32_buf(alloc, scratch.data_rel_ro.as_mut_slice(), offset, tls_offsets, target_sym, addend, tls_aligned_memsz, interner, err_msg);
+        }
+        .Data => {
+            return try patch_tpoff32_buf(alloc, scratch.data.as_mut_slice(), offset, tls_offsets, target_sym, addend, tls_aligned_memsz, interner, err_msg);
+        }
+        .Tdata => {
+            if !allow_tdata {
+                try set_err(err_msg, alloc, "ELF64 linker error: relocation inside `.tdata` is not supported in PIE/Shared mode");
+                return false;
+            }
+            return try patch_tpoff32_buf(alloc, scratch.tdata.as_mut_slice(), offset, tls_offsets, target_sym, addend, tls_aligned_memsz, interner, err_msg);
+        }
+        .Bss => {
+            try set_err(err_msg, alloc, "ELF64 linker error: cannot apply relocation inside NOBITS section");
+            return false;
+        }
+        .Tbss => {
+            try set_err(err_msg, alloc, "ELF64 linker error: cannot apply relocation inside NOBITS section");
+            return false;
+        }
+    }
+}
+
+fn write_abs64_sec(
+    alloc: *mut AllocCap,
+    scratch: *mut RelocScratch,
+    sec: RelocSection,
+    allow_tdata: bool,
+    offset: usize,
+    val: u64,
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    match sec {
+        .Text => {
+            let b = scratch.text.as_mut_slice();
+            if offset +% 8_usize > b.len {
+                try set_err(err_msg, alloc, "ELF64 linker error: Abs64 offset out of range");
+                return false;
+            }
+            write_u64_le_at(b, offset, val);
+            return true;
+        }
+        .Rodata => {
+            let b = scratch.rodata.as_mut_slice();
+            if offset +% 8_usize > b.len {
+                try set_err(err_msg, alloc, "ELF64 linker error: Abs64 offset out of range");
+                return false;
+            }
+            write_u64_le_at(b, offset, val);
+            return true;
+        }
+        .DataRelRo => {
+            let b = scratch.data_rel_ro.as_mut_slice();
+            if offset +% 8_usize > b.len {
+                try set_err(err_msg, alloc, "ELF64 linker error: Abs64 offset out of range");
+                return false;
+            }
+            write_u64_le_at(b, offset, val);
+            return true;
+        }
+        .Data => {
+            let b = scratch.data.as_mut_slice();
+            if offset +% 8_usize > b.len {
+                try set_err(err_msg, alloc, "ELF64 linker error: Abs64 offset out of range");
+                return false;
+            }
+            write_u64_le_at(b, offset, val);
+            return true;
+        }
+        .Tdata => {
+            if !allow_tdata {
+                try set_err(err_msg, alloc, "ELF64 linker error: Abs64 inside `.tdata` is not supported in PIE/Shared mode");
+                return false;
+            }
+            let b = scratch.tdata.as_mut_slice();
+            if offset +% 8_usize > b.len {
+                try set_err(err_msg, alloc, "ELF64 linker error: Abs64 offset out of range");
+                return false;
+            }
+            write_u64_le_at(b, offset, val);
+            return true;
+        }
+        .Bss => {
+            try set_err(err_msg, alloc, "ELF64 linker error: cannot apply relocation inside NOBITS section");
+            return false;
+        }
+        .Tbss => {
+            try set_err(err_msg, alloc, "ELF64 linker error: cannot apply relocation inside NOBITS section");
+            return false;
+        }
+    }
+}
+
+fn push_symtab_entry(
+    alloc: *mut AllocCap,
+    symtab: *mut col.DynBuf[u8],
+    strtab: *mut col.DynBuf[u8],
+    s: ElfSymbol,
+    bind: u8,
+    addrs: *SectionAddrs,
+    sec_indices: *SectionIndices,
+    interner: *span.SymInterner,
+) -> !OutOfMemory {
+    let name_off = (try push_cstr(strtab, alloc, interner.get(s.name_sym))).trunc.[u32]();
+    let shndx = sec_indices_get(sec_indices, s.section);
+    var st_type: u8 = STT_OBJECT;
+    var st_val: u64 = 0_u64;
+    if s.section == .Tdata || s.section == .Tbss {
+        st_type = STT_TLS;
+        if let toff = tls_offset_for(addrs, s.section, s.offset) {
+            st_val = toff;
+        }
+    } else {
+        st_type = if s.is_func { STT_FUNC } else { STT_OBJECT };
+        st_val = sym_vaddr_for(addrs, s.section, s.offset);
+    }
+    try push_elf_sym(symtab, alloc, name_off, (bind <<% 4_u8) | st_type, shndx, st_val, s.size);
+    return;
+}
+
+struct SymtabTailInfo {
+    shdr_off: usize;
+    shstrtab_idx: u16;
+}
+
+struct DebugSectionLocs {
+    has_debug: bool;
+    abbrev_off: usize;
+    abbrev_len: usize;
+    info_off: usize;
+    info_len: usize;
+    line_off: usize;
+    line_len: usize;
+    shn_abbrev: u32;
+    shn_info: u32;
+    shn_line: u32;
+}
+
+fn append_dwarf5_sections(
+    alloc: *mut AllocCap,
+    out: *mut col.DynBuf[u8],
+    input: *ElfLinkInput,
+    text_vaddr: u64,
+    text_len: u64,
+    shstrtab: *mut col.DynBuf[u8],
+    interner: *span.SymInterner,
+) -> DebugSectionLocs ! OutOfMemory {
+    var locs = DebugSectionLocs.{
+        has_debug: false,
+        abbrev_off: 0_usize,
+        abbrev_len: 0_usize,
+        info_off: 0_usize,
+        info_len: 0_usize,
+        line_off: 0_usize,
+        line_len: 0_usize,
+        shn_abbrev: 0_u32,
+        shn_info: 0_u32,
+        shn_line: 0_u32,
+    };
+    let want_debug = input.emit_debug_line
+        || !input.line_entries.is_empty()
+        || !input.debug_files.is_empty();
+    if !want_debug {
+        return locs;
+    }
+
+    let debug_line = try build_dwarf5_debug_line(
+        alloc,
+        text_vaddr,
+        text_len,
+        input.debug_files.as_slice(),
+        input.line_entries.as_slice(),
+        interner,
+    );
+    errdefer debug_line.destroy(alloc);
+    if !debug_line.is_empty() {
+        let dfiles = input.debug_files.as_slice();
+        let primary_raw = if dfiles.len > 0_usize {
+            interner.get(dfiles[0_usize])
+        } else {
+            "<eon>".as_bytes()
+        };
+        let primary = strip_dot_slash(primary_raw);
+        let pair = try build_dwarf5_debug_info(
+            alloc, text_vaddr, text_len, primary,
+            input.symbols.as_slice(), input.debug_vars.as_slice(), interner,
+        );
+        errdefer pair.destroy(alloc);
+
+        locs.shn_abbrev = (try push_cstr(shstrtab, alloc, ".debug_abbrev".as_bytes())).trunc.[u32]();
+        locs.shn_info = (try push_cstr(shstrtab, alloc, ".debug_info".as_bytes())).trunc.[u32]();
+        locs.shn_line = (try push_cstr(shstrtab, alloc, ".debug_line".as_bytes())).trunc.[u32]();
+
+        try pad_to(out, alloc, 4_usize);
+        locs.abbrev_off = out.len();
+        locs.abbrev_len = pair.abbrev.len();
+        try out.push_slice(alloc, pair.abbrev.as_slice());
+
+        try pad_to(out, alloc, 4_usize);
+        locs.info_off = out.len();
+        locs.info_len = pair.info.len();
+        try out.push_slice(alloc, pair.info.as_slice());
+
+        try pad_to(out, alloc, 4_usize);
+        locs.line_off = out.len();
+        locs.line_len = debug_line.len();
+        try out.push_slice(alloc, debug_line.as_slice());
+
+        locs.has_debug = true;
+        pair.destroy(alloc);
+    }
+    debug_line.destroy(alloc);
+    return locs;
+}
+
+fn append_debug_and_symtab_sections(
+    alloc: *mut AllocCap,
+    out: *mut col.DynBuf[u8],
+    input: *ElfLinkInput,
+    text_vaddr: u64,
+    text_len: u64,
+    addrs: *SectionAddrs,
+    sec_indices: *SectionIndices,
+    shstrtab: *mut col.DynBuf[u8],
+    shdrs: *mut col.DynBuf[Shdr],
+    interner: *span.SymInterner,
+) -> SymtabTailInfo ! OutOfMemory {
+    let dbg = try append_dwarf5_sections(alloc, out, input, text_vaddr, text_len, shstrtab, interner);
+
+    var strtab = try col.DynBuf.[u8].init(alloc, 64_usize);
+    errdefer strtab.destroy(alloc);
+    try strtab.push(alloc, 0_u8);
+
+    var symtab = try col.DynBuf.[u8].init(alloc, 64_usize);
+    errdefer symtab.destroy(alloc);
+    try push_zeros(&mut symtab, alloc, SYM_SIZE);
+
+    let syms = input.symbols.as_slice();
+    var local_count: u32 = 0_u32;
+    var i: usize = 0_usize;
+    while i < syms.len {
+        if !syms[i].is_global {
+            try push_symtab_entry(alloc, &mut symtab, &mut strtab, syms[i], STB_LOCAL, addrs, sec_indices, interner);
+            local_count = local_count +% 1_u32;
+        }
+        i = i +% 1_usize;
+    }
+    let first_global = 1_u32 +% local_count;
+    i = 0_usize;
+    while i < syms.len {
+        if syms[i].is_global {
+            try push_symtab_entry(alloc, &mut symtab, &mut strtab, syms[i], STB_GLOBAL, addrs, sec_indices, interner);
+        }
+        i = i +% 1_usize;
+    }
+
+    let shn_symtab = (try push_cstr(shstrtab, alloc, ".symtab".as_bytes())).trunc.[u32]();
+    let shn_strtab = (try push_cstr(shstrtab, alloc, ".strtab".as_bytes())).trunc.[u32]();
+    let shn_shstrtab = (try push_cstr(shstrtab, alloc, ".shstrtab".as_bytes())).trunc.[u32]();
+
+    try pad_to(out, alloc, 8_usize);
+    let symtab_off = out.len();
+    try out.push_slice(alloc, symtab.as_slice());
+
+    let strtab_off = out.len();
+    try out.push_slice(alloc, strtab.as_slice());
+
+    let shstrtab_off = out.len();
+    try out.push_slice(alloc, shstrtab.as_slice());
+
+    try pad_to(out, alloc, 8_usize);
+    let shdr_off = out.len();
+
+    if dbg.has_debug {
+        try shdrs.push(alloc, Shdr.{ name: dbg.shn_abbrev, kind: SHT_PROGBITS, flags: 0_u64, addr: 0_u64, offset: dbg.abbrev_off.widen.[u64](), size: dbg.abbrev_len.widen.[u64](), link: 0_u32, info: 0_u32, addralign: 1_u64, entsize: 0_u64 });
+        try shdrs.push(alloc, Shdr.{ name: dbg.shn_info, kind: SHT_PROGBITS, flags: 0_u64, addr: 0_u64, offset: dbg.info_off.widen.[u64](), size: dbg.info_len.widen.[u64](), link: 0_u32, info: 0_u32, addralign: 1_u64, entsize: 0_u64 });
+        try shdrs.push(alloc, Shdr.{ name: dbg.shn_line, kind: SHT_PROGBITS, flags: 0_u64, addr: 0_u64, offset: dbg.line_off.widen.[u64](), size: dbg.line_len.widen.[u64](), link: 0_u32, info: 0_u32, addralign: 1_u64, entsize: 0_u64 });
+    }
+
+    let strtab_idx = (shdrs.len() +% 1_usize).trunc.[u32]();
+    try shdrs.push(alloc, Shdr.{ name: shn_symtab, kind: SHT_SYMTAB, flags: 0_u64, addr: 0_u64, offset: symtab_off.widen.[u64](), size: symtab.len().widen.[u64](), link: strtab_idx, info: first_global, addralign: 8_u64, entsize: SYM_SIZE.widen.[u64]() });
+    try shdrs.push(alloc, Shdr.{ name: shn_strtab, kind: SHT_STRTAB, flags: 0_u64, addr: 0_u64, offset: strtab_off.widen.[u64](), size: strtab.len().widen.[u64](), link: 0_u32, info: 0_u32, addralign: 1_u64, entsize: 0_u64 });
+    let shstrtab_idx = shdrs.len().trunc.[u16]();
+    try shdrs.push(alloc, Shdr.{ name: shn_shstrtab, kind: SHT_STRTAB, flags: 0_u64, addr: 0_u64, offset: shstrtab_off.widen.[u64](), size: shstrtab.len().widen.[u64](), link: 0_u32, info: 0_u32, addralign: 1_u64, entsize: 0_u64 });
+
+    let sh_slice = shdrs.as_slice();
+    var si: usize = 0_usize;
+    while si < sh_slice.len {
+        let entry = sh_slice[si];
+        try write_shdr(out, alloc, &entry);
+        si = si +% 1_usize;
+    }
+
+    symtab.destroy(alloc);
+    strtab.destroy(alloc);
+    return SymtabTailInfo.{ shdr_off: shdr_off, shstrtab_idx: shstrtab_idx };
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic Linker Helpers (`.gnu.hash`, `.plt` / `.got.plt`, Plan & Layout)
+// ---------------------------------------------------------------------------
+
+fn cmp_exported_sym(a: u32, b: u32, nbuckets: u32, interner: *span.SymInterner) -> i32 {
+    let denom = if nbuckets == 0_u32 { 1_u32 } else { nbuckets };
+    let ba = interner.get(a);
+    let bb = interner.get(b);
+    let buck_a = gnu_hash_bytes(ba) % denom;
+    let buck_b = gnu_hash_bytes(bb) % denom;
+    if buck_a < buck_b {
+        return -1_i32;
+    }
+    if buck_a > buck_b {
+        return 1_i32;
+    }
+    return cmp_bytes(ba, bb);
+}
+
+fn sort_exported_syms(syms: *mut [u32], nbuckets: u32, interner: *span.SymInterner) {
+    let n = syms.len;
+    if n <= 1_usize {
+        return;
+    }
+    var gap: usize = 1_usize;
+    let third = n / 3_usize;
+    while gap < third {
+        gap = (gap *% 3_usize) +% 1_usize;
+    }
+    while gap > 0_usize {
+        var i = gap;
+        while i < n {
+            let cur = syms[i];
+            var j = i;
+            while j >= gap {
+                let prev = j - gap;
+                if cmp_exported_sym(syms[prev], cur, nbuckets, interner) <= 0_i32 {
+                    break;
+                }
+                syms[j] = syms[prev];
+                j = prev;
+            }
+            syms[j] = cur;
+            i = i +% 1_usize;
+        }
+        gap = gap / 3_usize;
+    }
+}
+
+fn build_gnu_hash_section(
+    alloc: *mut AllocCap,
+    exported_sorted: *[u32],
+    symoffset: u32,
+    nbuckets: u32,
+    interner: *span.SymInterner,
+) -> col.DynBuf[u8] ! OutOfMemory {
+    let bloom_size: u32 = if exported_sorted.len <= 8_usize {
+        1_u32
+    } else {
+        next_pow2_u32((exported_sorted.len / 8_usize).trunc.[u32]())
+    };
+    let bloom_shift: u32 = 6_u32;
+
+    var bloom = try col.DynBuf.[u64].init(alloc, bloom_size.widen.[usize]());
+    errdefer bloom.destroy(alloc);
+    var bi: u32 = 0_u32;
+    while bi < bloom_size {
+        try bloom.push(alloc, 0_u64);
+        bi = bi +% 1_u32;
+    }
+
+    var buckets = try col.DynBuf.[u32].init(alloc, nbuckets.widen.[usize]());
+    errdefer buckets.destroy(alloc);
+    var ki: u32 = 0_u32;
+    while ki < nbuckets {
+        try buckets.push(alloc, 0_u32);
+        ki = ki +% 1_u32;
+    }
+
+    var hashes = try col.DynBuf.[u32].init(alloc, if exported_sorted.len > 4_usize { exported_sorted.len } else { 4_usize });
+    errdefer hashes.destroy(alloc);
+    var hi: usize = 0_usize;
+    while hi < exported_sorted.len {
+        try hashes.push(alloc, gnu_hash_bytes(interner.get(exported_sorted[hi])));
+        hi = hi +% 1_usize;
+    }
+
+    var chains = try col.DynBuf.[u32].init(alloc, if exported_sorted.len > 4_usize { exported_sorted.len } else { 4_usize });
+    errdefer chains.destroy(alloc);
+    let hslice = hashes.as_slice();
+    let denom = if nbuckets == 0_u32 { 1_u32 } else { nbuckets };
+    let bloom_mask = (bloom_size -% 1_u32).widen.[usize]();
+    var i: usize = 0_usize;
+    while i < hslice.len {
+        let h = hslice[i];
+        let dynsym_idx = symoffset +% i.trunc.[u32]();
+        let bloom_idx = ((h.widen.[usize]()) >> 6_usize) & bloom_mask;
+        let b1 = 1_u64 <<% (h & 63_u32).widen.[u64]();
+        let b2 = 1_u64 <<% ((h >> bloom_shift) & 63_u32).widen.[u64]();
+        let bmut = bloom.as_mut_slice();
+        if bloom_idx < bmut.len {
+            bmut[bloom_idx] = bmut[bloom_idx] | b1 | b2;
+        }
+        let b = (h % denom).widen.[usize]();
+        let bkmut = buckets.as_mut_slice();
+        if b < bkmut.len && bkmut[b] == 0_u32 {
+            bkmut[b] = dynsym_idx;
+        }
+        let next_i = i +% 1_usize;
+        var is_last = true;
+        if next_i < hslice.len {
+            is_last = (hslice[next_i] % denom).widen.[usize]() != b;
+        }
+        let chain_val = if is_last { h | 1_u32 } else { h & (~1_u32) };
+        try chains.push(alloc, chain_val);
+        i = next_i;
+    }
+
+    let total = 16_usize +% (bloom.len() *% 8_usize) +% (buckets.len() *% 4_usize) +% (chains.len() *% 4_usize);
+    var out = try col.DynBuf.[u8].init(alloc, total);
+    errdefer out.destroy(alloc);
+    try push_u32_le(&mut out, alloc, nbuckets);
+    try push_u32_le(&mut out, alloc, symoffset);
+    try push_u32_le(&mut out, alloc, bloom_size);
+    try push_u32_le(&mut out, alloc, bloom_shift);
+
+    let bl = bloom.as_slice();
+    var wi: usize = 0_usize;
+    while wi < bl.len {
+        try push_u64_le(&mut out, alloc, bl[wi]);
+        wi = wi +% 1_usize;
+    }
+    let bk = buckets.as_slice();
+    var bki: usize = 0_usize;
+    while bki < bk.len {
+        try push_u32_le(&mut out, alloc, bk[bki]);
+        bki = bki +% 1_usize;
+    }
+    let ch = chains.as_slice();
+    var ci: usize = 0_usize;
+    while ci < ch.len {
+        try push_u32_le(&mut out, alloc, ch[ci]);
+        ci = ci +% 1_usize;
+    }
+
+    chains.destroy(alloc);
+    hashes.destroy(alloc);
+    buckets.destroy(alloc);
+    bloom.destroy(alloc);
+    return out;
+}
+
+fn build_plt_and_got_plt(
+    alloc: *mut AllocCap,
+    plt_vaddr: u64,
+    got_plt_vaddr: u64,
+    dynamic_vaddr: u64,
+    ext_count: usize,
+    plt_out: *mut col.DynBuf[u8],
+    got_plt_out: *mut col.DynBuf[u8],
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    try push_u64_le(got_plt_out, alloc, dynamic_vaddr);
+    try push_u64_le(got_plt_out, alloc, 0_u64);
+    try push_u64_le(got_plt_out, alloc, 0_u64);
+
+    let d1_raw = i128_sub(i128_from_u64(got_plt_vaddr +% 8_u64), i128_from_u64(plt_vaddr +% 6_u64));
+    let d2_raw = i128_sub(i128_from_u64(got_plt_vaddr +% 16_u64), i128_from_u64(plt_vaddr +% 12_u64));
+    var disp_got1: i32 = 0_i32;
+    if let d1 = i128_to_i32(d1_raw) {
+        disp_got1 = d1;
+    } else {
+        try set_err(err_msg, alloc, "ELF64 linker error: PLT0 -> GOT[1] displacement overflow");
+        return false;
+    }
+    var disp_got2: i32 = 0_i32;
+    if let d2 = i128_to_i32(d2_raw) {
+        disp_got2 = d2;
+    } else {
+        try set_err(err_msg, alloc, "ELF64 linker error: PLT0 -> GOT[2] displacement overflow");
+        return false;
+    }
+
+    let push_rip: [2]u8 = [0xFF_u8, 0x35_u8];
+    let jmp_rip: [2]u8 = [0xFF_u8, 0x25_u8];
+    let nop4: [4]u8 = [0x0F_u8, 0x1F_u8, 0x40_u8, 0x00_u8];
+    try plt_out.push_slice(alloc, &push_rip);
+    try push_i32_le(plt_out, alloc, disp_got1);
+    try plt_out.push_slice(alloc, &jmp_rip);
+    try push_i32_le(plt_out, alloc, disp_got2);
+    try plt_out.push_slice(alloc, &nop4);
+
+    var i: usize = 0_usize;
+    while i < ext_count {
+        let stub_vaddr = plt_vaddr +% ((1_usize +% i) *% 16_usize).widen.[u64]();
+        let slot_vaddr = got_plt_vaddr +% ((3_usize +% i) *% 8_usize).widen.[u64]();
+        let ds_raw = i128_sub(i128_from_u64(slot_vaddr), i128_from_u64(stub_vaddr +% 6_u64));
+        let dp_raw = i128_sub(i128_from_u64(plt_vaddr), i128_from_u64(stub_vaddr +% 16_u64));
+        var disp_slot: i32 = 0_i32;
+        if let ds = i128_to_i32(ds_raw) {
+            disp_slot = ds;
+        } else {
+            try set_err(err_msg, alloc, "ELF64 linker error: PLT -> GOT.PLT displacement overflow");
+            return false;
+        }
+        var disp_plt0: i32 = 0_i32;
+        if let dp = i128_to_i32(dp_raw) {
+            disp_plt0 = dp;
+        } else {
+            try set_err(err_msg, alloc, "ELF64 linker error: PLT -> PLT0 displacement overflow");
+            return false;
+        }
+        try plt_out.push_slice(alloc, &jmp_rip);
+        try push_i32_le(plt_out, alloc, disp_slot);
+        try plt_out.push(alloc, 0x68_u8);
+        try push_u32_le(plt_out, alloc, i.trunc.[u32]());
+        try plt_out.push(alloc, 0xE9_u8);
+        try push_i32_le(plt_out, alloc, disp_plt0);
+        try push_u64_le(got_plt_out, alloc, stub_vaddr +% 6_u64);
+        i = i +% 1_usize;
+    }
+    return true;
+}
+
+linear struct DynPlan {
+    local_defs: col.HashMap[u32];
+    ext_syms: col.DynBuf[u32];
+    ext_dynsym_idx: col.HashMap[u32];
+    ext_is_func: col.HashMap[u32];
+    got_syms: col.DynBuf[u32];
+    exported_syms: col.DynBuf[u32];
+    dynstr: col.DynBuf[u8];
+    needed_str_offs: col.DynBuf[u64];
+    ext_str_offs: col.DynBuf[u32];
+    exp_str_offs: col.DynBuf[u32];
+    gnu_hash_bytes: col.DynBuf[u8];
+    soname_str_off: u64;
+    has_soname: bool;
+    is_pie: bool;
+    has_interp: bool;
+    has_tls: bool;
+    has_plt: bool;
+    has_got: bool;
+    has_tdata: bool;
+    has_tbss: bool;
+    has_data_rel_ro: bool;
+    has_data: bool;
+    has_bss: bool;
+    nbuckets: u32;
+    symoffset: u32;
+    dynsym_len: usize;
+    relacount: usize;
+    non_rel_rela_dyn_count: usize;
+    rela_dyn_count: usize;
+    rela_dyn_len: usize;
+    rela_plt_len: usize;
+    dynamic_len: usize;
+    sec_indices: SectionIndices;
+    dynsym_shndx: u16;
+    dynstr_shndx: u16;
+    got_plt_shndx: u16;
+}
+
+impl DynPlan {
+    fn init(alloc: *mut AllocCap) -> DynPlan ! OutOfMemory {
+        let local_defs = try col.HashMap.[u32].init(alloc, 32_usize);
+        errdefer local_defs.destroy(alloc);
+        let ext_syms = try col.DynBuf.[u32].init(alloc, 8_usize);
+        errdefer ext_syms.destroy(alloc);
+        let ext_dynsym_idx = try col.HashMap.[u32].init(alloc, 16_usize);
+        errdefer ext_dynsym_idx.destroy(alloc);
+        let ext_is_func = try col.HashMap.[u32].init(alloc, 16_usize);
+        errdefer ext_is_func.destroy(alloc);
+        let got_syms = try col.DynBuf.[u32].init(alloc, 8_usize);
+        errdefer got_syms.destroy(alloc);
+        let exported_syms = try col.DynBuf.[u32].init(alloc, 8_usize);
+        errdefer exported_syms.destroy(alloc);
+        let dynstr = try col.DynBuf.[u8].init(alloc, 64_usize);
+        errdefer dynstr.destroy(alloc);
+        let needed_str_offs = try col.DynBuf.[u64].init(alloc, 4_usize);
+        errdefer needed_str_offs.destroy(alloc);
+        let ext_str_offs = try col.DynBuf.[u32].init(alloc, 8_usize);
+        errdefer ext_str_offs.destroy(alloc);
+        let exp_str_offs = try col.DynBuf.[u32].init(alloc, 8_usize);
+        errdefer exp_str_offs.destroy(alloc);
+        let gnu_hash_bytes = try col.DynBuf.[u8].init(alloc, 32_usize);
+        errdefer gnu_hash_bytes.destroy(alloc);
+        return DynPlan.{
+            local_defs: local_defs,
+            ext_syms: ext_syms,
+            ext_dynsym_idx: ext_dynsym_idx,
+            ext_is_func: ext_is_func,
+            got_syms: got_syms,
+            exported_syms: exported_syms,
+            dynstr: dynstr,
+            needed_str_offs: needed_str_offs,
+            ext_str_offs: ext_str_offs,
+            exp_str_offs: exp_str_offs,
+            gnu_hash_bytes: gnu_hash_bytes,
+            soname_str_off: 0_u64,
+            has_soname: false,
+            is_pie: false,
+            has_interp: false,
+            has_tls: false,
+            has_plt: false,
+            has_got: false,
+            has_tdata: false,
+            has_tbss: false,
+            has_data_rel_ro: false,
+            has_data: false,
+            has_bss: false,
+            nbuckets: 1_u32,
+            symoffset: 1_u32,
+            dynsym_len: 0_usize,
+            relacount: 0_usize,
+            non_rel_rela_dyn_count: 0_usize,
+            rela_dyn_count: 0_usize,
+            rela_dyn_len: 0_usize,
+            rela_plt_len: 0_usize,
+            dynamic_len: 0_usize,
+            sec_indices: section_indices_empty(),
+            dynsym_shndx: 0_u16,
+            dynstr_shndx: 0_u16,
+            got_plt_shndx: 0_u16,
+        };
+    }
+
+    fn destroy(self: DynPlan, alloc: *mut AllocCap) {
+        let DynPlan.{
+            local_defs,
+            ext_syms,
+            ext_dynsym_idx,
+            ext_is_func,
+            got_syms,
+            exported_syms,
+            dynstr,
+            needed_str_offs,
+            ext_str_offs,
+            exp_str_offs,
+            gnu_hash_bytes,
+            soname_str_off: _,
+            has_soname: _,
+            is_pie: _,
+            has_interp: _,
+            has_tls: _,
+            has_plt: _,
+            has_got: _,
+            has_tdata: _,
+            has_tbss: _,
+            has_data_rel_ro: _,
+            has_data: _,
+            has_bss: _,
+            nbuckets: _,
+            symoffset: _,
+            dynsym_len: _,
+            relacount: _,
+            non_rel_rela_dyn_count: _,
+            rela_dyn_count: _,
+            rela_dyn_len: _,
+            rela_plt_len: _,
+            dynamic_len: _,
+            sec_indices: _,
+            dynsym_shndx: _,
+            dynstr_shndx: _,
+            got_plt_shndx: _,
+        } = self;
+        local_defs.destroy(alloc);
+        ext_syms.destroy(alloc);
+        ext_dynsym_idx.destroy(alloc);
+        ext_is_func.destroy(alloc);
+        got_syms.destroy(alloc);
+        exported_syms.destroy(alloc);
+        dynstr.destroy(alloc);
+        needed_str_offs.destroy(alloc);
+        ext_str_offs.destroy(alloc);
+        exp_str_offs.destroy(alloc);
+        gnu_hash_bytes.destroy(alloc);
+    }
+}
+
+fn collect_ext_symbols(
+    alloc: *mut AllocCap,
+    input: *ElfLinkInput,
+    plan: *mut DynPlan,
+    interner: *span.SymInterner,
+) -> !OutOfMemory {
+    var ext_seen = try col.HashMap.[u32].init(alloc, 16_usize);
+    errdefer ext_seen.destroy(alloc);
+    if !input.external_syms.is_empty() {
+        let exts = input.external_syms.as_slice();
+        var ei: usize = 0_usize;
+        while ei < exts.len {
+            let sid = exts[ei];
+            let key = sid.widen.[u64]();
+            if !plan.local_defs.contains(key) && !ext_seen.contains(key) {
+                try ext_seen.insert(alloc, key, 1_u32);
+                try plan.ext_syms.push(alloc, sid);
+            }
+            ei = ei +% 1_usize;
+        }
+    } else if !input.needed_libs.is_empty() {
+        let rels = input.relocs.as_slice();
+        var ri: usize = 0_usize;
+        while ri < rels.len {
+            let r = rels[ri];
+            if r.kind == .Plt32 || r.kind == .GotPcRel32 || r.kind == .Abs64 {
+                let key = r.target_sym.widen.[u64]();
+                if !plan.local_defs.contains(key) && !is_synthetic_sym(interner, r.target_sym) && !ext_seen.contains(key) {
+                    try ext_seen.insert(alloc, key, 1_u32);
+                    try plan.ext_syms.push(alloc, r.target_sym);
+                }
+            }
+            ri = ri +% 1_usize;
+        }
+    }
+
+    let rels = input.relocs.as_slice();
+    var ri2: usize = 0_usize;
+    while ri2 < rels.len {
+        let r = rels[ri2];
+        if r.kind == .Plt32 && ext_seen.contains(r.target_sym.widen.[u64]()) {
+            try plan.ext_is_func.insert(alloc, r.target_sym.widen.[u64](), 1_u32);
+        }
+        ri2 = ri2 +% 1_usize;
+    }
+    ext_seen.destroy(alloc);
+    return;
+}
+
+fn copy_got_symbols_to_plan(
+    alloc: *mut AllocCap,
+    input: *ElfLinkInput,
+    plan: *mut DynPlan,
+) -> !OutOfMemory {
+    let gots = try collect_got_symbols(alloc, input);
+    errdefer gots.destroy(alloc);
+    try plan.got_syms.push_slice(alloc, gots.as_slice());
+    gots.destroy(alloc);
+    return;
+}
+
+fn collect_dyn_symbols(
+    alloc: *mut AllocCap,
+    input: *ElfLinkInput,
+    plan: *mut DynPlan,
+    interner: *span.SymInterner,
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    plan.is_pie = input.mode.kind == .LinuxPie;
+    plan.has_interp = plan.is_pie && !input.needed_libs.is_empty();
+    plan.has_tls = !input.tdata.is_empty() || input.tbss_size > 0_u64;
+
+    let syms = input.symbols.as_slice();
+    var i: usize = 0_usize;
+    while i < syms.len {
+        try plan.local_defs.insert(alloc, syms[i].name_sym.widen.[u64](), i.trunc.[u32]());
+        i = i +% 1_usize;
+    }
+
+    try collect_ext_symbols(alloc, input, plan, interner);
+    try copy_got_symbols_to_plan(alloc, input, plan);
+
+    plan.has_plt = !plan.ext_syms.is_empty();
+    plan.has_got = !plan.got_syms.is_empty();
+
+    var exp_seen = try col.HashMap.[u32].init(alloc, 16_usize);
+    errdefer exp_seen.destroy(alloc);
+    if !input.exported_syms.is_empty() {
+        let exps = input.exported_syms.as_slice();
+        var xi: usize = 0_usize;
+        while xi < exps.len {
+            let sid = exps[xi];
+            let key = sid.widen.[u64]();
+            if !plan.local_defs.contains(key) {
+                try set_err_sym(err_msg, alloc, "ELF64 linker error: exported symbol `", interner.get(sid), "` is not defined");
+                exp_seen.destroy(alloc);
+                return false;
+            }
+            if !exp_seen.contains(key) {
+                try exp_seen.insert(alloc, key, 1_u32);
+                try plan.exported_syms.push(alloc, sid);
+            }
+            xi = xi +% 1_usize;
+        }
+    } else if input.mode.kind == .LinuxShared {
+        var si: usize = 0_usize;
+        while si < syms.len {
+            let s = syms[si];
+            let key = s.name_sym.widen.[u64]();
+            if s.is_global && !exp_seen.contains(key) {
+                try exp_seen.insert(alloc, key, 1_u32);
+                try plan.exported_syms.push(alloc, s.name_sym);
+            }
+            si = si +% 1_usize;
+        }
+    }
+    exp_seen.destroy(alloc);
+
+    let exp_len = plan.exported_syms.len();
+    plan.nbuckets = if exp_len > 1_usize { exp_len.trunc.[u32]() } else { 1_u32 };
+    plan.symoffset = 1_u32 +% plan.ext_syms.len().trunc.[u32]();
+    sort_exported_syms(plan.exported_syms.as_mut_slice(), plan.nbuckets, interner);
+    return true;
+}
+
+fn assign_dyn_shndx(input: *ElfLinkInput, plan: *mut DynPlan) {
+    plan.has_tdata = !input.tdata.is_empty() || has_sym_or_reloc_in(input, .Tdata);
+    plan.has_tbss = input.tbss_size > 0_u64 || has_sym_or_reloc_in(input, .Tbss);
+    plan.has_data_rel_ro = !input.data_rel_ro.is_empty() || has_sym_or_reloc_in(input, .DataRelRo);
+    plan.has_data = !input.data.is_empty() || has_sym_or_reloc_in(input, .Data);
+    plan.has_bss = input.bss_size > 0_u64 || has_sym_or_reloc_in(input, .Bss);
+
+    var next: u16 = 1_u16;
+    if plan.has_interp {
+        next = next +% 1_u16;
+    }
+    next = next +% 1_u16; // .gnu.hash
+    plan.dynsym_shndx = next;
+    next = next +% 1_u16;
+    plan.dynstr_shndx = next;
+    next = next +% 1_u16;
+    next = next +% 1_u16; // .rela.dyn
+    next = next +% 1_u16; // .rela.plt
+    plan.sec_indices.rodata = next;
+    next = next +% 1_u16;
+    plan.sec_indices.text = next;
+    next = next +% 1_u16;
+    if plan.has_plt {
+        next = next +% 1_u16;
+    }
+    if plan.has_tdata {
+        plan.sec_indices.tdata = next;
+        next = next +% 1_u16;
+    }
+    if plan.has_tbss {
+        plan.sec_indices.tbss = next;
+        next = next +% 1_u16;
+    }
+    if plan.has_data_rel_ro {
+        plan.sec_indices.data_rel_ro = next;
+        next = next +% 1_u16;
+    }
+    next = next +% 1_u16; // .dynamic
+    if plan.has_got {
+        next = next +% 1_u16;
+    }
+    if plan.has_plt {
+        plan.got_plt_shndx = next;
+        next = next +% 1_u16;
+    }
+    if plan.has_data {
+        plan.sec_indices.data = next;
+        next = next +% 1_u16;
+    }
+    if plan.has_bss {
+        plan.sec_indices.bss = next;
+    }
+}
+
+fn populate_gnu_hash_in_plan(
+    alloc: *mut AllocCap,
+    plan: *mut DynPlan,
+    interner: *span.SymInterner,
+) -> !OutOfMemory {
+    let gh = try build_gnu_hash_section(alloc, plan.exported_syms.as_slice(), plan.symoffset, plan.nbuckets, interner);
+    errdefer gh.destroy(alloc);
+    try plan.gnu_hash_bytes.push_slice(alloc, gh.as_slice());
+    gh.destroy(alloc);
+    return;
+}
+
+fn build_dynstr_and_counts(
+    alloc: *mut AllocCap,
+    input: *ElfLinkInput,
+    plan: *mut DynPlan,
+    interner: *span.SymInterner,
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    try plan.dynstr.push(alloc, 0_u8);
+    let libs = input.needed_libs.as_slice();
+    var li: usize = 0_usize;
+    while li < libs.len {
+        let off = try push_cstr(&mut plan.dynstr, alloc, interner.get(libs[li]));
+        try plan.needed_str_offs.push(alloc, off.widen.[u64]());
+        li = li +% 1_usize;
+    }
+    if input.mode.kind == .LinuxShared && input.mode.soname_len > 0_u32 {
+        let s0 = input.mode.soname_off.widen.[usize]();
+        let s1 = s0 +% input.mode.soname_len.widen.[usize]();
+        let sn = input.soname_bytes.as_slice().sub(s0, s1) catch {
+            try set_err(err_msg, alloc, "ELF64 linker error: invalid soname byte slice");
+            return false;
+        };
+        plan.soname_str_off = (try push_cstr(&mut plan.dynstr, alloc, sn)).widen.[u64]();
+        plan.has_soname = true;
+    }
+
+    let exts = plan.ext_syms.as_slice();
+    var ei: usize = 0_usize;
+    while ei < exts.len {
+        let sid = exts[ei];
+        let off = (try push_cstr(&mut plan.dynstr, alloc, interner.get(sid))).trunc.[u32]();
+        try plan.ext_str_offs.push(alloc, off);
+        try plan.ext_dynsym_idx.insert(alloc, sid.widen.[u64](), 1_u32 +% ei.trunc.[u32]());
+        ei = ei +% 1_usize;
+    }
+    let exps = plan.exported_syms.as_slice();
+    var xi: usize = 0_usize;
+    while xi < exps.len {
+        let off = (try push_cstr(&mut plan.dynstr, alloc, interner.get(exps[xi]))).trunc.[u32]();
+        try plan.exp_str_offs.push(alloc, off);
+        xi = xi +% 1_usize;
+    }
+
+    try populate_gnu_hash_in_plan(alloc, plan, interner);
+
+    let dynsym_count = 1_usize +% exts.len +% exps.len;
+    plan.dynsym_len = dynsym_count *% SYM_SIZE;
+
+    let gots = plan.got_syms.as_slice();
+    var gi: usize = 0_usize;
+    while gi < gots.len {
+        let sid = gots[gi];
+        let key = sid.widen.[u64]();
+        if plan.local_defs.contains(key) || is_synthetic_sym(interner, sid) {
+            plan.relacount = plan.relacount +% 1_usize;
+        } else if plan.ext_dynsym_idx.contains(key) {
+            plan.non_rel_rela_dyn_count = plan.non_rel_rela_dyn_count +% 1_usize;
+        } else {
+            try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved GOT target symbol `", interner.get(sid), "`");
+            return false;
+        }
+        gi = gi +% 1_usize;
+    }
+
+    let rels = input.relocs.as_slice();
+    var ri: usize = 0_usize;
+    while ri < rels.len {
+        let r = rels[ri];
+        if r.kind == .Abs64 {
+            if r.section == .DataRelRo || r.section == .Data {
+                let key = r.target_sym.widen.[u64]();
+                if plan.local_defs.contains(key) || is_synthetic_sym(interner, r.target_sym) {
+                    plan.relacount = plan.relacount +% 1_usize;
+                } else if plan.ext_dynsym_idx.contains(key) {
+                    plan.non_rel_rela_dyn_count = plan.non_rel_rela_dyn_count +% 1_usize;
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved Abs64 target symbol `", interner.get(r.target_sym), "`");
+                    return false;
+                }
+            } else if r.section == .Bss || r.section == .Tbss {
+                try set_err(err_msg, alloc, "ELF64 linker error: cannot apply relocation inside NOBITS section");
+                return false;
+            } else {
+                try set_err(err_msg, alloc, "ELF64 linker error: Abs64 relocation in Text/Rodata/Tdata is not supported in PIE/Shared mode");
+                return false;
+            }
+        }
+        ri = ri +% 1_usize;
+    }
+
+    plan.rela_dyn_count = plan.relacount +% plan.non_rel_rela_dyn_count;
+    plan.rela_dyn_len = plan.rela_dyn_count *% RELA_SIZE;
+    plan.rela_plt_len = exts.len *% RELA_SIZE;
+
+    var tags = plan.needed_str_offs.len() +% 8_usize; // 7 core + DT_NULL
+    if plan.has_soname {
+        tags = tags +% 1_usize;
+    }
+    if plan.has_plt {
+        tags = tags +% 4_usize;
+    }
+    if plan.rela_dyn_count > 0_usize {
+        tags = tags +% 3_usize;
+        if plan.relacount > 0_usize {
+            tags = tags +% 1_usize;
+        }
+    }
+    plan.dynamic_len = tags *% DYN_SIZE;
+    return true;
+}
+
+struct DynLayout {
+    phnum: u16;
+    phdr_off: usize;
+    interp_off: usize;
+    gnu_hash_off: usize;
+    dynsym_off: usize;
+    dynstr_off: usize;
+    rela_dyn_off: usize;
+    rela_plt_off: usize;
+    rodata_off: usize;
+    seg0_filesz: usize;
+    seg1_off: usize;
+    text_off: usize;
+    plt_off: usize;
+    plt_len: usize;
+    seg1_filesz: usize;
+    seg2_off: usize;
+    tdata_off: usize;
+    data_rel_ro_off: usize;
+    dynamic_off: usize;
+    got_off: usize;
+    relro_size: usize;
+    got_plt_off: usize;
+    data_off: usize;
+    seg2_filesz: usize;
+    seg2_memsz: usize;
+    bss_vaddr: u64;
+    tls_memsz: u64;
+    addrs: SectionAddrs;
+}
+
+fn fill_dyn_seg2_layout(input: *ElfLinkInput, plan: *DynPlan, lay: *mut DynLayout, start_off: usize) {
+    var cur = align_up(start_off, PAGE_SIZE);
+    lay.seg2_off = cur;
+    lay.tdata_off = cur;
+    let tdata_len = input.tdata.len();
+    cur = cur +% tdata_len;
+    lay.tls_memsz = tdata_len.widen.[u64]() +% input.tbss_size;
+
+    lay.data_rel_ro_off = cur;
+    if plan.has_data_rel_ro {
+        cur = align_up(cur, 16_usize);
+        lay.data_rel_ro_off = cur;
+        cur = cur +% input.data_rel_ro.len();
+    }
+
+    cur = align_up(cur, 16_usize);
+    lay.dynamic_off = cur;
+    cur = cur +% plan.dynamic_len;
+
+    lay.got_off = cur;
+    if plan.has_got {
+        cur = align_up(cur, 8_usize);
+        lay.got_off = cur;
+        cur = cur +% (plan.got_syms.len() *% 8_usize);
+    }
+
+    // Pad RELRO prefix to exact PAGE_SIZE boundary
+    cur = align_up(cur, PAGE_SIZE);
+    lay.relro_size = cur -% lay.seg2_off;
+
+    lay.got_plt_off = cur;
+    if plan.has_plt {
+        cur = cur +% ((3_usize +% plan.ext_syms.len()) *% 8_usize);
+    }
+
+    lay.data_off = cur;
+    if plan.has_data {
+        cur = align_up(cur, 16_usize);
+        lay.data_off = cur;
+        cur = cur +% input.data.len();
+    }
+    lay.seg2_filesz = cur -% lay.seg2_off;
+
+    lay.bss_vaddr = cur.widen.[u64]();
+    lay.seg2_memsz = lay.seg2_filesz;
+    if plan.has_bss {
+        let bss_aligned = align_up(cur, 16_usize);
+        lay.bss_vaddr = bss_aligned.widen.[u64]();
+        lay.seg2_memsz = (bss_aligned +% input.bss_size.trunc.[usize]()) -% lay.seg2_off;
+    }
+
+    lay.addrs = SectionAddrs.{
+        text: lay.text_off.widen.[u64](),
+        rodata: lay.rodata_off.widen.[u64](),
+        data_rel_ro: lay.data_rel_ro_off.widen.[u64](),
+        data: lay.data_off.widen.[u64](),
+        bss: lay.bss_vaddr,
+        tdata: lay.tdata_off.widen.[u64](),
+        tbss_tls_offset: tdata_len.widen.[u64](),
+    };
+}
+
+fn compute_dyn_layout(input: *ElfLinkInput, plan: *DynPlan) -> DynLayout {
+    var phnum: u16 = 7_u16;
+    if plan.has_interp {
+        phnum = phnum +% 1_u16;
+    }
+    if plan.has_tls {
+        phnum = phnum +% 1_u16;
+    }
+    let phdr_off = EHDR_SIZE;
+    var cur = phdr_off +% (phnum.widen.[usize]() *% PHDR_SIZE);
+
+    var interp_off = cur;
+    if plan.has_interp {
+        cur = align_up(cur, 16_usize);
+        interp_off = cur;
+        cur = cur +% INTERP_LEN;
+    }
+    cur = align_up(cur, 8_usize);
+    let gnu_hash_off = cur;
+    cur = cur +% plan.gnu_hash_bytes.len();
+    cur = align_up(cur, 8_usize);
+    let dynsym_off = cur;
+    cur = cur +% plan.dynsym_len;
+    let dynstr_off = cur;
+    cur = cur +% plan.dynstr.len();
+    cur = align_up(cur, 8_usize);
+    let rela_dyn_off = cur;
+    cur = cur +% plan.rela_dyn_len;
+    cur = align_up(cur, 8_usize);
+    let rela_plt_off = cur;
+    cur = cur +% plan.rela_plt_len;
+    cur = align_up(cur, 16_usize);
+    let rodata_off = cur;
+    cur = cur +% input.rodata.len();
+    let seg0_filesz = cur;
+
+    // Segment 1 (PF_R | PF_X, page-aligned)
+    cur = align_up(cur, PAGE_SIZE);
+    let seg1_off = cur;
+    let text_off = cur;
+    cur = cur +% input.text.len();
+
+    var plt_off = cur;
+    let plt_len: usize = if plan.has_plt { 16_usize +% (plan.ext_syms.len() *% 16_usize) } else { 0_usize };
+    if plan.has_plt {
+        cur = align_up(cur, 16_usize);
+        plt_off = cur;
+        cur = cur +% plt_len;
+    }
+    let seg1_filesz = cur -% seg1_off;
+
+    var lay = DynLayout.{
+        phnum: phnum,
+        phdr_off: phdr_off,
+        interp_off: interp_off,
+        gnu_hash_off: gnu_hash_off,
+        dynsym_off: dynsym_off,
+        dynstr_off: dynstr_off,
+        rela_dyn_off: rela_dyn_off,
+        rela_plt_off: rela_plt_off,
+        rodata_off: rodata_off,
+        seg0_filesz: seg0_filesz,
+        seg1_off: seg1_off,
+        text_off: text_off,
+        plt_off: plt_off,
+        plt_len: plt_len,
+        seg1_filesz: seg1_filesz,
+        seg2_off: 0_usize,
+        tdata_off: 0_usize,
+        data_rel_ro_off: 0_usize,
+        dynamic_off: 0_usize,
+        got_off: 0_usize,
+        relro_size: 0_usize,
+        got_plt_off: 0_usize,
+        data_off: 0_usize,
+        seg2_filesz: 0_usize,
+        seg2_memsz: 0_usize,
+        bss_vaddr: 0_u64,
+        tls_memsz: 0_u64,
+        addrs: SectionAddrs.{ text: 0_u64, rodata: 0_u64, data_rel_ro: 0_u64, data: 0_u64, bss: 0_u64, tdata: 0_u64, tbss_tls_offset: 0_u64 },
+    };
+    fill_dyn_seg2_layout(input, plan, &mut lay, cur);
+    return lay;
+}
+
+fn build_dynsym_section(
+    alloc: *mut AllocCap,
+    input: *ElfLinkInput,
+    plan: *DynPlan,
+    addrs: *SectionAddrs,
+    tls_offsets: *col.HashMap[u64],
+    interner: *span.SymInterner,
+    dynsym_out: *mut col.DynBuf[u8],
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    try push_zeros(dynsym_out, alloc, SYM_SIZE);
+    let exts = plan.ext_syms.as_slice();
+    let ext_offs = plan.ext_str_offs.as_slice();
+    var ei: usize = 0_usize;
+    while ei < exts.len && ei < ext_offs.len {
+        let sid = exts[ei];
+        let st_type: u8 = if plan.ext_is_func.contains(sid.widen.[u64]()) { STT_FUNC } else { STT_NOTYPE };
+        try push_elf_sym(dynsym_out, alloc, ext_offs[ei], (STB_GLOBAL <<% 4_u8) | st_type, 0_u16, 0_u64, 0_u64);
+        ei = ei +% 1_usize;
+    }
+
+    let exps = plan.exported_syms.as_slice();
+    let exp_offs = plan.exp_str_offs.as_slice();
+    let syms = input.symbols.as_slice();
+    var xi: usize = 0_usize;
+    while xi < exps.len && xi < exp_offs.len {
+        let sid = exps[xi];
+        var def_idx: usize = 0_usize;
+        if let idx_u32 = plan.local_defs.get(sid.widen.[u64]()) {
+            def_idx = idx_u32.widen.[usize]();
+        } else {
+            try set_err_sym(err_msg, alloc, "ELF64 linker error: missing local def for export `", interner.get(sid), "`");
+            return false;
+        }
+        if def_idx >= syms.len {
+            try set_err_sym(err_msg, alloc, "ELF64 linker error: invalid local def index for export `", interner.get(sid), "`");
+            return false;
+        }
+        let def = syms[def_idx];
+        let shndx = sec_indices_get(&plan.sec_indices, def.section);
+        if shndx == 0_u16 {
+            try set_err_sym(err_msg, alloc, "ELF64 linker error: missing section index for `", interner.get(sid), "`");
+            return false;
+        }
+        var st_type: u8 = STT_OBJECT;
+        var st_val: u64 = 0_u64;
+        if def.section == .Tdata || def.section == .Tbss {
+            st_type = STT_TLS;
+            if let toff = tls_offsets.get(sid.widen.[u64]()) {
+                st_val = toff;
+            }
+        } else {
+            st_type = if def.is_func { STT_FUNC } else { STT_OBJECT };
+            st_val = sym_vaddr_for(addrs, def.section, def.offset);
+        }
+        try push_elf_sym(dynsym_out, alloc, exp_offs[xi], (STB_GLOBAL <<% 4_u8) | st_type, shndx, st_val, def.size);
+        xi = xi +% 1_usize;
+    }
+    return true;
+}
+
+fn apply_dyn_relocs(
+    alloc: *mut AllocCap,
+    input: *ElfLinkInput,
+    plan: *DynPlan,
+    lay: *DynLayout,
+    sym_vaddrs: *col.HashMap[u64],
+    tls_offsets: *col.HashMap[u64],
+    ext_plt_vaddr: *col.HashMap[u64],
+    scratch: *mut RelocScratch,
+    got_bytes: *mut col.DynBuf[u8],
+    rela_dyn_bytes: *mut col.DynBuf[u8],
+    interner: *span.SymInterner,
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    let oth_cap = if plan.non_rel_rela_dyn_count > 0_usize { plan.non_rel_rela_dyn_count *% RELA_SIZE } else { 4_usize };
+    var rela_oth_bytes = try col.DynBuf.[u8].init(alloc, oth_cap);
+    errdefer rela_oth_bytes.destroy(alloc);
+    var got_index = try col.HashMap.[u32].init(alloc, 16_usize);
+    errdefer got_index.destroy(alloc);
+
+    let got_vaddr = lay.got_off.widen.[u64]();
+    let gots = plan.got_syms.as_slice();
+    try push_zeros(got_bytes, alloc, gots.len *% 8_usize);
+    var gi: usize = 0_usize;
+    while gi < gots.len {
+        let sid = gots[gi];
+        let key = sid.widen.[u64]();
+        let slot_vaddr = got_vaddr +% (gi *% 8_usize).widen.[u64]();
+        if let tv = sym_vaddrs.get(key) {
+            write_u64_le_at(got_bytes.as_mut_slice(), gi *% 8_usize, tv);
+            try write_rela(rela_dyn_bytes, alloc, slot_vaddr, 0_u32, R_X86_64_RELATIVE, tv.bitcast.[i64]());
+        } else if let didx = plan.ext_dynsym_idx.get(key) {
+            try write_rela(&mut rela_oth_bytes, alloc, slot_vaddr, didx, R_X86_64_GLOB_DAT, 0_i64);
+        } else {
+            try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved GOT symbol `", interner.get(sid), "`");
+            got_index.destroy(alloc);
+            rela_oth_bytes.destroy(alloc);
+            return false;
+        }
+        try got_index.insert(alloc, key, gi.trunc.[u32]());
+        gi = gi +% 1_usize;
+    }
+
+    let tls_aligned_memsz = align_up(lay.tls_memsz.trunc.[usize](), TLS_ALIGN).widen.[u64]();
+    let rels = input.relocs.as_slice();
+    var ri: usize = 0_usize;
+    while ri < rels.len {
+        let r = rels[ri];
+        let off = r.offset.trunc.[usize]();
+        let key = r.target_sym.widen.[u64]();
+        let sbytes = interner.get(r.target_sym);
+        var ok = true;
+        match r.kind {
+            .Rel32 => {
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_rel32_sec(alloc, scratch, &lay.addrs, r.section, false, off, tv, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved local symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .Plt32 => {
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_rel32_sec(alloc, scratch, &lay.addrs, r.section, false, off, tv, r.addend, sbytes, err_msg);
+                } else if let plt_stub = ext_plt_vaddr.get(key) {
+                    ok = try patch_rel32_sec(alloc, scratch, &lay.addrs, r.section, false, off, plt_stub, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .Abs64 => {
+                let place_vaddr = sym_vaddr_for(&lay.addrs, r.section, r.offset);
+                if let tv = sym_vaddrs.get(key) {
+                    let val = tv +% r.addend.bitcast.[u64]();
+                    ok = try write_abs64_sec(alloc, scratch, r.section, false, off, val, err_msg);
+                    if ok {
+                        try write_rela(rela_dyn_bytes, alloc, place_vaddr, 0_u32, R_X86_64_RELATIVE, val.bitcast.[i64]());
+                    }
+                } else if let didx = plan.ext_dynsym_idx.get(key) {
+                    ok = try write_abs64_sec(alloc, scratch, r.section, false, off, 0_u64, err_msg);
+                    if ok {
+                        try write_rela(&mut rela_oth_bytes, alloc, place_vaddr, didx, R_X86_64_64, r.addend);
+                    }
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .GotPcRel32 => {
+                if let slot_i = got_index.get(key) {
+                    let slot_vaddr = got_vaddr +% (slot_i.widen.[u64]() *% 8_u64);
+                    ok = try patch_rel32_sec(alloc, scratch, &lay.addrs, r.section, false, off, slot_vaddr, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: missing GOT slot for `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .TpOff32 => {
+                ok = try patch_tpoff32_sec(alloc, scratch, r.section, false, off, tls_offsets, r.target_sym, r.addend, tls_aligned_memsz, interner, err_msg);
+            }
+        }
+        if !ok {
+            got_index.destroy(alloc);
+            rela_oth_bytes.destroy(alloc);
+            return false;
+        }
+        ri = ri +% 1_usize;
+    }
+
+    try rela_dyn_bytes.push_slice(alloc, rela_oth_bytes.as_slice());
+    got_index.destroy(alloc);
+    rela_oth_bytes.destroy(alloc);
+    return true;
+}
+
+fn build_dynamic_section(
+    alloc: *mut AllocCap,
+    plan: *DynPlan,
+    lay: *DynLayout,
+) -> col.DynBuf[u8] ! OutOfMemory {
+    var dyn_bytes = try col.DynBuf.[u8].init(alloc, plan.dynamic_len);
+    errdefer dyn_bytes.destroy(alloc);
+    let libs = plan.needed_str_offs.as_slice();
+    var i: usize = 0_usize;
+    while i < libs.len {
+        try write_dyn(&mut dyn_bytes, alloc, DT_NEEDED, libs[i]);
+        i = i +% 1_usize;
+    }
+    if plan.has_soname {
+        try write_dyn(&mut dyn_bytes, alloc, DT_SONAME, plan.soname_str_off);
+    }
+    try write_dyn(&mut dyn_bytes, alloc, DT_FLAGS, DF_BIND_NOW);
+    let flags_1 = DF_1_NOW | (if plan.is_pie { DF_1_PIE } else { 0_u64 });
+    try write_dyn(&mut dyn_bytes, alloc, DT_FLAGS_1, flags_1);
+    try write_dyn(&mut dyn_bytes, alloc, DT_GNU_HASH, lay.gnu_hash_off.widen.[u64]());
+    try write_dyn(&mut dyn_bytes, alloc, DT_STRTAB, lay.dynstr_off.widen.[u64]());
+    try write_dyn(&mut dyn_bytes, alloc, DT_SYMTAB, lay.dynsym_off.widen.[u64]());
+    try write_dyn(&mut dyn_bytes, alloc, DT_STRSZ, plan.dynstr.len().widen.[u64]());
+    try write_dyn(&mut dyn_bytes, alloc, DT_SYMENT, SYM_SIZE.widen.[u64]());
+    if plan.has_plt {
+        try write_dyn(&mut dyn_bytes, alloc, DT_PLTGOT, lay.got_plt_off.widen.[u64]());
+        try write_dyn(&mut dyn_bytes, alloc, DT_PLTRELSZ, plan.rela_plt_len.widen.[u64]());
+        try write_dyn(&mut dyn_bytes, alloc, DT_PLTREL, DT_RELA_VAL);
+        try write_dyn(&mut dyn_bytes, alloc, DT_JMPREL, lay.rela_plt_off.widen.[u64]());
+    }
+    if plan.rela_dyn_count > 0_usize {
+        try write_dyn(&mut dyn_bytes, alloc, DT_RELA, lay.rela_dyn_off.widen.[u64]());
+        try write_dyn(&mut dyn_bytes, alloc, DT_RELASZ, plan.rela_dyn_len.widen.[u64]());
+        try write_dyn(&mut dyn_bytes, alloc, DT_RELAENT, RELA_SIZE.widen.[u64]());
+        if plan.relacount > 0_usize {
+            try write_dyn(&mut dyn_bytes, alloc, DT_RELACOUNT, plan.relacount.widen.[u64]());
+        }
+    }
+    try write_dyn(&mut dyn_bytes, alloc, DT_NULL, 0_u64);
+    return dyn_bytes;
+}
+
+fn push_dyn_shdrs_seg01(
+    alloc: *mut AllocCap,
+    plan: *DynPlan,
+    lay: *DynLayout,
+    text_len: usize,
+    rodata_len: usize,
+    shstrtab: *mut col.DynBuf[u8],
+    shdrs: *mut col.DynBuf[Shdr],
+) -> !OutOfMemory {
+    if plan.has_interp {
+        let n = (try push_cstr(shstrtab, alloc, ".interp".as_bytes())).trunc.[u32]();
+        try shdrs.push(alloc, Shdr.{ name: n, kind: SHT_PROGBITS, flags: SHF_ALLOC, addr: lay.interp_off.widen.[u64](), offset: lay.interp_off.widen.[u64](), size: INTERP_LEN.widen.[u64](), link: 0_u32, info: 0_u32, addralign: 1_u64, entsize: 0_u64 });
+    }
+    let n_gh = (try push_cstr(shstrtab, alloc, ".gnu.hash".as_bytes())).trunc.[u32]();
+    try shdrs.push(alloc, Shdr.{ name: n_gh, kind: SHT_GNU_HASH, flags: SHF_ALLOC, addr: lay.gnu_hash_off.widen.[u64](), offset: lay.gnu_hash_off.widen.[u64](), size: plan.gnu_hash_bytes.len().widen.[u64](), link: plan.dynsym_shndx.widen.[u32](), info: 0_u32, addralign: 8_u64, entsize: 0_u64 });
+    let n_ds = (try push_cstr(shstrtab, alloc, ".dynsym".as_bytes())).trunc.[u32]();
+    try shdrs.push(alloc, Shdr.{ name: n_ds, kind: SHT_DYNSYM, flags: SHF_ALLOC, addr: lay.dynsym_off.widen.[u64](), offset: lay.dynsym_off.widen.[u64](), size: plan.dynsym_len.widen.[u64](), link: plan.dynstr_shndx.widen.[u32](), info: 1_u32, addralign: 8_u64, entsize: SYM_SIZE.widen.[u64]() });
+    let n_str = (try push_cstr(shstrtab, alloc, ".dynstr".as_bytes())).trunc.[u32]();
+    try shdrs.push(alloc, Shdr.{ name: n_str, kind: SHT_STRTAB, flags: SHF_ALLOC, addr: lay.dynstr_off.widen.[u64](), offset: lay.dynstr_off.widen.[u64](), size: plan.dynstr.len().widen.[u64](), link: 0_u32, info: 0_u32, addralign: 1_u64, entsize: 0_u64 });
+    let n_rd = (try push_cstr(shstrtab, alloc, ".rela.dyn".as_bytes())).trunc.[u32]();
+    try shdrs.push(alloc, Shdr.{ name: n_rd, kind: SHT_RELA, flags: SHF_ALLOC, addr: lay.rela_dyn_off.widen.[u64](), offset: lay.rela_dyn_off.widen.[u64](), size: plan.rela_dyn_len.widen.[u64](), link: plan.dynsym_shndx.widen.[u32](), info: 0_u32, addralign: 8_u64, entsize: RELA_SIZE.widen.[u64]() });
+    let n_rp = (try push_cstr(shstrtab, alloc, ".rela.plt".as_bytes())).trunc.[u32]();
+    let rp_flags = SHF_ALLOC | (if plan.got_plt_shndx != 0_u16 { SHF_INFO_LINK } else { 0_u64 });
+    try shdrs.push(alloc, Shdr.{ name: n_rp, kind: SHT_RELA, flags: rp_flags, addr: lay.rela_plt_off.widen.[u64](), offset: lay.rela_plt_off.widen.[u64](), size: plan.rela_plt_len.widen.[u64](), link: plan.dynsym_shndx.widen.[u32](), info: plan.got_plt_shndx.widen.[u32](), addralign: 8_u64, entsize: RELA_SIZE.widen.[u64]() });
+    let n_ro = (try push_cstr(shstrtab, alloc, ".rodata".as_bytes())).trunc.[u32]();
+    try shdrs.push(alloc, Shdr.{ name: n_ro, kind: SHT_PROGBITS, flags: SHF_ALLOC, addr: lay.rodata_off.widen.[u64](), offset: lay.rodata_off.widen.[u64](), size: rodata_len.widen.[u64](), link: 0_u32, info: 0_u32, addralign: 16_u64, entsize: 0_u64 });
+    let n_tx = (try push_cstr(shstrtab, alloc, ".text".as_bytes())).trunc.[u32]();
+    try shdrs.push(alloc, Shdr.{ name: n_tx, kind: SHT_PROGBITS, flags: SHF_ALLOC | SHF_EXECINSTR, addr: lay.text_off.widen.[u64](), offset: lay.text_off.widen.[u64](), size: text_len.widen.[u64](), link: 0_u32, info: 0_u32, addralign: 16_u64, entsize: 0_u64 });
+    if plan.has_plt {
+        let n_pl = (try push_cstr(shstrtab, alloc, ".plt".as_bytes())).trunc.[u32]();
+        try shdrs.push(alloc, Shdr.{ name: n_pl, kind: SHT_PROGBITS, flags: SHF_ALLOC | SHF_EXECINSTR, addr: lay.plt_off.widen.[u64](), offset: lay.plt_off.widen.[u64](), size: lay.plt_len.widen.[u64](), link: 0_u32, info: 0_u32, addralign: 16_u64, entsize: 16_u64 });
+    }
+    return;
+}
+
+fn push_dyn_shdrs_seg2(
+    alloc: *mut AllocCap,
+    input: *ElfLinkInput,
+    plan: *DynPlan,
+    lay: *DynLayout,
+    total_load_filesz: usize,
+    shstrtab: *mut col.DynBuf[u8],
+    shdrs: *mut col.DynBuf[Shdr],
+) -> !OutOfMemory {
+    let tdata_len = input.tdata.len();
+    if plan.has_tdata {
+        let n = (try push_cstr(shstrtab, alloc, ".tdata".as_bytes())).trunc.[u32]();
+        try shdrs.push(alloc, Shdr.{ name: n, kind: SHT_PROGBITS, flags: SHF_ALLOC | SHF_WRITE | SHF_TLS, addr: lay.tdata_off.widen.[u64](), offset: lay.tdata_off.widen.[u64](), size: tdata_len.widen.[u64](), link: 0_u32, info: 0_u32, addralign: TLS_ALIGN.widen.[u64](), entsize: 0_u64 });
+    }
+    if plan.has_tbss {
+        let n = (try push_cstr(shstrtab, alloc, ".tbss".as_bytes())).trunc.[u32]();
+        let tbss_off = (lay.tdata_off +% tdata_len).widen.[u64]();
+        try shdrs.push(alloc, Shdr.{ name: n, kind: SHT_NOBITS, flags: SHF_ALLOC | SHF_WRITE | SHF_TLS, addr: tbss_off, offset: tbss_off, size: input.tbss_size, link: 0_u32, info: 0_u32, addralign: tls_tbss_align(tdata_len), entsize: 0_u64 });
+    }
+    if plan.has_data_rel_ro {
+        let n = (try push_cstr(shstrtab, alloc, ".data.rel.ro".as_bytes())).trunc.[u32]();
+        try shdrs.push(alloc, Shdr.{ name: n, kind: SHT_PROGBITS, flags: SHF_ALLOC | SHF_WRITE, addr: lay.data_rel_ro_off.widen.[u64](), offset: lay.data_rel_ro_off.widen.[u64](), size: input.data_rel_ro.len().widen.[u64](), link: 0_u32, info: 0_u32, addralign: 16_u64, entsize: 0_u64 });
+    }
+    let n_dyn = (try push_cstr(shstrtab, alloc, ".dynamic".as_bytes())).trunc.[u32]();
+    try shdrs.push(alloc, Shdr.{ name: n_dyn, kind: SHT_DYNAMIC, flags: SHF_ALLOC | SHF_WRITE, addr: lay.dynamic_off.widen.[u64](), offset: lay.dynamic_off.widen.[u64](), size: plan.dynamic_len.widen.[u64](), link: plan.dynstr_shndx.widen.[u32](), info: 0_u32, addralign: 16_u64, entsize: DYN_SIZE.widen.[u64]() });
+    if plan.has_got {
+        let n = (try push_cstr(shstrtab, alloc, ".got".as_bytes())).trunc.[u32]();
+        try shdrs.push(alloc, Shdr.{ name: n, kind: SHT_PROGBITS, flags: SHF_ALLOC | SHF_WRITE, addr: lay.got_off.widen.[u64](), offset: lay.got_off.widen.[u64](), size: (plan.got_syms.len() *% 8_usize).widen.[u64](), link: 0_u32, info: 0_u32, addralign: 8_u64, entsize: 8_u64 });
+    }
+    if plan.has_plt {
+        let n = (try push_cstr(shstrtab, alloc, ".got.plt".as_bytes())).trunc.[u32]();
+        let gp_sz = ((3_usize +% plan.ext_syms.len()) *% 8_usize).widen.[u64]();
+        try shdrs.push(alloc, Shdr.{ name: n, kind: SHT_PROGBITS, flags: SHF_ALLOC | SHF_WRITE, addr: lay.got_plt_off.widen.[u64](), offset: lay.got_plt_off.widen.[u64](), size: gp_sz, link: 0_u32, info: 0_u32, addralign: 8_u64, entsize: 8_u64 });
+    }
+    if plan.has_data {
+        let n = (try push_cstr(shstrtab, alloc, ".data".as_bytes())).trunc.[u32]();
+        try shdrs.push(alloc, Shdr.{ name: n, kind: SHT_PROGBITS, flags: SHF_ALLOC | SHF_WRITE, addr: lay.data_off.widen.[u64](), offset: lay.data_off.widen.[u64](), size: input.data.len().widen.[u64](), link: 0_u32, info: 0_u32, addralign: 16_u64, entsize: 0_u64 });
+    }
+    if plan.has_bss {
+        let n = (try push_cstr(shstrtab, alloc, ".bss".as_bytes())).trunc.[u32]();
+        try shdrs.push(alloc, Shdr.{ name: n, kind: SHT_NOBITS, flags: SHF_ALLOC | SHF_WRITE, addr: lay.bss_vaddr, offset: total_load_filesz.widen.[u64](), size: input.bss_size, link: 0_u32, info: 0_u32, addralign: 16_u64, entsize: 0_u64 });
+    }
+    return;
+}
+
+fn emit_dyn_phdrs(
+    alloc: *mut AllocCap,
+    plan: *DynPlan,
+    lay: *DynLayout,
+    tdata_len: usize,
+) -> col.DynBuf[u8] ! OutOfMemory {
+    var phdrs = try col.DynBuf.[u8].init(alloc, lay.phnum.widen.[usize]() *% PHDR_SIZE);
+    errdefer phdrs.destroy(alloc);
+    let ph_bytes = lay.phnum.widen.[u64]() *% PHDR_SIZE.widen.[u64]();
+    let ph_off = lay.phdr_off.widen.[u64]();
+    try write_phdr(&mut phdrs, alloc, PT_PHDR, PF_R, ph_off, ph_off, ph_off, ph_bytes, ph_bytes, 8_u64);
+    if plan.has_interp {
+        let ioff = lay.interp_off.widen.[u64]();
+        let ilen = INTERP_LEN.widen.[u64]();
+        try write_phdr(&mut phdrs, alloc, PT_INTERP, PF_R, ioff, ioff, ioff, ilen, ilen, 1_u64);
+    }
+    let s0 = lay.seg0_filesz.widen.[u64]();
+    try write_phdr(&mut phdrs, alloc, PT_LOAD, PF_R, 0_u64, 0_u64, 0_u64, s0, s0, PAGE_SIZE.widen.[u64]());
+    let s1o = lay.seg1_off.widen.[u64]();
+    let s1s = lay.seg1_filesz.widen.[u64]();
+    try write_phdr(&mut phdrs, alloc, PT_LOAD, PF_R | PF_X, s1o, s1o, s1o, s1s, s1s, PAGE_SIZE.widen.[u64]());
+    let s2o = lay.seg2_off.widen.[u64]();
+    try write_phdr(&mut phdrs, alloc, PT_LOAD, PF_R | PF_W, s2o, s2o, s2o, lay.seg2_filesz.widen.[u64](), lay.seg2_memsz.widen.[u64](), PAGE_SIZE.widen.[u64]());
+    let dy_o = lay.dynamic_off.widen.[u64]();
+    let dy_s = plan.dynamic_len.widen.[u64]();
+    try write_phdr(&mut phdrs, alloc, PT_DYNAMIC, PF_R | PF_W, dy_o, dy_o, dy_o, dy_s, dy_s, 8_u64);
+    if plan.has_tls {
+        let td_o = lay.tdata_off.widen.[u64]();
+        try write_phdr(&mut phdrs, alloc, PT_TLS, PF_R, td_o, td_o, td_o, tdata_len.widen.[u64](), lay.tls_memsz, TLS_ALIGN.widen.[u64]());
+    }
+    try write_phdr(&mut phdrs, alloc, PT_GNU_STACK, PF_R | PF_W, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 16_u64);
+    let rr = lay.relro_size.widen.[u64]();
+    try write_phdr(&mut phdrs, alloc, PT_GNU_RELRO, PF_R, s2o, s2o, s2o, rr, rr, 1_u64);
+    return phdrs;
+}
+
+linear struct DynArtifacts {
+    dynsym: col.DynBuf[u8];
+    plt: col.DynBuf[u8];
+    got_plt: col.DynBuf[u8];
+    rela_plt: col.DynBuf[u8];
+    got: col.DynBuf[u8];
+    rela_dyn: col.DynBuf[u8];
+    dynamic: col.DynBuf[u8];
+}
+
+impl DynArtifacts {
+    fn init(alloc: *mut AllocCap) -> DynArtifacts ! OutOfMemory {
+        let dynsym = try col.DynBuf.[u8].init(alloc, 32_usize);
+        errdefer dynsym.destroy(alloc);
+        let plt = try col.DynBuf.[u8].init(alloc, 4_usize);
+        errdefer plt.destroy(alloc);
+        let got_plt = try col.DynBuf.[u8].init(alloc, 4_usize);
+        errdefer got_plt.destroy(alloc);
+        let rela_plt = try col.DynBuf.[u8].init(alloc, 4_usize);
+        errdefer rela_plt.destroy(alloc);
+        let got = try col.DynBuf.[u8].init(alloc, 4_usize);
+        errdefer got.destroy(alloc);
+        let rela_dyn = try col.DynBuf.[u8].init(alloc, 4_usize);
+        errdefer rela_dyn.destroy(alloc);
+        let dynamic = try col.DynBuf.[u8].init(alloc, 32_usize);
+        errdefer dynamic.destroy(alloc);
+        return DynArtifacts.{
+            dynsym: dynsym,
+            plt: plt,
+            got_plt: got_plt,
+            rela_plt: rela_plt,
+            got: got,
+            rela_dyn: rela_dyn,
+            dynamic: dynamic,
+        };
+    }
+
+    fn destroy(self: DynArtifacts, alloc: *mut AllocCap) {
+        let DynArtifacts.{ dynsym, plt, got_plt, rela_plt, got, rela_dyn, dynamic } = self;
+        dynsym.destroy(alloc);
+        plt.destroy(alloc);
+        got_plt.destroy(alloc);
+        rela_plt.destroy(alloc);
+        got.destroy(alloc);
+        rela_dyn.destroy(alloc);
+        dynamic.destroy(alloc);
+    }
+}
+
+fn build_plt_and_apply_dyn_relocs(
+    alloc: *mut AllocCap,
+    input: *ElfLinkInput,
+    plan: *DynPlan,
+    lay: *DynLayout,
+    sym_vaddrs: *col.HashMap[u64],
+    tls_offsets: *col.HashMap[u64],
+    scratch: *mut RelocScratch,
+    art: *mut DynArtifacts,
+    interner: *span.SymInterner,
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    var ext_plt_vaddr = try col.HashMap.[u64].init(alloc, 16_usize);
+    errdefer ext_plt_vaddr.destroy(alloc);
+    if plan.has_plt {
+        let exts = plan.ext_syms.as_slice();
+        let ok_plt = try build_plt_and_got_plt(
+            alloc,
+            lay.plt_off.widen.[u64](),
+            lay.got_plt_off.widen.[u64](),
+            lay.dynamic_off.widen.[u64](),
+            exts.len,
+            &mut art.plt,
+            &mut art.got_plt,
+            err_msg,
+        );
+        if !ok_plt {
+            ext_plt_vaddr.destroy(alloc);
+            return false;
+        }
+        var ei: usize = 0_usize;
+        while ei < exts.len {
+            let sid = exts[ei];
+            var didx: u32 = 0_u32;
+            if let d = plan.ext_dynsym_idx.get(sid.widen.[u64]()) {
+                didx = d;
+            }
+            let slot_vaddr = lay.got_plt_off.widen.[u64]() +% ((3_usize +% ei) *% 8_usize).widen.[u64]();
+            try write_rela(&mut art.rela_plt, alloc, slot_vaddr, didx, R_X86_64_JUMP_SLOT, 0_i64);
+            try ext_plt_vaddr.insert(alloc, sid.widen.[u64](), lay.plt_off.widen.[u64]() +% ((1_usize +% ei) *% 16_usize).widen.[u64]());
+            ei = ei +% 1_usize;
+        }
+    }
+
+    let ok_rel = try apply_dyn_relocs(
+        alloc,
+        input,
+        plan,
+        lay,
+        sym_vaddrs,
+        tls_offsets,
+        &ext_plt_vaddr,
+        scratch,
+        &mut art.got,
+        &mut art.rela_dyn,
+        interner,
+        err_msg,
+    );
+    ext_plt_vaddr.destroy(alloc);
+    return ok_rel;
+}
+
+fn build_dyn_artifacts(
+    alloc: *mut AllocCap,
+    input: *ElfLinkInput,
+    plan: *DynPlan,
+    lay: *DynLayout,
+    sym_vaddrs: *col.HashMap[u64],
+    tls_offsets: *col.HashMap[u64],
+    scratch: *mut RelocScratch,
+    art: *mut DynArtifacts,
+    interner: *span.SymInterner,
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    let ok_ds = try build_dynsym_section(alloc, input, plan, &lay.addrs, tls_offsets, interner, &mut art.dynsym, err_msg);
+    if !ok_ds {
+        return false;
+    }
+
+    let ok_rel = try build_plt_and_apply_dyn_relocs(alloc, input, plan, lay, sym_vaddrs, tls_offsets, scratch, art, interner, err_msg);
+    if !ok_rel {
+        return false;
+    }
+
+    let dyn_sec = try build_dynamic_section(alloc, plan, lay);
+    errdefer dyn_sec.destroy(alloc);
+    try art.dynamic.push_slice(alloc, dyn_sec.as_slice());
+    dyn_sec.destroy(alloc);
+    return true;
+}
+
+fn assemble_dyn_loaded_image(
+    alloc: *mut AllocCap,
+    plan: *DynPlan,
+    lay: *DynLayout,
+    scratch: *RelocScratch,
+    art: *DynArtifacts,
+) -> col.DynBuf[u8] ! OutOfMemory {
+    let total = lay.seg2_off +% lay.seg2_filesz;
+    var out = try col.DynBuf.[u8].init(alloc, total +% 512_usize);
+    errdefer out.destroy(alloc);
+    try push_zeros(&mut out, alloc, total);
+
+    let dst = out.as_mut_slice();
+    if plan.has_interp {
+        copy_into(dst, lay.interp_off, "/lib64/ld-linux-x86-64.so.2".as_bytes());
+    }
+    copy_into(dst, lay.gnu_hash_off, plan.gnu_hash_bytes.as_slice());
+    copy_into(dst, lay.dynsym_off, art.dynsym.as_slice());
+    copy_into(dst, lay.dynstr_off, plan.dynstr.as_slice());
+    copy_into(dst, lay.rela_dyn_off, art.rela_dyn.as_slice());
+    copy_into(dst, lay.rela_plt_off, art.rela_plt.as_slice());
+    copy_into(dst, lay.rodata_off, scratch.rodata.as_slice());
+    copy_into(dst, lay.text_off, scratch.text.as_slice());
+    copy_into(dst, lay.plt_off, art.plt.as_slice());
+    copy_into(dst, lay.tdata_off, scratch.tdata.as_slice());
+    if plan.has_data_rel_ro {
+        copy_into(dst, lay.data_rel_ro_off, scratch.data_rel_ro.as_slice());
+    }
+    copy_into(dst, lay.dynamic_off, art.dynamic.as_slice());
+    if plan.has_got {
+        copy_into(dst, lay.got_off, art.got.as_slice());
+    }
+    copy_into(dst, lay.got_plt_off, art.got_plt.as_slice());
+    if plan.has_data {
+        copy_into(dst, lay.data_off, scratch.data.as_slice());
+    }
+    return out;
+}
+
+fn finalize_dyn_elf(
+    alloc: *mut AllocCap,
+    input: *ElfLinkInput,
+    plan: *DynPlan,
+    lay: *DynLayout,
+    entry_vaddr: u64,
+    scratch: *RelocScratch,
+    art: *DynArtifacts,
+    interner: *span.SymInterner,
+) -> LinkedElf ! OutOfMemory {
+    let total_load_filesz = lay.seg2_off +% lay.seg2_filesz;
+    var out = try assemble_dyn_loaded_image(alloc, plan, lay, scratch, art);
+    errdefer out.destroy(alloc);
+
+    var shstrtab = try col.DynBuf.[u8].init(alloc, 128_usize);
+    errdefer shstrtab.destroy(alloc);
+    try shstrtab.push(alloc, 0_u8);
+    var shdrs = try col.DynBuf.[Shdr].init(alloc, 24_usize);
+    errdefer shdrs.destroy(alloc);
+    try shdrs.push(alloc, shdr_null());
+
+    try push_dyn_shdrs_seg01(alloc, plan, lay, scratch.text.len(), scratch.rodata.len(), &mut shstrtab, &mut shdrs);
+    try push_dyn_shdrs_seg2(alloc, input, plan, lay, total_load_filesz, &mut shstrtab, &mut shdrs);
+
+    let tail = try append_debug_and_symtab_sections(
+        alloc,
+        &mut out,
+        input,
+        lay.addrs.text,
+        scratch.text.len().widen.[u64](),
+        &lay.addrs,
+        &plan.sec_indices,
+        &mut shstrtab,
+        &mut shdrs,
+        interner,
+    );
+
+    try stamp_ehdr(
+        alloc,
+        &mut out,
+        ET_DYN,
+        entry_vaddr,
+        lay.phdr_off.widen.[u64](),
+        tail.shdr_off.widen.[u64](),
+        lay.phnum,
+        shdrs.len().trunc.[u16](),
+        tail.shstrtab_idx,
+    );
+
+    let phdrs = try emit_dyn_phdrs(alloc, plan, lay, scratch.tdata.len());
+    errdefer phdrs.destroy(alloc);
+    copy_into(out.as_mut_slice(), lay.phdr_off, phdrs.as_slice());
+    phdrs.destroy(alloc);
+
+    shdrs.destroy(alloc);
+    shstrtab.destroy(alloc);
+
+    return LinkedElf.{
+        bytes: out,
+        entry_vaddr: entry_vaddr,
+        text_vaddr: lay.addrs.text,
+        rodata_vaddr: lay.addrs.rodata,
+        data_rel_ro_vaddr: lay.addrs.data_rel_ro,
+        data_vaddr: lay.addrs.data,
+        bss_vaddr: lay.addrs.bss,
+        tdata_vaddr: lay.addrs.tdata,
+        tls_memsz: lay.tls_memsz,
+    };
+}
+
+fn link_dynamic_elf(
+    alloc: *mut AllocCap,
+    input: *ElfLinkInput,
+    interner: *span.SymInterner,
+) -> LinkResult ! OutOfMemory {
+    var err_msg = try str.StrBuf.init(alloc, 64_usize);
+    errdefer err_msg.destroy(alloc);
+    var plan = try DynPlan.init(alloc);
+    errdefer plan.destroy(alloc);
+
+    let ok_syms = try collect_dyn_symbols(alloc, input, &mut plan, interner, &mut err_msg);
+    if !ok_syms {
+        let empty_elf = try LinkedElf.empty(alloc);
+        plan.destroy(alloc);
+        return LinkResult.{ ok: false, elf: empty_elf, err_msg: err_msg };
+    }
+    assign_dyn_shndx(input, &mut plan);
+    let ok_cnt = try build_dynstr_and_counts(alloc, input, &mut plan, interner, &mut err_msg);
+    if !ok_cnt {
+        let empty_elf = try LinkedElf.empty(alloc);
+        plan.destroy(alloc);
+        return LinkResult.{ ok: false, elf: empty_elf, err_msg: err_msg };
+    }
+
+    let lay = compute_dyn_layout(input, &plan);
+    var sym_vaddrs = try col.HashMap.[u64].init(alloc, 32_usize);
+    errdefer sym_vaddrs.destroy(alloc);
+    var tls_offsets = try col.HashMap.[u64].init(alloc, 16_usize);
+    errdefer tls_offsets.destroy(alloc);
+    try populate_symbol_maps(alloc, input, &lay.addrs, &mut sym_vaddrs, &mut tls_offsets);
+    try insert_synthetic_symbols(
+        alloc,
+        interner,
+        &mut sym_vaddrs,
+        0_u64,
+        lay.rela_dyn_off.widen.[u64](),
+        (lay.rela_dyn_off +% plan.rela_dyn_len).widen.[u64](),
+        lay.tdata_off.widen.[u64](),
+        input.tdata.len().widen.[u64](),
+    );
+
+    var entry_vaddr: u64 = 0_u64;
+    if input.mode.kind == .LinuxShared {
+        if input.entry_sym != span.SYM_EMPTY {
+            if let ev = sym_vaddrs.get(input.entry_sym.widen.[u64]()) {
+                entry_vaddr = ev;
+            }
+        }
+    } else {
+        if let ev = sym_vaddrs.get(input.entry_sym.widen.[u64]()) {
+            entry_vaddr = ev;
+        } else {
+            try set_err_sym(&mut err_msg, alloc, "ELF64 linker error: unresolved entry symbol `", interner.get(input.entry_sym), "`");
+            let empty_elf = try LinkedElf.empty(alloc);
+            tls_offsets.destroy(alloc);
+            sym_vaddrs.destroy(alloc);
+            plan.destroy(alloc);
+            return LinkResult.{ ok: false, elf: empty_elf, err_msg: err_msg };
+        }
+    }
+
+    var scratch = try RelocScratch.init_from_input(alloc, input);
+    errdefer scratch.destroy(alloc);
+    var art = try DynArtifacts.init(alloc);
+    errdefer art.destroy(alloc);
+
+    let ok_art = try build_dyn_artifacts(alloc, input, &plan, &lay, &sym_vaddrs, &tls_offsets, &mut scratch, &mut art, interner, &mut err_msg);
+    if !ok_art {
+        let empty_elf = try LinkedElf.empty(alloc);
+        art.destroy(alloc);
+        scratch.destroy(alloc);
+        tls_offsets.destroy(alloc);
+        sym_vaddrs.destroy(alloc);
+        plan.destroy(alloc);
+        return LinkResult.{ ok: false, elf: empty_elf, err_msg: err_msg };
+    }
+
+    let elf = try finalize_dyn_elf(alloc, input, &plan, &lay, entry_vaddr, &scratch, &art, interner);
+    art.destroy(alloc);
+    scratch.destroy(alloc);
+    tls_offsets.destroy(alloc);
+    sym_vaddrs.destroy(alloc);
+    plan.destroy(alloc);
+    return LinkResult.{ ok: true, elf: elf, err_msg: err_msg };
+}
+
+// ---------------------------------------------------------------------------
+// Freestanding Bare-Metal `ET_EXEC` Linker (+ Optional Multiboot2 Header)
+// ---------------------------------------------------------------------------
+
+struct FreeLayout {
+    has_mb2: bool;
+    has_tls: bool;
+    has_rodata: bool;
+    has_rw: bool;
+    has_data_rel_ro: bool;
+    has_data: bool;
+    has_bss: bool;
+    has_tdata: bool;
+    has_tbss: bool;
+    has_got: bool;
+    phnum: u16;
+    phdr_off: usize;
+    mb2_off: usize;
+    text_off: usize;
+    seg_rx_size: usize;
+    rodata_off: usize;
+    seg_ro_size: usize;
+    seg_rw_off: usize;
+    seg_rw_filesz: usize;
+    seg_rw_memsz: usize;
+    data_rel_ro_off: usize;
+    data_off: usize;
+    tdata_off: usize;
+    got_off: usize;
+    load_filesz: usize;
+    load_memsz: usize;
+    tls_memsz: u64;
+    addrs: SectionAddrs;
+}
+
+fn compute_free_layout(
+    input: *ElfLinkInput,
+    base_vaddr: u64,
+    mb2_len: usize,
+    got_count: usize,
+) -> FreeLayout {
+    let has_mb2 = mb2_len >= 48_usize;
+    let has_tls = !input.tdata.is_empty() || input.tbss_size > 0_u64;
+    let has_rodata = !input.rodata.is_empty() || has_sym_or_reloc_in(input, .Rodata);
+    let has_data_rel_ro = !input.data_rel_ro.is_empty() || has_sym_or_reloc_in(input, .DataRelRo);
+    let has_data = !input.data.is_empty() || has_sym_or_reloc_in(input, .Data);
+    let has_bss = input.bss_size > 0_u64 || has_sym_or_reloc_in(input, .Bss);
+    let has_tdata = !input.tdata.is_empty() || has_sym_or_reloc_in(input, .Tdata);
+    let has_tbss = input.tbss_size > 0_u64 || has_sym_or_reloc_in(input, .Tbss);
+    let has_got = got_count > 0_usize;
+    let has_rw = has_data_rel_ro || has_data || has_tls || has_got || has_bss;
+
+    // Strict W^X freestanding program headers:
+    //   PT_LOAD[0] (PF_R | PF_X): EHDR + PHDRs + MB2/PVH boot trampoline + .text
+    //   PT_LOAD[1] (PF_R):        .rodata (if present)
+    //   PT_LOAD[2] (PF_R | PF_W): .data.rel.ro + .data + .tdata + .got + .bss (if present)
+    let phnum: u16 = 1_u16
+        +% (if has_rodata { 1_u16 } else { 0_u16 })
+        +% (if has_rw { 1_u16 } else { 0_u16 })
+        +% (if has_mb2 { 1_u16 } else { 0_u16 })
+        +% (if has_tls { 1_u16 } else { 0_u16 });
+    let phdr_off = EHDR_SIZE;
+    var cur = align_up(phdr_off +% (phnum.widen.[usize]() *% PHDR_SIZE), 16_usize);
+
+    let mb2_off = cur;
+    if mb2_len > 0_usize {
+        cur = align_up(cur +% mb2_len, 16_usize);
+    }
+
+    let text_off = cur;
+    cur = text_off +% input.text.len();
+    let seg_rx_size = cur;
+
+    var rodata_off = cur;
+    var seg_ro_size: usize = 0_usize;
+    if has_rodata {
+        cur = align_up(cur, PAGE_SIZE);
+        rodata_off = cur;
+        seg_ro_size = input.rodata.len();
+        cur = cur +% seg_ro_size;
+    }
+
+    var seg_rw_off = cur;
+    var data_rel_ro_off = cur;
+    var data_off = cur;
+    var tdata_off = cur;
+    var got_off = cur;
+    let tdata_len = input.tdata.len();
+    let tls_memsz = tdata_len.widen.[u64]() +% input.tbss_size;
+    var seg_rw_filesz: usize = 0_usize;
+    var seg_rw_memsz: usize = 0_usize;
+    var bss_vaddr = base_vaddr +% cur.widen.[u64]();
+    var load_filesz = cur;
+    var load_memsz = cur;
+
+    if has_rw {
+        cur = align_up(cur, PAGE_SIZE);
+        seg_rw_off = cur;
+        data_rel_ro_off = cur;
+        if has_data_rel_ro {
+            cur = align_up(cur, 8_usize);
+            data_rel_ro_off = cur;
+            cur = cur +% input.data_rel_ro.len();
+        }
+        data_off = cur;
+        if has_data {
+            cur = align_up(cur, 8_usize);
+            data_off = cur;
+            cur = cur +% input.data.len();
+        }
+        tdata_off = cur;
+        if has_tls {
+            cur = align_up(cur, TLS_ALIGN);
+            tdata_off = cur;
+            cur = cur +% tdata_len;
+        }
+        got_off = cur;
+        if has_got {
+            cur = align_up(cur, 8_usize);
+            got_off = cur;
+            cur = cur +% (got_count *% 8_usize);
+        }
+        load_filesz = cur;
+        seg_rw_filesz = cur -% seg_rw_off;
+        bss_vaddr = base_vaddr +% cur.widen.[u64]();
+        load_memsz = load_filesz;
+        if has_bss {
+            let bss_aligned = align_up(cur, 16_usize);
+            bss_vaddr = base_vaddr +% bss_aligned.widen.[u64]();
+            load_memsz = bss_aligned +% input.bss_size.trunc.[usize]();
+        }
+        seg_rw_memsz = load_memsz -% seg_rw_off;
+    }
+
+    let addrs = SectionAddrs.{
+        text: base_vaddr +% text_off.widen.[u64](),
+        rodata: base_vaddr +% rodata_off.widen.[u64](),
+        data_rel_ro: base_vaddr +% data_rel_ro_off.widen.[u64](),
+        data: base_vaddr +% data_off.widen.[u64](),
+        bss: bss_vaddr,
+        tdata: base_vaddr +% tdata_off.widen.[u64](),
+        tbss_tls_offset: tdata_len.widen.[u64](),
+    };
+
+    return FreeLayout.{
+        has_mb2: has_mb2,
+        has_tls: has_tls,
+        has_rodata: has_rodata,
+        has_rw: has_rw,
+        has_data_rel_ro: has_data_rel_ro,
+        has_data: has_data,
+        has_bss: has_bss,
+        has_tdata: has_tdata,
+        has_tbss: has_tbss,
+        has_got: has_got,
+        phnum: phnum,
+        phdr_off: phdr_off,
+        mb2_off: mb2_off,
+        text_off: text_off,
+        seg_rx_size: seg_rx_size,
+        rodata_off: rodata_off,
+        seg_ro_size: seg_ro_size,
+        seg_rw_off: seg_rw_off,
+        seg_rw_filesz: seg_rw_filesz,
+        seg_rw_memsz: seg_rw_memsz,
+        data_rel_ro_off: data_rel_ro_off,
+        data_off: data_off,
+        tdata_off: tdata_off,
+        got_off: got_off,
+        load_filesz: load_filesz,
+        load_memsz: load_memsz,
+        tls_memsz: tls_memsz,
+        addrs: addrs,
+    };
+}
+
+fn apply_free_relocs(
+    alloc: *mut AllocCap,
+    input: *ElfLinkInput,
+    lay: *FreeLayout,
+    base_vaddr: u64,
+    got_syms: *[u32],
+    sym_vaddrs: *col.HashMap[u64],
+    tls_offsets: *col.HashMap[u64],
+    scratch: *mut RelocScratch,
+    got_bytes: *mut col.DynBuf[u8],
+    interner: *span.SymInterner,
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    var got_index = try col.HashMap.[u32].init(alloc, 16_usize);
+    errdefer got_index.destroy(alloc);
+    try push_zeros(got_bytes, alloc, got_syms.len *% 8_usize);
+
+    var gi: usize = 0_usize;
+    while gi < got_syms.len {
+        let sid = got_syms[gi];
+        let key = sid.widen.[u64]();
+        if let tv = sym_vaddrs.get(key) {
+            write_u64_le_at(got_bytes.as_mut_slice(), gi *% 8_usize, tv);
+            try got_index.insert(alloc, key, gi.trunc.[u32]());
+        } else {
+            try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved GOT target symbol `", interner.get(sid), "`");
+            got_index.destroy(alloc);
+            return false;
+        }
+        gi = gi +% 1_usize;
+    }
+
+    let got_vaddr = base_vaddr +% lay.got_off.widen.[u64]();
+    let tls_aligned_memsz = align_up(lay.tls_memsz.trunc.[usize](), TLS_ALIGN).widen.[u64]();
+    let rels = input.relocs.as_slice();
+    var ri: usize = 0_usize;
+    while ri < rels.len {
+        let r = rels[ri];
+        let off = r.offset.trunc.[usize]();
+        let key = r.target_sym.widen.[u64]();
+        let sbytes = interner.get(r.target_sym);
+        var ok = true;
+        match r.kind {
+            .Rel32 => {
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_rel32_sec(alloc, scratch, &lay.addrs, r.section, true, off, tv, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .Plt32 => {
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_rel32_sec(alloc, scratch, &lay.addrs, r.section, true, off, tv, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .Abs64 => {
+                if let tv = sym_vaddrs.get(key) {
+                    let val = tv +% r.addend.bitcast.[u64]();
+                    ok = try write_abs64_sec(alloc, scratch, r.section, true, off, val, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .GotPcRel32 => {
+                if let slot_i = got_index.get(key) {
+                    let slot_vaddr = got_vaddr +% (slot_i.widen.[u64]() *% 8_u64);
+                    ok = try patch_rel32_sec(alloc, scratch, &lay.addrs, r.section, true, off, slot_vaddr, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: missing GOT slot for `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .TpOff32 => {
+                ok = try patch_tpoff32_sec(alloc, scratch, r.section, true, off, tls_offsets, r.target_sym, r.addend, tls_aligned_memsz, interner, err_msg);
+            }
+        }
+        if !ok {
+            got_index.destroy(alloc);
+            return false;
+        }
+        ri = ri +% 1_usize;
+    }
+
+    got_index.destroy(alloc);
+    return true;
+}
+
+fn push_free_shdrs(
+    alloc: *mut AllocCap,
+    input: *ElfLinkInput,
+    lay: *FreeLayout,
+    base_vaddr: u64,
+    got_len: usize,
+    shstrtab: *mut col.DynBuf[u8],
+    shdrs: *mut col.DynBuf[Shdr],
+) -> SectionIndices ! OutOfMemory {
+    var si = section_indices_empty();
+    si.text = shdrs.len().trunc.[u16]();
+    let n_tx = (try push_cstr(shstrtab, alloc, ".text".as_bytes())).trunc.[u32]();
+    try shdrs.push(alloc, Shdr.{ name: n_tx, kind: SHT_PROGBITS, flags: SHF_ALLOC | SHF_EXECINSTR, addr: lay.addrs.text, offset: lay.text_off.widen.[u64](), size: input.text.len().widen.[u64](), link: 0_u32, info: 0_u32, addralign: 16_u64, entsize: 0_u64 });
+
+    si.rodata = shdrs.len().trunc.[u16]();
+    let n_ro = (try push_cstr(shstrtab, alloc, ".rodata".as_bytes())).trunc.[u32]();
+    try shdrs.push(alloc, Shdr.{ name: n_ro, kind: SHT_PROGBITS, flags: SHF_ALLOC, addr: lay.addrs.rodata, offset: lay.rodata_off.widen.[u64](), size: input.rodata.len().widen.[u64](), link: 0_u32, info: 0_u32, addralign: 8_u64, entsize: 0_u64 });
+
+    if lay.has_data_rel_ro {
+        si.data_rel_ro = shdrs.len().trunc.[u16]();
+        let n = (try push_cstr(shstrtab, alloc, ".data.rel.ro".as_bytes())).trunc.[u32]();
+        try shdrs.push(alloc, Shdr.{ name: n, kind: SHT_PROGBITS, flags: SHF_ALLOC | SHF_WRITE, addr: lay.addrs.data_rel_ro, offset: lay.data_rel_ro_off.widen.[u64](), size: input.data_rel_ro.len().widen.[u64](), link: 0_u32, info: 0_u32, addralign: 8_u64, entsize: 0_u64 });
+    }
+    if lay.has_data {
+        si.data = shdrs.len().trunc.[u16]();
+        let n = (try push_cstr(shstrtab, alloc, ".data".as_bytes())).trunc.[u32]();
+        try shdrs.push(alloc, Shdr.{ name: n, kind: SHT_PROGBITS, flags: SHF_ALLOC | SHF_WRITE, addr: lay.addrs.data, offset: lay.data_off.widen.[u64](), size: input.data.len().widen.[u64](), link: 0_u32, info: 0_u32, addralign: 8_u64, entsize: 0_u64 });
+    }
+    let tdata_len = input.tdata.len();
+    if lay.has_tdata {
+        si.tdata = shdrs.len().trunc.[u16]();
+        let n = (try push_cstr(shstrtab, alloc, ".tdata".as_bytes())).trunc.[u32]();
+        try shdrs.push(alloc, Shdr.{ name: n, kind: SHT_PROGBITS, flags: SHF_ALLOC | SHF_WRITE | SHF_TLS, addr: lay.addrs.tdata, offset: lay.tdata_off.widen.[u64](), size: tdata_len.widen.[u64](), link: 0_u32, info: 0_u32, addralign: TLS_ALIGN.widen.[u64](), entsize: 0_u64 });
+    }
+    if lay.has_tbss {
+        si.tbss = shdrs.len().trunc.[u16]();
+        let n = (try push_cstr(shstrtab, alloc, ".tbss".as_bytes())).trunc.[u32]();
+        try shdrs.push(alloc, Shdr.{ name: n, kind: SHT_NOBITS, flags: SHF_ALLOC | SHF_WRITE | SHF_TLS, addr: lay.addrs.tdata +% tdata_len.widen.[u64](), offset: (lay.tdata_off +% tdata_len).widen.[u64](), size: input.tbss_size, link: 0_u32, info: 0_u32, addralign: tls_tbss_align(tdata_len), entsize: 0_u64 });
+    }
+    if lay.has_got {
+        let n = (try push_cstr(shstrtab, alloc, ".got".as_bytes())).trunc.[u32]();
+        try shdrs.push(alloc, Shdr.{ name: n, kind: SHT_PROGBITS, flags: SHF_ALLOC | SHF_WRITE, addr: base_vaddr +% lay.got_off.widen.[u64](), offset: lay.got_off.widen.[u64](), size: got_len.widen.[u64](), link: 0_u32, info: 0_u32, addralign: 8_u64, entsize: 8_u64 });
+    }
+    if lay.has_bss {
+        si.bss = shdrs.len().trunc.[u16]();
+        let n = (try push_cstr(shstrtab, alloc, ".bss".as_bytes())).trunc.[u32]();
+        try shdrs.push(alloc, Shdr.{ name: n, kind: SHT_NOBITS, flags: SHF_ALLOC | SHF_WRITE, addr: lay.addrs.bss, offset: lay.load_filesz.widen.[u64](), size: input.bss_size, link: 0_u32, info: 0_u32, addralign: 16_u64, entsize: 0_u64 });
+    }
+    return si;
+}
+
+fn finalize_free_elf(
+    alloc: *mut AllocCap,
+    input: *ElfLinkInput,
+    lay: *FreeLayout,
+    base_vaddr: u64,
+    entry_vaddr: u64,
+    mb2_bytes: *[u8],
+    scratch: *RelocScratch,
+    got_bytes: *[u8],
+    interner: *span.SymInterner,
+) -> LinkedElf ! OutOfMemory {
+    var out = try col.DynBuf.[u8].init(alloc, lay.load_filesz +% 512_usize);
+    errdefer out.destroy(alloc);
+    try push_zeros(&mut out, alloc, lay.load_filesz);
+
+    let dst = out.as_mut_slice();
+    copy_into(dst, lay.mb2_off, mb2_bytes);
+    copy_into(dst, lay.text_off, scratch.text.as_slice());
+    copy_into(dst, lay.rodata_off, scratch.rodata.as_slice());
+    if lay.has_data_rel_ro {
+        copy_into(dst, lay.data_rel_ro_off, scratch.data_rel_ro.as_slice());
+    }
+    if lay.has_data {
+        copy_into(dst, lay.data_off, scratch.data.as_slice());
+    }
+    copy_into(dst, lay.tdata_off, scratch.tdata.as_slice());
+    if lay.has_got {
+        copy_into(dst, lay.got_off, got_bytes);
+    }
+
+    var shstrtab = try col.DynBuf.[u8].init(alloc, 128_usize);
+    errdefer shstrtab.destroy(alloc);
+    try shstrtab.push(alloc, 0_u8);
+    var shdrs = try col.DynBuf.[Shdr].init(alloc, 16_usize);
+    errdefer shdrs.destroy(alloc);
+    try shdrs.push(alloc, shdr_null());
+
+    let sec_indices = try push_free_shdrs(alloc, input, lay, base_vaddr, got_bytes.len, &mut shstrtab, &mut shdrs);
+    let tail = try append_debug_and_symtab_sections(
+        alloc,
+        &mut out,
+        input,
+        lay.addrs.text,
+        scratch.text.len().widen.[u64](),
+        &lay.addrs,
+        &sec_indices,
+        &mut shstrtab,
+        &mut shdrs,
+        interner,
+    );
+
+    try stamp_ehdr(
+        alloc,
+        &mut out,
+        ET_EXEC,
+        entry_vaddr,
+        lay.phdr_off.widen.[u64](),
+        tail.shdr_off.widen.[u64](),
+        lay.phnum,
+        shdrs.len().trunc.[u16](),
+        tail.shstrtab_idx,
+    );
+
+    var phdrs = try col.DynBuf.[u8].init(alloc, lay.phnum.widen.[usize]() *% PHDR_SIZE);
+    errdefer phdrs.destroy(alloc);
+    // Strict W^X freestanding PT_LOAD segments: RX (code + boot stub), R (.rodata), RW (.data/.bss)
+    try write_phdr(
+        &mut phdrs, alloc, PT_LOAD, PF_R | PF_X,
+        0_u64, base_vaddr, base_vaddr,
+        lay.seg_rx_size.widen.[u64](), lay.seg_rx_size.widen.[u64](), PAGE_SIZE.widen.[u64](),
+    );
+    if lay.has_rodata {
+        let ro_off = lay.rodata_off.widen.[u64]();
+        let ro_va = base_vaddr +% ro_off;
+        try write_phdr(
+            &mut phdrs, alloc, PT_LOAD, PF_R,
+            ro_off, ro_va, ro_va,
+            lay.seg_ro_size.widen.[u64](), lay.seg_ro_size.widen.[u64](), PAGE_SIZE.widen.[u64](),
+        );
+    }
+    if lay.has_rw {
+        let rw_off = lay.seg_rw_off.widen.[u64]();
+        let rw_va = base_vaddr +% rw_off;
+        try write_phdr(
+            &mut phdrs, alloc, PT_LOAD, PF_R | PF_W,
+            rw_off, rw_va, rw_va,
+            lay.seg_rw_filesz.widen.[u64](), lay.seg_rw_memsz.widen.[u64](), PAGE_SIZE.widen.[u64](),
+        );
+    }
+    if lay.has_mb2 {
+        let note_off = (lay.mb2_off +% 24_usize).widen.[u64]();
+        let note_va = base_vaddr +% note_off;
+        try write_phdr(&mut phdrs, alloc, PT_NOTE, PF_R, note_off, note_va, note_va, 20_u64, 20_u64, 4_u64);
+    }
+    if lay.has_tls {
+        try write_phdr(&mut phdrs, alloc, PT_TLS, PF_R, lay.tdata_off.widen.[u64](), lay.addrs.tdata, lay.addrs.tdata, scratch.tdata.len().widen.[u64](), lay.tls_memsz, TLS_ALIGN.widen.[u64]());
+    }
+    copy_into(out.as_mut_slice(), lay.phdr_off, phdrs.as_slice());
+    phdrs.destroy(alloc);
+
+    shdrs.destroy(alloc);
+    shstrtab.destroy(alloc);
+
+    return LinkedElf.{
+        bytes: out,
+        entry_vaddr: entry_vaddr,
+        text_vaddr: lay.addrs.text,
+        rodata_vaddr: lay.addrs.rodata,
+        data_rel_ro_vaddr: lay.addrs.data_rel_ro,
+        data_vaddr: lay.addrs.data,
+        bss_vaddr: lay.addrs.bss,
+        tdata_vaddr: lay.addrs.tdata,
+        tls_memsz: lay.tls_memsz,
+    };
+}
+
+fn link_freestanding(
+    alloc: *mut AllocCap,
+    input: *ElfLinkInput,
+    interner: *span.SymInterner,
+) -> LinkResult ! OutOfMemory {
+    var err_msg = try str.StrBuf.init(alloc, 64_usize);
+    errdefer err_msg.destroy(alloc);
+    let base_vaddr = input.mode.load_addr;
+
+    let got_syms = try collect_got_symbols(alloc, input);
+    errdefer got_syms.destroy(alloc);
+    let mb2_len: usize = if input.mode.multiboot2 { MB2_BOOT_LEN } else { 0_usize };
+    let lay = compute_free_layout(input, base_vaddr, mb2_len, got_syms.len());
+    var sym_vaddrs = try col.HashMap.[u64].init(alloc, 32_usize);
+    errdefer sym_vaddrs.destroy(alloc);
+    var tls_offsets = try col.HashMap.[u64].init(alloc, 16_usize);
+    errdefer tls_offsets.destroy(alloc);
+    try populate_symbol_maps(alloc, input, &lay.addrs, &mut sym_vaddrs, &mut tls_offsets);
+    try insert_synthetic_symbols(
+        alloc,
+        interner,
+        &mut sym_vaddrs,
+        base_vaddr,
+        base_vaddr,
+        base_vaddr,
+        lay.addrs.tdata,
+        input.tdata.len().widen.[u64](),
+    );
+
+    var entry_vaddr: u64 = 0_u64;
+    if let ev = sym_vaddrs.get(input.entry_sym.widen.[u64]()) {
+        entry_vaddr = ev;
+    } else {
+        try set_err_sym(&mut err_msg, alloc, "ELF64 linker error: unresolved entry symbol `", interner.get(input.entry_sym), "`");
+        let empty_elf = try LinkedElf.empty(alloc);
+        tls_offsets.destroy(alloc);
+        sym_vaddrs.destroy(alloc);
+        got_syms.destroy(alloc);
+        return LinkResult.{ ok: false, elf: empty_elf, err_msg: err_msg };
+    }
+
+    var mb2 = try col.DynBuf.[u8].init(alloc, if mb2_len > 0_usize { mb2_len } else { 4_usize });
+    errdefer mb2.destroy(alloc);
+    if input.mode.multiboot2 {
+        let hdr = try build_multiboot2_pvh_boot(alloc, base_vaddr +% lay.mb2_off.widen.[u64](), entry_vaddr);
+        errdefer hdr.destroy(alloc);
+        try mb2.push_slice(alloc, hdr.as_slice());
+        hdr.destroy(alloc);
+    }
+
+    var scratch = try RelocScratch.init_from_input(alloc, input);
+    errdefer scratch.destroy(alloc);
+    var got_bytes = try col.DynBuf.[u8].init(alloc, 4_usize);
+    errdefer got_bytes.destroy(alloc);
+
+    let ok_rel = try apply_free_relocs(
+        alloc,
+        input,
+        &lay,
+        base_vaddr,
+        got_syms.as_slice(),
+        &sym_vaddrs,
+        &tls_offsets,
+        &mut scratch,
+        &mut got_bytes,
+        interner,
+        &mut err_msg,
+    );
+    if !ok_rel {
+        let empty_elf = try LinkedElf.empty(alloc);
+        got_bytes.destroy(alloc);
+        scratch.destroy(alloc);
+        tls_offsets.destroy(alloc);
+        sym_vaddrs.destroy(alloc);
+        mb2.destroy(alloc);
+        got_syms.destroy(alloc);
+        return LinkResult.{ ok: false, elf: empty_elf, err_msg: err_msg };
+    }
+
+    let elf = try finalize_free_elf(alloc, input, &lay, base_vaddr, entry_vaddr, mb2.as_slice(), &scratch, got_bytes.as_slice(), interner);
+    got_bytes.destroy(alloc);
+    scratch.destroy(alloc);
+    tls_offsets.destroy(alloc);
+    sym_vaddrs.destroy(alloc);
+    mb2.destroy(alloc);
+    got_syms.destroy(alloc);
+    return LinkResult.{ ok: true, elf: elf, err_msg: err_msg };
+}
+
+// ---------------------------------------------------------------------------
+// Top-Level Public Entry Point
+// ---------------------------------------------------------------------------
+
+pub fn link_elf64(
+    alloc: *mut AllocCap,
+    input: *ElfLinkInput,
+    interner: *span.SymInterner,
+) -> LinkResult ! OutOfMemory {
+    match input.mode.kind {
+        .Freestanding => {
+            return try link_freestanding(alloc, input, interner);
+        }
+        .LinuxPie => {
+            return try link_dynamic_elf(alloc, input, interner);
+        }
+        .LinuxShared => {
+            return try link_dynamic_elf(alloc, input, interner);
+        }
+    }
+}

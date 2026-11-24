@@ -1,0 +1,2 @@
+module app.fake_hal @hal; //~ ERROR E0111
+pub fn f() {}
