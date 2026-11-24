@@ -21,6 +21,9 @@ jobs:
         with:
           components: clippy
 
+      - name: Install spirv-tools (spirv-val)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends spirv-tools
+
       - name: Clippy (zero warnings, unsafe forbidden)
         working-directory: compiler
         run: cargo clippy --all-targets
