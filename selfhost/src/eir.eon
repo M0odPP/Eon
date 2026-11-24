@@ -251,6 +251,9 @@ pub enum EirInstKind : u8 {
     GetVar = 27,
     SetVar = 28,
     ParForHint = 29,
+    VecLoad = 30,
+    VecStore = 31,
+    VecFma = 32,
 }
 
 pub struct EirInst {
@@ -298,6 +301,7 @@ pub fn inst_def(inst: *EirInst) -> EirValue {
         .InlineAsm => { return EIR_NONE; }
         .SetVar => { return EIR_NONE; }
         .ParForHint => { return EIR_NONE; }
+        .VecStore => { return EIR_NONE; }
         _ => { return inst.dst; }
     }
 }
@@ -463,6 +467,7 @@ pub struct EirOptConfig {
     pub verify_opt: bool;   // run eir_lint after each pass
     pub target_avx2: bool;  // enable 256-bit AVX2/FMA lowering
     pub incremental_cgu: bool; // disable non-@inline inlining for sound .emi function caching
+    pub opt_size: bool;     // -Os / -Oz size optimization profile
 }
 
 pub fn opt_config_dev() -> EirOptConfig {
@@ -472,6 +477,7 @@ pub fn opt_config_dev() -> EirOptConfig {
         verify_opt: false,
         target_avx2: false,
         incremental_cgu: false,
+        opt_size: false,
     };
 }
 
@@ -482,6 +488,18 @@ pub fn opt_config_release() -> EirOptConfig {
         verify_opt: false,
         target_avx2: true,
         incremental_cgu: false,
+        opt_size: false,
+    };
+}
+
+pub fn opt_config_size() -> EirOptConfig {
+    return EirOptConfig.{
+        opt_level: 2_u8,
+        opt_bisect: -1_i64,
+        verify_opt: false,
+        target_avx2: false,
+        incremental_cgu: false,
+        opt_size: true,
     };
 }
 
@@ -5713,6 +5731,20 @@ pub fn rewrite_inst_operands(eir: *mut EirProgram, inst: *mut EirInst, remap: *[
                 inst.v2 = resolve_val(inst.v2, remap);
             }
         }
+        .VecLoad => {
+            inst.v0 = resolve_val(inst.v0, remap);
+            inst.v1 = resolve_val(inst.v1, remap);
+        }
+        .VecStore => {
+            inst.v0 = resolve_val(inst.v0, remap);
+            inst.v1 = resolve_val(inst.v1, remap);
+            inst.v2 = resolve_val(inst.v2, remap);
+        }
+        .VecFma => {
+            inst.v0 = resolve_val(inst.v0, remap);
+            inst.v1 = resolve_val(inst.v1, remap);
+            inst.v2 = resolve_val(inst.v2, remap);
+        }
         .Aggregate => { rewrite_val_range_in_eir(eir, inst.range, remap); }
         .UnwrapOptional => { inst.v0 = resolve_val(inst.v0, remap); }
         .UnwrapErrorOk => { inst.v0 = resolve_val(inst.v0, remap); }
@@ -7552,6 +7584,20 @@ pub fn collect_inst_uses(
             if inst.v2 != EIR_NONE {
                 try out.push(alloc, inst.v2);
             }
+        }
+        .VecLoad => {
+            try out.push(alloc, inst.v0);
+            try out.push(alloc, inst.v1);
+        }
+        .VecStore => {
+            try out.push(alloc, inst.v0);
+            try out.push(alloc, inst.v1);
+            try out.push(alloc, inst.v2);
+        }
+        .VecFma => {
+            try out.push(alloc, inst.v0);
+            try out.push(alloc, inst.v1);
+            try out.push(alloc, inst.v2);
         }
         .Aggregate => {
             try out.push_slice(alloc, eir.vals_slice(inst.range));
@@ -9695,6 +9741,32 @@ fn fmt_eir_inst_hi(
         .ParForHint => {
             try out.push_str_grow(alloc, "par_for_hint r");
             try out.push_u64_grow(alloc, inst.aux0.widen.[u64]());
+        }
+        .VecLoad => {
+            try write_val_header(alloc, inst.dst, inst.ty0, env, interner, out);
+            try out.push_str_grow(alloc, "vec_load %v");
+            try out.push_u64_grow(alloc, inst.v0.widen.[u64]());
+            try out.push_str_grow(alloc, "[%v");
+            try out.push_u64_grow(alloc, inst.v1.widen.[u64]());
+            try out.push_byte_grow(alloc, b']');
+        }
+        .VecStore => {
+            try out.push_str_grow(alloc, "vec_store %v");
+            try out.push_u64_grow(alloc, inst.v0.widen.[u64]());
+            try out.push_str_grow(alloc, "[%v");
+            try out.push_u64_grow(alloc, inst.v1.widen.[u64]());
+            try out.push_str_grow(alloc, "] = %v");
+            try out.push_u64_grow(alloc, inst.v2.widen.[u64]());
+        }
+        .VecFma => {
+            try write_val_header(alloc, inst.dst, inst.ty0, env, interner, out);
+            try out.push_str_grow(alloc, "vec_fma(%v");
+            try out.push_u64_grow(alloc, inst.v0.widen.[u64]());
+            try out.push_str_grow(alloc, ", %v");
+            try out.push_u64_grow(alloc, inst.v1.widen.[u64]());
+            try out.push_str_grow(alloc, ", %v");
+            try out.push_u64_grow(alloc, inst.v2.widen.[u64]());
+            try out.push_byte_grow(alloc, b')');
         }
         _ => {}
     }

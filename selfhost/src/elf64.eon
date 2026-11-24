@@ -4128,6 +4128,907 @@ fn link_freestanding(
 }
 
 // ---------------------------------------------------------------------------
+// Link-Time Function Dead-Stripping (Reachability GC) & Safe ICF
+// ---------------------------------------------------------------------------
+
+struct TextFnInfo {
+    sym_idx: u32;
+    name_sym: u32;
+    old_off: u64;
+    size: u64;
+    rel_start: u32;
+    rel_len: u32;
+    alias_cnt: u32;
+    live: bool;
+    addr_taken: bool;
+    canon_idx: u32;
+    new_off: u64;
+}
+
+fn reloc_kind_to_u8(k: RelocKind) -> u8 {
+    match k {
+        .Rel32 => { return 0_u8; }
+        .Abs64 => { return 1_u8; }
+        .GotPcRel32 => { return 2_u8; }
+        .Plt32 => { return 3_u8; }
+        .TpOff32 => { return 4_u8; }
+    }
+}
+
+fn sort_tsym_indices(syms: *[ElfSymbol], idxs: *mut [u32]) {
+    let n = idxs.len;
+    if n <= 1_usize {
+        return;
+    }
+    var gap: usize = 1_usize;
+    let third = n / 3_usize;
+    while gap < third {
+        gap = (gap *% 3_usize) +% 1_usize;
+    }
+    while gap > 0_usize {
+        var i = gap;
+        while i < idxs.len {
+            let cur = idxs[i];
+            let cu = cur.widen.[usize]();
+            let coff = if cu < syms.len { syms[cu].offset } else { 0_u64 };
+            var j = i;
+            while j >= gap && j < idxs.len {
+                let prev_idx = j - gap;
+                let prev = idxs[prev_idx];
+                let pu = prev.widen.[usize]();
+                let poff = if pu < syms.len { syms[pu].offset } else { 0_u64 };
+                if poff < coff || (poff == coff && prev <= cur) {
+                    break;
+                }
+                idxs[j] = prev;
+                j = prev_idx;
+            }
+            idxs[j] = cur;
+            i = i +% 1_usize;
+        }
+        gap = gap / 3_usize;
+    }
+}
+
+fn sort_trel_indices(relocs: *[ElfReloc], idxs: *mut [u32]) {
+    let n = idxs.len;
+    if n <= 1_usize {
+        return;
+    }
+    var gap: usize = 1_usize;
+    let third = n / 3_usize;
+    while gap < third {
+        gap = (gap *% 3_usize) +% 1_usize;
+    }
+    while gap > 0_usize {
+        var i = gap;
+        while i < idxs.len {
+            let cur = idxs[i];
+            let cu = cur.widen.[usize]();
+            let coff = if cu < relocs.len { relocs[cu].offset } else { 0_u64 };
+            var j = i;
+            while j >= gap && j < idxs.len {
+                let prev_idx = j - gap;
+                let prev = idxs[prev_idx];
+                let pu = prev.widen.[usize]();
+                let poff = if pu < relocs.len { relocs[pu].offset } else { 0_u64 };
+                if poff < coff || (poff == coff && prev <= cur) {
+                    break;
+                }
+                idxs[j] = prev;
+                j = prev_idx;
+            }
+            idxs[j] = cur;
+            i = i +% 1_usize;
+        }
+        gap = gap / 3_usize;
+    }
+}
+
+fn find_tfn_for_off(tfns: *[TextFnInfo], off: u64) -> ?usize {
+    if tfns.len == 0_usize {
+        return null;
+    }
+    var lo: usize = 0_usize;
+    var hi = tfns.len;
+    while lo < hi {
+        let mid = lo +% ((hi - lo) >> 1_usize);
+        if mid >= tfns.len {
+            break;
+        }
+        let f = tfns[mid];
+        if off < f.old_off {
+            hi = mid;
+        } else if off >= f.old_off +% f.size {
+            lo = mid +% 1_usize;
+        } else {
+            return mid;
+        }
+    }
+    return null;
+}
+
+fn icf_canon_sym(sym: u32, sym_to_fn: *col.HashMap[u32], tfns: *[TextFnInfo]) -> u32 {
+    if let fi = sym_to_fn.get(sym.widen.[u64]()) {
+        let fiu = fi.widen.[usize]();
+        if fiu < tfns.len {
+            let c = tfns[fiu].canon_idx.widen.[usize]();
+            if c < tfns.len {
+                return tfns[c].name_sym;
+            }
+        }
+    }
+    return sym;
+}
+
+fn icf_fn_hash(
+    f: *TextFnInfo,
+    text: *[u8],
+    relocs: *[ElfReloc],
+    trel_idxs: *[u32],
+    sym_to_fn: *col.HashMap[u32],
+    tfns: *[TextFnInfo],
+) -> u64 {
+    var h: u64 = 0xCBF29CE484222325_u64;
+    h = (h ^ f.size) *% 0x100000001B3_u64;
+    h = (h ^ f.rel_len.widen.[u64]()) *% 0x100000001B3_u64;
+    let base = f.old_off.trunc.[usize]();
+    let sz = f.size.trunc.[usize]();
+    let rstart = f.rel_start.widen.[usize]();
+    let rend = rstart +% f.rel_len.widen.[usize]();
+    var rk = rstart;
+    var bi: usize = 0_usize;
+    while bi < sz {
+        let abs_o = base +% bi;
+        while rk < rend && rk < trel_idxs.len {
+            let ri = trel_idxs[rk].widen.[usize]();
+            if ri < relocs.len {
+                let rsz: usize = if relocs[ri].kind == .Abs64 { 8_usize } else { 4_usize };
+                if relocs[ri].offset.trunc.[usize]() +% rsz <= abs_o {
+                    rk = rk +% 1_usize;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        var masked = false;
+        if rk < rend && rk < trel_idxs.len {
+            let ri = trel_idxs[rk].widen.[usize]();
+            if ri < relocs.len {
+                let ro = relocs[ri].offset.trunc.[usize]();
+                let rsz: usize = if relocs[ri].kind == .Abs64 { 8_usize } else { 4_usize };
+                if abs_o >= ro && abs_o < ro +% rsz {
+                    masked = true;
+                }
+            }
+        }
+        let b: u8 = if masked {
+            0_u8
+        } else if abs_o < text.len {
+            text[abs_o]
+        } else {
+            0_u8
+        };
+        h = (h ^ b.widen.[u64]()) *% 0x100000001B3_u64;
+        bi = bi +% 1_usize;
+    }
+    var rj = rstart;
+    while rj < rend && rj < trel_idxs.len {
+        let ri = trel_idxs[rj].widen.[usize]();
+        if ri < relocs.len {
+            let r = relocs[ri];
+            let roff = r.offset -% f.old_off;
+            let csym = icf_canon_sym(r.target_sym, sym_to_fn, tfns);
+            h = (h ^ roff) *% 0x100000001B3_u64;
+            h = (h ^ reloc_kind_to_u8(r.kind).widen.[u64]()) *% 0x100000001B3_u64;
+            h = (h ^ r.addend.bitcast.[u64]()) *% 0x100000001B3_u64;
+            h = (h ^ csym.widen.[u64]()) *% 0x100000001B3_u64;
+        }
+        rj = rj +% 1_usize;
+    }
+    if h == 0_u64 {
+        h = 1_u64;
+    }
+    return h;
+}
+
+fn icf_fns_equal(
+    a: *TextFnInfo,
+    b: *TextFnInfo,
+    text: *[u8],
+    relocs: *[ElfReloc],
+    trel_idxs: *[u32],
+    sym_to_fn: *col.HashMap[u32],
+    tfns: *[TextFnInfo],
+) -> bool {
+    if a.size != b.size || a.rel_len != b.rel_len {
+        return false;
+    }
+    let ra0 = a.rel_start.widen.[usize]();
+    let rb0 = b.rel_start.widen.[usize]();
+    let rcnt = a.rel_len.widen.[usize]();
+    var ri: usize = 0_usize;
+    while ri < rcnt {
+        let idx_a = ra0 +% ri;
+        let idx_b = rb0 +% ri;
+        if idx_a >= trel_idxs.len || idx_b >= trel_idxs.len {
+            return false;
+        }
+        let ia = trel_idxs[idx_a].widen.[usize]();
+        let ib = trel_idxs[idx_b].widen.[usize]();
+        if ia >= relocs.len || ib >= relocs.len {
+            return false;
+        }
+        let ra = relocs[ia];
+        let rb = relocs[ib];
+        if (ra.offset -% a.old_off) != (rb.offset -% b.old_off) {
+            return false;
+        }
+        if reloc_kind_to_u8(ra.kind) != reloc_kind_to_u8(rb.kind) || ra.addend != rb.addend {
+            return false;
+        }
+        let ca = icf_canon_sym(ra.target_sym, sym_to_fn, tfns);
+        let cb = icf_canon_sym(rb.target_sym, sym_to_fn, tfns);
+        if ca != cb {
+            return false;
+        }
+        ri = ri +% 1_usize;
+    }
+    let base_a = a.old_off.trunc.[usize]();
+    let base_b = b.old_off.trunc.[usize]();
+    let sz = a.size.trunc.[usize]();
+    let rend_a = ra0 +% rcnt;
+    var rk = ra0;
+    var bi: usize = 0_usize;
+    while bi < sz {
+        let abs_a = base_a +% bi;
+        let abs_b = base_b +% bi;
+        while rk < rend_a && rk < trel_idxs.len {
+            let idx_r = trel_idxs[rk].widen.[usize]();
+            if idx_r < relocs.len {
+                let rsz: usize = if relocs[idx_r].kind == .Abs64 { 8_usize } else { 4_usize };
+                if relocs[idx_r].offset.trunc.[usize]() +% rsz <= abs_a {
+                    rk = rk +% 1_usize;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        var masked = false;
+        if rk < rend_a && rk < trel_idxs.len {
+            let idx_r = trel_idxs[rk].widen.[usize]();
+            if idx_r < relocs.len {
+                let ro = relocs[idx_r].offset.trunc.[usize]();
+                let rsz: usize = if relocs[idx_r].kind == .Abs64 { 8_usize } else { 4_usize };
+                if abs_a >= ro && abs_a < ro +% rsz {
+                    masked = true;
+                }
+            }
+        }
+        if !masked {
+            if abs_a >= text.len || abs_b >= text.len || text[abs_a] != text[abs_b] {
+                return false;
+            }
+        }
+        bi = bi +% 1_usize;
+    }
+    return true;
+}
+
+/// Reachability dead-stripping (GC) of unreachable `.text` functions + Safe ICF
+/// (folding byte-identical non-address-taken functions), compacting `.text` and
+/// remapping symbols, relocations, DWARF5 line entries, and debug variables.
+pub fn gc_and_icf_link_input(
+    alloc: *mut AllocCap,
+    input: *mut ElfLinkInput,
+    interner: *span.SymInterner,
+    enable_icf: bool,
+) -> !OutOfMemory {
+    _ = interner;
+    let text_len = input.text.len().widen.[u64]();
+    let syms_ro = input.symbols.as_slice();
+    if text_len == 0_u64 || syms_ro.len == 0_usize {
+        return;
+    }
+
+    var tsym_idxs = try col.DynBuf.[u32].init(alloc, 32_usize);
+    errdefer tsym_idxs.destroy(alloc);
+    var si: usize = 0_usize;
+    while si < syms_ro.len {
+        let s = syms_ro[si];
+        if s.section == .Text {
+            if !s.is_func || s.size == 0_u64 || s.offset > text_len || s.offset +% s.size > text_len {
+                tsym_idxs.destroy(alloc);
+                return;
+            }
+            try tsym_idxs.push(alloc, si.trunc.[u32]());
+        }
+        si = si +% 1_usize;
+    }
+    if tsym_idxs.is_empty() {
+        tsym_idxs.destroy(alloc);
+        return;
+    }
+    sort_tsym_indices(syms_ro, tsym_idxs.as_mut_slice());
+
+    var tfns = try col.DynBuf.[TextFnInfo].init(alloc, tsym_idxs.len());
+    errdefer tfns.destroy(alloc);
+    var sym_to_fn = try col.HashMap.[u32].init(alloc, tsym_idxs.len() +% 16_usize);
+    errdefer sym_to_fn.destroy(alloc);
+    var sym_fn_idx = try col.DynBuf.[u32].init(alloc, syms_ro.len);
+    errdefer sym_fn_idx.destroy(alloc);
+    var sfi0: usize = 0_usize;
+    while sfi0 < syms_ro.len {
+        try sym_fn_idx.push(alloc, 0xFFFFFFFF_u32);
+        sfi0 = sfi0 +% 1_usize;
+    }
+
+    let tsi = tsym_idxs.as_slice();
+    var ti: usize = 0_usize;
+    var prev_end: u64 = 0_u64;
+    while ti < tsi.len {
+        let sidx = tsi[ti].widen.[usize]();
+        if sidx >= syms_ro.len {
+            ti = ti +% 1_usize;
+            continue;
+        }
+        let s = syms_ro[sidx];
+        let tfn_cnt = tfns.len();
+        if tfn_cnt > 0_usize {
+            let last_i = tfn_cnt - 1_usize;
+            if let last_fp = tfns.get(last_i) {
+                let last_f = last_fp.*;
+                if s.offset == last_f.old_off && s.size == last_f.size {
+                    if let lm = tfns.get_mut(last_i) {
+                        lm.alias_cnt = lm.alias_cnt +% 1_u32;
+                    }
+                    try sym_to_fn.insert(alloc, s.name_sym.widen.[u64](), last_i.trunc.[u32]());
+                    let sfm = sym_fn_idx.as_mut_slice();
+                    if sidx < sfm.len {
+                        sfm[sidx] = last_i.trunc.[u32]();
+                    }
+                    ti = ti +% 1_usize;
+                    continue;
+                }
+            }
+            if s.offset < prev_end {
+                sym_fn_idx.destroy(alloc);
+                sym_to_fn.destroy(alloc);
+                tfns.destroy(alloc);
+                tsym_idxs.destroy(alloc);
+                return;
+            }
+        }
+        let new_fi = tfns.len().trunc.[u32]();
+        try tfns.push(alloc, TextFnInfo.{
+            sym_idx: sidx.trunc.[u32](),
+            name_sym: s.name_sym,
+            old_off: s.offset,
+            size: s.size,
+            rel_start: 0_u32,
+            rel_len: 0_u32,
+            alias_cnt: 1_u32,
+            live: false,
+            addr_taken: false,
+            canon_idx: new_fi,
+            new_off: 0_u64,
+        });
+        try sym_to_fn.insert(alloc, s.name_sym.widen.[u64](), new_fi);
+        let sfm = sym_fn_idx.as_mut_slice();
+        if sidx < sfm.len {
+            sfm[sidx] = new_fi;
+        }
+        prev_end = s.offset +% s.size;
+        ti = ti +% 1_usize;
+    }
+
+    // Collect and sort all `.Text` relocations and attach them to owning `TextFnInfo`
+    let rels_ro = input.relocs.as_slice();
+    var trel_idxs = try col.DynBuf.[u32].init(alloc, 32_usize);
+    errdefer trel_idxs.destroy(alloc);
+    var ri0: usize = 0_usize;
+    while ri0 < rels_ro.len {
+        if rels_ro[ri0].section == .Text {
+            try trel_idxs.push(alloc, ri0.trunc.[u32]());
+        }
+        ri0 = ri0 +% 1_usize;
+    }
+    sort_trel_indices(rels_ro, trel_idxs.as_mut_slice());
+
+    let tri_s = trel_idxs.as_slice();
+    var r_pos: usize = 0_usize;
+    var f_pos: usize = 0_usize;
+    let n_tfns = tfns.len();
+    while r_pos < tri_s.len {
+        let ridx = tri_s[r_pos].widen.[usize]();
+        if ridx >= rels_ro.len {
+            r_pos = r_pos +% 1_usize;
+            continue;
+        }
+        let roff = rels_ro[ridx].offset;
+        while f_pos < n_tfns {
+            if let fp = tfns.get(f_pos) {
+                let fcur = fp.*;
+                if roff >= fcur.old_off +% fcur.size {
+                    f_pos = f_pos +% 1_usize;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        let fcur_opt = tfns.get(f_pos);
+        if fcur_opt == null {
+            trel_idxs.destroy(alloc);
+            sym_fn_idx.destroy(alloc);
+            sym_to_fn.destroy(alloc);
+            tfns.destroy(alloc);
+            tsym_idxs.destroy(alloc);
+            return;
+        }
+        var fcur_off: u64 = 0_u64;
+        var fcur_sz: u64 = 0_u64;
+        if let fcp = fcur_opt {
+            fcur_off = fcp.old_off;
+            fcur_sz = fcp.size;
+        }
+        if roff < fcur_off || roff +% 4_u64 > fcur_off +% fcur_sz {
+            trel_idxs.destroy(alloc);
+            sym_fn_idx.destroy(alloc);
+            sym_to_fn.destroy(alloc);
+            tfns.destroy(alloc);
+            tsym_idxs.destroy(alloc);
+            return;
+        }
+        if let fm = tfns.get_mut(f_pos) {
+            if fm.rel_len == 0_u32 {
+                fm.rel_start = r_pos.trunc.[u32]();
+            }
+            fm.rel_len = fm.rel_len +% 1_u32;
+        }
+        r_pos = r_pos +% 1_usize;
+    }
+
+    // 1. Reachability GC (BFS from entry, exports, shared globals, and non-.Text relocs)
+    var has_any_live = false;
+    if n_tfns > 0_usize {
+        var bfs_q = try col.DynBuf.[u32].init(alloc, 64_usize);
+        errdefer bfs_q.destroy(alloc);
+        if input.entry_sym != span.SYM_EMPTY {
+            if let fi = sym_to_fn.get(input.entry_sym.widen.[u64]()) {
+                let fiu = fi.widen.[usize]();
+                if let fm = tfns.get_mut(fiu) {
+                    fm.addr_taken = true;
+                    if !fm.live {
+                        fm.live = true;
+                        try bfs_q.push(alloc, fi);
+                    }
+                }
+            }
+        }
+        let exps_ro = input.exported_syms.as_slice();
+        var xi: usize = 0_usize;
+        while xi < exps_ro.len {
+            if let fi = sym_to_fn.get(exps_ro[xi].widen.[u64]()) {
+                let fiu = fi.widen.[usize]();
+                if let fm = tfns.get_mut(fiu) {
+                    fm.addr_taken = true;
+                    if !fm.live {
+                        fm.live = true;
+                        try bfs_q.push(alloc, fi);
+                    }
+                }
+            }
+            xi = xi +% 1_usize;
+        }
+        if input.mode.kind == .LinuxShared {
+            var gi: usize = 0_usize;
+            while gi < syms_ro.len {
+                let s = syms_ro[gi];
+                if s.section == .Text && s.is_global {
+                    if let fi = sym_to_fn.get(s.name_sym.widen.[u64]()) {
+                        let fiu = fi.widen.[usize]();
+                        if let fm = tfns.get_mut(fiu) {
+                            fm.addr_taken = true;
+                            if !fm.live {
+                                fm.live = true;
+                                try bfs_q.push(alloc, fi);
+                            }
+                        }
+                    }
+                }
+                gi = gi +% 1_usize;
+            }
+        }
+        var nri: usize = 0_usize;
+        while nri < rels_ro.len {
+            let r = rels_ro[nri];
+            if r.section != .Text {
+                if let fi = sym_to_fn.get(r.target_sym.widen.[u64]()) {
+                    let fiu = fi.widen.[usize]();
+                    if let fm = tfns.get_mut(fiu) {
+                        fm.addr_taken = true;
+                        if !fm.live {
+                            fm.live = true;
+                            try bfs_q.push(alloc, fi);
+                        }
+                    }
+                }
+            }
+            nri = nri +% 1_usize;
+        }
+
+        has_any_live = !bfs_q.is_empty();
+        var qh: usize = 0_usize;
+        while qh < bfs_q.len() {
+            var cur_fi: u32 = 0_u32;
+            if let qp = bfs_q.get(qh) {
+                cur_fi = qp.*;
+            }
+            qh = qh +% 1_usize;
+            let cu = cur_fi.widen.[usize]();
+            let cf_opt = tfns.get(cu);
+            if cf_opt == null {
+                continue;
+            }
+            var rs: usize = 0_usize;
+            var re: usize = 0_usize;
+            if let cfp = cf_opt {
+                rs = cfp.rel_start.widen.[usize]();
+                re = rs +% cfp.rel_len.widen.[usize]();
+            }
+            var rk = rs;
+            while rk < re && rk < tri_s.len {
+                let ridx = tri_s[rk].widen.[usize]();
+                if ridx < rels_ro.len {
+                    let r = rels_ro[ridx];
+                    if let tfi = sym_to_fn.get(r.target_sym.widen.[u64]()) {
+                        let tfu = tfi.widen.[usize]();
+                        if let tm = tfns.get_mut(tfu) {
+                            if !tm.live {
+                                tm.live = true;
+                                try bfs_q.push(alloc, tfi);
+                            }
+                        }
+                    }
+                }
+                rk = rk +% 1_usize;
+            }
+        }
+        bfs_q.destroy(alloc);
+    }
+    if !has_any_live {
+        trel_idxs.destroy(alloc);
+        sym_fn_idx.destroy(alloc);
+        sym_to_fn.destroy(alloc);
+        tfns.destroy(alloc);
+        tsym_idxs.destroy(alloc);
+        return;
+    }
+
+    // 2. Safe ICF (iterative fixed-point over non-address-taken live functions)
+    let text_ro = input.text.as_slice();
+    if enable_icf {
+        var fi_a: usize = 0_usize;
+        while fi_a < n_tfns {
+            if let fp = tfns.get(fi_a) {
+                let f = fp.*;
+                if f.alias_cnt > 1_u32 {
+                    if let fm = tfns.get_mut(fi_a) {
+                        fm.addr_taken = true;
+                    }
+                }
+                if f.live {
+                    let rs = f.rel_start.widen.[usize]();
+                    let re = rs +% f.rel_len.widen.[usize]();
+                    var rk = rs;
+                    while rk < re && rk < tri_s.len {
+                        let ridx = tri_s[rk].widen.[usize]();
+                        if ridx < rels_ro.len {
+                            let r = rels_ro[ridx];
+                            if let tfi = sym_to_fn.get(r.target_sym.widen.[u64]()) {
+                                var is_direct_call_or_jmp = false;
+                                if (r.kind == .Rel32 || r.kind == .Plt32) && r.addend == 0_i64 && r.offset > 0_u64 {
+                                    let prev_o = (r.offset -% 1_u64).trunc.[usize]();
+                                    if prev_o < text_ro.len {
+                                        let op = text_ro[prev_o];
+                                        if op == 0xE8_u8 || op == 0xE9_u8 {
+                                            is_direct_call_or_jmp = true;
+                                        }
+                                    }
+                                }
+                                if !is_direct_call_or_jmp {
+                                    if let tm = tfns.get_mut(tfi.widen.[usize]()) {
+                                        tm.addr_taken = true;
+                                    }
+                                }
+                            }
+                        }
+                        rk = rk +% 1_usize;
+                    }
+                }
+            }
+            fi_a = fi_a +% 1_usize;
+        }
+
+        var icf_buckets = try col.HashMap.[u32].init(alloc, n_tfns +% 16_usize);
+        errdefer icf_buckets.destroy(alloc);
+        var icf_next = try col.DynBuf.[u32].init(alloc, n_tfns);
+        errdefer icf_next.destroy(alloc);
+        var in0: usize = 0_usize;
+        while in0 < n_tfns {
+            try icf_next.push(alloc, 0xFFFFFFFF_u32);
+            in0 = in0 +% 1_usize;
+        }
+
+        var round: usize = 0_usize;
+        while round < 4_usize {
+            icf_buckets.clear();
+            let inm = icf_next.as_mut_slice();
+            var zi: usize = 0_usize;
+            while zi < inm.len {
+                inm[zi] = 0xFFFFFFFF_u32;
+                zi = zi +% 1_usize;
+            }
+            var merged_any = false;
+            var fi_i: usize = 0_usize;
+            while fi_i < n_tfns {
+                if let fp = tfns.get(fi_i) {
+                    let f = fp.*;
+                    if f.live && !f.addr_taken && f.canon_idx.widen.[usize]() == fi_i {
+                        let h = icf_fn_hash(&f, text_ro, rels_ro, tri_s, &sym_to_fn, tfns.as_slice());
+                        var matched: u32 = 0xFFFFFFFF_u32;
+                        var cur_c = icf_buckets.get(h) orelse 0xFFFFFFFF_u32;
+                        while cur_c != 0xFFFFFFFF_u32 {
+                            let cu = cur_c.widen.[usize]();
+                            if let cp = tfns.get(cu) {
+                                let cand = cp.*;
+                                if icf_fns_equal(&cand, &f, text_ro, rels_ro, tri_s, &sym_to_fn, tfns.as_slice()) {
+                                    matched = cur_c;
+                                    break;
+                                }
+                                if let np = icf_next.get(cu) {
+                                    cur_c = np.*;
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        if matched != 0xFFFFFFFF_u32 {
+                            if let fm = tfns.get_mut(fi_i) {
+                                fm.canon_idx = matched;
+                            }
+                            merged_any = true;
+                        } else {
+                            let prev_head = icf_buckets.get(h) orelse 0xFFFFFFFF_u32;
+                            let inm2 = icf_next.as_mut_slice();
+                            if fi_i < inm2.len {
+                                inm2[fi_i] = prev_head;
+                            }
+                            try icf_buckets.insert(alloc, h, fi_i.trunc.[u32]());
+                        }
+                    }
+                }
+                fi_i = fi_i +% 1_usize;
+            }
+            // Flatten canonical chains
+            var fi_f: usize = 0_usize;
+            while fi_f < n_tfns {
+                if let fp = tfns.get(fi_f) {
+                    var c = fp.canon_idx;
+                    var steps: usize = 0_usize;
+                    while steps < 16_usize {
+                        if let cp = tfns.get(c.widen.[usize]()) {
+                            let nc = cp.canon_idx;
+                            if nc == c {
+                                break;
+                            }
+                            c = nc;
+                        } else {
+                            break;
+                        }
+                        steps = steps +% 1_usize;
+                    }
+                    if let fm = tfns.get_mut(fi_f) {
+                        fm.canon_idx = c;
+                    }
+                }
+                fi_f = fi_f +% 1_usize;
+            }
+            if !merged_any {
+                break;
+            }
+            round = round +% 1_usize;
+        }
+        icf_next.destroy(alloc);
+        icf_buckets.destroy(alloc);
+    }
+
+    // Check if anything was actually stripped or folded before rewriting buffers
+    var removed_cnt: usize = 0_usize;
+    var fi_c: usize = 0_usize;
+    while fi_c < n_tfns {
+        if let fp = tfns.get(fi_c) {
+            let f = fp.*;
+            if !f.live || f.canon_idx.widen.[usize]() != fi_c {
+                removed_cnt = removed_cnt +% 1_usize;
+            }
+        }
+        fi_c = fi_c +% 1_usize;
+    }
+    if removed_cnt == 0_usize {
+        trel_idxs.destroy(alloc);
+        sym_fn_idx.destroy(alloc);
+        sym_to_fn.destroy(alloc);
+        tfns.destroy(alloc);
+        tsym_idxs.destroy(alloc);
+        return;
+    }
+
+    // 3. Compact `.text` and remap symbols, relocations, line entries, and debug vars
+    var new_text = try col.DynBuf.[u8].init(alloc, input.text.len());
+    errdefer new_text.destroy(alloc);
+    var fi_p: usize = 0_usize;
+    while fi_p < n_tfns {
+        if let fp = tfns.get(fi_p) {
+            let f = fp.*;
+            if f.live && f.canon_idx.widen.[usize]() == fi_p {
+                try pad_to(&mut new_text, alloc, 16_usize);
+                let noff = new_text.len().widen.[u64]();
+                if let fm = tfns.get_mut(fi_p) {
+                    fm.new_off = noff;
+                }
+                let s0 = f.old_off.trunc.[usize]();
+                let s1 = s0 +% f.size.trunc.[usize]();
+                if s1 <= text_ro.len {
+                    let slice_code = text_ro.sub(s0, s1) catch { "".as_bytes() };
+                    try new_text.push_slice(alloc, slice_code);
+                }
+            }
+        }
+        fi_p = fi_p +% 1_usize;
+    }
+    fi_p = 0_usize;
+    while fi_p < n_tfns {
+        if let fp = tfns.get(fi_p) {
+            let f = fp.*;
+            if f.live && f.canon_idx.widen.[usize]() != fi_p {
+                if let cp = tfns.get(f.canon_idx.widen.[usize]()) {
+                    let cf = cp.*;
+                    if let fm = tfns.get_mut(fi_p) {
+                        fm.new_off = cf.new_off;
+                        fm.size = cf.size;
+                    }
+                }
+            }
+        }
+        fi_p = fi_p +% 1_usize;
+    }
+
+    var new_syms = try col.DynBuf.[ElfSymbol].init(alloc, syms_ro.len);
+    errdefer new_syms.destroy(alloc);
+    let sfi_ro = sym_fn_idx.as_slice();
+    var si2: usize = 0_usize;
+    while si2 < syms_ro.len {
+        var s = syms_ro[si2];
+        if s.section == .Text {
+            let fi = if si2 < sfi_ro.len { sfi_ro[si2] } else { 0xFFFFFFFF_u32 };
+            if let fp = tfns.get(fi.widen.[usize]()) {
+                let f = fp.*;
+                if f.live {
+                    s.offset = f.new_off;
+                    s.size = f.size;
+                    try new_syms.push(alloc, s);
+                }
+            }
+        } else {
+            try new_syms.push(alloc, s);
+        }
+        si2 = si2 +% 1_usize;
+    }
+
+    var new_relocs = try col.DynBuf.[ElfReloc].init(alloc, rels_ro.len);
+    errdefer new_relocs.destroy(alloc);
+    var ri2: usize = 0_usize;
+    while ri2 < rels_ro.len {
+        let r = rels_ro[ri2];
+        if r.section != .Text {
+            try new_relocs.push(alloc, r);
+        }
+        ri2 = ri2 +% 1_usize;
+    }
+    var fi_r: usize = 0_usize;
+    while fi_r < n_tfns {
+        if let fp = tfns.get(fi_r) {
+            let f = fp.*;
+            if f.live && f.canon_idx.widen.[usize]() == fi_r {
+                let rs = f.rel_start.widen.[usize]();
+                let re = rs +% f.rel_len.widen.[usize]();
+                var rk = rs;
+                while rk < re && rk < tri_s.len {
+                    let ridx = tri_s[rk].widen.[usize]();
+                    if ridx < rels_ro.len {
+                        var r = rels_ro[ridx];
+                        r.offset = f.new_off +% (r.offset -% f.old_off);
+                        r.target_sym = icf_canon_sym(r.target_sym, &sym_to_fn, tfns.as_slice());
+                        try new_relocs.push(alloc, r);
+                    }
+                    rk = rk +% 1_usize;
+                }
+            }
+        }
+        fi_r = fi_r +% 1_usize;
+    }
+
+    var new_lines = try col.DynBuf.[LineEntry].init(alloc, input.line_entries.len());
+    errdefer new_lines.destroy(alloc);
+    let lines_ro = input.line_entries.as_slice();
+    var li: usize = 0_usize;
+    while li < lines_ro.len {
+        var le = lines_ro[li];
+        let loff = le.code_offset.widen.[u64]();
+        if let fiu = find_tfn_for_off(tfns.as_slice(), loff) {
+            if let fp = tfns.get(fiu) {
+                let f = fp.*;
+                if f.live && f.canon_idx.widen.[usize]() == fiu {
+                    le.code_offset = (f.new_off +% (loff -% f.old_off)).trunc.[u32]();
+                    try new_lines.push(alloc, le);
+                }
+            }
+        }
+        li = li +% 1_usize;
+    }
+
+    var new_dvars = try col.DynBuf.[DebugVarEntry].init(alloc, input.debug_vars.len());
+    errdefer new_dvars.destroy(alloc);
+    let dvars_ro = input.debug_vars.as_slice();
+    var di: usize = 0_usize;
+    while di < dvars_ro.len {
+        let dv = dvars_ro[di];
+        if let fi = sym_to_fn.get(dv.fn_sym.widen.[u64]()) {
+            let fiu = fi.widen.[usize]();
+            if let fp = tfns.get(fiu) {
+                let f = fp.*;
+                if f.live && f.canon_idx.widen.[usize]() == fiu {
+                    try new_dvars.push(alloc, dv);
+                }
+            }
+        }
+        di = di +% 1_usize;
+    }
+
+    input.text.clear();
+    try input.text.push_slice(alloc, new_text.as_slice());
+    input.symbols.clear();
+    try input.symbols.push_slice(alloc, new_syms.as_slice());
+    input.relocs.clear();
+    try input.relocs.push_slice(alloc, new_relocs.as_slice());
+    input.line_entries.clear();
+    try input.line_entries.push_slice(alloc, new_lines.as_slice());
+    input.debug_vars.clear();
+    try input.debug_vars.push_slice(alloc, new_dvars.as_slice());
+
+    new_dvars.destroy(alloc);
+    new_lines.destroy(alloc);
+    new_relocs.destroy(alloc);
+    new_syms.destroy(alloc);
+    new_text.destroy(alloc);
+    trel_idxs.destroy(alloc);
+    sym_fn_idx.destroy(alloc);
+    sym_to_fn.destroy(alloc);
+    tfns.destroy(alloc);
+    tsym_idxs.destroy(alloc);
+    return;
+}
+
+// ---------------------------------------------------------------------------
 // Top-Level Public Entry Point
 // ---------------------------------------------------------------------------
 

@@ -2613,21 +2613,37 @@ fn try_parse_opt_flag(
     if rt.str_eq(arg, "--release") || rt.str_eq(arg, "-O") || rt.str_eq(arg, "-O2") {
         opt.opt_level = 2_u8;
         opt.target_avx2 = true;
+        opt.opt_size = false;
         return 1_u8;
     }
     if rt.str_eq(arg, "-O3") {
         opt.opt_level = 3_u8;
         opt.target_avx2 = true;
+        opt.opt_size = false;
+        return 1_u8;
+    }
+    if rt.str_eq(arg, "-Os") {
+        opt.opt_level = 2_u8;
+        opt.target_avx2 = true;
+        opt.opt_size = true;
+        return 1_u8;
+    }
+    if rt.str_eq(arg, "-Oz") {
+        opt.opt_level = 2_u8;
+        opt.target_avx2 = false;
+        opt.opt_size = true;
         return 1_u8;
     }
     if rt.str_eq(arg, "-O1") {
         opt.opt_level = 1_u8;
         opt.target_avx2 = false;
+        opt.opt_size = false;
         return 1_u8;
     }
     if rt.str_eq(arg, "--dev") || rt.str_eq(arg, "-O0") {
         opt.opt_level = 0_u8;
         opt.target_avx2 = false;
+        opt.opt_size = false;
         return 1_u8;
     }
     if rt.str_eq(arg, "--verify-opt") {
@@ -3429,6 +3445,7 @@ fn inc_compile_partial_units(
         err_buf.clear();
         var lint_ok = try eir.eir_lint_with_jobs(alloc, &eir_prog, &tenv, err_buf, copts.jobs);
         if lint_ok && copts.opt.opt_level > 0_u8 {
+            try tenv.preintern_opt_vec_tys(alloc);
             err_buf.clear();
             let _ = try eir_opt.optimize_program_with_jobs(
                 alloc, &mut eir_prog, &tenv, interner, copts.opt, err_buf, copts.jobs,
@@ -4720,6 +4737,7 @@ fn compile_loaded_to_elf_file(
         var lint_ok = try eir.eir_lint_with_jobs(alloc, &eir_prog, &tenv, err_buf, jobs);
         if profile_phases { try print_phase_line(alloc, clock, "eir_lint", t0, u0); t0 = rt.now_ns(clock); u0 = alloc.used_bytes(); }
         if lint_ok && copts.opt.opt_level > 0_u8 {
+            try tenv.preintern_opt_vec_tys(alloc);
             err_buf.clear();
             let stats = try eir_opt.optimize_program_profiled_with_jobs(
                 alloc, clock, profile_phases, &mut eir_prog, &tenv, interner, copts.opt, err_buf, jobs,
@@ -6020,6 +6038,7 @@ fn run_loaded_interp(
         err_buf.clear();
         var lint_ok = try eir.eir_lint_with_jobs(alloc, &eir_prog, &tenv, err_buf, jobs);
         if lint_ok && opt.opt_level > 0_u8 {
+            try tenv.preintern_opt_vec_tys(alloc);
             err_buf.clear();
             let stats = try eir_opt.optimize_program_with_jobs(
                 alloc, &mut eir_prog, &tenv, interner, opt, err_buf, jobs,

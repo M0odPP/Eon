@@ -1274,6 +1274,20 @@ fn collect_inst_uses_for_isel(
             bump_use(uc, inst.v1);
             bump_use(uc, inst.v2);
         }
+        .VecLoad => {
+            bump_use(uc, inst.v0);
+            bump_use(uc, inst.v1);
+        }
+        .VecStore => {
+            bump_use(uc, inst.v0);
+            bump_use(uc, inst.v1);
+            bump_use(uc, inst.v2);
+        }
+        .VecFma => {
+            bump_use(uc, inst.v0);
+            bump_use(uc, inst.v1);
+            bump_use(uc, inst.v2);
+        }
         .Aggregate => {
             let elems = eir_prog.vals_slice(inst.range);
             var i: usize = 0_usize;
@@ -7379,6 +7393,57 @@ fn emit_unwrap_and_extract(
                 return;
             }
             if src_n.kind == .Vec && sloc.kind == .Vec256 {
+                let en = env.get(src_n.primary);
+                let lane = inst.aux0.widen.[usize]();
+                if en.kind == .Float && en.u8_val == 32_u8 && lane < 8_usize {
+                    let half = try mf.new_vreg(alloc, .Vec128);
+                    var ex = mach_ir.inst_empty(.VExtractF128, sp);
+                    ex.dst = half;
+                    ex.src0 = sloc.vreg0;
+                    ex.imm = if lane < 4_usize { 0_i64 } else { 1_i64 };
+                    ex.flag0 = true;
+                    ex.size_bytes = 32_u8;
+                    try mf.emit_inst(alloc, ex);
+                    let sub_lane = lane & 3_usize;
+                    if sub_lane == 0_usize {
+                        try store_float_to_val(alloc, ctx, mf, eir_prog, env, inst.dst, half, sp);
+                    } else {
+                        let res = try mf.new_vreg(alloc, .Vec128);
+                        var sh = mach_ir.inst_empty(.VShufPS, sp);
+                        sh.dst = res;
+                        sh.src0 = half;
+                        sh.src1 = half;
+                        sh.imm = sub_lane.trunc.[u8]().widen.[i64]();
+                        sh.size_bytes = 16_u8;
+                        try mf.emit_inst(alloc, sh);
+                        try store_float_to_val(alloc, ctx, mf, eir_prog, env, inst.dst, res, sp);
+                    }
+                    return;
+                }
+                if en.kind == .Float && en.u8_val == 64_u8 && lane < 4_usize {
+                    let half = try mf.new_vreg(alloc, .Vec128);
+                    var ex = mach_ir.inst_empty(.VExtractF128, sp);
+                    ex.dst = half;
+                    ex.src0 = sloc.vreg0;
+                    ex.imm = if lane < 2_usize { 0_i64 } else { 1_i64 };
+                    ex.flag0 = true;
+                    ex.size_bytes = 32_u8;
+                    try mf.emit_inst(alloc, ex);
+                    if (lane & 1_usize) == 0_usize {
+                        try store_float_to_val(alloc, ctx, mf, eir_prog, env, inst.dst, half, sp);
+                    } else {
+                        let res = try mf.new_vreg(alloc, .Vec128);
+                        var sh = mach_ir.inst_empty(.VShufPS, sp);
+                        sh.dst = res;
+                        sh.src0 = half;
+                        sh.src1 = half;
+                        sh.imm = 0xEE_i64;
+                        sh.size_bytes = 16_u8;
+                        try mf.emit_inst(alloc, sh);
+                        try store_float_to_val(alloc, ctx, mf, eir_prog, env, inst.dst, res, sp);
+                    }
+                    return;
+                }
                 let sc = ensure_scratch_vec_off(ctx, mf);
                 var st = mach_ir.inst_empty(.VMovUpsStore, sp);
                 st.src0 = sloc.vreg0;
@@ -7387,7 +7452,6 @@ fn emit_unwrap_and_extract(
                 st.size_bytes = 32_u8;
                 try mf.emit_inst(alloc, st);
                 let esz = env.x64_layout(src_n.primary).size;
-                let lane = inst.aux0.widen.[usize]();
                 let dst_ty = eir_prog.fn_val_ty(ctx.fn_id, inst.dst);
                 try load_val_from_mem(alloc, ctx, mf, eir_prog, env, inst.dst, mach_ir.mem_stack_slot(sc +% (lane *% esz).trunc.[i32]()), dst_ty, sp);
                 return;
@@ -14296,6 +14360,101 @@ fn emit_eir_inst(
             try emit_builtin_call_inst(alloc, ctx, mf, eir_prog, env, interner, inst_gid, inst.dst, inst.aux0, sp);
         }
         .ParForHint => {}
+        .VecLoad => {
+            let base_ptr = if inst.flag0 {
+                try load_val_gpr(alloc, ctx, mf, eir_prog, env, inst.v0, false, sp)
+            } else {
+                (try load_slice_pair(alloc, ctx, mf, inst.v0, sp)).lo
+            };
+            let idx_g = try load_val_gpr(alloc, ctx, mf, eir_prog, env, inst.v1, false, sp);
+            let esz = env.x64_layout(inst.ty1).size;
+            let vsz = env.x64_layout(inst.ty0).size;
+            let is_256 = vsz == 32_usize;
+            var mem = mach_ir.mem_sib(base_ptr, idx_g, 1_u8, 0_i32);
+            if esz == 1_usize || esz == 2_usize || esz == 4_usize || esz == 8_usize {
+                mem = mach_ir.mem_sib(base_ptr, idx_g, esz.trunc.[u8](), 0_i32);
+            } else {
+                let sc = try emit_imm_vreg(alloc, mf, esz.widen.[u64](), sp);
+                let off = try mf.new_vreg(alloc, .Gpr);
+                try emit_alu_rr(alloc, mf, .Mul, off, idx_g, sc, sp);
+                mem = mach_ir.mem_sib(base_ptr, off, 1_u8, 0_i32);
+            }
+            let vdst = try mf.new_vreg(alloc, if is_256 { .Vec256 } else { .Vec128 });
+            var ld = mach_ir.inst_empty(.VMovUpsLoad, sp);
+            ld.dst = vdst;
+            ld.mem = mem;
+            ld.flag0 = is_256;
+            ld.size_bytes = if is_256 { 32_u8 } else { 16_u8 };
+            try mf.emit_inst(alloc, ld);
+            try store_vec_to_val(alloc, ctx, mf, inst.dst, vdst, is_256, sp);
+        }
+        .VecStore => {
+            let base_ptr = if inst.flag0 {
+                try load_val_gpr(alloc, ctx, mf, eir_prog, env, inst.v0, false, sp)
+            } else {
+                (try load_slice_pair(alloc, ctx, mf, inst.v0, sp)).lo
+            };
+            let idx_g = try load_val_gpr(alloc, ctx, mf, eir_prog, env, inst.v1, false, sp);
+            let esz = env.x64_layout(inst.ty1).size;
+            let vsz = env.x64_layout(inst.ty0).size;
+            let is_256 = vsz == 32_usize;
+            let sv = try load_val_vec(alloc, ctx, mf, inst.v2, is_256, sp);
+            var mem = mach_ir.mem_sib(base_ptr, idx_g, 1_u8, 0_i32);
+            if esz == 1_usize || esz == 2_usize || esz == 4_usize || esz == 8_usize {
+                mem = mach_ir.mem_sib(base_ptr, idx_g, esz.trunc.[u8](), 0_i32);
+            } else {
+                let sc = try emit_imm_vreg(alloc, mf, esz.widen.[u64](), sp);
+                let off = try mf.new_vreg(alloc, .Gpr);
+                try emit_alu_rr(alloc, mf, .Mul, off, idx_g, sc, sp);
+                mem = mach_ir.mem_sib(base_ptr, off, 1_u8, 0_i32);
+            }
+            var st = mach_ir.inst_empty(.VMovUpsStore, sp);
+            st.src0 = sv;
+            st.mem = mem;
+            st.flag0 = is_256;
+            st.size_bytes = if is_256 { 32_u8 } else { 16_u8 };
+            try mf.emit_inst(alloc, st);
+        }
+        .VecFma => {
+            let vn = env.get(inst.ty0);
+            let vsz = env.x64_layout(inst.ty0).size;
+            let is_256 = vsz == 32_usize;
+            let is_f64 = env.get(vn.primary).kind == .Float && env.get(vn.primary).u8_val == 64_u8;
+            let va = try load_val_vec(alloc, ctx, mf, inst.v0, is_256, sp);
+            let vb = try load_val_vec(alloc, ctx, mf, inst.v1, is_256, sp);
+            let vc = try load_val_vec(alloc, ctx, mf, inst.v2, is_256, sp);
+            if ctx.cfg.target_avx2 {
+                let res = try mf.new_vreg(alloc, if is_256 { .Vec256 } else { .Vec128 });
+                var fma = mach_ir.inst_empty(if is_f64 { .VFmadd231PD } else { .VFmadd231PS }, sp);
+                fma.dst = res;
+                fma.src0 = vc;
+                fma.src1 = va;
+                fma.src2 = vb;
+                fma.tied_src0 = true;
+                fma.flag0 = is_256;
+                fma.size_bytes = if is_256 { 32_u8 } else { 16_u8 };
+                try mf.emit_inst(alloc, fma);
+                try store_vec_to_val(alloc, ctx, mf, inst.dst, res, is_256, sp);
+            } else {
+                let prod = try mf.new_vreg(alloc, if is_256 { .Vec256 } else { .Vec128 });
+                var mul_i = mach_ir.inst_empty(if is_f64 { .VMulPD } else { .VMulPS }, sp);
+                mul_i.dst = prod;
+                mul_i.src0 = va;
+                mul_i.src1 = vb;
+                mul_i.flag0 = is_256;
+                mul_i.size_bytes = if is_256 { 32_u8 } else { 16_u8 };
+                try mf.emit_inst(alloc, mul_i);
+                let sum = try mf.new_vreg(alloc, if is_256 { .Vec256 } else { .Vec128 });
+                var add_i = mach_ir.inst_empty(if is_f64 { .VAddPD } else { .VAddPS }, sp);
+                add_i.dst = sum;
+                add_i.src0 = prod;
+                add_i.src1 = vc;
+                add_i.flag0 = is_256;
+                add_i.size_bytes = if is_256 { 32_u8 } else { 16_u8 };
+                try mf.emit_inst(alloc, add_i);
+                try store_vec_to_val(alloc, ctx, mf, inst.dst, sum, is_256, sp);
+            }
+        }
         _ => {
             try emit_unwrap_and_extract(alloc, ctx, mf, eir_prog, env, interner, inst);
         }
@@ -15038,6 +15197,844 @@ fn try_emit_avx2_vec_fma_loop(
     return;
 }
 
+/// Checks if `v` is defined outside the loop rooted at `hdr_bb` (i.e. loop-invariant).
+fn is_loop_inv_val(ctx: *IselCtx, eir_prog: *eir.EirProgram, hdr_bb: eir.BlockId, v: eir.EirValue) -> bool {
+    if v == eir.EIR_NONE {
+        return true;
+    }
+    let dbb = ctx_def_bb(ctx, v);
+    if dbb == eir.EIR_NONE {
+        return true;
+    }
+    return !eir_prog.dominates_block(ctx.fn_id, hdr_bb, dbb);
+}
+
+/// Matches `val == base + inv` or `inv + base` (`Add` or `AddWrap`) and returns `inv`.
+fn match_add_with_base(all_insts: *[eir.EirInst], ctx: *IselCtx, val: eir.EirValue, base: eir.EirValue) -> eir.EirValue {
+    let gid = ctx_def_inst_gid(ctx, val);
+    if gid == eir.EIR_NONE || gid.widen.[usize]() >= all_insts.len {
+        return eir.EIR_NONE;
+    }
+    let inst = all_insts[gid.widen.[usize]()];
+    if inst.kind != .Binary || (inst.bin_op != .Add && inst.bin_op != .AddWrap) {
+        return eir.EIR_NONE;
+    }
+    if inst.v0 == base {
+        return inst.v1;
+    }
+    if inst.v1 == base {
+        return inst.v0;
+    }
+    return eir.EIR_NONE;
+}
+
+/// Universal 2D Loop-Interchange + 8-YMM Register-Blocked Tile Optimizer for counted outer `k` loops
+/// accumulating into a fixed `f32x4` slice `c_tile[0..len]` from row slices `b[k*stride + jb .. k*stride + j_end]`
+/// scaled by `a_row[k]` (`c_tile[j] = fma(splat(a_row[k]), b_tile[j], c_tile[j])`).
+/// Keeps `c_tile[j..j+64]` in `ymm0..ymm7` across all `k = kb..k_end` iterations with bit-exact IEEE-754 FMA order!
+fn try_emit_avx2_2d_fma_tile_loop(
+    alloc: *mut AllocCap,
+    ctx: *mut IselCtx,
+    mf: *mut mach_ir.MachFunc,
+    eir_prog: *eir.EirProgram,
+    env: *types.TypeEnv,
+    outer_hdr: eir.BlockId,
+    sp: span.Span,
+) -> bool ! OutOfMemory {
+    let hblk = eir_prog.fn_block(ctx.fn_id, outer_hdr) orelse { return false; };
+    let hphis = eir_prog.phis_slice(hblk.phis);
+    let hpreds = eir_prog.preds_slice(hblk.preds);
+    if (hphis.len != 1_usize && hphis.len != 2_usize) || hpreds.len != 2_usize || hblk.term.kind != .Branch {
+        return false;
+    }
+    var outer_pre = eir.EIR_NONE;
+    var outer_latch = eir.EIR_NONE;
+    if eir_prog.dominates_block(ctx.fn_id, outer_hdr, hpreds[0_usize]) && !eir_prog.dominates_block(ctx.fn_id, outer_hdr, hpreds[1_usize]) {
+        outer_latch = hpreds[0_usize];
+        outer_pre = hpreds[1_usize];
+    } else if eir_prog.dominates_block(ctx.fn_id, outer_hdr, hpreds[1_usize]) && !eir_prog.dominates_block(ctx.fn_id, outer_hdr, hpreds[0_usize]) {
+        outer_latch = hpreds[1_usize];
+        outer_pre = hpreds[0_usize];
+    } else {
+        return false;
+    }
+
+    let all_insts = eir_prog.funcs.insts.as_slice();
+    let cond_gid = ctx_def_inst_gid(ctx, hblk.term.val);
+    if cond_gid == eir.EIR_NONE || cond_gid.widen.[usize]() >= all_insts.len {
+        return false;
+    }
+    let cond_i = all_insts[cond_gid.widen.[usize]()];
+    if cond_i.kind != .Binary || cond_i.bin_op != .Lt {
+        return false;
+    }
+    let k_val = cond_i.v0;
+    let k_end_val = cond_i.v1;
+    let outer_body0 = hblk.term.bb0;
+    let outer_exit = hblk.term.bb1;
+    if outer_body0 == outer_hdr || outer_body0 == outer_exit || !is_loop_inv_val(ctx, eir_prog, outer_hdr, k_end_val) {
+        return false;
+    }
+
+    // Identify `k_phi` and optional strength-reduced `b_base_phi` (`b_base = phi(kb*stride, b_base + stride)`)
+    var k_start_val = eir.EIR_NONE;
+    var k_step_val = eir.EIR_NONE;
+    var has_sec_phi = false;
+    var sec_phi_val = eir.EIR_NONE;
+    var sec_init_val = eir.EIR_NONE;
+    var sec_stride_val = eir.EIR_NONE;
+    var found_k_phi = false;
+    var pi: usize = 0_usize;
+    while pi < hphis.len {
+        let ph = hphis[pi];
+        let incs = eir_prog.phi_incoming(ph.incoming);
+        if incs.len != 2_usize {
+            return false;
+        }
+        var init_v = eir.EIR_NONE;
+        var next_v = eir.EIR_NONE;
+        if incs[0_usize].pred_bb == outer_pre {
+            init_v = incs[0_usize].val;
+            next_v = incs[1_usize].val;
+        } else if incs[1_usize].pred_bb == outer_pre {
+            init_v = incs[1_usize].val;
+            next_v = incs[0_usize].val;
+        } else {
+            return false;
+        }
+        if env.x64_layout(ph.ty).size != 8_usize || env.get(ph.ty).kind != .Int || env.is_signed_int(ph.ty) {
+            return false;
+        }
+        if ph.dst == k_val {
+            found_k_phi = true;
+            k_start_val = init_v;
+            k_step_val = next_v;
+        } else {
+            // Secondary induction variable must be `sec_next = sec + inv_stride` with `sec_init = k_start * inv_stride`
+            let st_v = match_add_with_base(all_insts, ctx, next_v, ph.dst);
+            if st_v == eir.EIR_NONE || !is_loop_inv_val(ctx, eir_prog, outer_hdr, st_v) {
+                return false;
+            }
+            has_sec_phi = true;
+            sec_phi_val = ph.dst;
+            sec_init_val = init_v;
+            sec_stride_val = st_v;
+        }
+        pi = pi +% 1_usize;
+    }
+    if !found_k_phi {
+        return false;
+    }
+    // Verify `k_step_val == k_val + 1`
+    let kstep_gid = ctx_def_inst_gid(ctx, k_step_val);
+    if kstep_gid == eir.EIR_NONE || kstep_gid.widen.[usize]() >= all_insts.len {
+        return false;
+    }
+    let kstep_i = all_insts[kstep_gid.widen.[usize]()];
+    if kstep_i.kind != .Binary || (kstep_i.bin_op != .Add && kstep_i.bin_op != .AddWrap) {
+        return false;
+    }
+    let kstep_ok = (kstep_i.v0 == k_val && ctx_is_const_int(ctx, kstep_i.v1) && ctx_const_int(ctx, kstep_i.v1) == 1_u64)
+        || (kstep_i.v1 == k_val && ctx_is_const_int(ctx, kstep_i.v0) && ctx_const_int(ctx, kstep_i.v0) == 1_u64);
+    if !kstep_ok {
+        return false;
+    }
+    // Check `outer_exit` has no phis depending on outer loop values, and `outer_hdr` not already claimed
+    let ex_blk = eir_prog.fn_block(ctx.fn_id, outer_exit) orelse { return false; };
+    if ex_blk.phis.len != 0_u32 {
+        return false;
+    }
+    let ex_loops = ctx.avx2_loops.as_slice();
+    var li: usize = 0_usize;
+    while li < ex_loops.len {
+        if ex_loops[li].pre_bb == outer_pre || ex_loops[li].hdr_bb == outer_hdr {
+            return false;
+        }
+        li = li +% 1_usize;
+    }
+
+    // Walk straight-line outer loop prelude blocks (`outer_body0` -> optional `k < a_row.len` -> `SliceSub` -> optional `c_tile.len <= b_tile.len` -> `inner_hdr`)
+    var a_slice = eir.EIR_NONE;
+    var aik_val = eir.EIR_NONE;
+    var b_slice = eir.EIR_NONE;
+    var b_stride = eir.EIR_NONE;
+    var jb_val = eir.EIR_NONE;
+    var j_end_val = eir.EIR_NONE;
+    var b_tile_val = eir.EIR_NONE;
+    var inner_hdr = eir.EIR_NONE;
+
+    var cur_bb = outer_body0;
+    var steps: usize = 0_usize;
+    while steps < 8_usize {
+        let cb = eir_prog.fn_block(ctx.fn_id, cur_bb) orelse { return false; };
+        let cinsts = eir_prog.insts_slice(cb.insts);
+        var ii: usize = 0_usize;
+        while ii < cinsts.len {
+            let inst = cinsts[ii];
+            match inst.kind {
+                .Const => {}
+                .Copy => {}
+                .Binary => {
+                    // Reject side-effecting ops (Div/Mod)
+                    if inst.bin_op == .Div || inst.bin_op == .Mod {
+                        return false;
+                    }
+                }
+                .LoadPlace => {
+                    let pl = eir_prog.get_place(inst.aux0) orelse { return false; };
+                    if pl.base.kind != .Val { return false; }
+                    let ps = eir_prog.projs_slice(pl.projs);
+                    if ps.len != 1_usize || ps[0_usize].kind != .Index || ps[0_usize].index != k_val { return false; }
+                    if !avx2_is_f32_ty(env, pl.ty) || !is_slice_or_str_ty(eir_prog.fn_val_ty(ctx.fn_id, pl.base.id), env) {
+                        return false;
+                    }
+                    a_slice = pl.base.id;
+                }
+                .BuiltinCall => {
+                    let bc = eir_prog.get_builtin_call(inst.aux0) orelse { return false; };
+                    if bc.op.kind == .VecSplat {
+                        let vn = env.get(bc.op.ty0);
+                        if vn.kind != .Vec || vn.u8_val != 4_u8 || !avx2_is_f32_ty(env, vn.primary) { return false; }
+                        aik_val = inst.dst;
+                    } else if bc.op.kind == .SliceLen {
+                        // ok (for k < a_row.len or c_tile.len <= b_tile.len)
+                    } else if bc.op.kind == .SliceSub {
+                        let bargs = eir_prog.vals_slice(bc.args);
+                        if bargs.len < 3_usize { return false; }
+                        let b_cand = bargs[0_usize];
+                        let lo_v = bargs[1_usize];
+                        let hi_v = bargs[2_usize];
+                        let b_elem = eir_prog.fn_val_ty(ctx.fn_id, b_cand);
+                        if !is_slice_or_str_ty(b_elem, env) { return false; }
+                        // Match `lo_v = b_base + jb`, `hi_v = b_base + j_end` where `b_base = k * stride` or `sec_phi_val`
+                        let lo_gid = ctx_def_inst_gid(ctx, lo_v);
+                        if lo_gid == eir.EIR_NONE || lo_gid.widen.[usize]() >= all_insts.len { return false; }
+                        let lo_i = all_insts[lo_gid.widen.[usize]()];
+                        if lo_i.kind != .Binary || (lo_i.bin_op != .Add && lo_i.bin_op != .AddWrap) { return false; }
+                        var base_cand = eir.EIR_NONE;
+                        var jb_cand = eir.EIR_NONE;
+                        if has_sec_phi && lo_i.v0 == sec_phi_val {
+                            base_cand = sec_phi_val;
+                            jb_cand = lo_i.v1;
+                            b_stride = sec_stride_val;
+                        } else if has_sec_phi && lo_i.v1 == sec_phi_val {
+                            base_cand = sec_phi_val;
+                            jb_cand = lo_i.v0;
+                            b_stride = sec_stride_val;
+                        } else {
+                            // Check if lo_i.v0 or lo_i.v1 is `k * stride`
+                            let bg0 = ctx_def_inst_gid(ctx, lo_i.v0);
+                            if bg0 != eir.EIR_NONE && bg0.widen.[usize]() < all_insts.len {
+                                let bi0 = all_insts[bg0.widen.[usize]()];
+                                if bi0.kind == .Binary && (bi0.bin_op == .Mul || bi0.bin_op == .MulWrap) {
+                                    if bi0.v0 == k_val {
+                                        base_cand = lo_i.v0; jb_cand = lo_i.v1; b_stride = bi0.v1;
+                                    } else if bi0.v1 == k_val {
+                                        base_cand = lo_i.v0; jb_cand = lo_i.v1; b_stride = bi0.v0;
+                                    }
+                                }
+                            }
+                            if base_cand == eir.EIR_NONE {
+                                let bg1 = ctx_def_inst_gid(ctx, lo_i.v1);
+                                if bg1 != eir.EIR_NONE && bg1.widen.[usize]() < all_insts.len {
+                                    let bi1 = all_insts[bg1.widen.[usize]()];
+                                    if bi1.kind == .Binary && (bi1.bin_op == .Mul || bi1.bin_op == .MulWrap) {
+                                        if bi1.v0 == k_val {
+                                            base_cand = lo_i.v1; jb_cand = lo_i.v0; b_stride = bi1.v1;
+                                        } else if bi1.v1 == k_val {
+                                            base_cand = lo_i.v1; jb_cand = lo_i.v0; b_stride = bi1.v0;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if base_cand == eir.EIR_NONE || b_stride == eir.EIR_NONE { return false; }
+                        let je_cand = match_add_with_base(all_insts, ctx, hi_v, base_cand);
+                        if je_cand == eir.EIR_NONE { return false; }
+                        b_slice = b_cand;
+                        jb_val = jb_cand;
+                        j_end_val = je_cand;
+                    } else {
+                        return false;
+                    }
+                }
+                .IsError => {}
+                .UnwrapErrorOk => {
+                    b_tile_val = inst.dst;
+                }
+                _ => { return false; }
+            }
+            ii = ii +% 1_usize;
+        }
+        if cb.term.kind == .Goto {
+            let nxt = cb.term.bb0;
+            let nb = eir_prog.fn_block(ctx.fn_id, nxt) orelse { return false; };
+            if nb.phis.len == 1_u32 && nb.term.kind == .Branch {
+                inner_hdr = nxt;
+                break;
+            }
+            cur_bb = nxt;
+            steps = steps +% 1_usize;
+            continue;
+        }
+        if cb.term.kind == .Branch {
+            let b0 = cb.term.bb0;
+            let b1 = cb.term.bb1;
+            let tg = ctx_def_inst_gid(ctx, cb.term.val);
+            if tg != eir.EIR_NONE && tg.widen.[usize]() < all_insts.len {
+                let ti = all_insts[tg.widen.[usize]()];
+                if ti.kind == .IsError {
+                    // `IsError(b_tile)` -> then=err, else=ok!
+                    cur_bb = b1;
+                    steps = steps +% 1_usize;
+                    continue;
+                }
+                if ti.kind == .Binary && (ti.bin_op == .Lt || ti.bin_op == .LtEq) {
+                    // Guard `k < a_row.len` or `c_tile.len <= b_tile.len`: false branch must go to outer_latch!
+                    if b1 == outer_latch || avx2_is_empty_goto_to(eir_prog, ctx.fn_id, b1, outer_latch) {
+                        let nb = eir_prog.fn_block(ctx.fn_id, b0) orelse { return false; };
+                        if nb.phis.len == 1_u32 && nb.term.kind == .Branch {
+                            inner_hdr = b0;
+                            break;
+                        }
+                        cur_bb = b0;
+                        steps = steps +% 1_usize;
+                        continue;
+                    }
+                }
+            }
+            return false;
+        }
+        return false;
+    }
+
+    if inner_hdr == eir.EIR_NONE || a_slice == eir.EIR_NONE || aik_val == eir.EIR_NONE
+        || b_slice == eir.EIR_NONE || b_stride == eir.EIR_NONE || jb_val == eir.EIR_NONE
+        || j_end_val == eir.EIR_NONE || b_tile_val == eir.EIR_NONE
+    {
+        return false;
+    }
+    if !is_loop_inv_val(ctx, eir_prog, outer_hdr, a_slice)
+        || !is_loop_inv_val(ctx, eir_prog, outer_hdr, b_slice)
+        || !is_loop_inv_val(ctx, eir_prog, outer_hdr, b_stride)
+        || !is_loop_inv_val(ctx, eir_prog, outer_hdr, jb_val)
+        || !is_loop_inv_val(ctx, eir_prog, outer_hdr, j_end_val)
+    {
+        return false;
+    }
+
+    // Verify `inner_hdr` is the exact `j in 0..c_tile.len` f32x4 FMA loop exiting to `outer_latch`!
+    let ih = eir_prog.fn_block(ctx.fn_id, inner_hdr) orelse { return false; };
+    let iphis = eir_prog.phis_slice(ih.phis);
+    let ipreds = eir_prog.preds_slice(ih.preds);
+    if iphis.len != 1_usize || ipreds.len != 2_usize || ih.term.kind != .Branch {
+        return false;
+    }
+    let j_phi = iphis[0_usize];
+    let j_val = j_phi.dst;
+    let j_incs = eir_prog.phi_incoming(j_phi.incoming);
+    if j_incs.len != 2_usize {
+        return false;
+    }
+    let inner_body = ih.term.bb0;
+    let inner_exit = ih.term.bb1;
+    if inner_exit != outer_latch && !avx2_is_empty_goto_to(eir_prog, ctx.fn_id, inner_exit, outer_latch) {
+        return false;
+    }
+    var j_start = eir.EIR_NONE;
+    var j_step = eir.EIR_NONE;
+    if j_incs[0_usize].pred_bb == inner_body {
+        j_step = j_incs[0_usize].val;
+        j_start = j_incs[1_usize].val;
+    } else if j_incs[1_usize].pred_bb == inner_body {
+        j_step = j_incs[1_usize].val;
+        j_start = j_incs[0_usize].val;
+    } else {
+        return false;
+    }
+    if !ctx_is_const_int(ctx, j_start) || ctx_const_int(ctx, j_start) != 0_u64 {
+        return false;
+    }
+    let icond_gid = ctx_def_inst_gid(ctx, ih.term.val);
+    if icond_gid == eir.EIR_NONE || icond_gid.widen.[usize]() >= all_insts.len {
+        return false;
+    }
+    let icond_i = all_insts[icond_gid.widen.[usize]()];
+    if icond_i.kind != .Binary || icond_i.bin_op != .Lt || icond_i.v0 != j_val {
+        return false;
+    }
+    let j_bound = icond_i.v1;
+    if !is_loop_inv_val(ctx, eir_prog, outer_hdr, j_bound) {
+        return false;
+    }
+    let jst_gid = ctx_def_inst_gid(ctx, j_step);
+    if jst_gid == eir.EIR_NONE || jst_gid.widen.[usize]() >= all_insts.len {
+        return false;
+    }
+    let jst_i = all_insts[jst_gid.widen.[usize]()];
+    if jst_i.kind != .Binary || (jst_i.bin_op != .Add && jst_i.bin_op != .AddWrap) {
+        return false;
+    }
+    let jst_ok = (jst_i.v0 == j_val && ctx_is_const_int(ctx, jst_i.v1) && ctx_const_int(ctx, jst_i.v1) == 1_u64)
+        || (jst_i.v1 == j_val && ctx_is_const_int(ctx, jst_i.v0) && ctx_const_int(ctx, jst_i.v0) == 1_u64);
+    if !jst_ok {
+        return false;
+    }
+
+    // Verify `inner_body` contains ONLY: Load(b_tile[j]), Load(c_tile[j]), VecFma(aik, b_v, c_v), Store(c_tile[j], res), j+1
+    let ib = eir_prog.fn_block(ctx.fn_id, inner_body) orelse { return false; };
+    if ib.phis.len != 0_u32 || ib.term.kind != .Goto || ib.term.bb0 != inner_hdr {
+        return false;
+    }
+    let ib_insts = eir_prog.insts_slice(ib.insts);
+    var ld0_v = eir.EIR_NONE;
+    var ld0_sl = eir.EIR_NONE;
+    var ld1_v = eir.EIR_NONE;
+    var ld1_sl = eir.EIR_NONE;
+    var fma_dst = eir.EIR_NONE;
+    var fma_a = eir.EIR_NONE;
+    var fma_b = eir.EIR_NONE;
+    var fma_c = eir.EIR_NONE;
+    var c_slice = eir.EIR_NONE;
+    var st_v = eir.EIR_NONE;
+    var n_ld: usize = 0_usize;
+    var n_fm: usize = 0_usize;
+    var n_st: usize = 0_usize;
+    var bi_i: usize = 0_usize;
+    while bi_i < ib_insts.len {
+        let inst = ib_insts[bi_i];
+        match inst.kind {
+            .Const => { if !ctx_is_const_int(ctx, inst.dst) { return false; } }
+            .Binary => { if inst.dst != j_step { return false; } }
+            .LoadPlace => {
+                let pl = eir_prog.get_place(inst.aux0) orelse { return false; };
+                if pl.base.kind != .Val { return false; }
+                let ps = eir_prog.projs_slice(pl.projs);
+                if ps.len != 1_usize || ps[0_usize].kind != .Index || ps[0_usize].index != j_val { return false; }
+                let vn = env.get(pl.ty);
+                if vn.kind != .Vec || vn.u8_val != 4_u8 || !avx2_is_f32_ty(env, vn.primary) { return false; }
+                if n_ld == 0_usize { ld0_v = inst.dst; ld0_sl = pl.base.id; }
+                else if n_ld == 1_usize { ld1_v = inst.dst; ld1_sl = pl.base.id; }
+                else { return false; }
+                n_ld = n_ld +% 1_usize;
+            }
+            .BuiltinCall => {
+                let bc = eir_prog.get_builtin_call(inst.aux0) orelse { return false; };
+                if bc.op.kind != .VecFma || n_fm != 0_usize { return false; }
+                let vn = env.get(bc.op.ty0);
+                if vn.kind != .Vec || vn.u8_val != 4_u8 || !avx2_is_f32_ty(env, vn.primary) { return false; }
+                let args = eir_prog.vals_slice(bc.args);
+                if args.len != 3_usize { return false; }
+                fma_dst = inst.dst; fma_a = args[0_usize]; fma_b = args[1_usize]; fma_c = args[2_usize];
+                n_fm = 1_usize;
+            }
+            .StorePlace => {
+                let pl = eir_prog.get_place(inst.aux0) orelse { return false; };
+                if pl.base.kind != .Val || n_st != 0_usize { return false; }
+                let ps = eir_prog.projs_slice(pl.projs);
+                if ps.len != 1_usize || ps[0_usize].kind != .Index || ps[0_usize].index != j_val { return false; }
+                let vn = env.get(pl.ty);
+                if vn.kind != .Vec || vn.u8_val != 4_u8 || !avx2_is_f32_ty(env, vn.primary) { return false; }
+                c_slice = pl.base.id;
+                st_v = inst.v0;
+                n_st = 1_usize;
+            }
+            _ => { return false; }
+        }
+        bi_i = bi_i +% 1_usize;
+    }
+    if n_ld != 2_usize || n_fm != 1_usize || n_st != 1_usize || st_v != fma_dst {
+        return false;
+    }
+    if !is_loop_inv_val(ctx, eir_prog, outer_hdr, c_slice) {
+        return false;
+    }
+    var c_ld_v = eir.EIR_NONE;
+    var b_ld_v = eir.EIR_NONE;
+    if ld0_sl == c_slice && ld1_sl == b_tile_val {
+        c_ld_v = ld0_v; b_ld_v = ld1_v;
+    } else if ld1_sl == c_slice && ld0_sl == b_tile_val {
+        c_ld_v = ld1_v; b_ld_v = ld0_v;
+    } else {
+        return false;
+    }
+    if fma_c != c_ld_v { return false; }
+    if !((fma_a == aik_val && fma_b == b_ld_v) || (fma_b == aik_val && fma_a == b_ld_v)) {
+        return false;
+    }
+
+    // Verify `outer_latch` ONLY computes `k + 1` (and optional `sec + stride`) and jumps back to `outer_hdr`!
+    let ol = eir_prog.fn_block(ctx.fn_id, outer_latch) orelse { return false; };
+    if ol.phis.len != 0_u32 || ol.term.kind != .Goto || ol.term.bb0 != outer_hdr {
+        return false;
+    }
+    let ol_insts = eir_prog.insts_slice(ol.insts);
+    var oli: usize = 0_usize;
+    while oli < ol_insts.len {
+        let inst = ol_insts[oli];
+        if inst.kind != .Const && inst.kind != .Binary && inst.kind != .Copy {
+            return false;
+        }
+        if inst.kind == .Binary && (inst.bin_op == .Div || inst.bin_op == .Mod) {
+            return false;
+        }
+        oli = oli +% 1_usize;
+    }
+
+    // ---- Emit 8-YMM (64-float) Register-Blocked Interchanged Tile Loop (`j_blk` outer, `k` inner) ----
+    let out_depth = eir_prog.block_depth(ctx.fn_id, outer_hdr);
+    let pre_d = if out_depth > 0_u8 { out_depth -% 1_u8 } else { 0_u8 };
+    let mid_d = out_depth +% 1_u8;
+    let in_d = out_depth +% 2_u8;
+
+    let v_pre = try mf.add_block(alloc, pre_d);
+    let b_chk1 = try mf.add_block(alloc, pre_d);
+    let b_chk2 = try mf.add_block(alloc, pre_d);
+    let b_chk3 = try mf.add_block(alloc, pre_d);
+    let b_chk4 = try mf.add_block(alloc, pre_d);
+    let b_chk_al1 = try mf.add_block(alloc, pre_d);
+    let b_chk_al2 = try mf.add_block(alloc, pre_d);
+    let b_chk_al3 = try mf.add_block(alloc, pre_d);
+    let b_setup = try mf.add_block(alloc, pre_d);
+    let b_j_hdr = try mf.add_block(alloc, mid_d);
+    let b_j_load = try mf.add_block(alloc, mid_d);
+    let b_k_loop = try mf.add_block(alloc, in_d);
+    let b_j_store = try mf.add_block(alloc, mid_d);
+    let b_tail_hdr = try mf.add_block(alloc, mid_d);
+    let b_tail_ld = try mf.add_block(alloc, mid_d);
+    let b_tail_k = try mf.add_block(alloc, in_d);
+    let b_tail_st = try mf.add_block(alloc, mid_d);
+    let b_bail = try mf.add_block(alloc, pre_d);
+
+    mf.begin_block_insts(v_pre);
+    ctx.cur_mbb = v_pre;
+    let v_kb = try load_val_gpr(alloc, ctx, mf, eir_prog, env, k_start_val, true, sp);
+    let v_kend = try load_val_gpr(alloc, ctx, mf, eir_prog, env, k_end_val, true, sp);
+    let v_jb = try load_val_gpr(alloc, ctx, mf, eir_prog, env, jb_val, true, sp);
+    let v_jend = try load_val_gpr(alloc, ctx, mf, eir_prog, env, j_end_val, true, sp);
+    let v_stride = try load_val_gpr(alloc, ctx, mf, eir_prog, env, b_stride, true, sp);
+    let v_jbound = try load_val_gpr(alloc, ctx, mf, eir_prog, env, j_bound, true, sp);
+    let a_pair = try load_slice_pair(alloc, ctx, mf, a_slice, sp);
+    let b_pair = try load_slice_pair(alloc, ctx, mf, b_slice, sp);
+    let c_pair = try load_slice_pair(alloc, ctx, mf, c_slice, sp);
+
+    // Pre-check 0: `kb < k_end && k_end <= a_row.len && jb <= j_end`
+    try emit_cmp_rr(alloc, mf, v_kb, v_kend, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jcc(.Ae, b_bail, sp));
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_chk1, sp));
+    mf.end_block_insts(v_pre);
+
+    mf.begin_block_insts(b_chk1);
+    try emit_cmp_rr(alloc, mf, v_kend, a_pair.hi, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jcc(.A, b_bail, sp));
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_chk2, sp));
+    mf.end_block_insts(b_chk1);
+
+    mf.begin_block_insts(b_chk2);
+    try emit_cmp_rr(alloc, mf, v_jb, v_jend, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jcc(.A, b_bail, sp));
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_chk3, sp));
+    mf.end_block_insts(b_chk2);
+
+    // Pre-check 3: `c_tile.len <= (j_end - jb) && j_bound == c_tile.len && c_tile.len >= 16`
+    mf.begin_block_insts(b_chk3);
+    let v_tile_w = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_rr(alloc, mf, .Sub, v_tile_w, v_jend, v_jb, sp);
+    try emit_cmp_rr(alloc, mf, c_pair.hi, v_tile_w, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jcc(.A, b_bail, sp));
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_chk4, sp));
+    mf.end_block_insts(b_chk3);
+
+    // Pre-check 4: overflow-safe `k_end <= 0x10000000 && stride <= 0x10000000 && (k_end - 1)*stride + j_end <= b.len && eff_j >= 16`
+    let b_chk4b = try mf.add_block(alloc, pre_d);
+    let b_chk4c = try mf.add_block(alloc, pre_d);
+    mf.begin_block_insts(b_chk4);
+    let v_eff_j = try mf.new_vreg(alloc, .Gpr);
+    try emit_cmp_rr(alloc, mf, v_jbound, c_pair.hi, sp);
+    try emit_cmov(alloc, mf, .B, v_eff_j, c_pair.hi, v_jbound, sp);
+    try emit_cmp_ri(alloc, mf, v_eff_j, 16_i32, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jcc(.B, b_bail, sp));
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_chk4b, sp));
+    mf.end_block_insts(b_chk4);
+
+    mf.begin_block_insts(b_chk4b);
+    let v_lim_ov = try emit_imm_vreg(alloc, mf, 0x10000000_u64, sp);
+    try emit_cmp_rr(alloc, mf, v_kend, v_lim_ov, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jcc(.A, b_bail, sp));
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_chk4c, sp));
+    mf.end_block_insts(b_chk4b);
+
+    let b_chk4d = try mf.add_block(alloc, pre_d);
+    mf.begin_block_insts(b_chk4c);
+    try emit_cmp_rr(alloc, mf, v_stride, v_lim_ov, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jcc(.A, b_bail, sp));
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_chk4d, sp));
+    mf.end_block_insts(b_chk4c);
+
+    mf.begin_block_insts(b_chk4d);
+    let v_klast = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_ri(alloc, mf, .SubImm, v_klast, v_kend, 1_i64, sp);
+    let v_bmax0 = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_rr(alloc, mf, .Mul, v_bmax0, v_klast, v_stride, sp);
+    let v_bmax = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_rr(alloc, mf, .Add, v_bmax, v_bmax0, v_jend, sp);
+    try emit_cmp_rr(alloc, mf, v_bmax, b_pair.hi, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jcc(.A, b_bail, sp));
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_chk_al1, sp));
+    mf.end_block_insts(b_chk4d);
+
+    // Non-overlap check: `c_tile` disjoint from `b` and `a_row`
+    let b_chk_al1b = try mf.add_block(alloc, pre_d);
+    mf.begin_block_insts(b_chk_al1);
+    let v_c_bytes = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_ri(alloc, mf, .ShlImm, v_c_bytes, v_eff_j, 4_i64, sp);
+    let v_c_end = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_rr(alloc, mf, .Add, v_c_end, c_pair.lo, v_c_bytes, sp);
+    let v_b_bytes = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_ri(alloc, mf, .ShlImm, v_b_bytes, b_pair.hi, 4_i64, sp);
+    let v_b_end = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_rr(alloc, mf, .Add, v_b_end, b_pair.lo, v_b_bytes, sp);
+    try emit_cmp_rr(alloc, mf, v_c_end, b_pair.lo, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jcc(.Be, b_chk_al2, sp));
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_chk_al1b, sp));
+    mf.end_block_insts(b_chk_al1);
+
+    mf.begin_block_insts(b_chk_al1b);
+    try emit_cmp_rr(alloc, mf, v_b_end, c_pair.lo, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jcc(.Be, b_chk_al2, sp));
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_bail, sp));
+    mf.end_block_insts(b_chk_al1b);
+
+    mf.begin_block_insts(b_chk_al2);
+    let v_a_bytes = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_ri(alloc, mf, .ShlImm, v_a_bytes, a_pair.hi, 2_i64, sp);
+    let v_a_end_all = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_rr(alloc, mf, .Add, v_a_end_all, a_pair.lo, v_a_bytes, sp);
+    try emit_cmp_rr(alloc, mf, v_c_end, a_pair.lo, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jcc(.Be, b_setup, sp));
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_chk_al3, sp));
+    mf.end_block_insts(b_chk_al2);
+
+    mf.begin_block_insts(b_chk_al3);
+    try emit_cmp_rr(alloc, mf, v_a_end_all, c_pair.lo, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jcc(.Be, b_setup, sp));
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_bail, sp));
+    mf.end_block_insts(b_chk_al3);
+
+    // Setup invariant base pointers for the interchanged (j_blk -> k) loop!
+    mf.begin_block_insts(b_setup);
+    let v_stride_bytes = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_ri(alloc, mf, .ShlImm, v_stride_bytes, v_stride, 4_i64, sp);
+    let v_a_start = try mf.new_vreg(alloc, .Gpr);
+    try mf.emit_inst(alloc, mach_ir.inst_lea(v_a_start, mach_ir.mem_sib(a_pair.lo, v_kb, 4_u8, 0_i32), sp));
+    let v_a_end = try mf.new_vreg(alloc, .Gpr);
+    try mf.emit_inst(alloc, mach_ir.inst_lea(v_a_end, mach_ir.mem_sib(a_pair.lo, v_kend, 4_u8, 0_i32), sp));
+    let v_kb_mul = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_rr(alloc, mf, .Mul, v_kb_mul, v_kb, v_stride, sp);
+    let v_b0_idx = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_rr(alloc, mf, .Add, v_b0_idx, v_kb_mul, v_jb, sp);
+    let v_b0_off = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_ri(alloc, mf, .ShlImm, v_b0_off, v_b0_idx, 4_i64, sp);
+    let v_b_base0 = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_rr(alloc, mf, .Add, v_b_base0, b_pair.lo, v_b0_off, sp);
+
+    // `j_lim_bytes = (v_eff_j - 16) * 16` (step by 256 bytes = 16 f32x4 = 8 YMM = 64 floats!)
+    let v_j_lim_idx = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_ri(alloc, mf, .SubImm, v_j_lim_idx, v_eff_j, 16_i64, sp);
+    let v_j_lim = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_ri(alloc, mf, .ShlImm, v_j_lim, v_j_lim_idx, 4_i64, sp);
+    let v_j_total = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_ri(alloc, mf, .ShlImm, v_j_total, v_eff_j, 4_i64, sp);
+
+    let v_j_off = try mf.new_vreg(alloc, .Gpr);
+    let v_zero0 = try emit_imm_vreg(alloc, mf, 0_u64, sp);
+    let p_ji = mf.pcopy_pairs.len().trunc.[u32]();
+    try mf.add_pcopy_pair(alloc, v_j_off, v_zero0);
+    try mf.emit_parallel_copy(alloc, p_ji, 1_u32, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_j_hdr, sp));
+    mf.end_block_insts(b_setup);
+
+    // Outer `j_off` header (step +256B = 8 YMMs)
+    mf.begin_block_insts(b_j_hdr);
+    try emit_cmp_rr(alloc, mf, v_j_off, v_j_lim, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jcc(.A, b_tail_hdr, sp));
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_j_load, sp));
+    mf.end_block_insts(b_j_hdr);
+
+    // Load 8 YMMs of `c_tile[j_off .. j_off + 256]` ONCE directly into `y0..y7` before entire `k` loop!
+    mf.begin_block_insts(b_j_load);
+    let y0 = try mf.new_vreg(alloc, .Vec256);
+    let y1 = try mf.new_vreg(alloc, .Vec256);
+    let y2 = try mf.new_vreg(alloc, .Vec256);
+    let y3 = try mf.new_vreg(alloc, .Vec256);
+    let y4 = try mf.new_vreg(alloc, .Vec256);
+    let y5 = try mf.new_vreg(alloc, .Vec256);
+    let y6 = try mf.new_vreg(alloc, .Vec256);
+    let y7 = try mf.new_vreg(alloc, .Vec256);
+    let v_c_cur = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_rr(alloc, mf, .Add, v_c_cur, c_pair.lo, v_j_off, sp);
+    let v_b_cur0 = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_rr(alloc, mf, .Add, v_b_cur0, v_b_base0, v_j_off, sp);
+
+    var l0 = mach_ir.inst_empty(.VMovUpsLoad, sp); l0.dst = y0; l0.mem = mach_ir.mem_base_disp(v_c_cur, 0_i32); l0.flag0 = true; l0.size_bytes = 32_u8; try mf.emit_inst(alloc, l0);
+    var l1 = mach_ir.inst_empty(.VMovUpsLoad, sp); l1.dst = y1; l1.mem = mach_ir.mem_base_disp(v_c_cur, 32_i32); l1.flag0 = true; l1.size_bytes = 32_u8; try mf.emit_inst(alloc, l1);
+    var l2 = mach_ir.inst_empty(.VMovUpsLoad, sp); l2.dst = y2; l2.mem = mach_ir.mem_base_disp(v_c_cur, 64_i32); l2.flag0 = true; l2.size_bytes = 32_u8; try mf.emit_inst(alloc, l2);
+    var l3 = mach_ir.inst_empty(.VMovUpsLoad, sp); l3.dst = y3; l3.mem = mach_ir.mem_base_disp(v_c_cur, 96_i32); l3.flag0 = true; l3.size_bytes = 32_u8; try mf.emit_inst(alloc, l3);
+    var l4 = mach_ir.inst_empty(.VMovUpsLoad, sp); l4.dst = y4; l4.mem = mach_ir.mem_base_disp(v_c_cur, 128_i32); l4.flag0 = true; l4.size_bytes = 32_u8; try mf.emit_inst(alloc, l4);
+    var l5 = mach_ir.inst_empty(.VMovUpsLoad, sp); l5.dst = y5; l5.mem = mach_ir.mem_base_disp(v_c_cur, 160_i32); l5.flag0 = true; l5.size_bytes = 32_u8; try mf.emit_inst(alloc, l5);
+    var l6 = mach_ir.inst_empty(.VMovUpsLoad, sp); l6.dst = y6; l6.mem = mach_ir.mem_base_disp(v_c_cur, 192_i32); l6.flag0 = true; l6.size_bytes = 32_u8; try mf.emit_inst(alloc, l6);
+    var l7 = mach_ir.inst_empty(.VMovUpsLoad, sp); l7.dst = y7; l7.mem = mach_ir.mem_base_disp(v_c_cur, 224_i32); l7.flag0 = true; l7.size_bytes = 32_u8; try mf.emit_inst(alloc, l7);
+
+    let v_ak = try mf.new_vreg(alloc, .Gpr);
+    let v_bk = try mf.new_vreg(alloc, .Gpr);
+    let p_ki = mf.pcopy_pairs.len().trunc.[u32]();
+    try mf.add_pcopy_pair(alloc, v_ak, v_a_start);
+    try mf.add_pcopy_pair(alloc, v_bk, v_b_cur0);
+    try mf.emit_parallel_copy(alloc, p_ki, 2_u32, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_k_loop, sp));
+    mf.end_block_insts(b_j_load);
+
+    // ULTRA-TIGHT INNER `k` LOOP: 64 float FMAs in 13 hardware instructions (in-place y0..y7, 0 spills, 0 vmovaps)!
+    mf.begin_block_insts(b_k_loop);
+    let y_a = try mf.new_vreg(alloc, .Vec256);
+    var bca = mach_ir.inst_empty(.VBroadcastSS, sp);
+    bca.dst = y_a; bca.mem = mach_ir.mem_base_disp(v_ak, 0_i32); bca.flag0 = true; bca.size_bytes = 32_u8;
+    try mf.emit_inst(alloc, bca);
+
+    var f0 = mach_ir.inst_empty(.VFmadd231PSMem, sp); f0.dst = y0; f0.src0 = y0; f0.src1 = y_a; f0.tied_src0 = true; f0.mem = mach_ir.mem_base_disp(v_bk, 0_i32); f0.flag0 = true; f0.size_bytes = 32_u8; try mf.emit_inst(alloc, f0);
+    var f1 = mach_ir.inst_empty(.VFmadd231PSMem, sp); f1.dst = y1; f1.src0 = y1; f1.src1 = y_a; f1.tied_src0 = true; f1.mem = mach_ir.mem_base_disp(v_bk, 32_i32); f1.flag0 = true; f1.size_bytes = 32_u8; try mf.emit_inst(alloc, f1);
+    var f2 = mach_ir.inst_empty(.VFmadd231PSMem, sp); f2.dst = y2; f2.src0 = y2; f2.src1 = y_a; f2.tied_src0 = true; f2.mem = mach_ir.mem_base_disp(v_bk, 64_i32); f2.flag0 = true; f2.size_bytes = 32_u8; try mf.emit_inst(alloc, f2);
+    var f3 = mach_ir.inst_empty(.VFmadd231PSMem, sp); f3.dst = y3; f3.src0 = y3; f3.src1 = y_a; f3.tied_src0 = true; f3.mem = mach_ir.mem_base_disp(v_bk, 96_i32); f3.flag0 = true; f3.size_bytes = 32_u8; try mf.emit_inst(alloc, f3);
+    var f4 = mach_ir.inst_empty(.VFmadd231PSMem, sp); f4.dst = y4; f4.src0 = y4; f4.src1 = y_a; f4.tied_src0 = true; f4.mem = mach_ir.mem_base_disp(v_bk, 128_i32); f4.flag0 = true; f4.size_bytes = 32_u8; try mf.emit_inst(alloc, f4);
+    var f5 = mach_ir.inst_empty(.VFmadd231PSMem, sp); f5.dst = y5; f5.src0 = y5; f5.src1 = y_a; f5.tied_src0 = true; f5.mem = mach_ir.mem_base_disp(v_bk, 160_i32); f5.flag0 = true; f5.size_bytes = 32_u8; try mf.emit_inst(alloc, f5);
+    var f6 = mach_ir.inst_empty(.VFmadd231PSMem, sp); f6.dst = y6; f6.src0 = y6; f6.src1 = y_a; f6.tied_src0 = true; f6.mem = mach_ir.mem_base_disp(v_bk, 192_i32); f6.flag0 = true; f6.size_bytes = 32_u8; try mf.emit_inst(alloc, f6);
+    var f7 = mach_ir.inst_empty(.VFmadd231PSMem, sp); f7.dst = y7; f7.src0 = y7; f7.src1 = y_a; f7.tied_src0 = true; f7.mem = mach_ir.mem_base_disp(v_bk, 224_i32); f7.flag0 = true; f7.size_bytes = 32_u8; try mf.emit_inst(alloc, f7);
+
+    let v_ak_next = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_ri(alloc, mf, .AddImm, v_ak_next, v_ak, 4_i64, sp);
+    let v_bk_next = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_rr(alloc, mf, .Add, v_bk_next, v_bk, v_stride_bytes, sp);
+    let p_kn = mf.pcopy_pairs.len().trunc.[u32]();
+    try mf.add_pcopy_pair(alloc, v_ak, v_ak_next);
+    try mf.add_pcopy_pair(alloc, v_bk, v_bk_next);
+    try mf.emit_parallel_copy(alloc, p_kn, 2_u32, sp);
+    try emit_cmp_rr(alloc, mf, v_ak, v_a_end, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jcc(.B, b_k_loop, sp));
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_j_store, sp));
+    mf.end_block_insts(b_k_loop);
+
+    // Store 8 YMMs back to `c_tile[j_off .. j_off + 256]` ONCE and advance `j_off += 256`!
+    mf.begin_block_insts(b_j_store);
+    var s0 = mach_ir.inst_empty(.VMovUpsStore, sp); s0.src0 = y0; s0.mem = mach_ir.mem_base_disp(v_c_cur, 0_i32); s0.flag0 = true; s0.size_bytes = 32_u8; try mf.emit_inst(alloc, s0);
+    var s1 = mach_ir.inst_empty(.VMovUpsStore, sp); s1.src0 = y1; s1.mem = mach_ir.mem_base_disp(v_c_cur, 32_i32); s1.flag0 = true; s1.size_bytes = 32_u8; try mf.emit_inst(alloc, s1);
+    var s2 = mach_ir.inst_empty(.VMovUpsStore, sp); s2.src0 = y2; s2.mem = mach_ir.mem_base_disp(v_c_cur, 64_i32); s2.flag0 = true; s2.size_bytes = 32_u8; try mf.emit_inst(alloc, s2);
+    var s3 = mach_ir.inst_empty(.VMovUpsStore, sp); s3.src0 = y3; s3.mem = mach_ir.mem_base_disp(v_c_cur, 96_i32); s3.flag0 = true; s3.size_bytes = 32_u8; try mf.emit_inst(alloc, s3);
+    var s4 = mach_ir.inst_empty(.VMovUpsStore, sp); s4.src0 = y4; s4.mem = mach_ir.mem_base_disp(v_c_cur, 128_i32); s4.flag0 = true; s4.size_bytes = 32_u8; try mf.emit_inst(alloc, s4);
+    var s5 = mach_ir.inst_empty(.VMovUpsStore, sp); s5.src0 = y5; s5.mem = mach_ir.mem_base_disp(v_c_cur, 160_i32); s5.flag0 = true; s5.size_bytes = 32_u8; try mf.emit_inst(alloc, s5);
+    var s6 = mach_ir.inst_empty(.VMovUpsStore, sp); s6.src0 = y6; s6.mem = mach_ir.mem_base_disp(v_c_cur, 192_i32); s6.flag0 = true; s6.size_bytes = 32_u8; try mf.emit_inst(alloc, s6);
+    var s7 = mach_ir.inst_empty(.VMovUpsStore, sp); s7.src0 = y7; s7.mem = mach_ir.mem_base_disp(v_c_cur, 224_i32); s7.flag0 = true; s7.size_bytes = 32_u8; try mf.emit_inst(alloc, s7);
+
+    let v_j_next = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_ri(alloc, mf, .AddImm, v_j_next, v_j_off, 256_i64, sp);
+    let p_jn = mf.pcopy_pairs.len().trunc.[u32]();
+    try mf.add_pcopy_pair(alloc, v_j_off, v_j_next);
+    try mf.emit_parallel_copy(alloc, p_jn, 1_u32, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_j_hdr, sp));
+    mf.end_block_insts(b_j_store);
+
+    // 1-XMM (`f32x4`) tail loop for any remaining `c_tile.len % 16` columns (handles ANY width!)
+    mf.begin_block_insts(b_tail_hdr);
+    try emit_cmp_rr(alloc, mf, v_j_off, v_j_total, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jcc(.Ae, ctx_mbb_for_eir(ctx, outer_exit), sp));
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_tail_ld, sp));
+    mf.end_block_insts(b_tail_hdr);
+
+    mf.begin_block_insts(b_tail_ld);
+    let v_tc = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_rr(alloc, mf, .Add, v_tc, c_pair.lo, v_j_off, sp);
+    let v_tb0 = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_rr(alloc, mf, .Add, v_tb0, v_b_base0, v_j_off, sp);
+    let tx = try mf.new_vreg(alloc, .Vec128);
+    var tl = mach_ir.inst_empty(.VMovUpsLoad, sp); tl.dst = tx; tl.mem = mach_ir.mem_base_disp(v_tc, 0_i32); tl.size_bytes = 16_u8; try mf.emit_inst(alloc, tl);
+    let v_tak = try mf.new_vreg(alloc, .Gpr);
+    let v_tbk = try mf.new_vreg(alloc, .Gpr);
+    let p_ti = mf.pcopy_pairs.len().trunc.[u32]();
+    try mf.add_pcopy_pair(alloc, v_tak, v_a_start);
+    try mf.add_pcopy_pair(alloc, v_tbk, v_tb0);
+    try mf.emit_parallel_copy(alloc, p_ti, 2_u32, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_tail_k, sp));
+    mf.end_block_insts(b_tail_ld);
+
+    mf.begin_block_insts(b_tail_k);
+    let xa = try mf.new_vreg(alloc, .Vec128);
+    var tbc = mach_ir.inst_empty(.VBroadcastSS, sp);
+    tbc.dst = xa; tbc.mem = mach_ir.mem_base_disp(v_tak, 0_i32); tbc.size_bytes = 16_u8;
+    try mf.emit_inst(alloc, tbc);
+    var tf = mach_ir.inst_empty(.VFmadd231PSMem, sp);
+    tf.dst = tx; tf.src0 = tx; tf.src1 = xa; tf.tied_src0 = true; tf.mem = mach_ir.mem_base_disp(v_tbk, 0_i32); tf.size_bytes = 16_u8;
+    try mf.emit_inst(alloc, tf);
+    let v_tak_n = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_ri(alloc, mf, .AddImm, v_tak_n, v_tak, 4_i64, sp);
+    let v_tbk_n = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_rr(alloc, mf, .Add, v_tbk_n, v_tbk, v_stride_bytes, sp);
+    let p_tn = mf.pcopy_pairs.len().trunc.[u32]();
+    try mf.add_pcopy_pair(alloc, v_tak, v_tak_n);
+    try mf.add_pcopy_pair(alloc, v_tbk, v_tbk_n);
+    try mf.emit_parallel_copy(alloc, p_tn, 2_u32, sp);
+    try emit_cmp_rr(alloc, mf, v_tak, v_a_end, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jcc(.B, b_tail_k, sp));
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_tail_st, sp));
+    mf.end_block_insts(b_tail_k);
+
+    mf.begin_block_insts(b_tail_st);
+    var ts = mach_ir.inst_empty(.VMovUpsStore, sp); ts.src0 = tx; ts.mem = mach_ir.mem_base_disp(v_tc, 0_i32); ts.size_bytes = 16_u8; try mf.emit_inst(alloc, ts);
+    let v_tj_n = try mf.new_vreg(alloc, .Gpr);
+    try emit_alu_ri(alloc, mf, .AddImm, v_tj_n, v_j_off, 16_i64, sp);
+    let p_tjn = mf.pcopy_pairs.len().trunc.[u32]();
+    try mf.add_pcopy_pair(alloc, v_j_off, v_tj_n);
+    try mf.emit_parallel_copy(alloc, p_tjn, 1_u32, sp);
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(b_tail_hdr, sp));
+    mf.end_block_insts(b_tail_st);
+
+    // Safe bailout: initialize `outer_hdr` phis with original entry values and jump to unmodified `outer_hdr`
+    mf.begin_block_insts(b_bail);
+    let k_loc = ctx_val_loc(ctx, k_val);
+    if k_loc.kind == .Gpr {
+        let p_bk = mf.pcopy_pairs.len().trunc.[u32]();
+        try mf.add_pcopy_pair(alloc, k_loc.vreg0, v_kb);
+        try mf.emit_parallel_copy(alloc, p_bk, 1_u32, sp);
+    } else if k_loc.kind == .Stack {
+        try emit_store_mem(alloc, mf, mach_ir.mem_stack_slot(k_loc.stack_off), v_kb, 8_usize, sp);
+    }
+    if has_sec_phi {
+        let v_sec_init = try load_val_gpr(alloc, ctx, mf, eir_prog, env, sec_init_val, true, sp);
+        let s_loc = ctx_val_loc(ctx, sec_phi_val);
+        if s_loc.kind == .Gpr {
+            let p_bs = mf.pcopy_pairs.len().trunc.[u32]();
+            try mf.add_pcopy_pair(alloc, s_loc.vreg0, v_sec_init);
+            try mf.emit_parallel_copy(alloc, p_bs, 1_u32, sp);
+        } else if s_loc.kind == .Stack {
+            try emit_store_mem(alloc, mf, mach_ir.mem_stack_slot(s_loc.stack_off), v_sec_init, 8_usize, sp);
+        }
+    }
+    try mf.emit_inst(alloc, mach_ir.inst_jmp(ctx_mbb_for_eir(ctx, outer_hdr), sp));
+    mf.end_block_insts(b_bail);
+
+    ctx.uses_avx2_loop = true;
+    try ctx.avx2_loops.push(alloc, Avx2LoopEntry.{
+        hdr_bb: outer_hdr,
+        pre_bb: outer_pre,
+        latch_bb: outer_latch,
+        body_bb: outer_body0,
+        exit_bb: outer_exit,
+        ind_val: k_val,
+        start_val: k_start_val,
+        bound_val: k_end_val,
+        v_pre_mbb: v_pre,
+    });
+    return true;
+}
+
 fn try_emit_avx2_loop_for_block(
     alloc: *mut AllocCap,
     ctx: *mut IselCtx,
@@ -15065,7 +16062,10 @@ fn try_emit_avx2_loop_for_block(
         });
     }
     if !did_soa {
-        try try_emit_avx2_vec_fma_loop(alloc, ctx, mf, eir_prog, env, bbid, sp);
+        let did_2d = try try_emit_avx2_2d_fma_tile_loop(alloc, ctx, mf, eir_prog, env, bbid, sp);
+        if !did_2d {
+            try try_emit_avx2_vec_fma_loop(alloc, ctx, mf, eir_prog, env, bbid, sp);
+        }
     }
     lplan.destroy(alloc);
     return;
@@ -15096,7 +16096,7 @@ pub fn lower_fn_to_mach_ir(
     errdefer ctx.destroy(alloc);
 
     // Phase A: Detect & emit 8-wide AVX2 SoA pre-loops (Super-Opt #3) BEFORE lowering EIR blocks!
-    if cfg.target_avx2 && cfg.opt_level >= 2_u8 {
+    if cfg.target_avx2 && cfg.opt_level >= 2_u8 && !cfg.opt_size {
         let blks = eir_prog.fn_blocks(fn_id);
         var bi: usize = 0_usize;
         while bi < blks.len {

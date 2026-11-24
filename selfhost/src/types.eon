@@ -2546,6 +2546,25 @@ impl TypeEnv {
         return try self.intern_simple_node(alloc, n);
     }
 
+    pub fn find_vec(self: *Self, elem: TyId, len: u8) -> ?TyId {
+        var n = ty_node_zero(.Vec);
+        n.primary = elem;
+        n.u8_val = len;
+        return self.find_simple_node(&n);
+    }
+
+    pub fn preintern_opt_vec_tys(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        _ = try self.intern_vec(alloc, TY_F32, 4_u8);
+        _ = try self.intern_vec(alloc, TY_F32, 8_u8);
+        _ = try self.intern_vec(alloc, TY_F64, 2_u8);
+        _ = try self.intern_vec(alloc, TY_F64, 4_u8);
+        _ = try self.intern_vec(alloc, TY_I32, 4_u8);
+        _ = try self.intern_vec(alloc, TY_I32, 8_u8);
+        _ = try self.intern_vec(alloc, TY_U32, 4_u8);
+        _ = try self.intern_vec(alloc, TY_U32, 8_u8);
+        return;
+    }
+
     pub fn intern_optional(self: *mut Self, alloc: *mut AllocCap, inner: TyId) -> TyId ! OutOfMemory {
         var n = ty_node_zero(.Optional);
         n.primary = inner;

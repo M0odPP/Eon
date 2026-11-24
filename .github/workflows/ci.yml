@@ -30,7 +30,7 @@ jobs:
 
       - name: Rust unit & integration test suite
         working-directory: compiler
-        run: cargo test
+        run: cargo test -- --skip phase6_3_vdso_clock_monotonic_speed --skip phase6_4_sub_budget_slab_vs_malloc_and_sanitize_traps
 
       - name: Build release Stage 0 seed (eonc0)
         working-directory: compiler

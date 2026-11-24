@@ -7259,6 +7259,106 @@ impl Interp {
                 try self.fail("ICE [eir_interp]: unlowered GetVar/SetVar reached interpreter");
             }
             .ParForHint => {}
+            .VecLoad => {
+                let vn = self.env.get(inst.ty0);
+                let lanes = if vn.kind == .Vec { vn.u8_val.widen.[usize]() } else { 1_usize };
+                let esz = max_usize(interp_ty_size(self.env, inst.ty1), 1_usize);
+                let total = lanes *% esz;
+                let base_v = frame.get_val(inst.v0);
+                let idx_v = self.st.vals.as_u64(frame.get_val(inst.v1));
+                var base_ptr: u64 = 0_u64;
+                if inst.flag0 {
+                    base_ptr = self.st.vals.as_u64(base_v);
+                } else {
+                    let pr = self.st.vals.as_pair(base_v);
+                    base_ptr = pr.a;
+                    if idx_v +% lanes.widen.[u64]() > pr.b {
+                        try self.fail("EIR-Interp: VecLoad out of bounds");
+                        return;
+                    }
+                }
+                let addr = try self.mem_ptr_add(base_ptr, idx_v.trunc.[usize]() *% esz);
+                if !self.st.faulted {
+                    let v = try self.mem_read_val(addr, total);
+                    frame.set_val(inst.dst, v);
+                }
+            }
+            .VecStore => {
+                let vn = self.env.get(inst.ty0);
+                let lanes = if vn.kind == .Vec { vn.u8_val.widen.[usize]() } else { 1_usize };
+                let esz = max_usize(interp_ty_size(self.env, inst.ty1), 1_usize);
+                let total = lanes *% esz;
+                let base_v = frame.get_val(inst.v0);
+                let idx_v = self.st.vals.as_u64(frame.get_val(inst.v1));
+                var base_ptr: u64 = 0_u64;
+                if inst.flag0 {
+                    base_ptr = self.st.vals.as_u64(base_v);
+                } else {
+                    let pr = self.st.vals.as_pair(base_v);
+                    base_ptr = pr.a;
+                    if idx_v +% lanes.widen.[u64]() > pr.b {
+                        try self.fail("EIR-Interp: VecStore out of bounds");
+                        return;
+                    }
+                }
+                let addr = try self.mem_ptr_add(base_ptr, idx_v.trunc.[usize]() *% esz);
+                if !self.st.faulted {
+                    var tmp = try col.DynBuf.[u8].init(self.alloc, max_usize(total, 16_usize));
+                    errdefer tmp.destroy(self.alloc);
+                    try self.st.vals.to_dyn_bytes(self.alloc, frame.get_val(inst.v2), total, &mut tmp);
+                    _ = try self.mem_write(addr, tmp.as_slice());
+                    tmp.destroy(self.alloc);
+                }
+            }
+            .VecFma => {
+                let vn = self.env.get(inst.ty0);
+                if vn.kind != .Vec {
+                    try self.fail("EIR-Interp: VecFma inst on non-vec");
+                    return;
+                }
+                let elem = vn.primary;
+                let lanes = vn.u8_val.widen.[usize]();
+                let esz = max_usize(self.env.x64_layout(elem).size, 1_usize);
+                let total = esz *% lanes;
+                var ab = try col.DynBuf.[u8].init(self.alloc, total);
+                errdefer ab.destroy(self.alloc);
+                var bb = try col.DynBuf.[u8].init(self.alloc, total);
+                errdefer bb.destroy(self.alloc);
+                var cb = try col.DynBuf.[u8].init(self.alloc, total);
+                errdefer cb.destroy(self.alloc);
+                try self.st.vals.to_dyn_bytes(self.alloc, frame.get_val(inst.v0), total, &mut ab);
+                try self.st.vals.to_dyn_bytes(self.alloc, frame.get_val(inst.v1), total, &mut bb);
+                try self.st.vals.to_dyn_bytes(self.alloc, frame.get_val(inst.v2), total, &mut cb);
+                let is_flt = self.env.is_float(elem);
+                let mul_op: ast.BinaryOp = if is_flt { .Mul } else { .MulWrap };
+                let add_op: ast.BinaryOp = if is_flt { .Add } else { .AddWrap };
+                var out = try col.DynBuf.[u8].init(self.alloc, total);
+                errdefer out.destroy(self.alloc);
+                try push_zero_bytes(self.alloc, &mut out, total);
+                var eb = try col.DynBuf.[u8].init(self.alloc, esz);
+                errdefer eb.destroy(self.alloc);
+                var li: usize = 0_usize;
+                while li < lanes {
+                    let off = li *% esz;
+                    let la = try self.st.vals.from_bytes(self.alloc, ab.as_slice().sub(off, off +% esz) catch { break; });
+                    let lb = try self.st.vals.from_bytes(self.alloc, bb.as_slice().sub(off, off +% esz) catch { break; });
+                    let lc = try self.st.vals.from_bytes(self.alloc, cb.as_slice().sub(off, off +% esz) catch { break; });
+                    let prod = try self.eval_binary(mul_op, la, lb, elem, elem);
+                    let sum = try self.eval_binary(add_op, prod, lc, elem, elem);
+                    try self.st.vals.to_dyn_bytes(self.alloc, sum, esz, &mut eb);
+                    copy_bytes_slice(out.as_mut_slice(), off, eb.as_slice(), 0_usize, esz);
+                    li = li +% 1_usize;
+                }
+                let res = try self.st.vals.from_bytes(self.alloc, out.as_slice());
+                eb.destroy(self.alloc);
+                out.destroy(self.alloc);
+                cb.destroy(self.alloc);
+                bb.destroy(self.alloc);
+                ab.destroy(self.alloc);
+                if !self.st.faulted && inst.dst != eir.EIR_NONE {
+                    frame.set_val(inst.dst, res);
+                }
+            }
             _ => {}
         }
         return;

@@ -798,6 +798,20 @@ fn eir_inst_collect_uses(
             if inst.v1 != eir.EIR_NONE { try out.push(alloc, inst.v1); }
             if inst.v2 != eir.EIR_NONE { try out.push(alloc, inst.v2); }
         }
+        .VecLoad => {
+            try out.push(alloc, inst.v0);
+            try out.push(alloc, inst.v1);
+        }
+        .VecStore => {
+            try out.push(alloc, inst.v0);
+            try out.push(alloc, inst.v1);
+            try out.push(alloc, inst.v2);
+        }
+        .VecFma => {
+            try out.push(alloc, inst.v0);
+            try out.push(alloc, inst.v1);
+            try out.push(alloc, inst.v2);
+        }
         .Aggregate => {
             let elems = eir_prog.vals_slice(inst.range);
             var i: usize = 0_usize;
@@ -8842,6 +8856,74 @@ fn cg_emit_inst(
         .Slice => {
             try cg_emit_slice(alloc, cg, eir_prog, env, inst.dst, inst.v0, inst.v1, inst.v2, inst.ty1);
         }
+        .VecLoad => {
+            let vlay = env.x64_layout(inst.ty0);
+            let esz_r = env.x64_layout(inst.ty1).size;
+            let esz = if esz_r == 0_usize { 4_usize } else { esz_r };
+            let soff = cg_val_stack_off(cg, inst.v0);
+            try cg.buf.load_mem(alloc, .R8, .Rbp, soff, 8_usize, false);
+            try cg_load_scalar_raw(alloc, cg, eir_prog, env, inst.v1, .R9);
+            if esz == 4_usize { try cg.buf.shl_imm(alloc, .R9, 2_u8); }
+            else if esz == 8_usize { try cg.buf.shl_imm(alloc, .R9, 3_u8); }
+            else if esz == 2_usize { try cg.buf.shl_imm(alloc, .R9, 1_u8); }
+            try cg.buf.add_rr(alloc, .R8, .R9);
+            let doff = cg_val_stack_off(cg, inst.dst);
+            var boff: usize = 0_usize;
+            while boff +% 8_usize <= vlay.size {
+                try cg.buf.load_mem(alloc, .Rax, .R8, boff.trunc.[i32](), 8_usize, false);
+                try cg.buf.store_mem(alloc, .Rbp, doff +% boff.trunc.[i32](), .Rax, 8_usize);
+                boff = boff +% 8_usize;
+            }
+        }
+        .VecStore => {
+            let vlay = env.x64_layout(inst.ty0);
+            let esz_r = env.x64_layout(inst.ty1).size;
+            let esz = if esz_r == 0_usize { 4_usize } else { esz_r };
+            let soff = cg_val_stack_off(cg, inst.v0);
+            try cg.buf.load_mem(alloc, .R8, .Rbp, soff, 8_usize, false);
+            try cg_load_scalar_raw(alloc, cg, eir_prog, env, inst.v1, .R9);
+            if esz == 4_usize { try cg.buf.shl_imm(alloc, .R9, 2_u8); }
+            else if esz == 8_usize { try cg.buf.shl_imm(alloc, .R9, 3_u8); }
+            else if esz == 2_usize { try cg.buf.shl_imm(alloc, .R9, 1_u8); }
+            try cg.buf.add_rr(alloc, .R8, .R9);
+            let voff = cg_val_stack_off(cg, inst.v2);
+            var boff: usize = 0_usize;
+            while boff +% 8_usize <= vlay.size {
+                try cg.buf.load_mem(alloc, .Rax, .Rbp, voff +% boff.trunc.[i32](), 8_usize, false);
+                try cg.buf.store_mem(alloc, .R8, boff.trunc.[i32](), .Rax, 8_usize);
+                boff = boff +% 8_usize;
+            }
+        }
+        .VecFma => {
+            let vn = env.get(inst.ty0);
+            let lanes = vn.u8_val.widen.[usize]();
+            let is_f64 = env.get(vn.primary).u8_val == 64_u8;
+            let esz: usize = if is_f64 { 8_usize } else { 4_usize };
+            let aoff = cg_val_stack_off(cg, inst.v0);
+            let boff = cg_val_stack_off(cg, inst.v1);
+            let coff = cg_val_stack_off(cg, inst.v2);
+            let doff = cg_val_stack_off(cg, inst.dst);
+            var li: usize = 0_usize;
+            while li < lanes {
+                let off_i = (li *% esz).trunc.[i32]();
+                if is_f64 {
+                    try cg.buf.movsd_load(alloc, .Xmm0, .Rbp, aoff +% off_i);
+                    try cg.buf.movsd_load(alloc, .Xmm1, .Rbp, boff +% off_i);
+                    try cg.buf.movsd_load(alloc, .Xmm2, .Rbp, coff +% off_i);
+                    try cg.buf.sse_bin(alloc, true, 0x59_u8, .Xmm0, .Xmm1);
+                    try cg.buf.sse_bin(alloc, true, 0x58_u8, .Xmm0, .Xmm2);
+                    try cg.buf.movsd_store(alloc, .Rbp, doff +% off_i, .Xmm0);
+                } else {
+                    try cg.buf.movss_load(alloc, .Xmm0, .Rbp, aoff +% off_i);
+                    try cg.buf.movss_load(alloc, .Xmm1, .Rbp, boff +% off_i);
+                    try cg.buf.movss_load(alloc, .Xmm2, .Rbp, coff +% off_i);
+                    try cg.buf.sse_bin(alloc, false, 0x59_u8, .Xmm0, .Xmm1);
+                    try cg.buf.sse_bin(alloc, false, 0x58_u8, .Xmm0, .Xmm2);
+                    try cg.buf.movss_store(alloc, .Rbp, doff +% off_i, .Xmm0);
+                }
+                li = li +% 1_usize;
+            }
+        }
         .Aggregate => {
             try cg_emit_aggregate(alloc, cg, eir_prog, env, inst.dst, inst.aux0, inst.range, inst.ty0);
         }
@@ -10302,7 +10384,7 @@ pub fn compute_opts_hash(opts: *CompileOptions) -> [32]u8 {
     }
     b[12_usize] = opts.opt.opt_level;
     b[13_usize] = if opts.opt.target_avx2 { 1_u8 } else { 0_u8 };
-    b[14_usize] = if opts.opt.verify_opt { 1_u8 } else { 0_u8 };
+    b[14_usize] = (if opts.opt.verify_opt { 1_u8 } else { 0_u8 }) | (if opts.opt.opt_size { 2_u8 } else { 0_u8 });
     b[15_usize] = if opts.opt.incremental_cgu { 1_u8 } else { 0_u8 };
     let ob = opts.opt.opt_bisect.bitcast.[u64]();
     i = 0_usize;
@@ -13598,7 +13680,8 @@ fn compile_and_link_impl(
         }
     }
 
-    // 6. Link ELF64 image
+    // 6. Link-time function dead-stripping (GC) + Safe ICF, then emit ELF64 image
+    try elf64.gc_and_icf_link_input(alloc, &mut input, interner, opts.opt.opt_level >= 2_u8 || opts.opt.opt_size);
     let link_res = try elf64.link_elf64(alloc, &input, interner);
     stk_err.destroy(alloc);
     wave_ranges.destroy(alloc);
@@ -13721,6 +13804,7 @@ pub linear struct IncLinkSession {
     helper_seen: col.HashMap[u32];
     all_fnref_thunks: col.DynBuf[FnRefThunkReq];
     scratch_blob: CompiledFnBlob;
+    enable_icf: bool;
 }
 
 impl IncLinkSession {
@@ -13743,6 +13827,7 @@ impl IncLinkSession {
             helper_seen: helper_seen,
             all_fnref_thunks: all_fnref_thunks,
             scratch_blob: scratch_blob,
+            enable_icf: opts.opt.opt_level >= 2_u8 || opts.opt.opt_size,
         };
     }
 
@@ -13789,6 +13874,7 @@ impl IncLinkSession {
             helper_seen: hs0,
             all_fnref_thunks: aft0,
             scratch_blob: sb0,
+            enable_icf: enable_icf,
         } = self;
         var input = input0;
         errdefer input.destroy(alloc);
@@ -13829,6 +13915,7 @@ impl IncLinkSession {
             &mut all_fnref_thunks,
         );
         try emit_rt_helpers_and_bss(alloc, interner, &mut helper_queue, &mut helper_seen, &mut input);
+        try elf64.gc_and_icf_link_input(alloc, &mut input, interner, enable_icf);
         let link_res = try elf64.link_elf64(alloc, &input, interner);
 
         scratch_blob.destroy(alloc);
@@ -13848,6 +13935,7 @@ impl IncLinkSession {
             helper_seen,
             all_fnref_thunks,
             scratch_blob,
+            enable_icf: _,
         } = self;
         scratch_blob.destroy(alloc);
         all_fnref_thunks.destroy(alloc);

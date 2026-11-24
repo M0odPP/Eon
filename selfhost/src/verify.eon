@@ -958,6 +958,8 @@ struct PairExprEntry {
     key: VarKey;
     a: VarKey;
     b: VarKey;
+    ty: types.TyId;
+    no_wrap: bool;
 }
 
 struct CheckedOpEntry {
@@ -1256,17 +1258,19 @@ fn pair_map_insert(
     key: VarKey,
     a: VarKey,
     b: VarKey,
+    ty: types.TyId,
+    no_wrap: bool,
 ) -> !OutOfMemory {
     let old_len = buf.len();
     let pos = pair_map_find(buf.as_slice(), key);
     if pos < old_len {
         let ms0 = buf.as_mut_slice();
         if pos < ms0.len && ms0[pos].key == key {
-            ms0[pos] = PairExprEntry.{ key: key, a: a, b: b };
+            ms0[pos] = PairExprEntry.{ key: key, a: a, b: b, ty: ty, no_wrap: no_wrap };
             return;
         }
     }
-    try buf.push(alloc, PairExprEntry.{ key: key, a: a, b: b });
+    try buf.push(alloc, PairExprEntry.{ key: key, a: a, b: b, ty: ty, no_wrap: no_wrap });
     let ms = buf.as_mut_slice();
     var j = old_len;
     while j > pos {
@@ -1277,7 +1281,7 @@ fn pair_map_insert(
         j = prev;
     }
     if pos < ms.len {
-        ms[pos] = PairExprEntry.{ key: key, a: a, b: b };
+        ms[pos] = PairExprEntry.{ key: key, a: a, b: b, ty: ty, no_wrap: no_wrap };
     }
     return;
 }
@@ -1308,7 +1312,12 @@ fn pair_map_eq(a: *[PairExprEntry], b: *[PairExprEntry]) -> bool {
     }
     var i: usize = 0_usize;
     while i < a.len {
-        if a[i].key != b[i].key || a[i].a != b[i].a || a[i].b != b[i].b {
+        if a[i].key != b[i].key
+            || a[i].a != b[i].a
+            || a[i].b != b[i].b
+            || a[i].ty != b[i].ty
+            || a[i].no_wrap != b[i].no_wrap
+        {
             return false;
         }
         i = i +% 1_usize;
@@ -5005,27 +5014,31 @@ fn dbm_refine_cmp(
     let li2 = dbm_get_interval(st, lhs);
     let ri2 = dbm_get_interval(st, rhs);
     if let de = pair_map_get(st.aux.diff_exprs.as_slice(), lhs) {
-        if interval_is_const(&ri2) {
+        if de.no_wrap && interval_is_const(&ri2) {
             try apply_diff_const(st, alloc, de.a, de.b, op, ri2.lo);
         }
     }
     if let de = pair_map_get(st.aux.diff_exprs.as_slice(), rhs) {
-        if interval_is_const(&li2) {
+        if de.no_wrap && interval_is_const(&li2) {
             try apply_diff_const(st, alloc, de.a, de.b, cmp_flip(op), li2.lo);
         }
     }
     if let se = pair_map_get(st.aux.sum_exprs.as_slice(), lhs) {
-        if op == .Lt {
-            try apply_sum_upper(st, alloc, se.a, se.b, rhs, true);
-        } else if op == .LtEq || op == .Eq {
-            try apply_sum_upper(st, alloc, se.a, se.b, rhs, false);
+        if se.no_wrap {
+            if op == .Lt {
+                try apply_sum_upper(st, alloc, se.a, se.b, rhs, true);
+            } else if op == .LtEq || op == .Eq {
+                try apply_sum_upper(st, alloc, se.a, se.b, rhs, false);
+            }
         }
     }
     if let se = pair_map_get(st.aux.sum_exprs.as_slice(), rhs) {
-        if op == .Gt {
-            try apply_sum_upper(st, alloc, se.a, se.b, lhs, true);
-        } else if op == .GtEq || op == .Eq {
-            try apply_sum_upper(st, alloc, se.a, se.b, lhs, false);
+        if se.no_wrap {
+            if op == .Gt {
+                try apply_sum_upper(st, alloc, se.a, se.b, lhs, true);
+            } else if op == .GtEq || op == .Eq {
+                try apply_sum_upper(st, alloc, se.a, se.b, lhs, false);
+            }
         }
     }
     return;
@@ -5089,7 +5102,7 @@ fn intersect_pairs(
     var j: usize = 0_usize;
     while i < a.len && j < b.len {
         if a[i].key == b[j].key {
-            if a[i].a == b[j].a && a[i].b == b[j].b {
+            if a[i].a == b[j].a && a[i].b == b[j].b && a[i].ty == b[j].ty && a[i].no_wrap == b[j].no_wrap {
                 if !has_wkeys || !vk_set_contains(wkeys, a[i].key) {
                     try out.push(alloc, a[i]);
                 }
@@ -6576,6 +6589,17 @@ fn has_len_ty(ty: types.TyId, env: *types.TypeEnv) -> bool {
     return false;
 }
 
+fn propagates_len_ty(ty: types.TyId, env: *types.TypeEnv) -> bool {
+    if has_len_ty(ty, env) {
+        return true;
+    }
+    let tn = env.get(ty);
+    if tn.kind == .Optional || tn.kind == .ErrorUnion {
+        return has_len_ty(tn.primary, env);
+    }
+    return false;
+}
+
 fn init_len_for_key(
     st: *mut DbmState,
     alloc: *mut AllocCap,
@@ -6659,6 +6683,47 @@ struct DiffCancelEdge {
     c: types.IntVal;
 }
 
+fn vk_dbm_eq(st: *DbmState, u: VarKey, v: VarKey) -> bool {
+    if u == v {
+        return true;
+    }
+    let iu = dbm_get_interval(st, u);
+    let iv = dbm_get_interval(st, v);
+    if interval_is_const(&iu) && interval_is_const(&iv) {
+        return types.int_val_eq(iu.lo, iv.lo);
+    }
+    let z_b = bound_some(types.int_val_zero());
+    let d1 = dbm_diff_upper(st, u, v);
+    if !bound_le(&d1, &z_b) {
+        return false;
+    }
+    let d2 = dbm_diff_upper(st, v, u);
+    return bound_le(&d2, &z_b);
+}
+
+fn find_equiv_pair_expr(
+    st: *DbmState,
+    xs: *[PairExprEntry],
+    lk: VarKey,
+    rk: VarKey,
+    ty: types.TyId,
+    commutative: bool,
+) -> ?VarKey {
+    var i: usize = 0_usize;
+    while i < xs.len {
+        let e = xs[i];
+        if e.ty == ty {
+            if (vk_dbm_eq(st, e.a, lk) && vk_dbm_eq(st, e.b, rk))
+                || (commutative && vk_dbm_eq(st, e.a, rk) && vk_dbm_eq(st, e.b, lk))
+            {
+                return e.key;
+            }
+        }
+        i = i +% 1_usize;
+    }
+    return null;
+}
+
 fn transfer_binary_add(
     st: *mut DbmState,
     alloc: *mut AllocCap,
@@ -6668,6 +6733,7 @@ fn transfer_binary_add(
     rk: VarKey,
     li: *Interval,
     ri: *Interval,
+    dst_ty: types.TyId,
     tb: *types.IntBounds,
 ) -> !OutOfMemory {
     let is_const_r = interval_is_const(ri);
@@ -6682,14 +6748,21 @@ fn transfer_binary_add(
             }
         }
     }
+    let prev_equiv = find_equiv_pair_expr(st, st.aux.sum_exprs.as_slice(), lk, rk, dst_ty, true);
     if no_wrap && is_const_r {
         try dbm_assign_offset(st, alloc, dk, lk, ri.lo, copy tb.*);
-        try pair_map_insert(&mut st.aux.sum_exprs, alloc, dk, lk, rk);
+        if let eq_k = prev_equiv {
+            try dbm_add_eq(st, alloc, dk, eq_k);
+        }
+        try pair_map_insert(&mut st.aux.sum_exprs, alloc, dk, lk, rk, dst_ty, true);
         return;
     }
     if no_wrap && is_const_l {
         try dbm_assign_offset(st, alloc, dk, rk, li.lo, copy tb.*);
-        try pair_map_insert(&mut st.aux.sum_exprs, alloc, dk, lk, rk);
+        if let eq_k = prev_equiv {
+            try dbm_add_eq(st, alloc, dk, eq_k);
+        }
+        try pair_map_insert(&mut st.aux.sum_exprs, alloc, dk, lk, rk, dst_ty, true);
         return;
     }
     if no_wrap {
@@ -6715,7 +6788,10 @@ fn transfer_binary_add(
             res = interval_intersect(&res, &tb_iv);
         }
         try dbm_set_interval(st, alloc, dk, res);
-        try pair_map_insert(&mut st.aux.sum_exprs, alloc, dk, lk, rk);
+        try pair_map_insert(&mut st.aux.sum_exprs, alloc, dk, lk, rk, dst_ty, true);
+        if let eq_k = prev_equiv {
+            try dbm_add_eq(st, alloc, dk, eq_k);
+        }
         if ri.has_lo {
             if let neg_rl = types.int_val_checked_neg(ri.lo) {
                 try dbm_add_diff(st, alloc, lk, dk, neg_rl);
@@ -6733,15 +6809,17 @@ fn transfer_binary_add(
             var di: usize = 0_usize;
             while di < des.len {
                 let de = des[di];
-                if de.b == lk {
-                    let c_b = dbm_diff_upper(st, rk, de.key);
-                    if c_b.has_val {
-                        try edges.push(alloc, DiffCancelEdge.{ m: de.a, c: c_b.val });
-                    }
-                } else if de.b == rk {
-                    let c_b = dbm_diff_upper(st, lk, de.key);
-                    if c_b.has_val {
-                        try edges.push(alloc, DiffCancelEdge.{ m: de.a, c: c_b.val });
+                if de.no_wrap {
+                    if de.b == lk {
+                        let c_b = dbm_diff_upper(st, rk, de.key);
+                        if c_b.has_val {
+                            try edges.push(alloc, DiffCancelEdge.{ m: de.a, c: c_b.val });
+                        }
+                    } else if de.b == rk {
+                        let c_b = dbm_diff_upper(st, lk, de.key);
+                        if c_b.has_val {
+                            try edges.push(alloc, DiffCancelEdge.{ m: de.a, c: c_b.val });
+                        }
                     }
                 }
                 di = di +% 1_usize;
@@ -6759,6 +6837,10 @@ fn transfer_binary_add(
     if tb.valid {
         try dbm_set_interval(st, alloc, dk, tb_ptr_to_interval(tb));
     }
+    if let eq_k = prev_equiv {
+        try dbm_add_eq(st, alloc, dk, eq_k);
+    }
+    try pair_map_insert(&mut st.aux.sum_exprs, alloc, dk, lk, rk, dst_ty, false);
     return;
 }
 
@@ -6771,6 +6853,7 @@ fn transfer_binary_sub(
     rk: VarKey,
     li: *Interval,
     ri: *Interval,
+    dst_ty: types.TyId,
     tb: *types.IntBounds,
 ) -> !OutOfMemory {
     let is_const_r = interval_is_const(ri);
@@ -6784,10 +6867,14 @@ fn transfer_binary_sub(
             }
         }
     }
+    let prev_equiv = find_equiv_pair_expr(st, st.aux.diff_exprs.as_slice(), lk, rk, dst_ty, false);
     if no_wrap && is_const_r {
         if let neg = types.int_val_checked_neg(ri.lo) {
             try dbm_assign_offset(st, alloc, dk, lk, neg, copy tb.*);
-            try pair_map_insert(&mut st.aux.diff_exprs, alloc, dk, lk, rk);
+            if let eq_k = prev_equiv {
+                try dbm_add_eq(st, alloc, dk, eq_k);
+            }
+            try pair_map_insert(&mut st.aux.diff_exprs, alloc, dk, lk, rk, dst_ty, true);
             return;
         }
     }
@@ -6826,7 +6913,10 @@ fn transfer_binary_sub(
             res = interval_intersect(&res, &tb_iv);
         }
         try dbm_set_interval(st, alloc, dk, res);
-        try pair_map_insert(&mut st.aux.diff_exprs, alloc, dk, lk, rk);
+        try pair_map_insert(&mut st.aux.diff_exprs, alloc, dk, lk, rk, dst_ty, true);
+        if let eq_k = prev_equiv {
+            try dbm_add_eq(st, alloc, dk, eq_k);
+        }
         if ri.has_lo {
             if let neg_rl = types.int_val_checked_neg(ri.lo) {
                 try dbm_add_diff(st, alloc, dk, lk, neg_rl);
@@ -6837,6 +6927,10 @@ fn transfer_binary_sub(
     if tb.valid {
         try dbm_set_interval(st, alloc, dk, tb_ptr_to_interval(tb));
     }
+    if let eq_k = prev_equiv {
+        try dbm_add_eq(st, alloc, dk, eq_k);
+    }
+    try pair_map_insert(&mut st.aux.diff_exprs, alloc, dk, lk, rk, dst_ty, false);
     return;
 }
 
@@ -7087,10 +7181,10 @@ fn transfer_binary(
     let ri = dbm_get_interval(st, rk);
 
     match op {
-        .Add => { try transfer_binary_add(st, alloc, op, dk, lk, rk, &li, &ri, &tb); }
-        .AddWrap => { try transfer_binary_add(st, alloc, op, dk, lk, rk, &li, &ri, &tb); }
-        .Sub => { try transfer_binary_sub(st, alloc, op, dk, lk, rk, &li, &ri, &tb); }
-        .SubWrap => { try transfer_binary_sub(st, alloc, op, dk, lk, rk, &li, &ri, &tb); }
+        .Add => { try transfer_binary_add(st, alloc, op, dk, lk, rk, &li, &ri, dst_ty, &tb); }
+        .AddWrap => { try transfer_binary_add(st, alloc, op, dk, lk, rk, &li, &ri, dst_ty, &tb); }
+        .Sub => { try transfer_binary_sub(st, alloc, op, dk, lk, rk, &li, &ri, dst_ty, &tb); }
+        .SubWrap => { try transfer_binary_sub(st, alloc, op, dk, lk, rk, &li, &ri, dst_ty, &tb); }
         .Mul => { try transfer_binary_mul_div_mod(st, alloc, op, dk, rk, &li, &ri, &tb); }
         .Div => { try transfer_binary_mul_div_mod(st, alloc, op, dk, rk, &li, &ri, &tb); }
         .Mod => { try transfer_binary_mul_div_mod(st, alloc, op, dk, rk, &li, &ri, &tb); }
@@ -7218,6 +7312,19 @@ fn transfer_cast(
                 try dbm_add_eq(st, alloc, vk_len_val(dst), vk_len_val(operand));
             }
         }
+        .WrapOptional => {
+            if env.is_integer(from_ty) {
+                let opt_kb = st.get_known_bits(vk_val(operand));
+                try dbm_assign_offset(st, alloc, vk_val(dst), vk_val(operand), types.int_val_zero(), ty_bounds(from_ty, env));
+                if let kb = opt_kb {
+                    try kb_map_insert(&mut st.aux.known_bits, alloc, vk_val(dst), kb);
+                }
+            }
+            if has_len_ty(from_ty, env) {
+                try init_len_for_key(st, alloc, vk_len_val(operand), from_ty, env);
+                try dbm_add_eq(st, alloc, vk_len_val(dst), vk_len_val(operand));
+            }
+        }
         .WrapOk => {
             if env.is_integer(from_ty) {
                 let opt_kb = st.get_known_bits(vk_val(operand));
@@ -7227,6 +7334,7 @@ fn transfer_cast(
                 }
             }
             if has_len_ty(from_ty, env) {
+                try init_len_for_key(st, alloc, vk_len_val(operand), from_ty, env);
                 try dbm_add_eq(st, alloc, vk_len_val(dst), vk_len_val(operand));
             }
         }
@@ -7276,7 +7384,7 @@ fn transfer_builtin_call(
             if lk != vk_val(dv) {
                 try dbm_add_eq(st, alloc, vk_val(dv), lk);
             }
-        } else if opk == .BufAsSlice {
+        } else if opk == .BufAsSlice || opk == .StrAsBytes || opk == .BytesAsStr {
             try init_len_for_key(st, alloc, vk_len_val(dv), bc.ret_ty, env);
             if arg_slots.len > 0_usize && arg_slots[0_usize] != eir.EIR_NONE {
                 let slot = arg_slots[0_usize];
@@ -7289,6 +7397,37 @@ fn transfer_builtin_call(
                 let aty = eir_prog.fn_val_ty(fn_id, a0);
                 try init_len_for_key(st, alloc, vk_len_val(a0), aty, env);
                 try dbm_add_eq(st, alloc, vk_len_val(dv), vk_len_val(a0));
+            }
+        } else if (opk == .SliceSub || opk == .ArraySub || opk == .BufSub) && args.len >= 3_usize {
+            let z = types.int_val_zero();
+            var base_lk = vk_len_val(args[0_usize]);
+            if arg_slots.len > 0_usize && arg_slots[0_usize] != eir.EIR_NONE {
+                let slot = arg_slots[0_usize];
+                if let si = eir_prog.fn_slot(fn_id, slot) {
+                    try init_len_for_key(st, alloc, vk_len_slot(slot), si.ty, env);
+                }
+                base_lk = vk_len_slot(slot);
+            } else {
+                try init_len_for_key(st, alloc, base_lk, eir_prog.fn_val_ty(fn_id, args[0_usize]), env);
+            }
+            let lo_k = vk_val(args[1_usize]);
+            let hi_k = vk_val(args[2_usize]);
+            let dst_lk = vk_len_val(dv);
+            try dbm_set_interval(st, alloc, dst_lk, interval_range(z, iv_i64_max()));
+            try dbm_add_diff(st, alloc, dst_lk, base_lk, z);
+            let lo_iv = dbm_get_interval(st, lo_k);
+            if interval_is_const(&lo_iv) && types.int_val_is_zero(lo_iv.lo) {
+                try dbm_add_eq(st, alloc, dst_lk, hi_k);
+            } else {
+                let d_hi = dbm_diff_upper(st, hi_k, lo_k);
+                let d_lo = dbm_diff_upper(st, lo_k, hi_k);
+                if d_hi.has_val && d_lo.has_val {
+                    if let neg_dlo = types.int_val_checked_neg(d_lo.val) {
+                        if types.int_val_eq(d_hi.val, neg_dlo) && !types.int_val_is_neg(d_hi.val) {
+                            try dbm_add_const(st, alloc, dst_lk, d_hi.val);
+                        }
+                    }
+                }
             }
         } else {
             let tb = ty_bounds(bc.ret_ty, env);
@@ -7427,8 +7566,11 @@ fn transfer_copy_slot_inst(
                     CheckedOpEntry.{ id: dst, op: cop.op, lhs: cop.lhs, rhs: cop.rhs, op_ty: cop.op_ty },
                 );
             }
-            if has_len_ty(dty, env) {
-                try dbm_add_eq(st, alloc, vk_len_val(dst), vk_len_val(src));
+            if propagates_len_ty(dty, env) {
+                let lsrc = vk_len_val(src);
+                if has_len_ty(dty, env) || st.core.intervals.contains(lsrc) || st.core.vmap.contains(lsrc) {
+                    try dbm_add_eq(st, alloc, vk_len_val(dst), lsrc);
+                }
             }
         }
         .LoadSlot => {
@@ -7453,9 +7595,14 @@ fn transfer_copy_slot_inst(
                     CheckedOpEntry.{ id: dst, op: cop.op, lhs: cop.lhs, rhs: cop.rhs, op_ty: cop.op_ty },
                 );
             }
-            if has_len_ty(dty, env) {
-                try init_len_for_key(st, alloc, vk_len_slot(slot), dty, env);
-                try dbm_add_eq(st, alloc, vk_len_val(dst), vk_len_slot(slot));
+            if propagates_len_ty(dty, env) {
+                let lslot = vk_len_slot(slot);
+                if has_len_ty(dty, env) {
+                    try init_len_for_key(st, alloc, lslot, dty, env);
+                    try dbm_add_eq(st, alloc, vk_len_val(dst), lslot);
+                } else if st.core.intervals.contains(lslot) || st.core.vmap.contains(lslot) {
+                    try dbm_add_eq(st, alloc, vk_len_val(dst), lslot);
+                }
             }
         }
         .StoreSlot => {
@@ -7482,12 +7629,38 @@ fn transfer_copy_slot_inst(
                     try kb_map_insert(&mut st.aux.known_bits, alloc, vk_slot(slot), kb);
                 }
             }
-            if has_len_ty(sty, env) {
+            if propagates_len_ty(sty, env) {
                 dbm_forget(st, vk_len_slot(slot));
-                try init_len_for_key(st, alloc, vk_len_slot(slot), sty, env);
+                if has_len_ty(sty, env) {
+                    try init_len_for_key(st, alloc, vk_len_slot(slot), sty, env);
+                }
                 let lval = vk_len_val(val);
                 if st.core.intervals.contains(lval) || st.core.vmap.contains(lval) {
                     try dbm_add_eq(st, alloc, vk_len_slot(slot), lval);
+                }
+            }
+            let stn = env.get(sty);
+            if stn.kind == .Struct || stn.kind == .Tuple {
+                var n_flds: u32 = 0_u32;
+                if stn.kind == .Struct {
+                    if let sm = env.get_struct(stn.primary) {
+                        n_flds = sm.fields.len;
+                    }
+                } else {
+                    n_flds = stn.list_len;
+                }
+                if n_flds > 16_u32 { n_flds = 16_u32; }
+                var fi_s: u32 = 0_u32;
+                while fi_s < n_flds {
+                    let fvk = vk_field_val(val, fi_s);
+                    if st.core.intervals.contains(fvk) || st.core.vmap.contains(fvk) {
+                        try dbm_add_eq(st, alloc, vk_field_slot(slot, fi_s), fvk);
+                    }
+                    let flk = vk_field_len_val(val, fi_s);
+                    if st.core.intervals.contains(flk) || st.core.vmap.contains(flk) {
+                        try dbm_add_eq(st, alloc, vk_field_len_slot(slot, fi_s), flk);
+                    }
+                    fi_s = fi_s +% 1_u32;
                 }
             }
         }
@@ -7668,12 +7841,23 @@ fn transfer_slice_inst(
         }
     }
     try dbm_set_interval(st, alloc, vk_len_val(inst.dst), interval_range(len_lo, iv_max(len_hi, len_lo)));
+    try dbm_add_diff(st, alloc, vk_len_val(inst.dst), base_len_k, z);
     if inst.v1 == eir.EIR_NONE && inst.v2 != eir.EIR_NONE {
         try dbm_add_eq(st, alloc, vk_len_val(inst.dst), vk_val(inst.v2));
     } else if inst.v1 != eir.EIR_NONE && inst.v2 != eir.EIR_NONE {
         let liv = dbm_get_interval(st, vk_val(inst.v1));
         if interval_is_const(&liv) && types.int_val_is_zero(liv.lo) {
             try dbm_add_eq(st, alloc, vk_len_val(inst.dst), vk_val(inst.v2));
+        } else {
+            let d_hi = dbm_diff_upper(st, vk_val(inst.v2), vk_val(inst.v1));
+            let d_lo = dbm_diff_upper(st, vk_val(inst.v1), vk_val(inst.v2));
+            if d_hi.has_val && d_lo.has_val {
+                if let neg_dlo = types.int_val_checked_neg(d_lo.val) {
+                    if types.int_val_eq(d_hi.val, neg_dlo) && !types.int_val_is_neg(d_hi.val) {
+                        try dbm_add_const(st, alloc, vk_len_val(inst.dst), d_hi.val);
+                    }
+                }
+            }
         }
     }
     return;
@@ -7736,6 +7920,25 @@ fn transfer_inst(
         .Slice => { try transfer_slice_inst(st, alloc, inst, env); }
         .Aggregate => {
             try init_len_for_key(st, alloc, vk_len_val(inst.dst), inst.ty0, env);
+            let atn = env.get(inst.ty0);
+            if atn.kind == .Struct || atn.kind == .Tuple {
+                let fvals = eir_prog.vals_slice(inst.range);
+                var fi_a: usize = 0_usize;
+                while fi_a < fvals.len && fi_a < 16_usize {
+                    let fv = fvals[fi_a];
+                    let fty = eir_prog.fn_val_ty(fn_id, fv);
+                    if env.is_integer(fty) {
+                        try dbm_assign_offset(st, alloc, vk_field_val(inst.dst, fi_a.trunc.[u32]()), vk_val(fv), types.int_val_zero(), ty_bounds(fty, env));
+                    }
+                    if has_len_ty(fty, env) {
+                        let flk = vk_field_len_val(inst.dst, fi_a.trunc.[u32]());
+                        try init_len_for_key(st, alloc, flk, fty, env);
+                        try init_len_for_key(st, alloc, vk_len_val(fv), fty, env);
+                        try dbm_add_eq(st, alloc, flk, vk_len_val(fv));
+                    }
+                    fi_a = fi_a +% 1_usize;
+                }
+            }
         }
         .UnwrapOptional => {
             let tb = ty_bounds(inst.ty0, env);
@@ -7743,13 +7946,31 @@ fn transfer_inst(
                 try dbm_set_interval(st, alloc, vk_val(inst.dst), tb_to_interval(tb));
             }
             try init_len_for_key(st, alloc, vk_len_val(inst.dst), inst.ty0, env);
+            if has_len_ty(inst.ty0, env) {
+                let lsrc = vk_len_val(inst.v0);
+                if st.core.intervals.contains(lsrc) || st.core.vmap.contains(lsrc) {
+                    try dbm_add_eq(st, alloc, vk_len_val(inst.dst), lsrc);
+                }
+            }
         }
         .FieldExtract => {
             let tb = ty_bounds(inst.ty0, env);
             if tb.valid {
                 try dbm_set_interval(st, alloc, vk_val(inst.dst), tb_to_interval(tb));
             }
+            if env.is_integer(inst.ty0) {
+                let fvk = vk_field_val(inst.v0, inst.aux0);
+                if st.core.intervals.contains(fvk) || st.core.vmap.contains(fvk) {
+                    try dbm_assign_offset(st, alloc, vk_val(inst.dst), fvk, types.int_val_zero(), ty_bounds(inst.ty0, env));
+                }
+            }
             try init_len_for_key(st, alloc, vk_len_val(inst.dst), inst.ty0, env);
+            if has_len_ty(inst.ty0, env) {
+                let flk = vk_field_len_val(inst.v0, inst.aux0);
+                if st.core.intervals.contains(flk) || st.core.vmap.contains(flk) {
+                    try dbm_add_eq(st, alloc, vk_len_val(inst.dst), flk);
+                }
+            }
         }
         .UnwrapErrorOk => {
             if let cop = checked_map_get(st.aux.checked_op.as_slice(), inst.v0) {
@@ -7770,6 +7991,12 @@ fn transfer_inst(
                     try dbm_set_interval(st, alloc, vk_val(inst.dst), tb_to_interval(tb));
                 }
                 try init_len_for_key(st, alloc, vk_len_val(inst.dst), inst.ty0, env);
+                if has_len_ty(inst.ty0, env) {
+                    let lsrc = vk_len_val(inst.v0);
+                    if st.core.intervals.contains(lsrc) || st.core.vmap.contains(lsrc) {
+                        try dbm_add_eq(st, alloc, vk_len_val(inst.dst), lsrc);
+                    }
+                }
             }
         }
         .BuiltinCall => {
@@ -7847,6 +8074,18 @@ fn phis_contains_dst_vk(phis: *[eir.EirPhi], k: VarKey) -> bool {
     return false;
 }
 
+fn bb_is_loop_hdr(eir_prog: *eir.EirProgram, fn_id: u32, bb: cfg_ir.BlockId) -> bool {
+    let preds = eir_prog.block_preds(fn_id, bb);
+    var i: usize = 0_usize;
+    while i < preds.len {
+        if eir_prog.dominates_block(fn_id, bb, preds[i]) {
+            return true;
+        }
+        i = i +% 1_usize;
+    }
+    return false;
+}
+
 fn apply_phis_on_edge(
     st: *mut DbmState,
     alloc: *mut AllocCap,
@@ -7869,6 +8108,7 @@ fn apply_phis_on_edge(
     if phis.len == 0_usize {
         return;
     }
+    let to_is_loop_hdr = bb_is_loop_hdr(eir_prog, fn_id, to_bb);
     // Fast path: when no live incoming value on edge `from_bb -> to_bb` collides with any live `phi.dst`
     // in `phis` (99%+ of blocks), read directly from `st` without saving/sorting a snapshot!
     var has_phi_conflict = false;
@@ -7940,7 +8180,11 @@ fn apply_phis_on_edge(
                     let sk_multi_use = inc_idx < val_uses.len && val_uses[inc_idx] > 1_u32;
                     if sk_in_vmap || (sk_multi_use && !interval_is_const(&sk_iv)) {
                         try dbm_add_eq(st, alloc, dk, sk);
+                    } else if !to_is_loop_hdr && interval_is_const(&sk_iv) {
+                        _ = try dbm_ensure_vertex(st, alloc, dk, false, VK_NONE);
                     }
+                } else if !to_is_loop_hdr && st.var_is_relational(dk) && interval_is_const(&sk_iv) {
+                    _ = try dbm_ensure_vertex(st, alloc, dk, false, VK_NONE);
                 }
                 if sk_nz {
                     try vk_set_insert(&mut st.aux.non_zero, alloc, dk);
@@ -8026,7 +8270,11 @@ fn apply_phis_on_edge(
                         }
                         oi = oi +% 1_usize;
                     }
+                } else if !to_is_loop_hdr && interval_is_const(&sk_iv) {
+                    _ = try dbm_ensure_vertex(st, alloc, dk, false, VK_NONE);
                 }
+            } else if !to_is_loop_hdr && st.var_is_relational(dk) && interval_is_const(&sk_iv) {
+                _ = try dbm_ensure_vertex(st, alloc, dk, false, VK_NONE);
             }
             if snap_is_non_zero(spool, &snap, sk, st) {
                 try vk_set_insert(&mut st.aux.non_zero, alloc, dk);
@@ -8194,11 +8442,16 @@ fn verify_index_proj(
     try msg_buf.push_str_grow(alloc, " < len`");
     let didx = try diags.emit_error_bytes(alloc, diag.E0107, sp, msg_buf.as_bytes());
     try emit_note_buf(diags, alloc, didx, note_buf);
-    try diags.add_help(
-        alloc,
-        didx,
-        "add a check `if i < buf.len { ... }`, strengthen `where`, or use `try buf.at(i)`",
-    );
+    var help_msg: *str = "add a check `if i < buf.len { ... }`, strengthen `where`, or use `try buf.at(i)`";
+    if !non_neg {
+        help_msg = "index may be negative: add `if i >= 0 && i < buf.len { ... }`, or use `usize`";
+    } else if has_len_k {
+        let diff_h = dbm_diff_upper(st, idx_k, len_k);
+        if diff_h.has_val && types.int_val_is_zero(diff_h.val) {
+            help_msg = "possible off-by-one (`idx <= len` allows `idx == len`): use `<` instead of `<=`, or `try buf.at(i)`";
+        }
+    }
+    try diags.add_help(alloc, didx, help_msg);
     return false;
 }
 
@@ -8359,12 +8612,14 @@ fn check_add_safe(st: *DbmState, lk: VarKey, rk: VarKey, li: *Interval, ri: *Int
             let de = des[di];
             var has_other = false;
             var other = VK_NONE;
-            if de.b == lk {
-                has_other = true;
-                other = rk;
-            } else if de.b == rk {
-                has_other = true;
-                other = lk;
+            if de.no_wrap {
+                if de.b == lk {
+                    has_other = true;
+                    other = rk;
+                } else if de.b == rk {
+                    has_other = true;
+                    other = lk;
+                }
             }
             if has_other {
                 let cb = dbm_diff_upper(st, other, de.key);
@@ -8488,9 +8743,14 @@ fn verify_binary_arith(
             try msg_buf.push_str_grow(alloc, "ZM-08: cannot prove `-` does not overflow/underflow `");
             try env.format_ty_short(alloc, op_ty, interner, msg_buf);
             try msg_buf.push_byte_grow(alloc, b'`');
+            let sub_help: *str = if !env.is_signed_integer(op_ty) {
+                "unsigned subtraction may underflow below 0: guard `if lhs >= rhs { ... }`, or use `-?` / `-%` / `-|`"
+            } else {
+                "use checked `-?`, wrapping `-%`, or saturating `-|`, or prove `lhs >= rhs`"
+            };
             try emit_arith_bin_err(
                 alloc, diags, sp, msg_buf, note_buf, lhs, rhs, &li, &ri, eir_prog, fn_id, interner,
-                "use checked `-?`, wrapping `-%`, or saturating `-|`, or prove `lhs >= rhs`",
+                sub_help,
             );
             return false;
         }

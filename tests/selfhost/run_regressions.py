@@ -307,6 +307,192 @@ def test_dwarf5_debug_info(eonc: str):
     print("[PASS] DWARF5 .debug_info (DW_TAG_subprogram, params, locals, gdb breakpoint + backtrace)")
 
 
+def test_m11_opt_and_dbm(eonc: str):
+    """Verify M1.1: auto-vectorization (loop + FMA + 4-lane SLP), SCEV-lite, -Oz, GC+ICF, and DBM ergonomics."""
+    with tempfile.TemporaryDirectory(prefix="eon_m11_reg_") as td:
+        td_p = Path(td)
+
+        # 1. Auto-vec (scalar slice loop + @fma + 4-lane SLP) + SCEV-lite + GC + Safe ICF parity vs --interp
+        src_opt = td_p / "m11_opt.eon"
+        src_opt.write_text(
+            "module test.m11_opt;\n"
+            "pub fn dead_giant_fn(x: u64) -> u64 {\n"
+            "    return (x *% 17_u64) ^ (x >> 3_u64) ^ 0x123456789ABCDEF_u64;\n"
+            "}\n"
+            "fn icf_dup_a(x: u64, y: u64) -> u64 {\n"
+            "    var acc = x ^ 0x9E3779B97F4A7C15_u64;\n"
+            "    var i: u64 = 0_u64;\n"
+            "    while i < y {\n"
+            "        acc = (acc *% 6364136223846793005_u64) +% 1442695040888963407_u64;\n"
+            "        i = i +% 1_u64;\n"
+            "    }\n"
+            "    return acc;\n"
+            "}\n"
+            "fn icf_dup_b(a: u64, b: u64) -> u64 {\n"
+            "    var acc = a ^ 0x9E3779B97F4A7C15_u64;\n"
+            "    var i: u64 = 0_u64;\n"
+            "    while i < b {\n"
+            "        acc = (acc *% 6364136223846793005_u64) +% 1442695040888963407_u64;\n"
+            "        i = i +% 1_u64;\n"
+            "    }\n"
+            "    return acc;\n"
+            "}\n"
+            "fn saxpy_loop(a: f32, x: *[f32], y: *mut [f32]) {\n"
+            "    let n = if x.len < y.len { x.len } else { y.len };\n"
+            "    var i: usize = 0_usize;\n"
+            "    while i < n {\n"
+            "        y[i] = @fma(a, x[i], y[i]);\n"
+            "        i = i + 1_usize;\n"
+            "    }\n"
+            "}\n"
+            "fn slp4_add(a: *[i32], b: *[i32], out: *mut [i32]) {\n"
+            "    if a.len >= 4_usize && b.len >= 4_usize && out.len >= 4_usize {\n"
+            "        let s0 = a[0_usize] +% b[0_usize];\n"
+            "        let s1 = a[1_usize] +% b[1_usize];\n"
+            "        let s2 = a[2_usize] +% b[2_usize];\n"
+            "        let s3 = a[3_usize] +% b[3_usize];\n"
+            "        out[0_usize] = s0;\n"
+            "        out[1_usize] = s1;\n"
+            "        out[2_usize] = s2;\n"
+            "        out[3_usize] = s3;\n"
+            "    }\n"
+            "}\n"
+            "fn scev_strided(buf: *[u32], rows: usize, stride: usize) -> u32 {\n"
+            "    var sum: u32 = 0_u32;\n"
+            "    var r: usize = 0_usize;\n"
+            "    while r < rows {\n"
+            "        let off = r *% stride;\n"
+            "        if off < buf.len {\n"
+            "            sum = sum +% buf[off];\n"
+            "        }\n"
+            "        r = r +% 1_usize;\n"
+            "    }\n"
+            "    return sum;\n"
+            "}\n"
+            "pub fn main() -> i32 {\n"
+            "    var x: [19]f32 = [1.0_f32; 19];\n"
+            "    var y: [19]f32 = [2.0_f32; 19];\n"
+            "    x[18_usize] = 3.0_f32;\n"
+            "    saxpy_loop(2.0_f32, &x, &mut y);\n"
+            "    let a4: [4]i32 = [1_i32, 2_i32, 3_i32, 4_i32];\n"
+            "    let b4: [4]i32 = [10_i32, 20_i32, 30_i32, 40_i32];\n"
+            "    var o4: [4]i32 = [0_i32; 4];\n"
+            "    slp4_add(&a4, &b4, &mut o4);\n"
+            "    let ubuf: [8]u32 = [1_u32, 2_u32, 3_u32, 4_u32, 5_u32, 6_u32, 7_u32, 8_u32];\n"
+            "    let sc = scev_strided(&ubuf, 4_usize, 2_usize);\n"
+            "    let h = (icf_dup_a(7_u64, 5_u64) ^ icf_dup_b(7_u64, 5_u64)) | (icf_dup_a(9_u64, 3_u64) ^ icf_dup_b(9_u64, 3_u64));\n"
+            "    let h2 = icf_dup_a(11_u64, 4_u64) ^ icf_dup_b(11_u64, 4_u64);\n"
+            "    if y[0_usize] == 4.0_f32 && y[18_usize] == 8.0_f32 && o4[3_usize] == 44_i32 && sc == 16_u32 && h == 0_u64 && h2 == 0_u64 {\n"
+            "        return 0_i32;\n"
+            "    }\n"
+            "    return 1_i32;\n"
+            "}\n"
+        )
+        b_rel = td_p / "m11_rel"
+        b_oz = td_p / "m11_oz"
+        r_int = run_cmd([eonc, "run", "--interp", str(src_opt)])
+        assert r_int.returncode == 0, f"m11_opt interp failed:\n{r_int.stderr}"
+        r_rel = run_cmd([eonc, "build", "--release", "--verify-opt", str(src_opt), "-o", str(b_rel)])
+        assert r_rel.returncode == 0, f"m11_opt --release failed:\n{r_rel.stderr}"
+        assert subprocess.run([str(b_rel)]).returncode == 0
+        r_oz = run_cmd([eonc, "build", "-Oz", "--verify-opt", str(src_opt), "-o", str(b_oz)])
+        assert r_oz.returncode == 0, f"m11_opt -Oz failed:\n{r_oz.stderr}"
+        assert subprocess.run([str(b_oz)]).returncode == 0
+        # Dead-strip check: `dead_giant_fn` must be absent from symbol table
+        rd_sym = run_cmd(["llvm-objdump", "-t", str(b_rel)])
+        assert rd_sym.returncode == 0
+        assert "dead_giant_fn" not in rd_sym.stdout, "Linker GC failed to dead-strip unreachable `dead_giant_fn`!"
+        # Safe ICF check: in -Oz, `icf_dup_a` and `icf_dup_b` must fold to the exact same .text address!
+        rd_oz = run_cmd(["llvm-objdump", "-t", str(b_oz)])
+        assert rd_oz.returncode == 0
+        icf_addrs = {}
+        for line in rd_oz.stdout.splitlines():
+            for fn_nm in ("icf_dup_a", "icf_dup_b"):
+                if line.endswith("__" + fn_nm):
+                    icf_addrs[fn_nm] = line.split()[0]
+        assert len(icf_addrs) == 2 and icf_addrs["icf_dup_a"] == icf_addrs["icf_dup_b"], (
+            f"Safe ICF failed to fold identical functions in -Oz: {icf_addrs}"
+        )
+        # -Oz vs --release size check on a multi-function program (`05_ecs_physics`)
+        ecs_rel = td_p / "ecs_rel"
+        ecs_oz = td_p / "ecs_oz"
+        r_er = run_cmd([eonc, "build", "--release", str(ROOT / "bench/05_ecs_physics/main.eon"), "-o", str(ecs_rel)])
+        r_ez = run_cmd([eonc, "build", "-Oz", str(ROOT / "bench/05_ecs_physics/main.eon"), "-o", str(ecs_oz)])
+        assert r_er.returncode == 0 and r_ez.returncode == 0, f"ecs build failed: {r_er.stderr}\n{r_ez.stderr}"
+        assert ecs_oz.stat().st_size < ecs_rel.stat().st_size, (
+            f"-Oz ({ecs_oz.stat().st_size}) not smaller than --release ({ecs_rel.stat().st_size})"
+        )
+
+        # 2. DBM Ergonomics: min(a.len, b.len), min(a.len, 16), base+k<len, base+%k<len, SliceSub, StrAsBytes, UnwrapOptional
+        src_dbm = td_p / "m11_dbm.eon"
+        src_dbm.write_text(
+            "module test.m11_dbm;\n"
+            "fn test_ergonomics(a: *[i32], b: *[i32], s: *str, base: usize, k: usize) -> i32 ! BoundsError {\n"
+            "    var total: i32 = 0_i32;\n"
+            "    let n = if a.len < b.len { a.len } else { b.len };\n"
+            "    var i: usize = 0_usize;\n"
+            "    while i < n {\n"
+            "        total = total +% a[i] +% b[i];\n"
+            "        i = i + 1_usize;\n"
+            "    }\n"
+            "    let cap16 = if a.len < 16_usize { a.len } else { 16_usize };\n"
+            "    var j: usize = 0_usize;\n"
+            "    while j < cap16 {\n"
+            "        total = total +% a[j];\n"
+            "        j = j + 1_usize;\n"
+            "    }\n"
+            "    if base <= a.len && base + 4_usize <= a.len {\n"
+            "        total = total +% a[base + 3_usize];\n"
+            "        let tile = try a.sub(base, base + 4_usize);\n"
+            "        total = total +% tile[0_usize] +% tile[3_usize];\n"
+            "    }\n"
+            "    if base +% k < a.len {\n"
+            "        total = total +% a[base +% k];\n"
+            "    }\n"
+            "    let sb = s.as_bytes();\n"
+            "    if s.len > 0_usize {\n"
+            "        total = total +% sb[0_usize].widen.[i32]();\n"
+            "    }\n"
+            "    let opt_a: ?*[i32] = a;\n"
+            "    if a.len > 0_usize {\n"
+            "        if let ua = opt_a {\n"
+            "            total = total +% ua[0_usize];\n"
+            "        }\n"
+            "    }\n"
+            "    return total;\n"
+            "}\n"
+            "pub fn main() -> i32 ! BoundsError {\n"
+            "    let xs: [6]i32 = [1_i32, 2_i32, 3_i32, 4_i32, 5_i32, 6_i32];\n"
+            "    let ys: [4]i32 = [10_i32, 20_i32, 30_i32, 40_i32];\n"
+            "    let r = try test_ergonomics(&xs, &ys, \"A\", 1_usize, 2_usize);\n"
+            "    return if r == 213_i32 { 0_i32 } else { 1_i32 };\n"
+            "}\n"
+        )
+        b_dbm = td_p / "m11_dbm"
+        r_dbm = run_cmd([eonc, "build", "--release", str(src_dbm), "-o", str(b_dbm)])
+        assert r_dbm.returncode == 0, f"m11_dbm ergonomics failed:\n{r_dbm.stderr}"
+        assert subprocess.run([str(b_dbm)]).returncode == 0
+
+        # 3. Contextual ZM-07 off-by-one diagnostic check
+        src_obo = td_p / "m11_obo.eon"
+        src_obo.write_text(
+            "module test.m11_obo;\n"
+            "pub fn bad(a: *[i32], i: usize) -> i32 {\n"
+            "    if i <= a.len {\n"
+            "        return a[i];\n"
+            "    }\n"
+            "    return 0_i32;\n"
+            "}\n"
+            "pub fn main() -> i32 { return 0_i32; }\n"
+        )
+        r_obo = run_cmd([eonc, "check", str(src_obo)])
+        assert r_obo.returncode != 0 and "off-by-one" in (r_obo.stdout + r_obo.stderr), (
+            f"Expected contextual off-by-one ZM-07 help, got:\n{r_obo.stdout}\n{r_obo.stderr}"
+        )
+
+    print("[PASS] M1.1 optimizer, -Oz, linker GC+ICF, and DBM ergonomics")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--eonc", default=str(ROOT / "selfhost/out/eonc2_rel"))
@@ -316,6 +502,7 @@ def main() -> int:
     test_emi_invalidation(eonc)
     test_real_native_stack_budget(eonc)
     test_dwarf5_debug_info(eonc)
+    test_m11_opt_and_dbm(eonc)
     print("ALL SELFHOST SOUNDNESS REGRESSIONS PASSED!")
     return 0
 
