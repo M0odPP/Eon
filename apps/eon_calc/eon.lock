@@ -1,0 +1,22 @@
+# Eon deterministic lockfile v1
+lock_version = 1
+
+[[dep]]
+name = "eon_gpu"
+path = "../../libs/eon_gpu"
+sha256 = "da9615197091bb711f9f0d6882bca69fd4e63a740f9a8ad7a7351d3e6554993a"
+
+[[dep]]
+name = "eon_text"
+path = "../../libs/eon_text"
+sha256 = "990793ae1a495e6f1bb5b785cbaf58082444f0a864c6f999fa6c6e8fb6af84f5"
+
+[[dep]]
+name = "eon_ui"
+path = "../../libs/eon_ui"
+sha256 = "be6f9b2b53abfa3735b724cda9e7db1475b331960e56f3f05b98970bd2943f70"
+
+[[dep]]
+name = "eon_win"
+path = "../../libs/eon_win"
+sha256 = "6049f204ac727c24db6685590f9a321b04dd9e64d596af20d6e11ca5db83bf89"
