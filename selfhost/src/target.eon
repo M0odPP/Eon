@@ -1,0 +1,511 @@
+module eonc.target;
+
+import core.str;
+
+// ============================================================================
+// Multi-Target Specification (`3 CPU x 6 OS`) & Target-Neutral Register File
+// ============================================================================
+
+pub enum TargetArch : u8 {
+    X86_64 = 0,
+    AArch64 = 1,
+    RiscV64 = 2,
+}
+
+pub enum TargetOs : u8 {
+    Linux = 0,
+    Windows = 1,
+    MacOS = 2,
+    Android = 3,
+    IOS = 4,
+    NoStd = 5,
+}
+
+pub enum ObjFormat : u8 {
+    Elf64 = 0,
+    PeCoff = 1,
+    MachO = 2,
+}
+
+pub enum TargetAbi : u8 {
+    SysV = 0,
+    Win64 = 1,
+    Aapcs64 = 2,
+    Lp64d = 3,
+}
+
+/// Compact 12-byte (Copy) target specification shared across frontend, comptime, layout, and codegen.
+pub struct TargetSpec {
+    pub arch: TargetArch;
+    pub os: TargetOs;
+    pub fmt: ObjFormat;
+    pub abi: TargetAbi;
+    pub is_pie: bool;
+    pub is_shared: bool;
+    pub has_avx2: bool;
+    pub has_neon: bool;
+    pub has_rvc: bool;
+    pub is_nostd: bool;
+}
+
+impl TargetSpec {
+    pub fn host_default() -> TargetSpec {
+        return TargetSpec.{
+            arch: .X86_64,
+            os: .Linux,
+            fmt: .Elf64,
+            abi: .SysV,
+            is_pie: true,
+            is_shared: false,
+            has_avx2: true,
+            has_neon: false,
+            has_rvc: false,
+            is_nostd: false,
+        };
+    }
+
+    pub fn make(arch: TargetArch, os: TargetOs) -> TargetSpec {
+        let fmt: ObjFormat = match os {
+            .Windows => .PeCoff,
+            .MacOS => .MachO,
+            .IOS => .MachO,
+            _ => .Elf64,
+        };
+        let abi: TargetAbi = match arch {
+            .X86_64 => if os == .Windows { .Win64 } else { .SysV },
+            .AArch64 => .Aapcs64,
+            .RiscV64 => .Lp64d,
+        };
+        let nostd = os == .NoStd;
+        let is_shared = os == .Android;
+        return TargetSpec.{
+            arch: arch,
+            os: os,
+            fmt: fmt,
+            abi: abi,
+            is_pie: !nostd && !is_shared,
+            is_shared: is_shared,
+            has_avx2: arch == .X86_64 && !nostd,
+            has_neon: arch == .AArch64,
+            has_rvc: arch == .RiscV64,
+            is_nostd: nostd,
+        };
+    }
+
+    /// Parse `<arch>-<os>` target triples (including `arm64-*` aliases).
+    pub fn parse_triple(s: *[u8]) -> ?TargetSpec {
+        if str.bytes_eq(s, "x86_64-linux".as_bytes()) { return TargetSpec.make(.X86_64, .Linux); }
+        if str.bytes_eq(s, "aarch64-linux".as_bytes()) || str.bytes_eq(s, "arm64-linux".as_bytes()) {
+            return TargetSpec.make(.AArch64, .Linux);
+        }
+        if str.bytes_eq(s, "riscv64-linux".as_bytes()) { return TargetSpec.make(.RiscV64, .Linux); }
+        if str.bytes_eq(s, "x86_64-windows".as_bytes()) { return TargetSpec.make(.X86_64, .Windows); }
+        if str.bytes_eq(s, "aarch64-windows".as_bytes()) || str.bytes_eq(s, "arm64-windows".as_bytes()) {
+            return TargetSpec.make(.AArch64, .Windows);
+        }
+        if str.bytes_eq(s, "aarch64-macos".as_bytes()) || str.bytes_eq(s, "arm64-macos".as_bytes()) {
+            return TargetSpec.make(.AArch64, .MacOS);
+        }
+        if str.bytes_eq(s, "x86_64-macos".as_bytes()) { return TargetSpec.make(.X86_64, .MacOS); }
+        if str.bytes_eq(s, "aarch64-android".as_bytes()) || str.bytes_eq(s, "arm64-android".as_bytes()) {
+            return TargetSpec.make(.AArch64, .Android);
+        }
+        if str.bytes_eq(s, "x86_64-android".as_bytes()) { return TargetSpec.make(.X86_64, .Android); }
+        if str.bytes_eq(s, "aarch64-ios".as_bytes()) || str.bytes_eq(s, "arm64-ios".as_bytes()) {
+            return TargetSpec.make(.AArch64, .IOS);
+        }
+        if str.bytes_eq(s, "x86_64-nostd".as_bytes()) { return TargetSpec.make(.X86_64, .NoStd); }
+        if str.bytes_eq(s, "aarch64-nostd".as_bytes()) || str.bytes_eq(s, "arm64-nostd".as_bytes()) {
+            return TargetSpec.make(.AArch64, .NoStd);
+        }
+        if str.bytes_eq(s, "riscv64-nostd".as_bytes()) { return TargetSpec.make(.RiscV64, .NoStd); }
+        return null;
+    }
+
+    pub view fn arch_variant_name(self: *Self) -> *str {
+        match self.arch {
+            .X86_64 => { return "X86_64"; }
+            .AArch64 => { return "AArch64"; }
+            .RiscV64 => { return "RiscV64"; }
+        }
+        return "X86_64";
+    }
+
+    pub view fn os_variant_name(self: *Self) -> *str {
+        match self.os {
+            .Linux => { return "Linux"; }
+            .Windows => { return "Windows"; }
+            .MacOS => { return "MacOS"; }
+            .Android => { return "Android"; }
+            .IOS => { return "IOS"; }
+            .NoStd => { return "NoStd"; }
+        }
+        return "Linux";
+    }
+
+    pub view fn triple_name(self: *Self) -> *str {
+        match self.arch {
+            .X86_64 => {
+                match self.os {
+                    .Linux => { return "x86_64-linux"; }
+                    .Windows => { return "x86_64-windows"; }
+                    .MacOS => { return "x86_64-macos"; }
+                    .Android => { return "x86_64-android"; }
+                    .IOS => { return "x86_64-ios"; }
+                    .NoStd => { return "x86_64-nostd"; }
+                }
+            }
+            .AArch64 => {
+                match self.os {
+                    .Linux => { return "aarch64-linux"; }
+                    .Windows => { return "aarch64-windows"; }
+                    .MacOS => { return "aarch64-macos"; }
+                    .Android => { return "aarch64-android"; }
+                    .IOS => { return "aarch64-ios"; }
+                    .NoStd => { return "aarch64-nostd"; }
+                }
+            }
+            .RiscV64 => {
+                match self.os {
+                    .Linux => { return "riscv64-linux"; }
+                    .Windows => { return "riscv64-windows"; }
+                    .MacOS => { return "riscv64-macos"; }
+                    .Android => { return "riscv64-android"; }
+                    .IOS => { return "riscv64-ios"; }
+                    .NoStd => { return "riscv64-nostd"; }
+                }
+            }
+        }
+        return "x86_64-linux";
+    }
+
+    @inline
+    pub fn ptr_size(self: Self) -> u64 {
+        let _ = self.arch;
+        return 8_u64;
+    }
+
+    @inline
+    pub fn c_long_size(self: Self) -> u64 {
+        // LLP64 on Win64 (`long` = 4 bytes) vs LP64 on SysV/Darwin/Linux/Android/iOS (`long` = 8 bytes).
+        return if self.os == .Windows { 4_u64 } else { 8_u64 };
+    }
+
+    @inline
+    pub fn is_darwin(self: Self) -> bool {
+        return self.os == .MacOS || self.os == .IOS;
+    }
+
+    @inline
+    pub fn is_windows(self: Self) -> bool {
+        return self.os == .Windows;
+    }
+
+    @inline
+    pub fn is_elf(self: Self) -> bool {
+        return self.fmt == .Elf64;
+    }
+
+    pub fn with_freestanding(self: Self) -> TargetSpec {
+        var t = self;
+        t.os = .NoStd;
+        t.fmt = .Elf64;
+        t.is_nostd = true;
+        t.is_pie = false;
+        t.is_shared = false;
+        t.has_avx2 = false;
+        return t;
+    }
+}
+
+// ============================================================================
+// Target-Neutral Register File Descriptor (`u32` masks support up to 32 regs!)
+// ============================================================================
+
+pub struct TargetRegFile {
+    pub gpr_count: u8;
+    pub vec_count: u8;
+    pub alloc_gpr_count: u8;
+    pub alloc_vec_count: u8;
+    pub scratch_gpr0: u8;
+    pub scratch_gpr1: u8;
+    pub scratch_vec0: u8;
+    pub scratch_vec1: u8;
+    pub err_reg_gpr: u8;
+    pub caller_saved_gprs: u32;
+    pub callee_saved_gprs: u32;
+    pub eon_call_err_clobber_gprs: u32;
+    pub alloc_gprs_all: u32;
+    pub alloc_gprs_no_err: u32;
+    pub caller_saved_vecs: u32;
+    pub callee_saved_vecs: u32;
+    pub alloc_vecs: u32;
+    pub gpr_order: [32]u8;
+    pub vec_order: [32]u8;
+}
+
+impl TargetRegFile {
+    pub fn x86_64_sysv() -> TargetRegFile {
+        var gpr_ord: [32]u8 = [255_u8; 32];
+        // Caller-saved first, then callee-saved (12 allocatable GPRs; R10/R11 scratch; RSP/RBP fixed)
+        gpr_ord[0_usize] = 0_u8;  // RAX
+        gpr_ord[1_usize] = 1_u8;  // RCX
+        gpr_ord[2_usize] = 2_u8;  // RDX
+        gpr_ord[3_usize] = 6_u8;  // RSI
+        gpr_ord[4_usize] = 7_u8;  // RDI
+        gpr_ord[5_usize] = 8_u8;  // R8
+        gpr_ord[6_usize] = 9_u8;  // R9
+        gpr_ord[7_usize] = 3_u8;  // RBX
+        gpr_ord[8_usize] = 12_u8; // R12
+        gpr_ord[9_usize] = 13_u8; // R13
+        gpr_ord[10_usize] = 14_u8;// R14
+        gpr_ord[11_usize] = 15_u8;// R15
+
+        var vec_ord: [32]u8 = [255_u8; 32];
+        var vi: usize = 0_usize;
+        while vi < 14_usize {
+            vec_ord[vi] = vi.trunc.[u8]();
+            vi = vi + 1_usize;
+        }
+        return TargetRegFile.{
+            gpr_count: 16_u8,
+            vec_count: 16_u8,
+            alloc_gpr_count: 12_u8,
+            alloc_vec_count: 14_u8,
+            scratch_gpr0: 10_u8,
+            scratch_gpr1: 11_u8,
+            scratch_vec0: 14_u8,
+            scratch_vec1: 15_u8,
+            err_reg_gpr: 15_u8,
+            caller_saved_gprs: 0x00000FC7_u32,
+            callee_saved_gprs: 0x0000F008_u32,
+            eon_call_err_clobber_gprs: 0x00008FC7_u32,
+            alloc_gprs_all: 0x0000F3CF_u32,
+            alloc_gprs_no_err: 0x000073CF_u32,
+            caller_saved_vecs: 0x0000FFFF_u32,
+            callee_saved_vecs: 0x00000000_u32,
+            alloc_vecs: 0x00003FFF_u32,
+            gpr_order: gpr_ord,
+            vec_order: vec_ord,
+        };
+    }
+
+    pub fn x86_64_win64() -> TargetRegFile {
+        // Win64 ABI: caller-saved GPRs = RAX,RCX,RDX,R8,R9,R10,R11 (0x0F07);
+        // callee-saved GPRs = RBX,RDI,RSI,R12..R15 (0xF0C8);
+        // caller-saved XMMs = XMM0..XMM5 (0x003F); callee-saved XMMs = XMM6..XMM15 (0xFFC0).
+        var rf = TargetRegFile.x86_64_sysv();
+        rf.gpr_order[0_usize] = 0_u8;  // RAX
+        rf.gpr_order[1_usize] = 1_u8;  // RCX
+        rf.gpr_order[2_usize] = 2_u8;  // RDX
+        rf.gpr_order[3_usize] = 8_u8;  // R8
+        rf.gpr_order[4_usize] = 9_u8;  // R9
+        rf.gpr_order[5_usize] = 3_u8;  // RBX
+        rf.gpr_order[6_usize] = 6_u8;  // RSI
+        rf.gpr_order[7_usize] = 7_u8;  // RDI
+        rf.gpr_order[8_usize] = 12_u8; // R12
+        rf.gpr_order[9_usize] = 13_u8; // R13
+        rf.gpr_order[10_usize] = 14_u8;// R14
+        rf.gpr_order[11_usize] = 15_u8;// R15
+        rf.caller_saved_gprs = 0x00000F07_u32;
+        rf.callee_saved_gprs = 0x0000F0C8_u32;
+        rf.eon_call_err_clobber_gprs = 0x00008F07_u32;
+        rf.caller_saved_vecs = 0x0000003F_u32;
+        rf.callee_saved_vecs = 0x0000FFC0_u32;
+        return rf;
+    }
+
+    pub fn aarch64_aapcs64() -> TargetRegFile {
+        // AAPCS64:
+        //   Caller-saved GPRs: x0..x15 (x16, x17 = IP0/IP1 scratch; x18 = platform reserved on Darwin/Windows)
+        //   Callee-saved GPRs: x19..x28 (x29 = FP, x30 = LR, x31 = SP/XZR)
+        //   Error channel: x8 (EonCall)
+        //   Scratch GPRs: x16, x17; Scratch Vecs: v30, v31
+        //   Allocatable GPRs (25): x0..x15, x19..x28 (26 if x8 included, 25 excluding x18)
+        //   Caller-saved Vecs: v0..v7, v16..v31; Callee-saved Vecs: v8..v15 (lower 64 bits)
+        var gpr_ord: [32]u8 = [255_u8; 32];
+        var gi: usize = 0_usize;
+        // Caller-saved x0..x15 first
+        var r: u8 = 0_u8;
+        while r <= 15_u8 {
+            if gi < 32_usize {
+                gpr_ord[gi] = r;
+                gi = gi + 1_usize;
+            }
+            r = r +% 1_u8;
+        }
+        // Callee-saved x19..x28 next
+        r = 19_u8;
+        while r <= 28_u8 {
+            if gi < 32_usize {
+                gpr_ord[gi] = r;
+                gi = gi + 1_usize;
+            }
+            r = r +% 1_u8;
+        }
+
+        var vec_ord: [32]u8 = [255_u8; 32];
+        var vi: usize = 0_usize;
+        // Caller-saved v0..v7, v16..v29 first, then callee-saved v8..v15 (v30/v31 scratch)
+        r = 0_u8;
+        while r <= 7_u8 {
+            if vi < 32_usize { vec_ord[vi] = r; vi = vi + 1_usize; }
+            r = r +% 1_u8;
+        }
+        r = 16_u8;
+        while r <= 29_u8 {
+            if vi < 32_usize { vec_ord[vi] = r; vi = vi + 1_usize; }
+            r = r +% 1_u8;
+        }
+        r = 8_u8;
+        while r <= 15_u8 {
+            if vi < 32_usize { vec_ord[vi] = r; vi = vi + 1_usize; }
+            r = r +% 1_u8;
+        }
+        return TargetRegFile.{
+            gpr_count: 32_u8,
+            vec_count: 32_u8,
+            alloc_gpr_count: 26_u8,
+            alloc_vec_count: 30_u8,
+            scratch_gpr0: 16_u8,
+            scratch_gpr1: 17_u8,
+            scratch_vec0: 30_u8,
+            scratch_vec1: 31_u8,
+            err_reg_gpr: 8_u8,
+            caller_saved_gprs: 0x0003FFFF_u32, // x0..x17
+            callee_saved_gprs: 0x1FF80000_u32, // x19..x28
+            eon_call_err_clobber_gprs: 0x0003FFFF_u32,
+            alloc_gprs_all: 0x1FF8FFFF_u32,    // x0..x15 | x19..x28
+            alloc_gprs_no_err: 0x1FF8FEFF_u32, // excluding x8
+            caller_saved_vecs: 0xFFFF00FF_u32, // v0..v7 | v16..v31
+            callee_saved_vecs: 0x0000FF00_u32, // v8..v15
+            alloc_vecs: 0x3FFFFFFF_u32,        // v0..v29
+            gpr_order: gpr_ord,
+            vec_order: vec_ord,
+        };
+    }
+
+    pub fn riscv64_lp64d() -> TargetRegFile {
+        // RV64GC LP64D:
+        //   Fixed: x0(zero), x1(ra), x2(sp), x3(gp), x4(tp), x8(fp/s0)
+        //   Scratch GPRs: x30(t5), x31(t6)
+        //   Error channel: x5(t0) (EonCall)
+        //   Caller-saved allocatable GPRs: x10..x17(a0..a7), x5..x7(t0..t2), x28..x29(t3..t4)
+        //   Callee-saved allocatable GPRs: x9(s1), x18..x27(s2..s11)
+        //   FP regs: f0..f31 (f30/f31 scratch; caller-saved f0..f7,f10..f17,f28..f31; callee-saved f8..f9,f18..f27)
+        var gpr_ord: [32]u8 = [255_u8; 32];
+        var gi: usize = 0_usize;
+        // a0..a7 (10..17)
+        var r: u8 = 10_u8;
+        while r <= 17_u8 {
+            if gi < 32_usize { gpr_ord[gi] = r; gi = gi + 1_usize; }
+            r = r +% 1_u8;
+        }
+        // t0..t2 (5..7), t3..t4 (28..29)
+        r = 5_u8;
+        while r <= 7_u8 {
+            if gi < 32_usize { gpr_ord[gi] = r; gi = gi + 1_usize; }
+            r = r +% 1_u8;
+        }
+        gpr_ord[11_usize] = 28_u8;
+        gpr_ord[12_usize] = 29_u8;
+        gi = 13_usize;
+        // s1 (9), s2..s11 (18..27)
+        gpr_ord[13_usize] = 9_u8;
+        gi = 14_usize;
+        r = 18_u8;
+        while r <= 27_u8 {
+            if gi < 32_usize { gpr_ord[gi] = r; gi = gi + 1_usize; }
+            r = r +% 1_u8;
+        }
+
+        var vec_ord: [32]u8 = [255_u8; 32];
+        var vi: usize = 0_usize;
+        // fa0..fa7 (10..17), ft0..ft7 (0..7), ft8..ft9 (28..29), fs0..fs1 (8..9), fs2..fs11 (18..27)
+        r = 10_u8;
+        while r <= 17_u8 {
+            if vi < 32_usize { vec_ord[vi] = r; vi = vi + 1_usize; }
+            r = r +% 1_u8;
+        }
+        r = 0_u8;
+        while r <= 7_u8 {
+            if vi < 32_usize { vec_ord[vi] = r; vi = vi + 1_usize; }
+            r = r +% 1_u8;
+        }
+        vec_ord[16_usize] = 28_u8;
+        vec_ord[17_usize] = 29_u8;
+        vec_ord[18_usize] = 8_u8;
+        vec_ord[19_usize] = 9_u8;
+        vi = 20_usize;
+        r = 18_u8;
+        while r <= 27_u8 {
+            if vi < 32_usize { vec_ord[vi] = r; vi = vi + 1_usize; }
+            r = r +% 1_u8;
+        }
+
+        return TargetRegFile.{
+            gpr_count: 32_u8,
+            vec_count: 32_u8,
+            alloc_gpr_count: 24_u8,
+            alloc_vec_count: 30_u8,
+            scratch_gpr0: 30_u8, // t5
+            scratch_gpr1: 31_u8, // t6
+            scratch_vec0: 30_u8, // ft10
+            scratch_vec1: 31_u8, // ft11
+            err_reg_gpr: 5_u8,   // t0
+            caller_saved_gprs: 0xF003FCE0_u32, // x5..x7, x10..x17, x28..x31
+            callee_saved_gprs: 0x0FFC0200_u32, // x9, x18..x27
+            eon_call_err_clobber_gprs: 0xF003FCE0_u32,
+            alloc_gprs_all: 0x3FFFFEE0_u32,    // x5..x7, x9..x29
+            alloc_gprs_no_err: 0x3FFFFEC0_u32, // excluding x5 (t0)
+            caller_saved_vecs: 0xF003FCFF_u32, // f0..f7, f10..f17, f28..f31
+            callee_saved_vecs: 0x0FFC0300_u32, // f8..f9, f18..f27
+            alloc_vecs: 0x3FFFFFFF_u32,        // f0..f29
+            gpr_order: gpr_ord,
+            vec_order: vec_ord,
+        };
+    }
+
+    pub fn for_target(spec: TargetSpec) -> TargetRegFile {
+        match spec.abi {
+            .SysV => { return TargetRegFile.x86_64_sysv(); }
+            .Win64 => { return TargetRegFile.x86_64_win64(); }
+            .Aapcs64 => { return TargetRegFile.aarch64_aapcs64(); }
+            .Lp64d => { return TargetRegFile.riscv64_lp64d(); }
+        }
+    }
+
+    @inline
+    pub fn phys_bit(phys: u8) -> u32 {
+        if phys >= 32_u8 {
+            return 0_u32;
+        }
+        return 1_u32 <<% phys.widen.[u32]();
+    }
+
+    @inline
+    pub fn is_callee_saved_gpr(self: *Self, phys: u8) -> bool {
+        return (self.callee_saved_gprs & TargetRegFile.phys_bit(phys)) != 0_u32;
+    }
+
+    @inline
+    pub fn is_callee_saved_vec(self: *Self, phys: u8) -> bool {
+        return (self.callee_saved_vecs & TargetRegFile.phys_bit(phys)) != 0_u32;
+    }
+
+    @inline
+    pub fn alloc_gpr_at(self: *Self, idx: usize) -> u8 {
+        if idx < self.alloc_gpr_count.widen.[usize]() && idx < 32_usize {
+            return self.gpr_order[idx];
+        }
+        return 255_u8;
+    }
+
+    @inline
+    pub fn alloc_vec_at(self: *Self, idx: usize) -> u8 {
+        if idx < self.alloc_vec_count.widen.[usize]() && idx < 32_usize {
+            return self.vec_order[idx];
+        }
+        return 255_u8;
+    }
+}

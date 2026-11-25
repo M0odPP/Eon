@@ -5296,6 +5296,9 @@ impl CfgBuilder {
             }
             return try self.cfg.add_const_op(self.alloc, cfg_ir.const_void());
         }
+        if str.bytes_eq(bs, "target_is_nostd".as_bytes()) {
+            return try self.cfg.add_const_op(self.alloc, cfg_ir.const_bool(self.env.target_spec.is_nostd));
+        }
         let is_gid = str.bytes_eq(bs, "gpu_global_id".as_bytes());
         let is_lid = str.bytes_eq(bs, "gpu_local_id".as_bytes());
         let is_wid = str.bytes_eq(bs, "gpu_workgroup_id".as_bytes());

@@ -983,8 +983,8 @@ pub linear struct EirProgram {
     pub value_facts: col.DynBuf[u8];
     pub proven_safe_insts: col.DynBuf[u8];
     pub block_loop_depth: col.DynBuf[u8];
-    pub fn_ipra_gpr_clobbers: col.DynBuf[u16];
-    pub fn_ipra_xmm_clobbers: col.DynBuf[u16];
+    pub fn_ipra_gpr_clobbers: col.DynBuf[u32];
+    pub fn_ipra_xmm_clobbers: col.DynBuf[u32];
     pub fn_ipra_valid: col.DynBuf[u8];
     pub fn_is_opt_eligible: col.DynBuf[u8];
 }
@@ -1007,9 +1007,9 @@ impl EirProgram {
         errdefer proven_safe_insts.destroy(alloc);
         let block_loop_depth = try col.DynBuf.[u8].init(alloc, 16_usize);
         errdefer block_loop_depth.destroy(alloc);
-        let fn_ipra_gpr_clobbers = try col.DynBuf.[u16].init(alloc, 16_usize);
+        let fn_ipra_gpr_clobbers = try col.DynBuf.[u32].init(alloc, 16_usize);
         errdefer fn_ipra_gpr_clobbers.destroy(alloc);
-        let fn_ipra_xmm_clobbers = try col.DynBuf.[u16].init(alloc, 16_usize);
+        let fn_ipra_xmm_clobbers = try col.DynBuf.[u32].init(alloc, 16_usize);
         errdefer fn_ipra_xmm_clobbers.destroy(alloc);
         let fn_ipra_valid = try col.DynBuf.[u8].init(alloc, 16_usize);
         errdefer fn_ipra_valid.destroy(alloc);
@@ -2370,15 +2370,15 @@ impl EirProgram {
         self: *mut Self,
         alloc: *mut AllocCap,
         fn_id: u32,
-        gpr_clobbers: u16,
-        xmm_clobbers: u16,
+        gpr_clobbers: u32,
+        xmm_clobbers: u32,
     ) -> !OutOfMemory {
         let idx = fn_id.widen.[usize]();
         while self.fn_ipra_gpr_clobbers.len() <= idx {
-            try self.fn_ipra_gpr_clobbers.push(alloc, 0xFFFF_u16);
+            try self.fn_ipra_gpr_clobbers.push(alloc, 0xFFFFFFFF_u32);
         }
         while self.fn_ipra_xmm_clobbers.len() <= idx {
-            try self.fn_ipra_xmm_clobbers.push(alloc, 0xFFFF_u16);
+            try self.fn_ipra_xmm_clobbers.push(alloc, 0xFFFFFFFF_u32);
         }
         while self.fn_ipra_valid.len() <= idx {
             try self.fn_ipra_valid.push(alloc, 0_u8);
@@ -2404,28 +2404,28 @@ impl EirProgram {
         return idx < vs.len && vs[idx] != 0_u8;
     }
 
-    pub fn fn_ipra_gprs(self: *Self, fn_id: u32) -> u16 {
+    pub fn fn_ipra_gprs(self: *Self, fn_id: u32) -> u32 {
         if !self.fn_has_ipra(fn_id) {
-            return 0xFFFF_u16;
+            return 0xFFFFFFFF_u32;
         }
         let idx = fn_id.widen.[usize]();
         let gs = self.fn_ipra_gpr_clobbers.as_slice();
         if idx < gs.len {
             return gs[idx];
         }
-        return 0xFFFF_u16;
+        return 0xFFFFFFFF_u32;
     }
 
-    pub fn fn_ipra_xmms(self: *Self, fn_id: u32) -> u16 {
+    pub fn fn_ipra_xmms(self: *Self, fn_id: u32) -> u32 {
         if !self.fn_has_ipra(fn_id) {
-            return 0xFFFF_u16;
+            return 0xFFFFFFFF_u32;
         }
         let idx = fn_id.widen.[usize]();
         let xs = self.fn_ipra_xmm_clobbers.as_slice();
         if idx < xs.len {
             return xs[idx];
         }
-        return 0xFFFF_u16;
+        return 0xFFFFFFFF_u32;
     }
 
     pub fn set_fn_opt_eligible(

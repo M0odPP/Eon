@@ -1158,6 +1158,123 @@ def test_m14_fmt_and_lsp(eonc: str):
     print("[PASS] M1.4 eonc fmt [--check] (idempotent, comment-safe) and eonc lsp (diagnostics, DBM+@stack hover, definition, completion, formatting, quick-fixes, 0 leaks)")
 
 
+def test_m21_target_spec_and_comptime(eonc: str) -> None:
+    print("[TEST] M2.1 TargetSpec (--target=<arch>-<os>), @target_arch/@target_os/@target_is_nostd, dead comptime branch pruning...")
+    with tempfile.TemporaryDirectory(prefix="eon_m21_") as td:
+        p = Path(td)
+        src = p / "target_matrix.eon"
+        src.write_text(
+            "module demo.target_matrix;\n"
+            "\n"
+            "fn arch_code() -> i32 {\n"
+            "    comptime if @target_arch() == .X86_64 {\n"
+            "        return 10_i32;\n"
+            "    } else {\n"
+            "        comptime if @target_arch() == .AArch64 {\n"
+            "            return 20_i32;\n"
+            "        } else {\n"
+            "            comptime if @target_arch() == .RiscV64 {\n"
+            "                return 30_i32;\n"
+            "            } else {\n"
+            "                @compile_error(\"unsupported arch\");\n"
+            "            }\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+            "\n"
+            "fn os_code() -> i32 {\n"
+            "    comptime if @target_os() == .Linux {\n"
+            "        return 1_i32;\n"
+            "    } else {\n"
+            "        comptime if @target_os() == .Windows {\n"
+            "            return 2_i32;\n"
+            "        } else {\n"
+            "            comptime if @target_os() == .MacOS {\n"
+            "                return 3_i32;\n"
+            "            } else {\n"
+            "                comptime if @target_os() == .Android {\n"
+            "                    return 4_i32;\n"
+            "                } else {\n"
+            "                    comptime if @target_os() == .IOS {\n"
+            "                        return 5_i32;\n"
+            "                    } else {\n"
+            "                        comptime if @target_os() == .NoStd {\n"
+            "                            return 6_i32;\n"
+            "                        } else {\n"
+            "                            return nonexistent_symbol_pruned();\n"
+            "                        }\n"
+            "                    }\n"
+            "                }\n"
+            "            }\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+            "\n"
+            "fn nostd_bonus(b: bool) -> i32 {\n"
+            "    return if b { 100_i32 } else { 0_i32 };\n"
+            "}\n"
+            "\n"
+            "pub fn main() -> i32 {\n"
+            "    let a = arch_code();\n"
+            "    let o = os_code();\n"
+            "    let n: i32 = comptime if @target_is_nostd() { 100_i32 } else { 0_i32 };\n"
+            "    let rt_n = nostd_bonus(@target_is_nostd());\n"
+            "    if n != rt_n {\n"
+            "        return 255_i32;\n"
+            "    }\n"
+            "    return a +% o +% n;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+
+        # Verify dead-branch pruning with an explicit unresolved symbol in the non-taken arm
+        prune_src = p / "prune.eon"
+        prune_src.write_text(
+            "module demo.prune;\n"
+            "pub fn main() -> i32 {\n"
+            "    comptime if @target_os() == .Windows {\n"
+            "        return 7_i32;\n"
+            "    } else {\n"
+            "        return missing_windows_only_api();\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        cp_prune_ok = run_cmd([eonc, "check", "--no-stdlib", "--target=x86_64-windows", str(prune_src)])
+        assert cp_prune_ok.returncode == 0, f"dead branch was not pruned:\n{cp_prune_ok.stderr}"
+        cp_prune_err = run_cmd([eonc, "check", "--no-stdlib", "--target=x86_64-linux", str(prune_src)])
+        assert cp_prune_err.returncode != 0, "expected unresolved symbol error on non-Windows target"
+
+        # Verify all 10 triples through both `check` and `run --interp`
+        matrix = [
+            ("x86_64-linux", 11),
+            ("aarch64-linux", 21),
+            ("riscv64-linux", 31),
+            ("x86_64-windows", 12),
+            ("aarch64-macos", 23),
+            ("aarch64-android", 24),
+            ("aarch64-ios", 25),
+            ("x86_64-nostd", 116),
+            ("aarch64-nostd", 126),
+            ("riscv64-nostd", 136),
+        ]
+        for triple, expected_rc in matrix:
+            cp_c = run_cmd([eonc, "check", "--no-stdlib", f"--target={triple}", str(src)])
+            assert cp_c.returncode == 0, f"check --target={triple} failed:\n{cp_c.stderr}"
+            cp_r = run_cmd([eonc, "run", "--interp", f"--target={triple}", str(src)])
+            assert cp_r.returncode == expected_rc, (
+                f"run --interp --target={triple}: expected rc={expected_rc}, got {cp_r.returncode}:\n{cp_r.stderr}"
+            )
+
+        # Verify invalid target triple is cleanly rejected
+        cp_bad = run_cmd([eonc, "check", "--no-stdlib", "--target=mips-plan9", str(src)])
+        assert cp_bad.returncode != 0 and "unknown target triple" in cp_bad.stderr, (
+            f"Expected clean unknown target triple error, got rc={cp_bad.returncode}:\n{cp_bad.stderr}"
+        )
+
+    print("[PASS] M2.1 TargetSpec (--target=<arch>-<os> across all 10 triples, @target_arch/@target_os/@target_is_nostd, dead comptime pruning)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--eonc", default=str(ROOT / "selfhost/out/eonc2_rel"))
@@ -1171,6 +1288,7 @@ def main() -> int:
     test_m12_deps_lock_and_impl_cutoff(eonc)
     test_m13_core_and_std(eonc)
     test_m14_fmt_and_lsp(eonc)
+    test_m21_target_spec_and_comptime(eonc)
     print("ALL SELFHOST SOUNDNESS REGRESSIONS PASSED!")
     return 0
 

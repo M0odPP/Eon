@@ -3,6 +3,7 @@ module eonc.mach_regalloc;
 import core.col;
 import eonc.span;
 import eonc.ast;
+import eonc.target;
 import eonc.mach_ir;
 
 // ============================================================================
@@ -14,8 +15,8 @@ struct LiveInterval {
     start: u32;
     end: u32;
     weight: u64;
-    crosses_clobber_gprs: u16;
-    crosses_clobber_xmms: u16;
+    crosses_clobber_gprs: u32;
+    crosses_clobber_xmms: u32;
     cls: mach_ir.RegClass;
     has_range: bool;
 }
@@ -24,8 +25,8 @@ struct CallSite {
     pos: u32;
     bb: u32;
     inst_idx: u32;
-    clobber_gprs: u16;
-    clobber_xmms: u16;
+    clobber_gprs: u32;
+    clobber_xmms: u32;
     is_call: bool;
 }
 
@@ -840,8 +841,11 @@ fn compute_liveness(
 // Section 4: Phase 2 — Intervals, Loop Weights, Hints, Call Sites & Fixed Ranges
 // ============================================================================
 
-fn inst_implicit_clobber_gprs(inst: *mach_ir.MachInst) -> u16 {
+fn inst_implicit_clobber_gprs(rf: *target.TargetRegFile, inst: *mach_ir.MachInst) -> u32 {
     var m = inst.clobber_gprs;
+    if rf.gpr_count != 16_u8 {
+        return m;
+    }
     if mach_ir.op_is_div_or_mul128(inst.op) {
         m = m | mach_ir.phys_bit(mach_ir.PHYS_RAX) | mach_ir.phys_bit(mach_ir.PHYS_RDX);
     } else if mach_ir.op_is_var_shift(inst.op) {
@@ -895,7 +899,7 @@ fn record_def_interval(ivs: *mut [LiveInterval], v: u32, pos: u32, step_w: u64) 
 
 fn accumulate_call_clobbers(cs_s: *[CallSite], start_pos: u32, end_pos: u32) -> CallSite {
     if cs_s.len == 0_usize || end_pos <= start_pos {
-        return CallSite.{ pos: 0_u32, bb: 0_u32, inst_idx: 0_u32, clobber_gprs: 0_u16, clobber_xmms: 0_u16, is_call: false };
+        return CallSite.{ pos: 0_u32, bb: 0_u32, inst_idx: 0_u32, clobber_gprs: 0_u32, clobber_xmms: 0_u32, is_call: false };
     }
     var lo: usize = 0_usize;
     var hi: usize = cs_s.len;
@@ -912,8 +916,8 @@ fn accumulate_call_clobbers(cs_s: *[CallSite], start_pos: u32, end_pos: u32) -> 
             break;
         }
     }
-    var cg: u16 = 0_u16;
-    var cx: u16 = 0_u16;
+    var cg: u32 = 0_u32;
+    var cx: u32 = 0_u32;
     var any_call = false;
     var ci = lo;
     while ci < cs_s.len {
@@ -991,8 +995,8 @@ fn build_intervals_and_constraints(
             start: 0xFFFFFFFF_u32,
             end: 0_u32,
             weight: 0_u64,
-            crosses_clobber_gprs: 0_u16,
-            crosses_clobber_xmms: 0_u16,
+            crosses_clobber_gprs: 0_u32,
+            crosses_clobber_xmms: 0_u32,
             cls: vs_init[vi_init].cls,
             has_range: false,
         });
@@ -1092,7 +1096,7 @@ fn build_intervals_and_constraints(
                 };
                 if inst.dst != mach_ir.VREG_NONE {
                     record_def_interval(intervals.as_mut_slice(), inst.dst, pos, step_w);
-                    if fp < 16_u8 {
+                    if fp < 32_u8 {
                         mf.set_vreg_hint_phys(inst.dst, fp);
                         let is_vec = mach_ir.reg_class_is_vec(mf.vreg_class(inst.dst));
                         try fixed_ranges.push(alloc, FixedRange.{
@@ -1117,11 +1121,11 @@ fn build_intervals_and_constraints(
                 };
                 if inst.src0 != mach_ir.VREG_NONE {
                     record_use_interval(intervals.as_mut_slice(), inst.src0, pos, step_w);
-                    if fp < 16_u8 {
+                    if fp < 32_u8 {
                         mf.set_vreg_hint_phys(inst.src0, fp);
                     }
                 }
-                if fp < 16_u8 {
+                if fp < 32_u8 {
                     let use_end = find_use_fixed_run_end(mf.block_insts(bb), ki, blk.start_pos);
                     let is_vec = if inst.src0 != mach_ir.VREG_NONE {
                         mach_ir.reg_class_is_vec(mf.vreg_class(inst.src0))
@@ -1166,9 +1170,9 @@ fn build_intervals_and_constraints(
                     if pair.dst != mach_ir.VREG_NONE && pair.src != mach_ir.VREG_NONE {
                         mf.set_vreg_hint_vreg(pair.dst, pair.src);
                         mf.set_vreg_hint_vreg(pair.src, pair.dst);
-                    } else if pair.dst != mach_ir.VREG_NONE && pair.src_phys < 16_u8 {
+                    } else if pair.dst != mach_ir.VREG_NONE && pair.src_phys < 32_u8 {
                         mf.set_vreg_hint_phys(pair.dst, pair.src_phys);
-                    } else if pair.src != mach_ir.VREG_NONE && pair.dst_phys < 16_u8 {
+                    } else if pair.src != mach_ir.VREG_NONE && pair.dst_phys < 32_u8 {
                         mf.set_vreg_hint_phys(pair.src, pair.dst_phys);
                     }
                     pi = pi +% 1_usize;
@@ -1205,62 +1209,64 @@ fn build_intervals_and_constraints(
                 mf.set_vreg_hint_vreg(inst.src0, inst.dst);
             }
 
-            // Implicit hardware register constraints & hints
-            if mach_ir.op_is_div_or_mul128(inst.op) {
-                if inst.src0 != mach_ir.VREG_NONE {
-                    mf.set_vreg_hint_phys(inst.src0, mach_ir.PHYS_RAX);
-                }
-                if inst.dst != mach_ir.VREG_NONE {
-                    mf.set_vreg_hint_phys(inst.dst, mach_ir.PHYS_RAX);
-                }
-                if inst.dst2 != mach_ir.VREG_NONE {
-                    mf.set_vreg_hint_phys(inst.dst2, mach_ir.PHYS_RDX);
-                }
-                // Keep divisor/multiplier src1 out of RAX/RDX when distinct from src0
-                if inst.src1 != mach_ir.VREG_NONE && inst.src1 != inst.src0 {
+            // Implicit hardware register constraints & hints (x86_64 16-GPR ISA only)
+            if mf.reg_file.gpr_count == 16_u8 {
+                if mach_ir.op_is_div_or_mul128(inst.op) {
+                    if inst.src0 != mach_ir.VREG_NONE {
+                        mf.set_vreg_hint_phys(inst.src0, mach_ir.PHYS_RAX);
+                    }
+                    if inst.dst != mach_ir.VREG_NONE {
+                        mf.set_vreg_hint_phys(inst.dst, mach_ir.PHYS_RAX);
+                    }
+                    if inst.dst2 != mach_ir.VREG_NONE {
+                        mf.set_vreg_hint_phys(inst.dst2, mach_ir.PHYS_RDX);
+                    }
+                    // Keep divisor/multiplier src1 out of RAX/RDX when distinct from src0
+                    if inst.src1 != mach_ir.VREG_NONE && inst.src1 != inst.src0 {
+                        try fixed_ranges.push(alloc, FixedRange.{
+                            start: pos -% 1_u32,
+                            end: pos +% 1_u32,
+                            phys: mach_ir.PHYS_RAX,
+                            is_vec: false,
+                            ignore_vreg: inst.src0,
+                        });
+                        try fixed_ranges.push(alloc, FixedRange.{
+                            start: pos -% 1_u32,
+                            end: pos +% 1_u32,
+                            phys: mach_ir.PHYS_RDX,
+                            is_vec: false,
+                            ignore_vreg: inst.dst2,
+                        });
+                    }
+                } else if mach_ir.op_is_var_shift(inst.op) {
+                    if inst.src1 != mach_ir.VREG_NONE {
+                        mf.set_vreg_hint_phys(inst.src1, mach_ir.PHYS_RCX);
+                    }
                     try fixed_ranges.push(alloc, FixedRange.{
-                        start: pos -% 1_u32,
+                        start: pos,
                         end: pos +% 1_u32,
-                        phys: mach_ir.PHYS_RAX,
+                        phys: mach_ir.PHYS_RCX,
                         is_vec: false,
-                        ignore_vreg: inst.src0,
+                        ignore_vreg: inst.src1,
                     });
-                    try fixed_ranges.push(alloc, FixedRange.{
-                        start: pos -% 1_u32,
-                        end: pos +% 1_u32,
-                        phys: mach_ir.PHYS_RDX,
-                        is_vec: false,
-                        ignore_vreg: inst.dst2,
-                    });
-                }
-            } else if mach_ir.op_is_var_shift(inst.op) {
-                if inst.src1 != mach_ir.VREG_NONE {
-                    mf.set_vreg_hint_phys(inst.src1, mach_ir.PHYS_RCX);
-                }
-                try fixed_ranges.push(alloc, FixedRange.{
-                    start: pos,
-                    end: pos +% 1_u32,
-                    phys: mach_ir.PHYS_RCX,
-                    is_vec: false,
-                    ignore_vreg: inst.src1,
-                });
-            } else if inst.op == .LockCmpxchg {
-                if inst.src0 != mach_ir.VREG_NONE {
-                    mf.set_vreg_hint_phys(inst.src0, mach_ir.PHYS_RAX);
-                }
-                if inst.dst != mach_ir.VREG_NONE {
-                    mf.set_vreg_hint_phys(inst.dst, mach_ir.PHYS_RAX);
+                } else if inst.op == .LockCmpxchg {
+                    if inst.src0 != mach_ir.VREG_NONE {
+                        mf.set_vreg_hint_phys(inst.src0, mach_ir.PHYS_RAX);
+                    }
+                    if inst.dst != mach_ir.VREG_NONE {
+                        mf.set_vreg_hint_phys(inst.dst, mach_ir.PHYS_RAX);
+                    }
                 }
             }
 
             // Record call / clobber sites (in strictly increasing pos order!)
             // Noreturn `Ud2` trap blocks never return to any live path, so their calls never clobber callers.
             if !blk_is_noreturn_trap {
-                let c_gprs = inst_implicit_clobber_gprs(&inst);
+                let c_gprs = inst_implicit_clobber_gprs(&mf.reg_file, &inst);
                 let c_xmms = inst.clobber_xmms;
                 let is_vzu_site = inst.op == .CallSym || inst.op == .CallReg || inst.op == .VZeroUpper
                     || inst.op == .InlineAsmRaw || inst.op == .RawBytes;
-                if c_gprs != 0_u16 || c_xmms != 0_u16 || is_vzu_site {
+                if c_gprs != 0_u32 || c_xmms != 0_u32 || is_vzu_site {
                     try call_sites.push(alloc, CallSite.{
                         pos: pos,
                         bb: bb,
@@ -1440,7 +1446,7 @@ fn finalize_fixed_and_ipra_clobbers(
         let iv_copy = ivs[vi];
         if iv_copy.has_range {
             let vinfo = vregs[vi];
-            if vinfo.fixed_phys < 16_u8 {
+            if vinfo.fixed_phys < 32_u8 {
                 ivs[vi].weight = 0xFFFFFFFFFFFFFFFF_u64;
                 try fixed_ranges.push(alloc, FixedRange.{
                     start: iv_copy.start,
@@ -1450,8 +1456,8 @@ fn finalize_fixed_and_ipra_clobbers(
                     ignore_vreg: vi.trunc.[u32](),
                 });
             }
-            var cg: u16 = 0_u16;
-            var cx: u16 = 0_u16;
+            var cg: u32 = 0_u32;
+            var cx: u32 = 0_u32;
             var any_call = false;
             if use_exact_live && iv_copy.end > iv_copy.start {
                 var lo: usize = 0_usize;
@@ -1488,8 +1494,8 @@ fn finalize_fixed_and_ipra_clobbers(
             ivs[vi].crosses_clobber_gprs = cg;
             // Soundness: x64 emitter emits `vzeroupper` before real calls in YMM functions,
             // zeroing bits 128..255 of ALL YMM0..YMM15 even when IPRA says callee is scalar!
-            if vinfo.cls == .Vec256 {
-                ivs[vi].crosses_clobber_xmms = if any_call { 0xFFFF_u16 } else { cx };
+            if vinfo.cls == .Vec256 && mf.reg_file.gpr_count == 16_u8 {
+                ivs[vi].crosses_clobber_xmms = if any_call { 0xFFFFFFFF_u32 } else { cx };
             } else {
                 ivs[vi].crosses_clobber_xmms = cx;
             }
@@ -1526,18 +1532,20 @@ fn alloc_spill_for_vreg(mf: *mut mach_ir.MachFunc, v: u32) {
 }
 
 fn pick_best_free_reg(
-    free_mask: u16,
+    rf: *target.TargetRegFile,
+    free_mask: u32,
     is_vec: bool,
     hint_phys: u8,
     hint_vreg: u32,
     vregs: *[mach_ir.VRegInfo],
-    used_callee_so_far: u16,
+    used_callee_so_far: u32,
 ) -> u8 {
-    if free_mask == 0_u16 {
+    if free_mask == 0_u32 {
         return mach_ir.PHYS_NONE;
     }
+    let reg_lim: u8 = if is_vec { rf.vec_count } else { rf.gpr_count };
     // 1. Direct physical coalescing hint
-    if hint_phys < 16_u8 && (free_mask & mach_ir.phys_bit(hint_phys)) != 0_u16 {
+    if hint_phys < reg_lim && (free_mask & mach_ir.phys_bit(hint_phys)) != 0_u32 {
         return hint_phys;
     }
     // 2. Coalescing hint from paired vreg (assigned phys or transitive hint_phys)
@@ -1545,21 +1553,43 @@ fn pick_best_free_reg(
         let hv = hint_vreg.widen.[usize]();
         if hv < vregs.len {
             let hp = vregs[hv].assigned_phys;
-            if hp < 16_u8 && (free_mask & mach_ir.phys_bit(hp)) != 0_u16 {
+            if hp < reg_lim && (free_mask & mach_ir.phys_bit(hp)) != 0_u32 {
                 return hp;
             }
             let hhp = vregs[hv].hint_phys;
-            if hhp < 16_u8 && (free_mask & mach_ir.phys_bit(hhp)) != 0_u16 {
+            if hhp < reg_lim && (free_mask & mach_ir.phys_bit(hhp)) != 0_u32 {
                 return hhp;
             }
         }
     }
 
     if is_vec {
+        let vc = rf.alloc_vec_count.widen.[usize]();
+        // (a) Caller-saved vecs first
         var i: usize = 0_usize;
-        while i < mach_ir.ALLOC_VEC_COUNT {
-            let r = mach_ir.alloc_vec_order(i);
-            if r < 16_u8 && (free_mask & mach_ir.phys_bit(r)) != 0_u16 {
+        while i < vc {
+            let r = rf.alloc_vec_at(i);
+            let bit = mach_ir.phys_bit(r);
+            if r < reg_lim && (free_mask & bit) != 0_u32 && !rf.is_callee_saved_vec(r) {
+                return r;
+            }
+            i = i +% 1_usize;
+        }
+        // (b) Already-dirtied callee-saved vecs
+        i = 0_usize;
+        while i < vc {
+            let r = rf.alloc_vec_at(i);
+            let bit = mach_ir.phys_bit(r);
+            if r < reg_lim && (free_mask & bit) != 0_u32 && (used_callee_so_far & bit) != 0_u32 {
+                return r;
+            }
+            i = i +% 1_usize;
+        }
+        // (c) Fresh callee-saved vecs
+        i = 0_usize;
+        while i < vc {
+            let r = rf.alloc_vec_at(i);
+            if r < reg_lim && (free_mask & mach_ir.phys_bit(r)) != 0_u32 {
                 return r;
             }
             i = i +% 1_usize;
@@ -1567,31 +1597,32 @@ fn pick_best_free_reg(
         return mach_ir.PHYS_NONE;
     }
 
+    let gc = rf.alloc_gpr_count.widen.[usize]();
     // GPR preference:
     // (a) Caller-saved GPRs first (zero prologue save/restore cost)
     var i: usize = 0_usize;
-    while i < 7_usize {
-        let r = mach_ir.alloc_gpr_order(i);
-        if r < 16_u8 && (free_mask & mach_ir.phys_bit(r)) != 0_u16 {
+    while i < gc {
+        let r = rf.alloc_gpr_at(i);
+        if r < reg_lim && (free_mask & mach_ir.phys_bit(r)) != 0_u32 && !rf.is_callee_saved_gpr(r) {
             return r;
         }
         i = i +% 1_usize;
     }
     // (b) Callee-saved GPRs already dirtied in this function
-    var j: usize = 7_usize;
-    while j < mach_ir.ALLOC_GPR_COUNT {
-        let r = mach_ir.alloc_gpr_order(j);
+    var j: usize = 0_usize;
+    while j < gc {
+        let r = rf.alloc_gpr_at(j);
         let bit = mach_ir.phys_bit(r);
-        if r < 16_u8 && (free_mask & bit) != 0_u16 && (used_callee_so_far & bit) != 0_u16 {
+        if r < reg_lim && (free_mask & bit) != 0_u32 && (used_callee_so_far & bit) != 0_u32 {
             return r;
         }
         j = j +% 1_usize;
     }
     // (c) Fresh callee-saved GPRs
-    j = 7_usize;
-    while j < mach_ir.ALLOC_GPR_COUNT {
-        let r = mach_ir.alloc_gpr_order(j);
-        if r < 16_u8 && (free_mask & mach_ir.phys_bit(r)) != 0_u16 {
+    j = 0_usize;
+    while j < gc {
+        let r = rf.alloc_gpr_at(j);
+        if r < reg_lim && (free_mask & mach_ir.phys_bit(r)) != 0_u32 {
             return r;
         }
         j = j +% 1_usize;
@@ -1607,14 +1638,16 @@ fn scan_register_class(
     is_vec: bool,
 ) -> bool {
     var had_spill = false;
-    let allowed_mask: u16 = if is_vec {
-        mach_ir.ALLOC_XMMS_MASK
+    let reg_lim_u8: u8 = if is_vec { mf.reg_file.vec_count } else { mf.reg_file.gpr_count };
+    let reg_lim: usize = if reg_lim_u8 <= 32_u8 { reg_lim_u8.widen.[usize]() } else { 32_usize };
+    let allowed_mask: u32 = if is_vec {
+        mf.reg_file.alloc_vecs
     } else {
-        mach_ir.ALLOC_GPRS_ALL_MASK
+        mf.reg_file.alloc_gprs_all
     };
 
-    var phys_owner: [16]u32 = [mach_ir.VREG_NONE; 16];
-    var used_callee_so_far: u16 = 0_u16;
+    var phys_owner: [32]u32 = [mach_ir.VREG_NONE; 32];
+    var used_callee_so_far: u32 = 0_u32;
     var fr_first: usize = 0_usize;
 
     var oi: usize = 0_usize;
@@ -1631,7 +1664,7 @@ fn scan_register_class(
 
         // 1. Expire old active intervals whose end <= cur.start
         var r: usize = 0_usize;
-        while r < 16_usize {
+        while r < reg_lim {
             let ov = phys_owner[r];
             if ov != mach_ir.VREG_NONE {
                 let oidx = ov.widen.[usize]();
@@ -1644,18 +1677,11 @@ fn scan_register_class(
 
         // Advance lower bound on fixed_ranges (sorted by start)
         while fr_first < fixed_ranges.len && fixed_ranges[fr_first].end <= cur.start {
-            // Note: fixed_ranges is sorted by start, not end, so only advance when
-            // fixed_ranges[fr_first].end <= cur.start AND no later range with smaller end was skipped.
-            // To be 100% sound even with nested fixed ranges, only advance if start < cur.start and end <= cur.start
-            // wait: a later fixed range could start before cur.end! So just scan from fr_first while start < cur.end,
-            // and only advance fr_first past ranges that cannot overlap ANY future interval (cur.start is monotonic!).
-            // Since future intervals all have future.start >= cur.start >= fixed_ranges[fr_first].end,
-            // fixed_ranges[fr_first] can NEVER overlap cur OR any future interval! 100% sound!
             fr_first = fr_first +% 1_usize;
         }
 
         // 2. Handle hard-pinned fixed physical vreg first
-        if vinfo.fixed_phys < 16_u8 {
+        if vinfo.fixed_phys < reg_lim_u8 && vinfo.fixed_phys < 32_u8 {
             let fp = vinfo.fixed_phys;
             let fp_idx = fp.widen.[usize]();
             let prev = phys_owner[fp_idx];
@@ -1668,7 +1694,11 @@ fn scan_register_class(
             if vidx < vs.len {
                 vs[vidx].assigned_phys = fp;
             }
-            if !is_vec && mach_ir.is_callee_saved_gpr(fp) {
+            if is_vec {
+                if mf.reg_file.is_callee_saved_vec(fp) {
+                    used_callee_so_far = used_callee_so_far | mach_ir.phys_bit(fp);
+                }
+            } else if mf.reg_file.is_callee_saved_gpr(fp) {
                 used_callee_so_far = used_callee_so_far | mach_ir.phys_bit(fp);
             }
             oi = oi +% 1_usize;
@@ -1676,7 +1706,7 @@ fn scan_register_class(
         }
 
         // 3. Compute forbidden mask = disallowed | IPRA clobbers | overlapping fixed ranges
-        var forbidden: u16 = ~allowed_mask;
+        var forbidden: u32 = ~allowed_mask;
         if is_vec {
             forbidden = forbidden | cur.crosses_clobber_xmms;
         } else {
@@ -1695,17 +1725,18 @@ fn scan_register_class(
         }
 
         // 4. Build free_mask of currently unoccupied & non-forbidden registers
-        var free_mask: u16 = 0_u16;
+        var free_mask: u32 = 0_u32;
         r = 0_usize;
-        while r < 16_usize {
+        while r < reg_lim {
             let bit = mach_ir.phys_bit(r.trunc.[u8]());
-            if (forbidden & bit) == 0_u16 && phys_owner[r] == mach_ir.VREG_NONE {
+            if (forbidden & bit) == 0_u32 && phys_owner[r] == mach_ir.VREG_NONE {
                 free_mask = free_mask | bit;
             }
             r = r +% 1_usize;
         }
 
         let chosen = pick_best_free_reg(
+            &mf.reg_file,
             free_mask,
             is_vec,
             vinfo.hint_phys,
@@ -1713,14 +1744,18 @@ fn scan_register_class(
             mf.vregs.as_slice(),
             used_callee_so_far,
         );
-        if chosen < 16_u8 {
+        if chosen < reg_lim_u8 && chosen < 32_u8 {
             let cidx = chosen.widen.[usize]();
             phys_owner[cidx] = v;
             let vs = mf.vregs.as_mut_slice();
             if vidx < vs.len {
                 vs[vidx].assigned_phys = chosen;
             }
-            if !is_vec && mach_ir.is_callee_saved_gpr(chosen) {
+            if is_vec {
+                if mf.reg_file.is_callee_saved_vec(chosen) {
+                    used_callee_so_far = used_callee_so_far | mach_ir.phys_bit(chosen);
+                }
+            } else if mf.reg_file.is_callee_saved_gpr(chosen) {
                 used_callee_so_far = used_callee_so_far | mach_ir.phys_bit(chosen);
             }
             oi = oi +% 1_usize;
@@ -1733,9 +1768,9 @@ fn scan_register_class(
         var victim_end: u32 = 0_u32;
         let vs_ro = mf.vregs.as_slice();
         r = 0_usize;
-        while r < 16_usize {
+        while r < reg_lim {
             let bit = mach_ir.phys_bit(r.trunc.[u8]());
-            if (forbidden & bit) == 0_u16 && phys_owner[r] != mach_ir.VREG_NONE {
+            if (forbidden & bit) == 0_u32 && phys_owner[r] != mach_ir.VREG_NONE {
                 let ov = phys_owner[r];
                 let oidx = ov.widen.[usize]();
                 if oidx < intervals.len && oidx < vs_ro.len && vs_ro[oidx].fixed_phys == mach_ir.PHYS_NONE {
@@ -1759,11 +1794,11 @@ fn scan_register_class(
             r = r +% 1_usize;
         }
 
-        let should_evict = victim_r < 16_u8
+        let should_evict = victim_r < reg_lim_u8
             && (cur.weight > victim_w || (cur.weight == victim_w && victim_end > cur.end));
         if should_evict {
             let vr_idx = victim_r.widen.[usize]();
-            if vr_idx < 16_usize {
+            if vr_idx < 32_usize {
                 let old_v = phys_owner[vr_idx];
                 alloc_spill_for_vreg(mf, old_v);
                 had_spill = true;
@@ -1772,7 +1807,11 @@ fn scan_register_class(
                 if vidx < vs.len {
                     vs[vidx].assigned_phys = victim_r;
                 }
-                if !is_vec && mach_ir.is_callee_saved_gpr(victim_r) {
+                if is_vec {
+                    if mf.reg_file.is_callee_saved_vec(victim_r) {
+                        used_callee_so_far = used_callee_so_far | mach_ir.phys_bit(victim_r);
+                    }
+                } else if mf.reg_file.is_callee_saved_gpr(victim_r) {
                     used_callee_so_far = used_callee_so_far | mach_ir.phys_bit(victim_r);
                 }
             }
@@ -1845,6 +1884,7 @@ fn emit_reg_move(
 
 fn emit_single_phys_move(
     alloc: *mut AllocCap,
+    rf: *target.TargetRegFile,
     out: *mut col.DynBuf[mach_ir.MachInst],
     m: PhysMove,
     sp: span.Span,
@@ -1856,11 +1896,11 @@ fn emit_single_phys_move(
     } else if m.dst_is_mem && !m.src_is_mem {
         try emit_store_spill(alloc, out, m.dst_off, m.src_phys, m.cls, sp);
     } else if m.dst_off != m.src_off {
-        // Mem <- Mem uses SCRATCH1 (R11 / Xmm15) so it never collides with SCRATCH0 cycle-breaker!
+        // Mem <- Mem uses SCRATCH1 so it never collides with SCRATCH0 cycle-breaker!
         let tmp = if mach_ir.reg_class_is_vec(m.cls) {
-            mach_ir.SCRATCH_VEC1
+            rf.scratch_vec1
         } else {
-            mach_ir.SCRATCH_GPR1
+            rf.scratch_gpr1
         };
         try emit_load_spill(alloc, out, tmp, m.src_off, m.cls, sp);
         try emit_store_spill(alloc, out, m.dst_off, tmp, m.cls, sp);
@@ -1892,6 +1932,7 @@ fn move_src_eq(a: PhysMove, b: PhysMove) -> bool {
 
 fn emit_parallel_moves(
     alloc: *mut AllocCap,
+    rf: *target.TargetRegFile,
     out: *mut col.DynBuf[mach_ir.MachInst],
     moves: *mut col.DynBuf[PhysMove],
     sp: span.Span,
@@ -1948,18 +1989,18 @@ fn emit_parallel_moves(
         let ms_act = moves.as_slice();
         if ready_idx < ms_act.len {
             let mv = ms_act[ready_idx];
-            try emit_single_phys_move(alloc, out, mv, sp);
+            try emit_single_phys_move(alloc, rf, out, mv, sp);
             let ms = moves.as_mut_slice();
             if ready_idx < ms.len {
                 ms[ready_idx].done = true;
             }
         } else if first_undone < ms_act.len {
-            // Break cycle using SCRATCH0 (R10 / Xmm14)
+            // Break cycle using SCRATCH0
             let pivot = ms_act[first_undone];
             let tmp = if mach_ir.reg_class_is_vec(pivot.cls) {
-                mach_ir.SCRATCH_VEC0
+                rf.scratch_vec0
             } else {
-                mach_ir.SCRATCH_GPR0
+                rf.scratch_gpr0
             };
             if pivot.src_is_mem {
                 try emit_load_spill(alloc, out, tmp, pivot.src_off, pivot.cls, sp);
@@ -2019,7 +2060,7 @@ fn resolve_vreg_loc(
     fallback_cls: mach_ir.RegClass,
 ) -> ResolvedLoc {
     if v == mach_ir.VREG_NONE {
-        if existing_phys < 16_u8 {
+        if existing_phys < 32_u8 {
             return ResolvedLoc.{
                 present: true,
                 spilled: false,
@@ -2051,7 +2092,7 @@ fn resolve_vreg_loc(
     let vs = mf.vregs.as_slice();
     if idx < vs.len {
         let vi = vs[idx];
-        if vi.assigned_phys < 16_u8 {
+        if vi.assigned_phys < 32_u8 {
             return ResolvedLoc.{
                 present: true,
                 spilled: false,
@@ -2071,9 +2112,9 @@ fn resolve_vreg_loc(
         }
         // Unallocated dead vreg fallback
         let fb = if mach_ir.reg_class_is_vec(vi.cls) {
-            mach_ir.SCRATCH_VEC0
+            mf.reg_file.scratch_vec0
         } else {
-            mach_ir.SCRATCH_GPR0
+            mf.reg_file.scratch_gpr0
         };
         return ResolvedLoc.{
             present: true,
@@ -2109,7 +2150,7 @@ fn note_seg_spilled_access(
         return;
     }
     let vi = vs[idx];
-    if vi.assigned_phys < 16_u8 || vi.spill_off >= 0_i32 || vi.fixed_phys < 16_u8 {
+    if vi.assigned_phys < 32_u8 || vi.spill_off >= 0_i32 || vi.fixed_phys < 32_u8 {
         return;
     }
     let cs = cands.as_mut_slice();
@@ -2212,15 +2253,15 @@ fn plan_segment_promotions(
     let seg_hi = blk_start_pos +% 2_u32 +% ((seg_end - 1_usize).trunc.[u32]() *% 2_u32) +% 1_u32;
 
     // Compute busy register masks across [seg_lo, seg_hi]
-    var busy_gprs: u16 = ~mach_ir.ALLOC_GPRS_ALL_MASK;
-    var busy_xmms: u16 = ~mach_ir.ALLOC_XMMS_MASK;
+    var busy_gprs: u32 = ~mf.reg_file.alloc_gprs_all;
+    var busy_xmms: u32 = ~mf.reg_file.alloc_vecs;
 
     let vs = mf.vregs.as_slice();
     var vi: usize = 0_usize;
     while vi < intervals.len && vi < vs.len {
         let iv = intervals[vi];
         let ap = vs[vi].assigned_phys;
-        if iv.has_range && ap < 16_u8 && iv.start <= seg_hi && seg_lo <= iv.end {
+        if iv.has_range && ap < 32_u8 && iv.start <= seg_hi && seg_lo <= iv.end {
             if mach_ir.reg_class_is_vec(iv.cls) {
                 busy_xmms = busy_xmms | mach_ir.phys_bit(ap);
             } else {
@@ -2257,29 +2298,29 @@ fn plan_segment_promotions(
     k = seg_start;
     while k < seg_end && k < insts.len {
         let inst = insts[k];
-        if inst.dst == mach_ir.VREG_NONE && inst.dst_phys < 16_u8 {
+        if inst.dst == mach_ir.VREG_NONE && inst.dst_phys < 32_u8 {
             if mach_ir.op_dst_is_vec(inst.op) {
                 busy_xmms = busy_xmms | mach_ir.phys_bit(inst.dst_phys);
             } else {
                 busy_gprs = busy_gprs | mach_ir.phys_bit(inst.dst_phys);
             }
         }
-        if inst.src0 == mach_ir.VREG_NONE && inst.src0_phys < 16_u8 {
+        if inst.src0 == mach_ir.VREG_NONE && inst.src0_phys < 32_u8 {
             busy_gprs = busy_gprs | mach_ir.phys_bit(inst.src0_phys);
             busy_xmms = busy_xmms | mach_ir.phys_bit(inst.src0_phys);
         }
-        if inst.src1 == mach_ir.VREG_NONE && inst.src1_phys < 16_u8 {
+        if inst.src1 == mach_ir.VREG_NONE && inst.src1_phys < 32_u8 {
             busy_gprs = busy_gprs | mach_ir.phys_bit(inst.src1_phys);
             busy_xmms = busy_xmms | mach_ir.phys_bit(inst.src1_phys);
         }
-        if inst.src2 == mach_ir.VREG_NONE && inst.src2_phys < 16_u8 {
+        if inst.src2 == mach_ir.VREG_NONE && inst.src2_phys < 32_u8 {
             busy_gprs = busy_gprs | mach_ir.phys_bit(inst.src2_phys);
             busy_xmms = busy_xmms | mach_ir.phys_bit(inst.src2_phys);
         }
-        if inst.mem.base == mach_ir.VREG_NONE && inst.mem.base_phys < 16_u8 {
+        if inst.mem.base == mach_ir.VREG_NONE && inst.mem.base_phys < 32_u8 {
             busy_gprs = busy_gprs | mach_ir.phys_bit(inst.mem.base_phys);
         }
-        if inst.mem.idx == mach_ir.VREG_NONE && inst.mem.idx_phys < 16_u8 {
+        if inst.mem.idx == mach_ir.VREG_NONE && inst.mem.idx_phys < 32_u8 {
             busy_gprs = busy_gprs | mach_ir.phys_bit(inst.mem.idx_phys);
         }
         k = k +% 1_usize;
@@ -2316,13 +2357,14 @@ fn plan_segment_promotions(
         }
         var cand = cs_pick[best_idx];
         let is_vec = mach_ir.reg_class_is_vec(cand.cls);
-        let free_mask: u16 = if is_vec { ~busy_xmms } else { ~busy_gprs };
+        let free_mask: u32 = if is_vec { ~busy_xmms } else { ~busy_gprs };
         var chosen: u8 = mach_ir.PHYS_NONE;
         if is_vec {
+            let vc = mf.reg_file.alloc_vec_count.widen.[usize]();
             var r: usize = 0_usize;
-            while r < mach_ir.ALLOC_VEC_COUNT {
-                let pr = mach_ir.alloc_vec_order(r);
-                if pr < 16_u8 && (free_mask & mach_ir.phys_bit(pr)) != 0_u16 {
+            while r < vc {
+                let pr = mf.reg_file.alloc_vec_at(r);
+                if pr < mf.reg_file.vec_count && !mf.reg_file.is_callee_saved_vec(pr) && (free_mask & mach_ir.phys_bit(pr)) != 0_u32 {
                     chosen = pr;
                     break;
                 }
@@ -2330,10 +2372,11 @@ fn plan_segment_promotions(
             }
         } else {
             // Prefer caller-saved GPRs so local splitting never forces extra callee-saved push/pop
+            let gc = mf.reg_file.alloc_gpr_count.widen.[usize]();
             var r: usize = 0_usize;
-            while r < 7_usize {
-                let pr = mach_ir.alloc_gpr_order(r);
-                if pr < 16_u8 && (free_mask & mach_ir.phys_bit(pr)) != 0_u16 {
+            while r < gc {
+                let pr = mf.reg_file.alloc_gpr_at(r);
+                if pr < mf.reg_file.gpr_count && !mf.reg_file.is_callee_saved_gpr(pr) && (free_mask & mach_ir.phys_bit(pr)) != 0_u32 {
                     chosen = pr;
                     break;
                 }
@@ -2346,7 +2389,7 @@ fn plan_segment_promotions(
         if best_idx < cm.len {
             cm[best_idx].accesses = 0_u32;
         }
-        if chosen < 16_u8 {
+        if chosen < 32_u8 {
             if is_vec {
                 busy_xmms = busy_xmms | mach_ir.phys_bit(chosen);
             } else {
@@ -2370,26 +2413,29 @@ fn plan_segment_promotions(
     return;
 }
 
-fn pick_emergency_reg(is_vec: bool, avoid_mask: u16) -> u8 {
+fn pick_emergency_reg(rf: *target.TargetRegFile, is_vec: bool, avoid_mask: u32) -> u8 {
     if is_vec {
-        var r: u8 = 0_u8;
-        while r < 14_u8 {
-            if (avoid_mask & mach_ir.phys_bit(r)) == 0_u16 {
+        let vc = rf.alloc_vec_count.widen.[usize]();
+        var i: usize = 0_usize;
+        while i < vc {
+            let r = rf.alloc_vec_at(i);
+            if r < rf.vec_count && (avoid_mask & mach_ir.phys_bit(r)) == 0_u32 {
                 return r;
             }
-            r = r +% 1_u8;
+            i = i +% 1_usize;
         }
-        return 0_u8;
+        return rf.alloc_vec_at(0_usize);
     }
+    let gc = rf.alloc_gpr_count.widen.[usize]();
     var i: usize = 0_usize;
-    while i < 11_usize {
-        let r = mach_ir.alloc_gpr_order(i);
-        if r < 16_u8 && (avoid_mask & mach_ir.phys_bit(r)) == 0_u16 {
+    while i < gc {
+        let r = rf.alloc_gpr_at(i);
+        if r < rf.gpr_count && r != rf.err_reg_gpr && (avoid_mask & mach_ir.phys_bit(r)) == 0_u32 {
             return r;
         }
         i = i +% 1_usize;
     }
-    return mach_ir.PHYS_RAX;
+    return rf.alloc_gpr_at(0_usize);
 }
 
 struct EmergencySlots {
@@ -2404,26 +2450,26 @@ fn acquire_reload_reg(
     st: *mut ScratchTracker,
     v: u32,
     loc: ResolvedLoc,
-    avoid_gprs: u16,
-    avoid_xmms: u16,
+    avoid_gprs: u32,
+    avoid_xmms: u32,
     em_slots: *mut EmergencySlots,
     sp: span.Span,
 ) -> u8 ! OutOfMemory {
     let existing = scratch_find_reloaded(st, v);
-    if existing < 16_u8 {
+    if existing < 32_u8 {
         return existing;
     }
     let is_vec = mach_ir.reg_class_is_vec(loc.cls);
     var reg: u8 = mach_ir.PHYS_NONE;
     if is_vec {
         if st.vec_used == 0_u8 {
-            reg = mach_ir.SCRATCH_VEC0;
+            reg = mf.reg_file.scratch_vec0;
             st.vec_used = 1_u8;
         } else if st.vec_used == 1_u8 {
-            reg = mach_ir.SCRATCH_VEC1;
+            reg = mf.reg_file.scratch_vec1;
             st.vec_used = 2_u8;
         } else {
-            let em = pick_emergency_reg(true, avoid_xmms);
+            let em = pick_emergency_reg(&mf.reg_file, true, avoid_xmms);
             if em_slots.vec_off == 0_i32 {
                 em_slots.vec_off = mf.alloc_stack_slot(32_usize, 16_usize);
             }
@@ -2435,13 +2481,13 @@ fn acquire_reload_reg(
         }
     } else {
         if st.gpr_used == 0_u8 {
-            reg = mach_ir.SCRATCH_GPR0;
+            reg = mf.reg_file.scratch_gpr0;
             st.gpr_used = 1_u8;
         } else if st.gpr_used == 1_u8 {
-            reg = mach_ir.SCRATCH_GPR1;
+            reg = mf.reg_file.scratch_gpr1;
             st.gpr_used = 2_u8;
         } else {
-            let em = pick_emergency_reg(false, avoid_gprs);
+            let em = pick_emergency_reg(&mf.reg_file, false, avoid_gprs);
             if em_slots.gpr_off == 0_i32 {
                 em_slots.gpr_off = mf.alloc_stack_slot(8_usize, 8_usize);
             }
@@ -2458,6 +2504,7 @@ fn acquire_reload_reg(
 
 fn emit_div_post_moves(
     alloc: *mut AllocCap,
+    rf: *target.TargetRegFile,
     out: *mut col.DynBuf[mach_ir.MachInst],
     dst_loc: ResolvedLoc,
     dst2_loc: ResolvedLoc,
@@ -2489,7 +2536,7 @@ fn emit_div_post_moves(
             done: false,
         });
     }
-    try emit_parallel_moves(alloc, out, &mut pm, sp);
+    try emit_parallel_moves(alloc, rf, out, &mut pm, sp);
     pm.destroy(alloc);
     return;
 }
@@ -2513,7 +2560,7 @@ fn rewrite_regular_inst(
     };
 
     let has_dst = mach_ir.op_has_dst(inst.op)
-        && (inst.dst != mach_ir.VREG_NONE || inst.dst_phys < 16_u8);
+        && (inst.dst != mach_ir.VREG_NONE || inst.dst_phys < 32_u8);
     let dst_loc = if has_dst {
         resolve_vreg_loc(mf, inst.dst, inst.dst_phys, promos, dst_cls)
     } else {
@@ -2534,6 +2581,12 @@ fn rewrite_regular_inst(
         ResolvedLoc.{ present: false, spilled: false, phys: inst.mem.idx_phys, spill_off: 0_i32, cls: .Gpr }
     };
 
+    let is_x64_isa = mf.reg_file.gpr_count == 16_u8;
+    let sc_gpr0 = mf.reg_file.scratch_gpr0;
+    let sc_gpr1 = mf.reg_file.scratch_gpr1;
+    let sc_vec0 = mf.reg_file.scratch_vec0;
+    let sc_vec1 = mf.reg_file.scratch_vec1;
+
     // Fast path: coalescable Copy lowers straight to 0/1/2 move instructions
     if inst.op == .Copy {
         if dst_loc.present && src0_loc.present {
@@ -2547,19 +2600,19 @@ fn rewrite_regular_inst(
                 cls: dst_loc.cls,
                 done: false,
             };
-            try emit_single_phys_move(alloc, out, mv, sp);
+            try emit_single_phys_move(alloc, &mf.reg_file, out, mv, sp);
         }
         return;
     }
 
-    // Fold spilled src2 directly into hardware FMA memory operand when possible!
-    if (inst.op == .VFmadd231PS || inst.op == .VFmadd231PD) && src2_loc.present && src2_loc.spilled {
+    // Fold spilled operands into x86_64 CISC memory-operand forms when targeting x86_64
+    if is_x64_isa && (inst.op == .VFmadd231PS || inst.op == .VFmadd231PD) && src2_loc.present && src2_loc.spilled {
         inst.op = if inst.op == .VFmadd231PS { .VFmadd231PSMem } else { .VFmadd231PDMem };
         inst.mem = mach_ir.mem_stack_slot(src2_loc.spill_off);
         inst.src2 = mach_ir.VREG_NONE;
         inst.src2_phys = mach_ir.PHYS_NONE;
         src2_loc = ResolvedLoc.{ present: false, spilled: false, phys: mach_ir.PHYS_NONE, spill_off: 0_i32, cls: src2_loc.cls };
-    } else if inst.op == .Cmp && src0_loc.present && src1_loc.present {
+    } else if is_x64_isa && inst.op == .Cmp && src0_loc.present && src1_loc.present {
         // Fold spilled GPR operand directly into `cmp reg, [rbp-off]` / `cmp [rbp-off], reg`!
         if !src0_loc.spilled && src1_loc.spilled {
             inst.op = .CmpMem;
@@ -2576,7 +2629,7 @@ fn rewrite_regular_inst(
             inst.src0_phys = mach_ir.PHYS_NONE;
             src0_loc = ResolvedLoc.{ present: false, spilled: false, phys: mach_ir.PHYS_NONE, spill_off: 0_i32, cls: .Gpr };
         }
-    } else if (inst.op == .Add || inst.op == .Sub || inst.op == .Mul
+    } else if is_x64_isa && (inst.op == .Add || inst.op == .Sub || inst.op == .Mul
         || inst.op == .And || inst.op == .Or || inst.op == .Xor)
         && dst_loc.present && !dst_loc.spilled && src0_loc.present && src1_loc.present
     {
@@ -2610,8 +2663,8 @@ fn rewrite_regular_inst(
     }
 
     // Build avoid masks of non-spilled registers touched by this instruction
-    var avoid_gprs: u16 = 0_u16;
-    var avoid_xmms: u16 = 0_u16;
+    var avoid_gprs: u32 = 0_u32;
+    var avoid_xmms: u32 = 0_u32;
     if dst_loc.present && !dst_loc.spilled {
         if mach_ir.reg_class_is_vec(dst_loc.cls) {
             avoid_xmms = avoid_xmms | mach_ir.phys_bit(dst_loc.phys);
@@ -2663,25 +2716,25 @@ fn rewrite_regular_inst(
         }
         if gpr_spills >= 3_u8 {
             let b_r = if base_loc.spilled {
-                try emit_load_spill(alloc, out, mach_ir.SCRATCH_GPR0, base_loc.spill_off, .Gpr, sp);
-                mach_ir.SCRATCH_GPR0
+                try emit_load_spill(alloc, out, sc_gpr0, base_loc.spill_off, .Gpr, sp);
+                sc_gpr0
             } else {
                 base_loc.phys
             };
             let i_r = if idx_loc.spilled {
                 if inst.mem.idx == inst.mem.base && base_loc.spilled {
-                    mach_ir.SCRATCH_GPR0
+                    sc_gpr0
                 } else {
-                    try emit_load_spill(alloc, out, mach_ir.SCRATCH_GPR1, idx_loc.spill_off, .Gpr, sp);
-                    mach_ir.SCRATCH_GPR1
+                    try emit_load_spill(alloc, out, sc_gpr1, idx_loc.spill_off, .Gpr, sp);
+                    sc_gpr1
                 }
             } else {
                 idx_loc.phys
             };
             let lea_mem = mach_ir.mem_sib_phys(b_r, i_r, inst.mem.scale, inst.mem.disp);
-            try out.push(alloc, mach_ir.inst_lea_phys(mach_ir.SCRATCH_GPR0, lea_mem, sp));
-            inst.mem = mach_ir.mem_phys_disp(mach_ir.SCRATCH_GPR0, 0_i32);
-            st.gpr_used = 1_u8; // R10 holds computed address, R11 is completely free!
+            try out.push(alloc, mach_ir.inst_lea_phys(sc_gpr0, lea_mem, sp));
+            inst.mem = mach_ir.mem_phys_disp(sc_gpr0, 0_i32);
+            st.gpr_used = 1_u8; // sc_gpr0 holds computed address, sc_gpr1 is completely free!
             sib_precomputed = true;
         }
     }
@@ -2746,11 +2799,11 @@ fn rewrite_regular_inst(
         }
     }
 
-    // Special Case 1: Div / Idiv / Div32 / Idiv32 / Mul128 / Imul128 (RAX:RDX implicit)
-    if mach_ir.op_is_div_or_mul128(inst.op) {
+    // Special Case 1: x86_64 Div / Idiv / Div32 / Idiv32 / Mul128 / Imul128 (RAX:RDX implicit)
+    if is_x64_isa && mach_ir.op_is_div_or_mul128(inst.op) {
         if src1_loc.present && (inst.src1_phys == mach_ir.PHYS_RAX || inst.src1_phys == mach_ir.PHYS_RDX) {
-            try emit_reg_move(alloc, out, mach_ir.SCRATCH_GPR1, inst.src1_phys, .Gpr, sp);
-            inst.src1_phys = mach_ir.SCRATCH_GPR1;
+            try emit_reg_move(alloc, out, sc_gpr1, inst.src1_phys, .Gpr, sp);
+            inst.src1_phys = sc_gpr1;
         }
         if src0_loc.present && inst.src0_phys != mach_ir.PHYS_RAX {
             try emit_reg_move(alloc, out, mach_ir.PHYS_RAX, inst.src0_phys, .Gpr, sp);
@@ -2761,7 +2814,7 @@ fn rewrite_regular_inst(
         try out.push(alloc, inst);
 
         // Route RAX -> dst_loc and RDX -> dst2_loc safely in parallel
-        try emit_div_post_moves(alloc, out, dst_loc, dst2_loc, sp);
+        try emit_div_post_moves(alloc, &mf.reg_file, out, dst_loc, dst2_loc, sp);
 
         if st.em_gpr_active {
             try emit_load_spill(alloc, out, st.em_gpr_phys, em_slots.gpr_off, .Gpr, sp);
@@ -2783,16 +2836,16 @@ fn rewrite_regular_inst(
             let is_vec_dst = mach_ir.reg_class_is_vec(dst_loc.cls);
             if is_vec_dst {
                 // Pick scratch vec not colliding with src1/src2 if tied_src0
-                if inst.tied_src0 && (inst.src1_phys == mach_ir.SCRATCH_VEC0 || inst.src2_phys == mach_ir.SCRATCH_VEC0) {
-                    inst.dst_phys = mach_ir.SCRATCH_VEC1;
+                if inst.tied_src0 && (inst.src1_phys == sc_vec0 || inst.src2_phys == sc_vec0) {
+                    inst.dst_phys = sc_vec1;
                 } else {
-                    inst.dst_phys = mach_ir.SCRATCH_VEC0;
+                    inst.dst_phys = sc_vec0;
                 }
             } else {
-                if inst.tied_src0 && inst.src1_phys == mach_ir.SCRATCH_GPR0 {
-                    inst.dst_phys = mach_ir.SCRATCH_GPR1;
+                if inst.tied_src0 && inst.src1_phys == sc_gpr0 {
+                    inst.dst_phys = sc_gpr1;
                 } else {
-                    inst.dst_phys = mach_ir.SCRATCH_GPR0;
+                    inst.dst_phys = sc_gpr0;
                 }
             }
         }
@@ -2801,24 +2854,24 @@ fn rewrite_regular_inst(
         if !dst2_loc.spilled {
             inst.dst2_phys = dst2_loc.phys;
         } else {
-            inst.dst2_phys = mach_ir.SCRATCH_GPR1;
+            inst.dst2_phys = sc_gpr1;
         }
     }
 
-    // Special Case 2: Variable shifts (shift count in RCX/CL!)
+    // Special Case 2: x86_64 Variable shifts (shift count in RCX/CL!)
     var post_shift_move_dst: u8 = mach_ir.PHYS_NONE;
-    if mach_ir.op_is_var_shift(inst.op) && src1_loc.present {
+    if is_x64_isa && mach_ir.op_is_var_shift(inst.op) && src1_loc.present {
         if inst.src1_phys != mach_ir.PHYS_RCX {
             if src0_loc.present && inst.src0_phys == mach_ir.PHYS_RCX {
-                try emit_reg_move(alloc, out, mach_ir.SCRATCH_GPR1, mach_ir.PHYS_RCX, .Gpr, sp);
-                inst.src0_phys = mach_ir.SCRATCH_GPR1;
+                try emit_reg_move(alloc, out, sc_gpr1, mach_ir.PHYS_RCX, .Gpr, sp);
+                inst.src0_phys = sc_gpr1;
             }
             try emit_reg_move(alloc, out, mach_ir.PHYS_RCX, inst.src1_phys, .Gpr, sp);
             inst.src1_phys = mach_ir.PHYS_RCX;
         }
         if dst_loc.present && inst.dst_phys == mach_ir.PHYS_RCX && inst.src0_phys != mach_ir.PHYS_RCX {
             post_shift_move_dst = mach_ir.PHYS_RCX;
-            inst.dst_phys = mach_ir.SCRATCH_GPR0;
+            inst.dst_phys = sc_gpr0;
         }
     }
 
@@ -2828,40 +2881,40 @@ fn rewrite_regular_inst(
         if !is_vec_dst {
             // Protect any other GPR source operand that currently sits in inst.dst_phys!
             if src1_loc.present && !mach_ir.reg_class_is_vec(src1_loc.cls) && inst.src1_phys == inst.dst_phys {
-                let sc = if inst.src0_phys != mach_ir.SCRATCH_GPR0
-                    && inst.mem.base_phys != mach_ir.SCRATCH_GPR0
-                    && inst.mem.idx_phys != mach_ir.SCRATCH_GPR0
+                let sc = if inst.src0_phys != sc_gpr0
+                    && inst.mem.base_phys != sc_gpr0
+                    && inst.mem.idx_phys != sc_gpr0
                 {
-                    mach_ir.SCRATCH_GPR0
+                    sc_gpr0
                 } else {
-                    mach_ir.SCRATCH_GPR1
+                    sc_gpr1
                 };
                 try emit_reg_move(alloc, out, sc, inst.src1_phys, .Gpr, sp);
                 inst.src1_phys = sc;
             }
             if src2_loc.present && !mach_ir.reg_class_is_vec(src2_loc.cls) && inst.src2_phys == inst.dst_phys {
-                let sc = if inst.src0_phys != mach_ir.SCRATCH_GPR0 && inst.src1_phys != mach_ir.SCRATCH_GPR0 {
-                    mach_ir.SCRATCH_GPR0
+                let sc = if inst.src0_phys != sc_gpr0 && inst.src1_phys != sc_gpr0 {
+                    sc_gpr0
                 } else {
-                    mach_ir.SCRATCH_GPR1
+                    sc_gpr1
                 };
                 try emit_reg_move(alloc, out, sc, inst.src2_phys, .Gpr, sp);
                 inst.src2_phys = sc;
             }
             if (inst.mem.kind == .BaseDisp || inst.mem.kind == .Sib) && inst.mem.base_phys == inst.dst_phys {
-                let sc = if inst.src0_phys != mach_ir.SCRATCH_GPR0 && inst.mem.idx_phys != mach_ir.SCRATCH_GPR0 {
-                    mach_ir.SCRATCH_GPR0
+                let sc = if inst.src0_phys != sc_gpr0 && inst.mem.idx_phys != sc_gpr0 {
+                    sc_gpr0
                 } else {
-                    mach_ir.SCRATCH_GPR1
+                    sc_gpr1
                 };
                 try emit_reg_move(alloc, out, sc, inst.mem.base_phys, .Gpr, sp);
                 inst.mem.base_phys = sc;
             }
             if inst.mem.kind == .Sib && inst.mem.idx_phys == inst.dst_phys {
-                let sc = if inst.src0_phys != mach_ir.SCRATCH_GPR0 && inst.mem.base_phys != mach_ir.SCRATCH_GPR0 {
-                    mach_ir.SCRATCH_GPR0
+                let sc = if inst.src0_phys != sc_gpr0 && inst.mem.base_phys != sc_gpr0 {
+                    sc_gpr0
                 } else {
-                    mach_ir.SCRATCH_GPR1
+                    sc_gpr1
                 };
                 try emit_reg_move(alloc, out, sc, inst.mem.idx_phys, .Gpr, sp);
                 inst.mem.idx_phys = sc;
@@ -2871,19 +2924,19 @@ fn rewrite_regular_inst(
         } else {
             // Vector tied_src0 (VFmadd231*, VFnMadd231PS): protect src1/src2 if equal to dst_phys
             if src1_loc.present && mach_ir.reg_class_is_vec(src1_loc.cls) && inst.src1_phys == inst.dst_phys {
-                let sc = if inst.src0_phys != mach_ir.SCRATCH_VEC0 && inst.src2_phys != mach_ir.SCRATCH_VEC0 {
-                    mach_ir.SCRATCH_VEC0
+                let sc = if inst.src0_phys != sc_vec0 && inst.src2_phys != sc_vec0 {
+                    sc_vec0
                 } else {
-                    mach_ir.SCRATCH_VEC1
+                    sc_vec1
                 };
                 try emit_reg_move(alloc, out, sc, inst.src1_phys, dst_loc.cls, sp);
                 inst.src1_phys = sc;
             }
             if src2_loc.present && mach_ir.reg_class_is_vec(src2_loc.cls) && inst.src2_phys == inst.dst_phys {
-                let sc = if inst.src0_phys != mach_ir.SCRATCH_VEC0 && inst.src1_phys != mach_ir.SCRATCH_VEC0 {
-                    mach_ir.SCRATCH_VEC0
+                let sc = if inst.src0_phys != sc_vec0 && inst.src1_phys != sc_vec0 {
+                    sc_vec0
                 } else {
-                    mach_ir.SCRATCH_VEC1
+                    sc_vec1
                 };
                 try emit_reg_move(alloc, out, sc, inst.src2_phys, dst_loc.cls, sp);
                 inst.src2_phys = sc;
@@ -2899,13 +2952,13 @@ fn rewrite_regular_inst(
     try out.push(alloc, inst);
 
     // Post-shift fixup if dst wanted RCX
-    if post_shift_move_dst < 16_u8 {
+    if post_shift_move_dst < 32_u8 {
         try emit_reg_move(alloc, out, post_shift_move_dst, final_dst_phys, .Gpr, sp);
     }
 
     // Emit spill store(s) for spilled destination(s)
     if dst_loc.present && dst_loc.spilled {
-        let src_r = if post_shift_move_dst < 16_u8 { post_shift_move_dst } else { final_dst_phys };
+        let src_r = if post_shift_move_dst < 32_u8 { post_shift_move_dst } else { final_dst_phys };
         try emit_store_spill(alloc, out, dst_loc.spill_off, src_r, dst_loc.cls, sp);
     }
     if dst2_loc.present && dst2_loc.spilled {
@@ -2993,7 +3046,7 @@ fn inst_touches_phys_for_fold(inst: *mach_ir.MachInst, p: u8, is_vec: bool) -> b
         if inst.op == .VZeroUpper {
             return true;
         }
-        if (inst.clobber_xmms & mach_ir.phys_bit(p)) != 0_u16 {
+        if (inst.clobber_xmms & mach_ir.phys_bit(p)) != 0_u32 {
             return true;
         }
         if mach_ir.op_has_dst(inst.op) && mach_ir.op_dst_is_vec(inst.op) && inst.dst_phys == p {
@@ -3004,7 +3057,7 @@ fn inst_touches_phys_for_fold(inst: *mach_ir.MachInst, p: u8, is_vec: bool) -> b
         }
         return false;
     }
-    if (inst.clobber_gprs & mach_ir.phys_bit(p)) != 0_u16 {
+    if (inst.clobber_gprs & mach_ir.phys_bit(p)) != 0_u32 {
         return true;
     }
     if mach_ir.op_is_div_or_mul128(inst.op) && (p == mach_ir.PHYS_RAX || p == mach_ir.PHYS_RDX) {
@@ -3085,13 +3138,14 @@ fn op_supports_pcopy_tied_fold(op: mach_ir.MachOp, is_vec: bool) -> bool {
 /// into `op dst=phi`, including 2-address `tied_src0` loop accumulators (`vfmadd231ps`, `add`, `xor`, ...),
 /// eliminating loop-latch `vmovaps` and `mov` copies 100% soundly.
 fn try_fold_dead_pcopy_moves(
+    rf: *target.TargetRegFile,
     new_insts: *mut col.DynBuf[mach_ir.MachInst],
     blk_start: usize,
     pcopy_out_start: usize,
-    dead_gpr_src: u16,
-    dead_vec_src: u16,
-    blocked_gpr_dst_in: u16,
-    blocked_vec_dst_in: u16,
+    dead_gpr_src: u32,
+    dead_vec_src: u32,
+    blocked_gpr_dst_in: u32,
+    blocked_vec_dst_in: u32,
 ) {
     var blocked_gpr = blocked_gpr_dst_in;
     var blocked_vec = blocked_vec_dst_in;
@@ -3112,7 +3166,7 @@ fn try_fold_dead_pcopy_moves(
         }
         let sp_reg = mv.src0_phys;
         let dp_reg = mv.dst_phys;
-        if sp_reg >= 16_u8 || dp_reg >= 16_u8 || sp_reg == dp_reg {
+        if sp_reg >= 32_u8 || dp_reg >= 32_u8 || sp_reg == dp_reg {
             mi = mi +% 1_usize;
             continue;
         }
@@ -3120,7 +3174,7 @@ fn try_fold_dead_pcopy_moves(
         let dbit = mach_ir.phys_bit(dp_reg);
         let dead_m = if is_vec { dead_vec_src } else { dead_gpr_src };
         let blk_m = if is_vec { blocked_vec } else { blocked_gpr };
-        if (dead_m & sbit) == 0_u16 || (blk_m & dbit) != 0_u16 {
+        if (dead_m & sbit) == 0_u32 || (blk_m & dbit) != 0_u32 {
             mi = mi +% 1_usize;
             continue;
         }
@@ -3162,14 +3216,14 @@ fn try_fold_dead_pcopy_moves(
                             let p2 = s_ro[bi - 2_usize];
                             if is_vec {
                                 if p2.op == .VMovVecReg && p2.flag0 == mv.flag0
-                                    && (p2.dst_phys == mach_ir.SCRATCH_VEC0 || p2.dst_phys == mach_ir.SCRATCH_VEC1)
+                                    && (p2.dst_phys == rf.scratch_vec0 || p2.dst_phys == rf.scratch_vec1)
                                     && p2.src0_phys == sp_reg
                                 {
                                     tied_p2_sc = p2.dst_phys;
                                 }
                             } else {
                                 if p2.op == .Mov
-                                    && (p2.dst_phys == mach_ir.SCRATCH_GPR0 || p2.dst_phys == mach_ir.SCRATCH_GPR1)
+                                    && (p2.dst_phys == rf.scratch_gpr0 || p2.dst_phys == rf.scratch_gpr1)
                                     && p2.src0_phys == sp_reg
                                 {
                                     tied_p2_sc = p2.dst_phys;
@@ -3192,7 +3246,7 @@ fn try_fold_dead_pcopy_moves(
                 if found_tied && found_bi > blk_start {
                     s_mut[found_bi].dst_phys = dp_reg;
                     s_mut[found_bi].src0_phys = dp_reg;
-                    if tied_p2_sc < 16_u8 && found_bi >= blk_start +% 2_usize {
+                    if tied_p2_sc < 32_u8 && found_bi >= blk_start +% 2_usize {
                         if s_mut[found_bi].src1_phys == tied_p2_sc {
                             s_mut[found_bi].src1_phys = sp_reg;
                         }
@@ -3294,12 +3348,12 @@ fn rewrite_function(
                     } else {
                         di.dst_phys
                     };
-                    if di.dst != mach_ir.VREG_NONE && fixed_in < 16_u8 {
+                    if di.dst != mach_ir.VREG_NONE && fixed_in < 32_u8 {
                         let vidx = di.dst.widen.[usize]();
                         let vs = mf.vregs.as_slice();
                         if vidx < vs.len {
                             let vi = vs[vidx];
-                            if vi.assigned_phys < 16_u8 {
+                            if vi.assigned_phys < 32_u8 {
                                 try pmoves.push(alloc, PhysMove.{
                                     dst_is_mem: false,
                                     dst_phys: vi.assigned_phys,
@@ -3326,7 +3380,7 @@ fn rewrite_function(
                     }
                     j = j +% 1_usize;
                 }
-                try emit_parallel_moves(alloc, &mut new_insts, &mut pmoves, inst.span);
+                try emit_parallel_moves(alloc, &mf.reg_file, &mut new_insts, &mut pmoves, inst.span);
                 k = j;
                 continue;
             }
@@ -3350,7 +3404,7 @@ fn rewrite_function(
                     } else {
                         ui.src0_phys
                     };
-                    if fixed_out < 16_u8 {
+                    if fixed_out < 32_u8 {
                         if ui.src0 != mach_ir.VREG_NONE {
                             let sloc = resolve_vreg_loc(mf, ui.src0, mach_ir.PHYS_NONE, empty_promos.as_slice(), .Gpr);
                             if sloc.present {
@@ -3365,7 +3419,7 @@ fn rewrite_function(
                                     done: false,
                                 });
                             }
-                        } else if ui.src0_phys < 16_u8 && ui.src0_phys != fixed_out {
+                        } else if ui.src0_phys < 32_u8 && ui.src0_phys != fixed_out {
                             try pmoves.push(alloc, PhysMove.{
                                 dst_is_mem: false,
                                 dst_phys: fixed_out,
@@ -3380,7 +3434,7 @@ fn rewrite_function(
                     }
                     j = j +% 1_usize;
                 }
-                try emit_parallel_moves(alloc, &mut new_insts, &mut pmoves, inst.span);
+                try emit_parallel_moves(alloc, &mf.reg_file, &mut new_insts, &mut pmoves, inst.span);
                 k = j;
                 continue;
             }
@@ -3389,14 +3443,14 @@ fn rewrite_function(
             if inst.op == .ParallelCopy {
                 pmoves.clear();
                 let cur_pos = b_start_pos +% 2_u32 +% (k.trunc.[u32]() *% 2_u32);
-                var gpr_src_seen: u16 = 0_u16;
-                var gpr_src_dup: u16 = 0_u16;
-                var gpr_dst_seen: u16 = 0_u16;
-                var gpr_dead_cand: u16 = 0_u16;
-                var vec_src_seen: u16 = 0_u16;
-                var vec_src_dup: u16 = 0_u16;
-                var vec_dst_seen: u16 = 0_u16;
-                var vec_dead_cand: u16 = 0_u16;
+                var gpr_src_seen: u32 = 0_u32;
+                var gpr_src_dup: u32 = 0_u32;
+                var gpr_dst_seen: u32 = 0_u32;
+                var gpr_dead_cand: u32 = 0_u32;
+                var vec_src_seen: u32 = 0_u32;
+                var vec_src_dup: u32 = 0_u32;
+                var vec_dst_seen: u32 = 0_u32;
+                var vec_dead_cand: u32 = 0_u32;
 
                 let pstart = inst.extra_range.start.widen.[usize]();
                 let plen = inst.extra_range.len.widen.[usize]();
@@ -3411,23 +3465,23 @@ fn rewrite_function(
                     let sloc = resolve_vreg_loc(mf, pair.src, pair.src_phys, empty_promos.as_slice(), pair.cls);
                     if dloc.present && sloc.present {
                         let is_v = mach_ir.reg_class_is_vec(dloc.cls);
-                        if !sloc.spilled && sloc.phys < 16_u8 {
+                        if !sloc.spilled && sloc.phys < 32_u8 {
                             let sb = mach_ir.phys_bit(sloc.phys);
                             if is_v {
-                                if (vec_src_seen & sb) != 0_u16 { vec_src_dup = vec_src_dup | sb; }
+                                if (vec_src_seen & sb) != 0_u32 { vec_src_dup = vec_src_dup | sb; }
                                 vec_src_seen = vec_src_seen | sb;
                             } else {
-                                if (gpr_src_seen & sb) != 0_u16 { gpr_src_dup = gpr_src_dup | sb; }
+                                if (gpr_src_seen & sb) != 0_u32 { gpr_src_dup = gpr_src_dup | sb; }
                                 gpr_src_seen = gpr_src_seen | sb;
                             }
-                            if !dloc.spilled && dloc.phys < 16_u8 && pair.src != mach_ir.VREG_NONE {
+                            if !dloc.spilled && dloc.phys < 32_u8 && pair.src != mach_ir.VREG_NONE {
                                 let svidx = pair.src.widen.[usize]();
                                 if svidx < intervals.len && intervals[svidx].end == cur_pos {
                                     if is_v { vec_dead_cand = vec_dead_cand | sb; } else { gpr_dead_cand = gpr_dead_cand | sb; }
                                 }
                             }
                         }
-                        if !dloc.spilled && dloc.phys < 16_u8 {
+                        if !dloc.spilled && dloc.phys < 32_u8 {
                             let db = mach_ir.phys_bit(dloc.phys);
                             if is_v { vec_dst_seen = vec_dst_seen | db; } else { gpr_dst_seen = gpr_dst_seen | db; }
                         }
@@ -3445,11 +3499,12 @@ fn rewrite_function(
                     pi = pi +% 1_usize;
                 }
                 let pcopy_out_start = new_insts.len();
-                try emit_parallel_moves(alloc, &mut new_insts, &mut pmoves, inst.span);
+                try emit_parallel_moves(alloc, &mf.reg_file, &mut new_insts, &mut pmoves, inst.span);
                 let dead_gpr = gpr_dead_cand & (~gpr_src_dup) & (~gpr_dst_seen);
                 let dead_vec = vec_dead_cand & (~vec_src_dup) & (~vec_dst_seen);
-                if dead_gpr != 0_u16 || dead_vec != 0_u16 {
+                if dead_gpr != 0_u32 || dead_vec != 0_u32 {
                     try_fold_dead_pcopy_moves(
+                        &mf.reg_file,
                         &mut new_insts,
                         new_start.widen.[usize](),
                         pcopy_out_start,
@@ -3560,10 +3615,10 @@ fn rewrite_function(
 // ============================================================================
 
 fn compute_frame_and_ipra_summary(mf: *mut mach_ir.MachFunc) {
-    var direct_gprs: u16 = 0_u16;
-    var direct_xmms: u16 = 0_u16;
-    var call_gprs: u16 = 0_u16;
-    var call_xmms: u16 = 0_u16;
+    var direct_gprs: u32 = 0_u32;
+    var direct_xmms: u32 = 0_u32;
+    var call_gprs: u32 = 0_u32;
+    var call_xmms: u32 = 0_u32;
     var saw_call = mf.has_calls;
     var saw_ymm = mf.uses_ymm;
 
@@ -3576,13 +3631,13 @@ fn compute_frame_and_ipra_summary(mf: *mut mach_ir.MachFunc) {
             call_gprs = call_gprs | inst.clobber_gprs;
             call_xmms = call_xmms | inst.clobber_xmms;
         } else {
-            if inst.clobber_gprs != 0_u16 {
+            if inst.clobber_gprs != 0_u32 {
                 direct_gprs = direct_gprs | inst.clobber_gprs;
             }
-            if inst.clobber_xmms != 0_u16 {
+            if inst.clobber_xmms != 0_u32 {
                 direct_xmms = direct_xmms | inst.clobber_xmms;
             }
-            let impl_g = inst_implicit_clobber_gprs(&inst);
+            let impl_g = inst_implicit_clobber_gprs(&mf.reg_file, &inst);
             direct_gprs = direct_gprs | impl_g;
         }
 
@@ -3590,7 +3645,7 @@ fn compute_frame_and_ipra_summary(mf: *mut mach_ir.MachFunc) {
             saw_ymm = true;
         }
 
-        if mach_ir.op_has_dst(inst.op) && inst.dst_phys < 16_u8 {
+        if mach_ir.op_has_dst(inst.op) && inst.dst_phys < 32_u8 {
             let is_vec = mach_ir.op_dst_is_vec(inst.op);
             if is_vec {
                 direct_xmms = direct_xmms | mach_ir.phys_bit(inst.dst_phys);
@@ -3598,36 +3653,43 @@ fn compute_frame_and_ipra_summary(mf: *mut mach_ir.MachFunc) {
                 direct_gprs = direct_gprs | mach_ir.phys_bit(inst.dst_phys);
             }
         }
-        if inst.dst2_phys < 16_u8 {
+        if inst.dst2_phys < 32_u8 {
             direct_gprs = direct_gprs | mach_ir.phys_bit(inst.dst2_phys);
         }
         i = i +% 1_usize;
     }
 
-    // Callee-saved GPRs that this function must push/pop in prologue/epilogue.
-    // Note: If a non-error function calls an error-union callee (clobbering R15),
-    // preserve R15 as callee-saved so callers allocating R15 as their 12th GPR stay sound!
-    var used_callee = direct_gprs & mach_ir.CALLEE_SAVED_GPRS_MASK;
-    if !mf.uses_r15_error && ((direct_gprs | call_gprs) & mach_ir.phys_bit(mach_ir.PHYS_R15)) != 0_u16 {
-        used_callee = used_callee | mach_ir.phys_bit(mach_ir.PHYS_R15);
+    // Callee-saved GPRs & Vecs that this function must save/restore in prologue/epilogue.
+    let err_bit = mach_ir.phys_bit(mf.reg_file.err_reg_gpr);
+    var used_callee = direct_gprs & mf.reg_file.callee_saved_gprs;
+    if (mf.reg_file.callee_saved_gprs & err_bit) != 0_u32 {
+        if !mf.uses_r15_error && ((direct_gprs | call_gprs) & err_bit) != 0_u32 {
+            used_callee = used_callee | err_bit;
+        }
+        if mf.uses_r15_error {
+            used_callee = used_callee & (~err_bit);
+        }
     }
-    if mf.uses_r15_error {
-        used_callee = used_callee & (~mach_ir.phys_bit(mach_ir.PHYS_R15));
-    }
+    let used_callee_v = direct_xmms & mf.reg_file.callee_saved_vecs;
 
     // Observable IPRA clobber masks for callers of this function:
-    // excludes registers saved/restored by prologue/epilogue and excludes RSP/RBP.
-    let frame_mask = mach_ir.phys_bit(mach_ir.PHYS_RSP) | mach_ir.phys_bit(mach_ir.PHYS_RBP);
+    // excludes registers saved/restored by prologue/epilogue and excludes frame pointers.
+    let frame_mask: u32 = if mf.reg_file.gpr_count == 16_u8 {
+        mach_ir.phys_bit(mach_ir.PHYS_RSP) | mach_ir.phys_bit(mach_ir.PHYS_RBP)
+    } else {
+        0_u32
+    };
     var ipra_g = ((direct_gprs | call_gprs) & (~used_callee)) & (~frame_mask);
     if mf.uses_r15_error {
-        ipra_g = ipra_g | mach_ir.phys_bit(mach_ir.PHYS_R15);
+        ipra_g = ipra_g | err_bit;
     }
-    let ipra_x = direct_xmms | call_xmms;
+    let ipra_x = (direct_xmms | call_xmms) & (~used_callee_v);
 
     mf.has_calls = saw_call;
     mf.is_leaf = !saw_call;
     mf.uses_ymm = saw_ymm;
     mf.used_callee_gprs = used_callee;
+    mf.used_callee_vecs = used_callee_v;
     mf.ipra_clobber_gprs = ipra_g;
     mf.ipra_clobber_xmms = ipra_x;
 }
@@ -3647,15 +3709,16 @@ fn second_chance_reallocate_class(
     fixed_ranges: *[FixedRange],
     is_vec: bool,
 ) -> !OutOfMemory {
-    let allowed_mask: u16 = if is_vec {
-        mach_ir.ALLOC_XMMS_MASK
+    let reg_lim_u8: u8 = if is_vec { mf.reg_file.vec_count } else { mf.reg_file.gpr_count };
+    let allowed_mask: u32 = if is_vec {
+        mf.reg_file.alloc_vecs
     } else {
-        mach_ir.ALLOC_GPRS_ALL_MASK
+        mf.reg_file.alloc_gprs_all
     };
 
     var spilled = try col.DynBuf.[u32].init(alloc, 16_usize);
     errdefer spilled.destroy(alloc);
-    var used_callee: u16 = 0_u16;
+    var used_callee: u32 = 0_u32;
     let vs0 = mf.vregs.as_slice();
     var oi: usize = 0_usize;
     while oi < order.len {
@@ -3663,11 +3726,15 @@ fn second_chance_reallocate_class(
         let vi = v.widen.[usize]();
         if vi < vs0.len {
             let ap = vs0[vi].assigned_phys;
-            if ap < 16_u8 {
-                if !is_vec && mach_ir.is_callee_saved_gpr(ap) {
+            if ap < reg_lim_u8 {
+                if is_vec {
+                    if mf.reg_file.is_callee_saved_vec(ap) {
+                        used_callee = used_callee | mach_ir.phys_bit(ap);
+                    }
+                } else if mf.reg_file.is_callee_saved_gpr(ap) {
                     used_callee = used_callee | mach_ir.phys_bit(ap);
                 }
-            } else if vs0[vi].spill_off < 0_i32 && vs0[vi].fixed_phys >= 16_u8 && spilled.len() < 256_usize {
+            } else if vs0[vi].spill_off < 0_i32 && vs0[vi].fixed_phys >= 32_u8 && spilled.len() < 256_usize {
                 try spilled.push(alloc, v);
             }
         }
@@ -3719,7 +3786,7 @@ fn second_chance_reallocate_class(
         let vidx = v.widen.[usize]();
         if vidx < intervals.len && vidx < mf.vregs.len() {
             let cur = intervals[vidx];
-            var busy: u16 = ~allowed_mask;
+            var busy: u32 = ~allowed_mask;
             if is_vec {
                 busy = busy | cur.crosses_clobber_xmms;
             } else {
@@ -3745,17 +3812,18 @@ fn second_chance_reallocate_class(
                     }
                     if uiv.end > cur.start && uidx < vs_chk.len {
                         let up = vs_chk[uidx].assigned_phys;
-                        if up < 16_u8 {
+                        if up < 32_u8 {
                             busy = busy | mach_ir.phys_bit(up);
                         }
                     }
                 }
                 ui = ui +% 1_usize;
             }
-            let free_mask: u16 = (~busy) & allowed_mask;
-            if free_mask != 0_u16 && vidx < vs_chk.len {
+            let free_mask: u32 = (~busy) & allowed_mask;
+            if free_mask != 0_u32 && vidx < vs_chk.len {
                 let vinfo = vs_chk[vidx];
                 let chosen = pick_best_free_reg(
+                    &mf.reg_file,
                     free_mask,
                     is_vec,
                     vinfo.hint_phys,
@@ -3763,13 +3831,17 @@ fn second_chance_reallocate_class(
                     vs_chk,
                     used_callee,
                 );
-                if chosen < 16_u8 {
+                if chosen < reg_lim_u8 {
                     let vs_m = mf.vregs.as_mut_slice();
                     if vidx < vs_m.len {
                         vs_m[vidx].assigned_phys = chosen;
                         vs_m[vidx].spill_off = 0_i32;
                     }
-                    if !is_vec && mach_ir.is_callee_saved_gpr(chosen) {
+                    if is_vec {
+                        if mf.reg_file.is_callee_saved_vec(chosen) {
+                            used_callee = used_callee | mach_ir.phys_bit(chosen);
+                        }
+                    } else if mf.reg_file.is_callee_saved_gpr(chosen) {
                         used_callee = used_callee | mach_ir.phys_bit(chosen);
                     }
                 }
@@ -4539,11 +4611,11 @@ fn optimize_pre_ra_mach(
             var k_s1 = mach_ir.VREG_NONE;
             var k_scale: u8 = 0_u8;
             var k_imm: i64 = 0_i64;
-            if ins.dst != mach_ir.VREG_NONE && ins.dst_phys >= 16_u8 && ins.dst2 == mach_ir.VREG_NONE {
+            if ins.dst != mach_ir.VREG_NONE && ins.dst_phys >= 32_u8 && ins.dst2 == mach_ir.VREG_NONE {
                 let di = ins.dst.widen.[usize]();
                 var single_def = false;
                 if di < dc_ro.len && di < vr_ro.len {
-                    single_def = dc_ro[di] == 1_u16 && vr_ro[di].fixed_phys >= 16_u8;
+                    single_def = dc_ro[di] == 1_u16 && vr_ro[di].fixed_phys >= 32_u8;
                 }
                 if single_def {
                     if (ins.op == .ShlImm || ins.op == .MulImm) && ins.src0 != mach_ir.VREG_NONE {
@@ -4625,11 +4697,11 @@ fn optimize_pre_ra_mach(
                 let s1i = ins.src1.widen.[usize]();
                 var try_s2 = false;
                 if s2i < uc_ro.len && s2i < dc_ro.len && s2i < vr_ro.len {
-                    try_s2 = uc_ro[s2i] == 1_u16 && dc_ro[s2i] == 1_u16 && vr_ro[s2i].fixed_phys >= 16_u8;
+                    try_s2 = uc_ro[s2i] == 1_u16 && dc_ro[s2i] == 1_u16 && vr_ro[s2i].fixed_phys >= 32_u8;
                 }
                 var try_s1 = false;
                 if !try_s2 && s1i < uc_ro.len && s1i < dc_ro.len && s1i < vr_ro.len {
-                    try_s1 = uc_ro[s1i] == 1_u16 && dc_ro[s1i] == 1_u16 && vr_ro[s1i].fixed_phys >= 16_u8;
+                    try_s1 = uc_ro[s1i] == 1_u16 && dc_ro[s1i] == 1_u16 && vr_ro[s1i].fixed_phys >= 32_u8;
                 }
                 if try_s2 || try_s1 {
                     let target_v = if try_s2 { ins.src2 } else { ins.src1 };

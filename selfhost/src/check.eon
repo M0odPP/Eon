@@ -5328,16 +5328,21 @@ impl Checker {
             return info_ty;
         }
         if self.sym_eq(name.sym, "target_arch") {
-            let sym = try ctvm.target_arch_sym(self.alloc, self.interner);
+            let sym = try ctvm.target_arch_sym(self.alloc, self.env, self.interner);
             let vid = try self.ct.add_enum_sym(self.alloc, sym, types.int_val_zero());
             try self.table.set_comptime_val(self.alloc, expr_id, vid);
             return types.TY_TYPE_TYPE;
         }
         if self.sym_eq(name.sym, "target_os") {
-            let sym = try ctvm.target_os_sym(self.alloc, self.interner);
+            let sym = try ctvm.target_os_sym(self.alloc, self.env, self.interner);
             let vid = try self.ct.add_enum_sym(self.alloc, sym, types.int_val_zero());
             try self.table.set_comptime_val(self.alloc, expr_id, vid);
             return types.TY_TYPE_TYPE;
+        }
+        if self.sym_eq(name.sym, "target_is_nostd") {
+            let vid = try self.ct.add_bool(self.alloc, ctvm.target_is_nostd(self.env));
+            try self.table.set_comptime_val(self.alloc, expr_id, vid);
+            return types.TY_BOOL;
         }
         if self.sym_eq(name.sym, "comptime_budget") {
             var i: usize = 0_usize;

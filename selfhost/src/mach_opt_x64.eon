@@ -113,10 +113,10 @@ fn cond_only_zf_sf(cc: x64_asm.Cond) -> bool {
 // ============================================================================
 
 struct InstEffects {
-    read_gprs: u16;
-    write_gprs: u16;
-    read_xmms: u16;
-    write_xmms: u16;
+    read_gprs: u32;
+    write_gprs: u32;
+    read_xmms: u32;
+    write_xmms: u32;
     reads_flags: bool;
     writes_flags: bool;
     reads_mem: bool;
@@ -439,10 +439,10 @@ fn op_latency(op: mach_ir.MachOp) -> u8 {
 }
 
 fn analyze_inst_effects(inst: *mach_ir.MachInst) -> InstEffects {
-    var rg: u16 = 0_u16;
-    var wg: u16 = 0_u16;
-    var rx: u16 = 0_u16;
-    var wx: u16 = 0_u16;
+    var rg: u32 = 0_u32;
+    var wg: u32 = 0_u32;
+    var rx: u32 = 0_u32;
+    var wx: u32 = 0_u32;
 
     let src0_vec = op_src0_is_vec(inst.op);
     let dst_vec = mach_ir.op_dst_is_vec(inst.op);
@@ -512,7 +512,7 @@ fn analyze_inst_effects(inst: *mach_ir.MachInst) -> InstEffects {
     wx = wx | inst.clobber_xmms;
 
     // Any instruction modifying RSP is treated as a barrier for stack safety
-    let touches_rsp = (wg & mach_ir.phys_bit(mach_ir.PHYS_RSP)) != 0_u16;
+    let touches_rsp = (wg & mach_ir.phys_bit(mach_ir.PHYS_RSP)) != 0_u32;
     return InstEffects.{
         read_gprs: rg,
         write_gprs: wg,
@@ -633,11 +633,11 @@ fn is_reverse_move_pair(prev: *mach_ir.MachInst, cur: *mach_ir.MachInst) -> bool
 }
 
 struct PeepState {
-    zero32_regs: u16;
-    zero8_regs: u16;
-    spill_valid: u16;
+    zero32_regs: u32;
+    zero8_regs: u32;
+    spill_valid: u32;
     spill_off: [16]i32;
-    lea_valid: u16;
+    lea_valid: u32;
     lea_base: [16]u8;
     lea_disp: [16]i32;
     cmp_valid: bool;
@@ -649,11 +649,11 @@ struct PeepState {
 
 fn peep_state_empty() -> PeepState {
     return PeepState.{
-        zero32_regs: 0_u16,
-        zero8_regs: 0_u16,
-        spill_valid: 0_u16,
+        zero32_regs: 0_u32,
+        zero8_regs: 0_u32,
+        spill_valid: 0_u32,
         spill_off: [0_i32; 16],
-        lea_valid: 0_u16,
+        lea_valid: 0_u32,
         lea_base: [0_u8; 16],
         lea_disp: [0_i32; 16],
         cmp_valid: false,
@@ -664,17 +664,17 @@ fn peep_state_empty() -> PeepState {
     };
 }
 
-fn peep_inval_lea_regs(st: *mut PeepState, wg: u16) {
-    if st.lea_valid == 0_u16 || wg == 0_u16 {
+fn peep_inval_lea_regs(st: *mut PeepState, wg: u32) {
+    if st.lea_valid == 0_u32 || wg == 0_u32 {
         return;
     }
     st.lea_valid = st.lea_valid & (~wg);
     var r: u8 = 0_u8;
     while r < 16_u8 {
         let b = mach_ir.phys_bit(r);
-        if (st.lea_valid & b) != 0_u16 {
+        if (st.lea_valid & b) != 0_u32 {
             let bp = st.lea_base[r.widen.[usize]()];
-            if bp < 16_u8 && (wg & mach_ir.phys_bit(bp)) != 0_u16 {
+            if bp < 16_u8 && (wg & mach_ir.phys_bit(bp)) != 0_u32 {
                 st.lea_valid = st.lea_valid & (~b);
             }
         }
@@ -683,12 +683,12 @@ fn peep_inval_lea_regs(st: *mut PeepState, wg: u16) {
 }
 
 fn peep_find_spill_reg(st: *PeepState, disp: i32) -> u8 {
-    if st.spill_valid == 0_u16 {
+    if st.spill_valid == 0_u32 {
         return mach_ir.PHYS_NONE;
     }
     var r: u8 = 0_u8;
     while r < 16_u8 {
-        if (st.spill_valid & mach_ir.phys_bit(r)) != 0_u16 && st.spill_off[r.widen.[usize]()] == disp {
+        if (st.spill_valid & mach_ir.phys_bit(r)) != 0_u32 && st.spill_off[r.widen.[usize]()] == disp {
             return r;
         }
         r = r +% 1_u8;
@@ -697,13 +697,13 @@ fn peep_find_spill_reg(st: *PeepState, disp: i32) -> u8 {
 }
 
 fn peep_inval_spill_slot(st: *mut PeepState, disp: i32, span_bytes: i32) {
-    if st.spill_valid == 0_u16 {
+    if st.spill_valid == 0_u32 {
         return;
     }
     var r: u8 = 0_u8;
     while r < 16_u8 {
         let b = mach_ir.phys_bit(r);
-        if (st.spill_valid & b) != 0_u16 {
+        if (st.spill_valid & b) != 0_u32 {
             let o = st.spill_off[r.widen.[usize]()];
             if o < disp +% span_bytes && o +% 8_i32 > disp {
                 st.spill_valid = st.spill_valid & (~b);
@@ -772,7 +772,7 @@ fn peephole_block(
         // 1a. Drop duplicate `Lea dst, [base + disp]` / duplicate `Cmp a, b` / guaranteed-not-taken duplicate `Jcc`
         if cur.op == .Lea && cur.mem.kind == .BaseDisp && cur.dst_phys < 16_u8 && cur.mem.base_phys < 16_u8 {
             let db_lea = mach_ir.phys_bit(cur.dst_phys);
-            if (st.lea_valid & db_lea) != 0_u16
+            if (st.lea_valid & db_lea) != 0_u32
                 && st.lea_base[cur.dst_phys.widen.[usize]()] == cur.mem.base_phys
                 && st.lea_disp[cur.dst_phys.widen.[usize]()] == cur.mem.disp
             {
@@ -791,17 +791,17 @@ fn peephole_block(
 
         // 1b. Drop redundant zero-extend (`Extend` unsigned 4B / 1B or self `Mov32`) when `r` is already zero-extended!
         if cur.op == .Mov32 && cur.dst_phys < 16_u8 && cur.dst_phys == cur.src0_phys
-            && (st.zero32_regs & mach_ir.phys_bit(cur.dst_phys)) != 0_u16
+            && (st.zero32_regs & mach_ir.phys_bit(cur.dst_phys)) != 0_u32
         {
             i = i +% 1_usize;
             continue;
         }
         if cur.op == .Extend && !cur.flag0 && cur.dst_phys < 16_u8 && cur.dst_phys == cur.src0_phys {
-            if cur.size_bytes == 4_u8 && (st.zero32_regs & mach_ir.phys_bit(cur.dst_phys)) != 0_u16 {
+            if cur.size_bytes == 4_u8 && (st.zero32_regs & mach_ir.phys_bit(cur.dst_phys)) != 0_u32 {
                 i = i +% 1_usize;
                 continue;
             }
-            if cur.size_bytes == 1_u8 && (st.zero8_regs & mach_ir.phys_bit(cur.dst_phys)) != 0_u16 {
+            if cur.size_bytes == 1_u8 && (st.zero8_regs & mach_ir.phys_bit(cur.dst_phys)) != 0_u32 {
                 i = i +% 1_usize;
                 continue;
             }
@@ -824,7 +824,7 @@ fn peephole_block(
                 }
             } else if cur.op == .Store && cur.size_bytes == 8_u8 && cur.src0_phys < 16_u8 {
                 let sb = mach_ir.phys_bit(cur.src0_phys);
-                if (st.spill_valid & sb) != 0_u16 && st.spill_off[cur.src0_phys.widen.[usize]()] == cur.mem.disp {
+                if (st.spill_valid & sb) != 0_u32 && st.spill_off[cur.src0_phys.widen.[usize]()] == cur.mem.disp {
                     i = i +% 1_usize;
                     continue;
                 }
@@ -931,16 +931,16 @@ fn peephole_block(
         let old_sv = st.spill_valid;
         let old_so = st.spill_off;
         if cur.op == .InlineAsmRaw || cur.op == .RawBytes || cur.op == .CallBarrier {
-            st.zero32_regs = 0_u16;
-            st.zero8_regs = 0_u16;
-            st.spill_valid = 0_u16;
-            st.lea_valid = 0_u16;
+            st.zero32_regs = 0_u32;
+            st.zero8_regs = 0_u32;
+            st.spill_valid = 0_u32;
+            st.lea_valid = 0_u32;
             st.cmp_valid = false;
             st.jcc_valid = false;
         } else if mach_ir.op_is_call(cur.op) {
-            st.zero32_regs = 0_u16;
-            st.zero8_regs = 0_u16;
-            let callee_saved_keep: u16 = mach_ir.phys_bit(mach_ir.PHYS_RBX)
+            st.zero32_regs = 0_u32;
+            st.zero8_regs = 0_u32;
+            let callee_saved_keep: u32 = mach_ir.phys_bit(mach_ir.PHYS_RBX)
                 | mach_ir.phys_bit(mach_ir.PHYS_R12)
                 | mach_ir.phys_bit(mach_ir.PHYS_R13)
                 | mach_ir.phys_bit(mach_ir.PHYS_R14);
@@ -963,8 +963,8 @@ fn peephole_block(
                 st.cmp_valid = false;
                 st.jcc_valid = false;
             } else if st.cmp_valid {
-                if (st.cmp_a < 16_u8 && (wg & mach_ir.phys_bit(st.cmp_a)) != 0_u16)
-                    || (st.cmp_b < 16_u8 && (wg & mach_ir.phys_bit(st.cmp_b)) != 0_u16)
+                if (st.cmp_a < 16_u8 && (wg & mach_ir.phys_bit(st.cmp_a)) != 0_u32)
+                    || (st.cmp_b < 16_u8 && (wg & mach_ir.phys_bit(st.cmp_b)) != 0_u32)
                 {
                     st.cmp_valid = false;
                 }
@@ -1026,9 +1026,9 @@ fn peephole_block(
                     || (cur.op == .ShrImm && cur.imm >= 32_i64);
                 if (cur.op == .Mov || cur.op == .Copy) && cur.src0_phys < 16_u8 {
                     let sb = mach_ir.phys_bit(cur.src0_phys);
-                    if (old_z32 & sb) != 0_u16 { st.zero32_regs = st.zero32_regs | db; }
-                    if (old_z8 & sb) != 0_u16 { st.zero8_regs = st.zero8_regs | db; }
-                    if (old_sv & sb) != 0_u16 {
+                    if (old_z32 & sb) != 0_u32 { st.zero32_regs = st.zero32_regs | db; }
+                    if (old_z8 & sb) != 0_u32 { st.zero8_regs = st.zero8_regs | db; }
+                    if (old_sv & sb) != 0_u32 {
                         st.spill_valid = st.spill_valid | db;
                         st.spill_off[cur.dst_phys.widen.[usize]()] = old_so[cur.src0_phys.widen.[usize]()];
                     }
@@ -1339,16 +1339,16 @@ fn eliminate_dead_spill_stores(alloc: *mut AllocCap, mf: *mut mach_ir.MachFunc) 
 const SCHED_MAX_REGION: usize = 96_usize;
 
 fn effects_depend(a: InstEffects, b: InstEffects) -> bool {
-    if (a.write_gprs & (b.read_gprs | b.write_gprs)) != 0_u16 {
+    if (a.write_gprs & (b.read_gprs | b.write_gprs)) != 0_u32 {
         return true;
     }
-    if (a.read_gprs & b.write_gprs) != 0_u16 {
+    if (a.read_gprs & b.write_gprs) != 0_u32 {
         return true;
     }
-    if (a.write_xmms & (b.read_xmms | b.write_xmms)) != 0_u16 {
+    if (a.write_xmms & (b.read_xmms | b.write_xmms)) != 0_u32 {
         return true;
     }
-    if (a.read_xmms & b.write_xmms) != 0_u16 {
+    if (a.read_xmms & b.write_xmms) != 0_u32 {
         return true;
     }
     if (a.writes_flags && (b.reads_flags || b.writes_flags)) || (a.reads_flags && b.writes_flags) {
@@ -1637,7 +1637,7 @@ fn plan_frame_layout(mf: *mach_ir.MachFunc) -> FrameLayout {
     ];
     var ci: usize = 0_usize;
     while ci < 5_usize {
-        if (mf.used_callee_gprs & mach_ir.phys_bit(cands[ci])) != 0_u16 && n_saved < 5_usize {
+        if (mf.used_callee_gprs & mach_ir.phys_bit(cands[ci])) != 0_u32 && n_saved < 5_usize {
             saved[n_saved] = cands[ci];
             n_saved = n_saved +% 1_usize;
         }

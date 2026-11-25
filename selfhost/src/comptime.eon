@@ -21,12 +21,24 @@ const MAX_CALL_DEPTH: u32 = 64_u32;
 pub const TARGET_ARCH_NAME: *str = "X86_64";
 pub const TARGET_OS_NAME: *str = "Linux";
 
-pub fn target_arch_sym(alloc: *mut AllocCap, interner: *mut span.SymInterner) -> u32 ! OutOfMemory {
-    return try interner.intern_str(alloc, TARGET_ARCH_NAME);
+pub fn target_arch_sym(
+    alloc: *mut AllocCap,
+    env: *types.TypeEnv,
+    interner: *mut span.SymInterner,
+) -> u32 ! OutOfMemory {
+    return try interner.intern_str(alloc, env.target_spec.arch_variant_name());
 }
 
-pub fn target_os_sym(alloc: *mut AllocCap, interner: *mut span.SymInterner) -> u32 ! OutOfMemory {
-    return try interner.intern_str(alloc, TARGET_OS_NAME);
+pub fn target_os_sym(
+    alloc: *mut AllocCap,
+    env: *types.TypeEnv,
+    interner: *mut span.SymInterner,
+) -> u32 ! OutOfMemory {
+    return try interner.intern_str(alloc, env.target_spec.os_variant_name());
+}
+
+pub fn target_is_nostd(env: *types.TypeEnv) -> bool {
+    return env.target_spec.is_nostd;
 }
 
 pub enum CtValKind : u8 {
@@ -2771,14 +2783,19 @@ impl CtComp {
             return dst;
         }
         if str.bytes_eq(bname, "target_arch".as_bytes()) {
-            let asym = try target_arch_sym(self.alloc, self.interner);
+            let asym = try target_arch_sym(self.alloc, self.env, self.interner);
             let vid = try self.ct.add_enum_sym(self.alloc, asym, types.int_val_zero());
             try self.emit_load_const(dst, vid, sp);
             return dst;
         }
         if str.bytes_eq(bname, "target_os".as_bytes()) {
-            let osym = try target_os_sym(self.alloc, self.interner);
+            let osym = try target_os_sym(self.alloc, self.env, self.interner);
             let vid = try self.ct.add_enum_sym(self.alloc, osym, types.int_val_zero());
+            try self.emit_load_const(dst, vid, sp);
+            return dst;
+        }
+        if str.bytes_eq(bname, "target_is_nostd".as_bytes()) {
+            let vid = try self.ct.add_bool(self.alloc, target_is_nostd(self.env));
             try self.emit_load_const(dst, vid, sp);
             return dst;
         }

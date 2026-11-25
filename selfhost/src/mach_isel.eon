@@ -7861,8 +7861,8 @@ fn emit_call_inst_core(
     }
 
     // 5. Compute IPRA clobber masks (Domain Super-Opt #4!)
-    var clob_gprs: u16 = if rc.kind == .ErrorUnion { mach_ir.EON_CALL_ERR_CLOBBER_GPRS } else { mach_ir.CALLER_SAVED_GPRS_MASK };
-    var clob_xmms: u16 = mach_ir.CALLER_SAVED_XMMS_MASK;
+    var clob_gprs: u32 = if rc.kind == .ErrorUnion { mach_ir.EON_CALL_ERR_CLOBBER_GPRS } else { mach_ir.CALLER_SAVED_GPRS_MASK };
+    var clob_xmms: u32 = mach_ir.CALLER_SAVED_XMMS_MASK;
     if !ctx.cfg.incremental_cgu {
         if let callee_fid = resolve_callee_fid(eir_prog, callee) {
             if eir_prog.fn_has_ipra(callee_fid) {

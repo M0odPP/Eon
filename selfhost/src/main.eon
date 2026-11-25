@@ -11,6 +11,7 @@ import eonc.lexer;
 import eonc.ast;
 import eonc.parser;
 import eonc.resolve;
+import eonc.target;
 import eonc.types;
 import eonc.ctvm;
 import eonc.check;
@@ -1927,6 +1928,7 @@ struct CheckCliOpts {
     no_stdlib: bool;
     profile_phases: bool;
     jobs: u32;
+    target_spec: target.TargetSpec;
 }
 
 fn check_opts_err(status: i32) -> CheckCliOpts {
@@ -1939,7 +1941,27 @@ fn check_opts_err(status: i32) -> CheckCliOpts {
         no_stdlib: false,
         profile_phases: false,
         jobs: 0_u32,
+        target_spec: target.TargetSpec.host_default(),
     };
+}
+
+fn parse_target_triple_or_err(
+    alloc: *mut AllocCap,
+    triple: *[u8],
+    err_buf: *mut str.StrBuf,
+) -> ?target.TargetSpec ! OutOfMemory {
+    if let spec = target.TargetSpec.parse_triple(triple) {
+        return spec;
+    }
+    err_buf.clear();
+    try err_buf.push_str_grow(alloc, "unknown target triple `");
+    try err_buf.push_bytes_grow(alloc, triple);
+    try err_buf.push_str_grow(
+        alloc,
+        "` (supported: x86_64-linux, aarch64-linux, riscv64-linux, x86_64-windows, aarch64-windows, aarch64-macos, x86_64-macos, aarch64-android, x86_64-android, aarch64-ios, x86_64-nostd, aarch64-nostd, riscv64-nostd)\n",
+    );
+    rt.eprint_bytes(err_buf.as_bytes());
+    return null;
 }
 
 fn parse_jobs_value(bs: *[u8]) -> ?u32 {
@@ -1964,6 +1986,7 @@ fn parse_cmd_check_args(
     var no_stdlib = false;
     var profile_phases = false;
     var jobs: u32 = 0_u32;
+    var target_spec = target.TargetSpec.host_default();
 
     var ai: usize = 2_usize;
     while ai < argc {
@@ -1978,6 +2001,27 @@ fn parse_cmd_check_args(
                 dump_verify = true;
             } else if rt.str_eq(arg, "--no-stdlib") {
                 no_stdlib = true;
+            } else if rt.str_eq(arg, "--target") {
+                ai = ai +% 1_usize;
+                if ai >= argc {
+                    rt.eprint_str("--target requires a target triple (e.g. aarch64-linux)\n");
+                    return check_opts_err(2_i32);
+                }
+                if let tv = env.args.get(ai) {
+                    if let ts = try parse_target_triple_or_err(&mut env.alloc, tv.as_bytes(), err_buf) {
+                        target_spec = ts;
+                    } else {
+                        return check_opts_err(2_i32);
+                    }
+                }
+            } else if str.starts_with(arg.as_bytes(), "--target=".as_bytes()) {
+                let ab = arg.as_bytes();
+                let tsub = ab.sub(9_usize, ab.len) catch { "".as_bytes() };
+                if let ts = try parse_target_triple_or_err(&mut env.alloc, tsub, err_buf) {
+                    target_spec = ts;
+                } else {
+                    return check_opts_err(2_i32);
+                }
             } else if rt.str_eq(arg, "--profile-phases") {
                 profile_phases = true;
             } else if rt.str_eq(arg, "-j") || rt.str_eq(arg, "--jobs") {
@@ -2037,6 +2081,7 @@ fn parse_cmd_check_args(
         no_stdlib: no_stdlib,
         profile_phases: profile_phases,
         jobs: jobs,
+        target_spec: target_spec,
     };
 }
 
@@ -2152,6 +2197,7 @@ fn run_check_pipeline(
 
     var tenv = try types.build_type_env(alloc, arena, &mut resolved, interner, diags);
     errdefer tenv.destroy(alloc);
+    tenv.set_target(opts.target_spec);
     if prof { try print_phase_line(alloc, clock, "types", t0, u0); t0 = rt.now_ns(clock); u0 = alloc.used_bytes(); }
 
     var ct = try ctvm.CtArena.init(alloc);
@@ -4940,6 +4986,7 @@ fn compile_loaded_to_elf_file(
 
     var tenv = try types.build_type_env(alloc, arena, &mut resolved, interner, diags);
     errdefer tenv.destroy(alloc);
+    tenv.set_target(copts.target_spec);
     if profile_phases { try print_phase_line(alloc, clock, "types", t0, u0); }
 
     var ct = try ctvm.CtArena.init(alloc);
@@ -5097,6 +5144,7 @@ linear struct BuildCliArgs {
     opt_stats: bool;
     profile_phases: bool;
     jobs: u32;
+    target_spec: target.TargetSpec;
     opt: eir.EirOptConfig;
     out_path: str.StrBuf;
     soname: str.StrBuf;
@@ -5129,6 +5177,7 @@ impl BuildCliArgs {
             opt_stats: false,
             profile_phases: false,
             jobs: 0_u32,
+            target_spec: target.TargetSpec.host_default(),
             opt: eir.opt_config_dev(),
             out_path: out_path,
             soname: soname,
@@ -5151,6 +5200,7 @@ impl BuildCliArgs {
             opt_stats: _,
             profile_phases: _,
             jobs: _,
+            target_spec: _,
             opt: _,
             out_path,
             soname,
@@ -5195,6 +5245,39 @@ fn parse_cmd_build_args(
                 // default
             } else if rt.str_eq(arg, "--freestanding") {
                 out.freestanding = true;
+            } else if rt.str_eq(arg, "--target") {
+                ai = ai +% 1_usize;
+                if ai >= argc {
+                    rt.eprint_str("--target requires a target triple (e.g. aarch64-linux)\n");
+                    out.status = 2_i32;
+                    lib_buf.destroy(&mut env.alloc);
+                    return;
+                }
+                if let tv = env.args.get(ai) {
+                    if let ts = try parse_target_triple_or_err(&mut env.alloc, tv.as_bytes(), err_buf) {
+                        out.target_spec = ts;
+                        if ts.is_nostd {
+                            out.freestanding = true;
+                        }
+                    } else {
+                        out.status = 2_i32;
+                        lib_buf.destroy(&mut env.alloc);
+                        return;
+                    }
+                }
+            } else if str.starts_with(arg.as_bytes(), "--target=".as_bytes()) {
+                let ab = arg.as_bytes();
+                let tsub = ab.sub(9_usize, ab.len) catch { "".as_bytes() };
+                if let ts = try parse_target_triple_or_err(&mut env.alloc, tsub, err_buf) {
+                    out.target_spec = ts;
+                    if ts.is_nostd {
+                        out.freestanding = true;
+                    }
+                } else {
+                    out.status = 2_i32;
+                    lib_buf.destroy(&mut env.alloc);
+                    return;
+                }
             } else if rt.str_eq(arg, "--shared") {
                 out.shared = true;
             } else if rt.str_eq(arg, "--soname") {
@@ -6120,8 +6203,14 @@ fn build_plan_target(
     } else {
         elf64.ElfMode.linux_pie()
     };
+    let eff_target = if args.freestanding && !args.target_spec.is_nostd {
+        args.target_spec.with_freestanding()
+    } else {
+        args.target_spec
+    };
     let copts = mach_x64.CompileOptions.{
         mode: mode,
+        target_spec: eff_target,
         sanitize: sanitize,
         emit_debug_line: true,
         has_emi_cache: args.has_emi_cache,
@@ -6520,8 +6609,14 @@ fn cmd_build(env: *mut Env) -> i32 ! OutOfMemory | Utf8Error {
     };
     var opt_cfg = args.opt;
     opt_cfg.incremental_cgu = args.has_emi_cache;
+    let eff_target = if args.freestanding && !args.target_spec.is_nostd {
+        args.target_spec.with_freestanding()
+    } else {
+        args.target_spec
+    };
     let copts = mach_x64.CompileOptions.{
         mode: mode,
+        target_spec: eff_target,
         sanitize: args.sanitize,
         emit_debug_line: true,
         has_emi_cache: args.has_emi_cache,
@@ -6686,6 +6781,7 @@ linear struct RunCliArgs {
     opt_stats: bool;
     profile_phases: bool;
     jobs: u32;
+    target_spec: target.TargetSpec;
     opt: eir.EirOptConfig;
     emi_cache: str.StrBuf;
     needed_libs: PathList;
@@ -6712,6 +6808,7 @@ impl RunCliArgs {
             opt_stats: false,
             profile_phases: false,
             jobs: 0_u32,
+            target_spec: target.TargetSpec.host_default(),
             opt: eir.opt_config_dev(),
             emi_cache: emi_cache,
             needed_libs: needed_libs,
@@ -6730,6 +6827,7 @@ impl RunCliArgs {
             opt_stats: _,
             profile_phases: _,
             jobs: _,
+            target_spec: _,
             opt: _,
             emi_cache,
             needed_libs,
@@ -6770,6 +6868,33 @@ fn parse_cmd_run_args(
                 out.interp = true;
             } else if rt.str_eq(arg, "--sanitize") {
                 out.sanitize = true;
+            } else if rt.str_eq(arg, "--target") {
+                ai = ai +% 1_usize;
+                if ai >= argc {
+                    rt.eprint_str("--target requires a target triple (e.g. aarch64-linux)\n");
+                    out.status = 2_i32;
+                    lib_buf.destroy(&mut env.alloc);
+                    return;
+                }
+                if let tv = env.args.get(ai) {
+                    if let ts = try parse_target_triple_or_err(&mut env.alloc, tv.as_bytes(), err_buf) {
+                        out.target_spec = ts;
+                    } else {
+                        out.status = 2_i32;
+                        lib_buf.destroy(&mut env.alloc);
+                        return;
+                    }
+                }
+            } else if str.starts_with(arg.as_bytes(), "--target=".as_bytes()) {
+                let ab = arg.as_bytes();
+                let tsub = ab.sub(9_usize, ab.len) catch { "".as_bytes() };
+                if let ts = try parse_target_triple_or_err(&mut env.alloc, tsub, err_buf) {
+                    out.target_spec = ts;
+                } else {
+                    out.status = 2_i32;
+                    lib_buf.destroy(&mut env.alloc);
+                    return;
+                }
             } else if rt.str_eq(arg, "--emi-cache") {
                 ai = ai +% 1_usize;
                 if ai >= argc {
@@ -6899,6 +7024,7 @@ fn run_loaded_interp(
     unit_ids: *[u32],
     interner: *mut span.SymInterner,
     diags: *mut diag.DiagBag,
+    target_spec: target.TargetSpec,
     opt: eir.EirOptConfig,
     print_opt_stats: bool,
     jobs: u32,
@@ -6909,6 +7035,7 @@ fn run_loaded_interp(
     errdefer resolved.destroy(alloc);
     var tenv = try types.build_type_env(alloc, arena, &mut resolved, interner, diags);
     errdefer tenv.destroy(alloc);
+    tenv.set_target(target_spec);
     var ct = try ctvm.CtArena.init(alloc);
     errdefer ct.destroy(alloc);
     let ttable = try check.check_program_with_jobs(
@@ -7080,7 +7207,7 @@ fn cmd_run(env: *mut Env) -> i32 ! OutOfMemory | Utf8Error {
     var rc: i32 = 1_i32;
     if args.interp {
         rc = try run_loaded_interp(
-            &mut env.alloc, &env.fs, &sm, &arena, unit_ids.as_slice(), &mut interner, &mut diags, args.opt, args.opt_stats, args.jobs, &args.prog_args, &mut err_buf,
+            &mut env.alloc, &env.fs, &sm, &arena, unit_ids.as_slice(), &mut interner, &mut diags, args.target_spec, args.opt, args.opt_stats, args.jobs, &args.prog_args, &mut err_buf,
         );
     } else {
         var tmp_bin = try str.StrBuf.init(&mut env.alloc, 64_usize);
@@ -7091,6 +7218,7 @@ fn cmd_run(env: *mut Env) -> i32 ! OutOfMemory | Utf8Error {
 
         let copts = mach_x64.CompileOptions.{
             mode: elf64.ElfMode.linux_pie(),
+            target_spec: args.target_spec,
             sanitize: args.sanitize,
             emit_debug_line: true,
             has_emi_cache: args.has_emi_cache,

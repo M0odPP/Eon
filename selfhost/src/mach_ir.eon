@@ -3,6 +3,7 @@ module eonc.mach_ir;
 import core.col;
 import eonc.span;
 import eonc.ast;
+import eonc.target;
 import eonc.x64_asm;
 
 // ============================================================================
@@ -51,34 +52,34 @@ pub const SCRATCH_GPR1: u8 = 11_u8; // R11
 pub const SCRATCH_VEC0: u8 = 14_u8; // Xmm14 / Ymm14
 pub const SCRATCH_VEC1: u8 = 15_u8; // Xmm15 / Ymm15
 
-// Bitmasks (bit i == physical register ID i)
+// Bitmasks (bit i == physical register ID i, supporting up to 32-register files)
 // Caller-saved GPRs: Rax(0), Rcx(1), Rdx(2), Rsi(6), Rdi(7), R8(8), R9(9), R10(10), R11(11)
-pub const CALLER_SAVED_GPRS_MASK: u16 = 0x0FC7_u16;
+pub const CALLER_SAVED_GPRS_MASK: u32 = 0x00000FC7_u32;
 // Callee-saved GPRs: Rbx(3), R12(12), R13(13), R14(14), R15(15)
-pub const CALLEE_SAVED_GPRS_MASK: u16 = 0xF008_u16;
+pub const CALLEE_SAVED_GPRS_MASK: u32 = 0x0000F008_u32;
 // EonCall error-union call default clobbers: caller-saved GPRs + R15(15)
-pub const EON_CALL_ERR_CLOBBER_GPRS: u16 = 0x8FC7_u16;
+pub const EON_CALL_ERR_CLOBBER_GPRS: u32 = 0x00008FC7_u32;
 // 12 allocatable GPRs: Rax, Rcx, Rdx, Rbx, Rsi, Rdi, R8, R9, R12, R13, R14, R15
-pub const ALLOC_GPRS_ALL_MASK: u16 = 0xF3CF_u16;
+pub const ALLOC_GPRS_ALL_MASK: u32 = 0x0000F3CF_u32;
 // 11 allocatable GPRs when R15 is reserved for ErrorUnion return channel
-pub const ALLOC_GPRS_NO_R15_MASK: u16 = 0x73CF_u16;
+pub const ALLOC_GPRS_NO_R15_MASK: u32 = 0x000073CF_u32;
 // Caller-saved XMM/YMM (all 16 in SysV & EonCall)
-pub const CALLER_SAVED_XMMS_MASK: u16 = 0xFFFF_u16;
+pub const CALLER_SAVED_XMMS_MASK: u32 = 0x0000FFFF_u32;
 // 14 allocatable XMM/YMM registers: Xmm0..Xmm13 (Xmm14/Xmm15 reserved as scratch)
-pub const ALLOC_XMMS_MASK: u16 = 0x3FFF_u16;
+pub const ALLOC_XMMS_MASK: u32 = 0x00003FFF_u32;
 
 pub const ALLOC_GPR_COUNT: usize = 12_usize;
 pub const ALLOC_VEC_COUNT: usize = 14_usize;
 
-pub fn phys_bit(phys: u8) -> u16 {
-    if phys >= 16_u8 {
-        return 0_u16;
+pub fn phys_bit(phys: u8) -> u32 {
+    if phys >= 32_u8 {
+        return 0_u32;
     }
-    return 1_u16 <<% phys.widen.[u16]();
+    return 1_u32 <<% phys.widen.[u32]();
 }
 
 pub fn is_callee_saved_gpr(phys: u8) -> bool {
-    return (CALLEE_SAVED_GPRS_MASK & phys_bit(phys)) != 0_u16;
+    return (CALLEE_SAVED_GPRS_MASK & phys_bit(phys)) != 0_u32;
 }
 
 /// Preferred allocation order across the 12 allocatable x86_64 GPRs:
@@ -572,8 +573,8 @@ pub struct MachInst {
     pub src2_phys: u8;
     pub imm: i64;
     pub mem: MemAddr;
-    pub clobber_gprs: u16;
-    pub clobber_xmms: u16;
+    pub clobber_gprs: u32;
+    pub clobber_xmms: u32;
     pub extra_range: ast.IdRange;
     pub span: span.Span;
 }
@@ -838,8 +839,8 @@ pub fn inst_empty(op: MachOp, sp: span.Span) -> MachInst {
         src2_phys: PHYS_NONE,
         imm: 0_i64,
         mem: mem_none(),
-        clobber_gprs: 0_u16,
-        clobber_xmms: 0_u16,
+        clobber_gprs: 0_u32,
+        clobber_xmms: 0_u32,
         extra_range: ast.range_empty(),
         span: sp,
     };
@@ -962,8 +963,8 @@ pub fn inst_use_fixed(src: VReg, phys: u8, sp: span.Span) -> MachInst {
 
 pub fn inst_call_sym(
     sym_id: u32,
-    clobber_gprs: u16,
-    clobber_xmms: u16,
+    clobber_gprs: u32,
+    clobber_xmms: u32,
     sp: span.Span,
 ) -> MachInst {
     var m = inst_empty(.CallSym, sp);
@@ -975,8 +976,8 @@ pub fn inst_call_sym(
 
 pub fn inst_call_reg(
     target: VReg,
-    clobber_gprs: u16,
-    clobber_xmms: u16,
+    clobber_gprs: u32,
+    clobber_xmms: u32,
     sp: span.Span,
 ) -> MachInst {
     var m = inst_empty(.CallReg, sp);
@@ -986,7 +987,7 @@ pub fn inst_call_reg(
     return m;
 }
 
-pub fn inst_call_barrier(clobber_gprs: u16, clobber_xmms: u16, sp: span.Span) -> MachInst {
+pub fn inst_call_barrier(clobber_gprs: u32, clobber_xmms: u32, sp: span.Span) -> MachInst {
     var m = inst_empty(.CallBarrier, sp);
     m.clobber_gprs = clobber_gprs;
     m.clobber_xmms = clobber_xmms;
@@ -1093,9 +1094,11 @@ pub linear struct MachFunc {
     pub first_spill_off: i32;
     pub uses_r15_error: bool;
     pub uses_ymm: bool;
-    pub used_callee_gprs: u16;
-    pub ipra_clobber_gprs: u16;
-    pub ipra_clobber_xmms: u16;
+    pub used_callee_gprs: u32;
+    pub used_callee_vecs: u32;
+    pub ipra_clobber_gprs: u32;
+    pub ipra_clobber_xmms: u32;
+    pub reg_file: target.TargetRegFile;
     pub has_calls: bool;
     pub is_leaf: bool;
     pub is_naked: bool;
@@ -1106,6 +1109,15 @@ pub linear struct MachFunc {
 
 impl MachFunc {
     pub fn init(alloc: *mut AllocCap, sym_id: u32, fn_id: u32) -> MachFunc ! OutOfMemory {
+        return try MachFunc.init_for_target(alloc, sym_id, fn_id, target.TargetSpec.host_default());
+    }
+
+    pub fn init_for_target(
+        alloc: *mut AllocCap,
+        sym_id: u32,
+        fn_id: u32,
+        spec: target.TargetSpec,
+    ) -> MachFunc ! OutOfMemory {
         let vregs = try col.DynBuf.[VRegInfo].init(alloc, 32_usize);
         errdefer vregs.destroy(alloc);
         let blocks = try col.DynBuf.[MachBlock].init(alloc, 8_usize);
@@ -1156,15 +1168,17 @@ impl MachFunc {
             first_spill_off: 0_i32,
             uses_r15_error: false,
             uses_ymm: false,
-            used_callee_gprs: 0_u16,
-            ipra_clobber_gprs: 0_u16,
-            ipra_clobber_xmms: 0_u16,
+            used_callee_gprs: 0_u32,
+            used_callee_vecs: 0_u32,
+            ipra_clobber_gprs: 0_u32,
+            ipra_clobber_xmms: 0_u32,
+            reg_file: target.TargetRegFile.for_target(spec),
             has_calls: false,
             is_leaf: true,
             is_naked: false,
             is_interrupt: false,
             save_simd: false,
-            target_avx2: true,
+            target_avx2: spec.has_avx2,
         };
     }
 
@@ -1192,8 +1206,10 @@ impl MachFunc {
             uses_r15_error: _,
             uses_ymm: _,
             used_callee_gprs: _,
+            used_callee_vecs: _,
             ipra_clobber_gprs: _,
             ipra_clobber_xmms: _,
+            reg_file: _,
             has_calls: _,
             is_leaf: _,
             is_naked: _,

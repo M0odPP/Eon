@@ -14,6 +14,7 @@ import eonc.elf64;
 import eonc.tcb_audit;
 import eonc.emi;
 import eonc.eir;
+import eonc.target;
 import eonc.mach_ir;
 import eonc.mach_isel;
 import eonc.mach_regalloc;
@@ -25,6 +26,7 @@ import eonc.mach_opt_x64;
 
 pub struct CompileOptions {
     pub mode: elf64.ElfMode;
+    pub target_spec: target.TargetSpec;
     pub sanitize: bool;
     pub emit_debug_line: bool;
     pub has_emi_cache: bool;
@@ -35,6 +37,7 @@ pub struct CompileOptions {
 pub fn compile_options_default() -> CompileOptions {
     return CompileOptions.{
         mode: elf64.ElfMode.linux_pie(),
+        target_spec: target.TargetSpec.host_default(),
         sanitize: false,
         emit_debug_line: true,
         has_emi_cache: false,
@@ -10404,12 +10407,42 @@ pub fn compute_opts_hash(opts: *CompileOptions) -> [32]u8 {
     b[29_usize] = ((mv >> 8_u32) & 0xFF_u32).trunc.[u8]();
     b[30_usize] = ((mv >> 16_u32) & 0xFF_u32).trunc.[u8]();
     b[31_usize] = ((mv >> 24_u32) & 0xFF_u32).trunc.[u8]();
-    let tag = "eonc-selfhost-x86_64-linux-abi1\n".as_bytes();
+    let tag = "eonc-selfhost-target-abi2\n".as_bytes();
     var ti: usize = 0_usize;
-    while ti < 32_usize && ti < tag.len {
+    while ti < 26_usize && ti < tag.len {
         b[32_usize +% ti] = tag[ti];
         ti = ti +% 1_usize;
     }
+    b[58_usize] = match opts.target_spec.arch {
+        .X86_64 => 1_u8,
+        .AArch64 => 2_u8,
+        .RiscV64 => 3_u8,
+    };
+    b[59_usize] = match opts.target_spec.os {
+        .Linux => 1_u8,
+        .Windows => 2_u8,
+        .MacOS => 3_u8,
+        .Android => 4_u8,
+        .IOS => 5_u8,
+        .NoStd => 6_u8,
+    };
+    b[60_usize] = match opts.target_spec.fmt {
+        .Elf64 => 1_u8,
+        .PeCoff => 2_u8,
+        .MachO => 3_u8,
+    };
+    b[61_usize] = match opts.target_spec.abi {
+        .SysV => 1_u8,
+        .Win64 => 2_u8,
+        .Aapcs64 => 3_u8,
+        .Lp64d => 4_u8,
+    };
+    b[62_usize] = (if opts.target_spec.is_pie { 1_u8 } else { 0_u8 })
+        | (if opts.target_spec.is_shared { 2_u8 } else { 0_u8 })
+        | (if opts.target_spec.is_nostd { 4_u8 } else { 0_u8 });
+    b[63_usize] = (if opts.target_spec.has_avx2 { 1_u8 } else { 0_u8 })
+        | (if opts.target_spec.has_neon { 2_u8 } else { 0_u8 })
+        | (if opts.target_spec.has_rvc { 4_u8 } else { 0_u8 });
     let d = tcb_audit.sha256(&b);
     return d.bytes;
 }
@@ -11471,8 +11504,8 @@ struct WaveRange {
 
 struct PendingIpra {
     fn_id: u32;
-    gprs: u16;
-    xmms: u16;
+    gprs: u32;
+    xmms: u32;
 }
 
 fn sort_u32_asc_cg(xs: *mut [u32]) {
@@ -11835,14 +11868,14 @@ fn try_compile_fn_optimized_core(
     opts: *CompileOptions,
     blob_out: *mut CompiledFnBlob,
     out_has_ipra: *mut bool,
-    out_ipra_gprs: *mut u16,
-    out_ipra_xmms: *mut u16,
+    out_ipra_gprs: *mut u32,
+    out_ipra_xmms: *mut u32,
 ) -> bool ! OutOfMemory {
     out_has_ipra.* = false;
-    out_ipra_gprs.* = 0xFFFF_u16;
-    out_ipra_xmms.* = 0xFFFF_u16;
+    out_ipra_gprs.* = 0xFFFFFFFF_u32;
+    out_ipra_xmms.* = 0xFFFFFFFF_u32;
 
-    var mf = try mach_ir.MachFunc.init(alloc, fn_sym, fn_id);
+    var mf = try mach_ir.MachFunc.init_for_target(alloc, fn_sym, fn_id, opts.target_spec);
     errdefer mf.destroy(alloc);
 
     let isel_res = try mach_isel.lower_fn_to_mach_ir(
@@ -11940,8 +11973,8 @@ fn try_compile_fn_optimized(
     blob_out: *mut CompiledFnBlob,
 ) -> bool ! OutOfMemory {
     var has_ipra = false;
-    var ipra_gprs: u16 = 0xFFFF_u16;
-    var ipra_xmms: u16 = 0xFFFF_u16;
+    var ipra_gprs: u32 = 0xFFFFFFFF_u32;
+    var ipra_xmms: u32 = 0xFFFFFFFF_u32;
     let ok = try try_compile_fn_optimized_core(
         alloc, sm, eir_prog, fn_id, fn_sym, env, ct, interner, opts, blob_out,
         &mut has_ipra, &mut ipra_gprs, &mut ipra_xmms,
@@ -11958,8 +11991,8 @@ struct WorkerCgItem {
     fn_sym: u32;
     ok: bool;
     has_ipra: bool;
-    ipra_gprs: u16;
-    ipra_xmms: u16;
+    ipra_gprs: u32;
+    ipra_xmms: u32;
     own_stack_bytes: u64;
     code_off: u32;
     code_len: u32;
@@ -12133,8 +12166,8 @@ fn pack_worker_item(
     fn_sym: u32,
     ok: bool,
     has_ipra: bool,
-    ipra_gprs: u16,
-    ipra_xmms: u16,
+    ipra_gprs: u32,
+    ipra_xmms: u32,
     blob: *CompiledFnBlob,
     extra_fns: *[ExtraFnEntry],
     extra_code: *[u8],
@@ -12246,8 +12279,8 @@ fn cg_worker_loop(
         if opts.opt.opt_level > 0_u8 {
             clear_compiled_blob(&mut opt_blob, fn_sym);
             var has_ipra = false;
-            var ipra_gprs: u16 = 0xFFFF_u16;
-            var ipra_xmms: u16 = 0xFFFF_u16;
+            var ipra_gprs: u32 = 0xFFFFFFFF_u32;
+            var ipra_xmms: u32 = 0xFFFFFFFF_u32;
             let ok_opt = try try_compile_fn_optimized_core(
                 alloc, sm, eir_prog, fi, fn_sym, env, ct, &mut out.interner, opts, &mut opt_blob,
                 &mut has_ipra, &mut ipra_gprs, &mut ipra_xmms,
@@ -12264,7 +12297,7 @@ fn cg_worker_loop(
             let outcome = try compile_function_x64(alloc, sm, eir_prog, fi, env, ct, &mut out.interner, opts);
             errdefer outcome.destroy(alloc);
             try pack_worker_item(
-                alloc, out, wpos, fi, fn_sym, outcome.ok, false, 0xFFFF_u16, 0xFFFF_u16,
+                alloc, out, wpos, fi, fn_sym, outcome.ok, false, 0xFFFFFFFF_u32, 0xFFFFFFFF_u32,
                 &outcome.blob, outcome.extra_fns.as_slice(), outcome.extra_code.as_slice(),
                 outcome.extra_relocs.as_slice(), outcome.err_msg.as_bytes(),
             );
@@ -13096,8 +13129,8 @@ fn compile_wave_sequential(
             if opts.opt.opt_level > 0_u8 {
                 clear_compiled_blob(&mut opt_blob, fn_sym);
                 var has_ipra = false;
-                var ipra_gprs: u16 = 0xFFFF_u16;
-                var ipra_xmms: u16 = 0xFFFF_u16;
+                var ipra_gprs: u32 = 0xFFFFFFFF_u32;
+                var ipra_xmms: u32 = 0xFFFFFFFF_u32;
                 let opt_ok = try try_compile_fn_optimized_core(
                     alloc, sm, eir_prog, fi, fn_sym, env, ct, interner, opts, &mut opt_blob,
                     &mut has_ipra, &mut ipra_gprs, &mut ipra_xmms,

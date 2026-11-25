@@ -6,6 +6,7 @@ import eonc.span;
 import eonc.diag;
 import eonc.ast;
 import eonc.resolve;
+import eonc.target;
 
 // ===========================================================================
 // Section 1: Type IDs, Pre-Interned Constants, and Exact 128-bit Integers
@@ -1540,6 +1541,7 @@ pub linear struct TypeEnv {
     pub decls: DeclMetaPools;
     pub sigs: SigDetailPools;
     pub index: TypeDefIndex;
+    pub target_spec: target.TargetSpec;
 }
 
 // ===========================================================================
@@ -1778,6 +1780,7 @@ impl TypeEnv {
             decls: decls,
             sigs: sigs,
             index: index,
+            target_spec: target.TargetSpec.host_default(),
         };
     }
 
@@ -1788,8 +1791,22 @@ impl TypeEnv {
         return env;
     }
 
+    pub fn set_target(self: *mut Self, spec: target.TargetSpec) {
+        self.target_spec = spec;
+    }
+
+    @inline
+    pub fn target_ptr_size(self: *Self) -> u64 {
+        return self.target_spec.ptr_size();
+    }
+
+    @inline
+    pub fn target_c_long_size(self: *Self) -> u64 {
+        return self.target_spec.c_long_size();
+    }
+
     pub fn destroy(self: TypeEnv, alloc: *mut AllocCap) {
-        let TypeEnv.{ intern, defs, decls, sigs, index } = self;
+        let TypeEnv.{ intern, defs, decls, sigs, index, target_spec: _ } = self;
         intern.destroy(alloc);
         defs.destroy(alloc);
         decls.destroy(alloc);
@@ -1813,6 +1830,7 @@ impl TypeEnv {
             decls: decls,
             sigs: sigs,
             index: index,
+            target_spec: self.target_spec,
         };
     }
 
