@@ -7,6 +7,7 @@ module eon_ui.platform_rt @hal;
 // ============================================================================
 
 extern "C" fn Sleep(ms: u32);
+extern "C" fn GetCommandLineA() -> u64;
 
 @layout(c)
 struct LinuxTimespec {
@@ -59,6 +60,30 @@ pub fn sleep_ms_portable(ms: u32) {
     }
 }
 
+/// Copy Windows process ASCII command line into `dst` (returns 0 on non-Windows).
+pub fn read_win_cmdline(dst: *mut [u8]) -> usize {
+    comptime if @target_os() == .Windows {
+        var n: usize = 0_usize;
+        raw {
+            let ptr = GetCommandLineA();
+            if ptr != 0_u64 {
+                while n < dst.len {
+                    let b = rawptr.[u8].from_usize((ptr +% n.widen.[u64]()).trunc.[usize]()).*;
+                    if b == 0_u8 {
+                        break;
+                    }
+                    dst[n] = b;
+                    n = n +% 1_usize;
+                }
+            }
+        }
+        return n;
+    } else {
+        _ = dst;
+        return 0_usize;
+    }
+}
+
 /// Return base physical RAM address for bare-metal `nostd` static UI working arena (32 MiB).
 pub fn nostd_arena_base() -> u64 {
     comptime if @target_os() == .NoStd {
@@ -76,14 +101,14 @@ pub fn nostd_arena_base() -> u64 {
     }
 }
 
-/// Bump allocator carving aligned typed slices out of bare-metal physical RAM on `nostd`.
+/// Bump allocator carving aligned physical RAM ranges on bare-metal `nostd`.
 pub struct NoStdScratch {
     pub cursor: u64;
     pub end: u64;
 }
 
 @naked
-view fn raw_slice_from_addr[T](_anchor: *mut NoStdScratch, _addr: u64, _len: usize) -> *mut [T] {
+pub view fn slice_from_addr[T](_anchor: *mut u8, _addr: u64, _len: usize) -> *mut [T] {
     comptime if @target_arch() == .AArch64 {
         raw { asm("mov x0, x1; mov x1, x2; ret", options(noreturn)); }
     } else comptime if @target_arch() == .RiscV64 {
@@ -103,31 +128,30 @@ impl NoStdScratch {
             end: base +% size,
         };
     }
-}
 
-pub view fn alloc_nostd_slice[T](scratch: *mut NoStdScratch, count: usize) -> *mut [T] {
-    let elem_sz = @size_of(T).widen.[u64]();
-    let aligned = (scratch.cursor +% 15_u64) & (~15_u64);
-    let bytes = elem_sz *% count.widen.[u64]();
-    if aligned +% bytes > scratch.end || aligned == 0_u64 {
-        return raw_slice_from_addr.[T](scratch, 0_u64, 0_usize);
-    }
-    scratch.cursor = aligned +% bytes;
-    comptime if @target_os() == .NoStd {
-        var p = aligned;
-        let lim = aligned +% bytes;
-        while p +% 8_u64 <= lim {
-            raw {
-                rawptr_mut.[u64].from_usize(p.trunc.[usize]()).* = 0_u64;
-            }
-            p = p +% 8_u64;
+    pub fn alloc_range(self: *mut Self, elem_size: usize, count: usize) -> u64 {
+        let aligned = (self.cursor +% 15_u64) & (~15_u64);
+        let bytes = elem_size.widen.[u64]() *% count.widen.[u64]();
+        if aligned +% bytes > self.end || aligned == 0_u64 {
+            return 0_u64;
         }
-        while p < lim {
-            raw {
-                rawptr_mut.[u8].from_usize(p.trunc.[usize]()).* = 0_u8;
+        self.cursor = aligned +% bytes;
+        comptime if @target_os() == .NoStd {
+            var p = aligned;
+            let lim = aligned +% bytes;
+            while p +% 8_u64 <= lim {
+                raw {
+                    rawptr_mut.[u64].from_usize(p.trunc.[usize]()).* = 0_u64;
+                }
+                p = p +% 8_u64;
             }
-            p = p +% 1_u64;
+            while p < lim {
+                raw {
+                    rawptr_mut.[u8].from_usize(p.trunc.[usize]()).* = 0_u8;
+                }
+                p = p +% 1_u64;
+            }
         }
+        return aligned;
     }
-    return raw_slice_from_addr.[T](scratch, aligned, count);
 }

@@ -83,6 +83,20 @@ fn blur_along_x(x: f32, y: f32, sigma: f32, corner: f32, hx: f32, hy: f32) -> f3
     return 0.5_f32 * (e0 - e1);
 }
 
+@inline
+fn fast_exp_neg_f32(z: f32) -> f32 {
+    if z <= 0.0_f32 {
+        return 1.0_f32;
+    }
+    if z >= 12.0_f32 {
+        return 0.0_f32;
+    }
+    let u = z * 0.25_f32;
+    let p = 1.0_f32 + u * (1.0_f32 + u * (0.5_f32 + u * (0.16666667_f32 + u * 0.04166667_f32)));
+    let p2 = p * p;
+    return 1.0_f32 / (p2 * p2);
+}
+
 fn shadow_box_alpha(px: f32, py: f32, hx: f32, hy: f32, corner: f32, sigma: f32) -> f32 {
     let s = math_vec.max_f32(sigma, 0.5_f32);
     let r = math_vec.clamp_f32(corner, 0.0_f32, math_vec.min_f32(hx, hy));
@@ -101,7 +115,7 @@ fn shadow_box_alpha(px: f32, py: f32, hx: f32, hy: f32, corner: f32, sigma: f32)
     var i: u32 = 0_u32;
     while i < 4_u32 {
         let sy = y0 + i.to_float.[f32]() * step;
-        let g = norm * math.exp(-(sy * sy * inv_s2).widen.[f64]()).trunc.[f32]();
+        let g = norm * fast_exp_neg_f32(sy * sy * inv_s2);
         let bx = blur_along_x(px, py - sy, s, r, hx, hy);
         acc = acc + bx * g * step;
         i = i +% 1_u32;
@@ -207,14 +221,41 @@ fn raster_quad(fb: *mut [u8], w: u32, h: u32, q: *scene.Quad) {
         return;
     }
 
+    let solid_fast = gmode == 0_u32 && q.bg_color[3_usize] >= 0.996_f32;
+    let solid_r = u8_from_f32(q.bg_color[0_usize]);
+    let solid_g = u8_from_f32(q.bg_color[1_usize]);
+    let solid_b = u8_from_f32(q.bg_color[2_usize]);
+    let inset = max_r + max_bw + 1.5_f32;
+    let ix0 = clamp_i32(ceil_to_i32(q.bounds[0_usize] + inset), x0, x1);
+    let ix1 = clamp_i32(floor_to_i32(q.bounds[0_usize] + bw - inset), x0, x1);
+    let iy0 = clamp_i32(ceil_to_i32(q.bounds[1_usize] + inset), y0, y1);
+    let iy1 = clamp_i32(floor_to_i32(q.bounds[1_usize] + bh - inset), y0, y1);
+    let has_interior = solid_fast && ix0 < ix1 && iy0 < iy1;
+
     var y = y0;
     while y < y1 {
         let fy = y.to_float.[f32]() + 0.5_f32;
         let py = fy - cy;
         let uy = math_vec.clamp_f32((fy - q.bounds[1_usize]) * inv_h, 0.0_f32, 1.0_f32);
         let row = (y.bitcast.[u32]() *% w).widen.[usize]();
+        let row_has_interior = has_interior && y >= iy0 && y < iy1;
         var x = x0;
         while x < x1 {
+            if row_has_interior && x == ix0 {
+                var fx_i = ix0;
+                while fx_i < ix1 {
+                    let off = (row +% fx_i.bitcast.[u32]().widen.[usize]()) *% 4_usize;
+                    if fb.len >= 4_usize && off <= fb.len - 4_usize {
+                        fb[off] = solid_r;
+                        fb[off + 1_usize] = solid_g;
+                        fb[off + 2_usize] = solid_b;
+                        fb[off + 3_usize] = 255_u8;
+                    }
+                    fx_i = fx_i +% 1_i32;
+                }
+                x = ix1;
+                continue;
+            }
             let fx = x.to_float.[f32]() + 0.5_f32;
             let px = fx - cx;
             let outer_d = rounded_rect_sdf(px, py, hx, hy, q.corner_radii);
@@ -287,18 +328,35 @@ fn raster_shadow(fb: *mut [u8], w: u32, h: u32, s: *scene.Shadow) {
     let cx = s.bounds[0_usize] + s.bounds[2_usize] * 0.5_f32;
     let cy = s.bounds[1_usize] + s.bounds[3_usize] * 0.5_f32;
     let sigma = s.blur_radius * 0.5_f32;
+    let max_cr = math_vec.max_f32(
+        math_vec.max_f32(s.corner_radii[0_usize], s.corner_radii[1_usize]),
+        math_vec.max_f32(s.corner_radii[2_usize], s.corner_radii[3_usize]),
+    );
+    let core_in = math_vec.max_f32(sigma * 3.0_f32, 1.0_f32) + max_cr;
+    let core_hx = hx - core_in;
+    let core_hy = hy - core_in;
+    let full_a = s.color[3_usize];
+    let full_sr = s.color[0_usize] * full_a;
+    let full_sg = s.color[1_usize] * full_a;
+    let full_sb = s.color[2_usize] * full_a;
     var y = y0;
     while y < y1 {
         let py = (y.to_float.[f32]() + 0.5_f32) - cy;
+        let in_core_y = core_hy > 0.0_f32 && math.abs_f32(py) < core_hy;
         let row = (y.bitcast.[u32]() *% w).widen.[usize]();
         var x = x0;
         while x < x1 {
             let px = (x.to_float.[f32]() + 0.5_f32) - cx;
-            let r = select_corner_r(px, py, s.corner_radii);
-            let a = s.color[3_usize] * shadow_box_alpha(px, py, hx, hy, r, sigma);
-            if a > 0.001_f32 {
+            if in_core_y && core_hx > 0.0_f32 && math.abs_f32(px) < core_hx {
                 let off = (row +% x.bitcast.[u32]().widen.[usize]()) *% 4_usize;
-                blend_premul_px(fb, off, s.color[0_usize] * a, s.color[1_usize] * a, s.color[2_usize] * a, a);
+                blend_premul_px(fb, off, full_sr, full_sg, full_sb, full_a);
+            } else {
+                let r = select_corner_r(px, py, s.corner_radii);
+                let a = full_a * shadow_box_alpha(px, py, hx, hy, r, sigma);
+                if a > 0.001_f32 {
+                    let off = (row +% x.bitcast.[u32]().widen.[usize]()) *% 4_usize;
+                    blend_premul_px(fb, off, s.color[0_usize] * a, s.color[1_usize] * a, s.color[2_usize] * a, a);
+                }
             }
             x = x +% 1_i32;
         }

@@ -1,0 +1,24 @@
+module eon_calc.main;
+
+import eon_ui.lib as ui_lib;
+import eon_calc.ui;
+
+// ============================================================================
+// Cross-Platform EonCalc Entry Point (`apps/eon_calc/src/main.eon`)
+// 100% safe Eon — ZERO `@hal`, ZERO `raw`, ZERO `@target_*`!
+// Compiles & runs identically across x86_64/AArch64/RISC-V64 on Linux,
+// Windows, macOS, Android, iOS, and bare-metal `nostd` framebuffers.
+// ============================================================================
+
+pub fn main(env: *mut Env) -> i32 {
+    var state = ui.CalcAppState.new();
+    let cfg = ui_lib.AppConfig.desktop("EonCalc", 880_u32, 620_u32);
+    return ui_lib.run_app.[ui.CalcAppState](
+        env,
+        &cfg,
+        &mut state,
+        ui.on_init,
+        ui.on_action,
+        ui.on_render,
+    );
+}

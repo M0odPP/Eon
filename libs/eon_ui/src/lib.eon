@@ -461,33 +461,76 @@ fn bytes_starts_with(bs: *[u8], pfx: *str) -> bool {
     return true;
 }
 
+fn apply_single_arg(bs: *[u8], cfg: *mut AppConfig) {
+    if bytes_eq_lit(bs, "--headless") {
+        cfg.headless = true;
+        cfg.force_software = true;
+        if cfg.max_frames == 0_u64 { cfg.max_frames = 2_u64; }
+    } else if bytes_eq_lit(bs, "--software") {
+        cfg.force_software = true;
+    } else if bytes_starts_with(bs, "--frames=") {
+        let tail = bs.sub(9_usize, bs.len) catch { "".as_bytes() };
+        cfg.max_frames = parse_u32_bytes(tail).widen.[u64]();
+    } else if bytes_starts_with(bs, "--width=") {
+        let tail = bs.sub(8_usize, bs.len) catch { "".as_bytes() };
+        let w = parse_u32_bytes(tail);
+        if w >= 200_u32 && w <= 4096_u32 { cfg.width = w; }
+    } else if bytes_starts_with(bs, "--height=") {
+        let tail = bs.sub(9_usize, bs.len) catch { "".as_bytes() };
+        let h = parse_u32_bytes(tail);
+        if h >= 200_u32 && h <= 4096_u32 { cfg.height = h; }
+    }
+}
+
 /// Apply standard hosted runtime CLI overrides (`--headless`, `--software`, `--frames=N`, `--width=W`, `--height=H`).
-fn apply_runtime_args(args: *ArgsCap, cfg: *mut AppConfig) {
-    let n = args.len();
-    var i: usize = 1_usize;
-    while i < n {
-        if let a = args.get(i) {
-            let bs = a.as_bytes();
-            if bytes_eq_lit(bs, "--headless") {
-                cfg.headless = true;
-                cfg.force_software = true;
-                if cfg.max_frames == 0_u64 { cfg.max_frames = 2_u64; }
-            } else if bytes_eq_lit(bs, "--software") {
-                cfg.force_software = true;
-            } else if bytes_starts_with(bs, "--frames=") {
-                let tail = bs.sub(9_usize, bs.len) catch { "".as_bytes() };
-                cfg.max_frames = parse_u32_bytes(tail).widen.[u64]();
-            } else if bytes_starts_with(bs, "--width=") {
-                let tail = bs.sub(8_usize, bs.len) catch { "".as_bytes() };
-                let w = parse_u32_bytes(tail);
-                if w >= 200_u32 && w <= 4096_u32 { cfg.width = w; }
-            } else if bytes_starts_with(bs, "--height=") {
-                let tail = bs.sub(9_usize, bs.len) catch { "".as_bytes() };
-                let h = parse_u32_bytes(tail);
-                if h >= 200_u32 && h <= 4096_u32 { cfg.height = h; }
+pub fn apply_runtime_args(args: *ArgsCap, cfg: *mut AppConfig) {
+    comptime if @target_os() == .Windows {
+        _ = args;
+        var cmd: [512]u8 = [0_u8; 512];
+        let n = platform_rt.read_win_cmdline(&mut cmd);
+        let lim = if n <= 512_usize { n } else { 512_usize };
+        var i: usize = 0_usize;
+        var tok_idx: usize = 0_usize;
+        while i < lim {
+            while i < lim && (cmd[i] == b' ' || cmd[i] == b'\t') {
+                i = i +% 1_usize;
             }
+            if i >= lim {
+                break;
+            }
+            var in_quote = false;
+            if cmd[i] == b'"' {
+                in_quote = true;
+                i = i +% 1_usize;
+            }
+            let s0 = i;
+            while i < lim {
+                let b = cmd[i];
+                if in_quote {
+                    if b == b'"' { break; }
+                } else if b == b' ' || b == b'\t' {
+                    break;
+                }
+                i = i +% 1_usize;
+            }
+            let s1 = i;
+            if in_quote && i < lim && cmd[i] == b'"' {
+                i = i +% 1_usize;
+            }
+            if tok_idx > 0_usize && s1 > s0 && s1 <= 512_usize {
+                apply_single_arg(cmd[s0..s1], cfg);
+            }
+            tok_idx = tok_idx +% 1_usize;
         }
-        i = i +% 1_usize;
+    } else {
+        let n = args.len();
+        var i: usize = 1_usize;
+        while i < n {
+            if let a = args.get(i) {
+                apply_single_arg(a.as_bytes(), cfg);
+            }
+            i = i +% 1_usize;
+        }
     }
 }
 
@@ -502,42 +545,78 @@ pub fn run_app[S](
     on_action: fn(*mut context.UiContextCore, *mut S, *input.DispatchedEvent) -> bool,
     on_render: fn(*mut UiCanvas, *mut context.UiContextCore, *mut S),
 ) -> i32 {
-    var cfg = cfg_in.*;
     comptime if @target_os() == .NoStd {
+        let cfg = cfg_in.*;
         _ = env;
         _ = bytes_eq_lit("".as_bytes(), "");
         _ = bytes_starts_with("".as_bytes(), "");
         _ = parse_u32_bytes("".as_bytes());
+        var win = win_lib.PlatformWindow.uninit();
+        let opts = cfg.to_window_options();
+        _ = win.open_in_place(&opts);
+        let fb_w = if win.width > 0_u32 { win.width } else { cfg.width };
+        let fb_h = if win.height > 0_u32 { win.height } else { cfg.height };
+
         var scratch = platform_rt.NoStdScratch.init_default();
         let max_n = if cfg.max_nodes < 128_usize { 128_usize } else { cfg.max_nodes };
-        let nodes = platform_rt.alloc_nostd_slice.[layout.LayoutNode](&mut scratch, max_n);
-        let styles = platform_rt.alloc_nostd_slice.[style.Style](&mut scratch, max_n);
-        let elems = platform_rt.alloc_nostd_slice.[element.ElemMeta](&mut scratch, max_n);
-        let rects = platform_rt.alloc_nostd_slice.[math_vec.Bounds](&mut scratch, max_n);
-        let order_buf = platform_rt.alloc_nostd_slice.[u32](&mut scratch, max_n);
-        let prepaint = platform_rt.alloc_nostd_slice.[element.PrepaintItem](&mut scratch, max_n);
-        let text_pool = platform_rt.alloc_nostd_slice.[u8](&mut scratch, 16384_usize);
-        let out_quads = platform_rt.alloc_nostd_slice.[scene.Quad](&mut scratch, 512_usize);
-        let out_shadows = platform_rt.alloc_nostd_slice.[scene.Shadow](&mut scratch, 256_usize);
-        let out_underlines = platform_rt.alloc_nostd_slice.[scene.Underline](&mut scratch, 64_usize);
-        let out_sprites = platform_rt.alloc_nostd_slice.[scene.MonoSprite](&mut scratch, 2048_usize);
-        let sans_ttf = platform_rt.alloc_nostd_slice.[u8](&mut scratch, embedded_font.FONT_UI_SANS_LEN);
-        let mono_ttf = platform_rt.alloc_nostd_slice.[u8](&mut scratch, embedded_font.FONT_UI_MONO_LEN);
         let atlas_w: u32 = 512_u32;
         let atlas_h: u32 = 512_u32;
-        let atlas_pixels = platform_rt.alloc_nostd_slice.[u8](&mut scratch, (atlas_w *% atlas_h).widen.[usize]());
-        let atlas_entries = platform_rt.alloc_nostd_slice.[atlas.GlyphEntry](&mut scratch, 2048_usize);
-        let fb_w = cfg.width;
-        let fb_h = cfg.height;
-        let soft_fb = platform_rt.alloc_nostd_slice.[u8](&mut scratch, fb_w.widen.[usize]() *% fb_h.widen.[usize]() *% 4_usize);
+        let a_nodes = scratch.alloc_range(@size_of(layout.LayoutNode), max_n);
+        let a_styles = scratch.alloc_range(@size_of(style.Style), max_n);
+        let a_elems = scratch.alloc_range(@size_of(element.ElemMeta), max_n);
+        let a_rects = scratch.alloc_range(@size_of(math_vec.Bounds), max_n);
+        let a_order = scratch.alloc_range(@size_of(u32), max_n);
+        let a_prepaint = scratch.alloc_range(@size_of(element.PrepaintItem), max_n);
+        let a_text_pool = scratch.alloc_range(1_usize, 16384_usize);
+        let a_quads = scratch.alloc_range(@size_of(scene.Quad), 512_usize);
+        let a_shadows = scratch.alloc_range(@size_of(scene.Shadow), 256_usize);
+        let a_underlines = scratch.alloc_range(@size_of(scene.Underline), 64_usize);
+        let a_sprites = scratch.alloc_range(@size_of(scene.MonoSprite), 2048_usize);
+        let a_sans = scratch.alloc_range(1_usize, embedded_font.FONT_UI_SANS_LEN);
+        let a_mono = scratch.alloc_range(1_usize, embedded_font.FONT_UI_MONO_LEN);
+        let atlas_px_n = (atlas_w *% atlas_h).widen.[usize]();
+        let a_atlas_px = scratch.alloc_range(1_usize, atlas_px_n);
+        let a_atlas_ent = scratch.alloc_range(@size_of(atlas.GlyphEntry), 2048_usize);
+        let fb_bytes_n = fb_w.widen.[usize]() *% fb_h.widen.[usize]() *% 4_usize;
+        let a_soft_fb = scratch.alloc_range(1_usize, fb_bytes_n);
+
+        var t0: u8 = 0_u8;
+        var t1: u8 = 0_u8;
+        var t2: u8 = 0_u8;
+        var t3: u8 = 0_u8;
+        var t4: u8 = 0_u8;
+        var t5: u8 = 0_u8;
+        var t6: u8 = 0_u8;
+        var t7: u8 = 0_u8;
+        var t8: u8 = 0_u8;
+        var t9: u8 = 0_u8;
+        var t10: u8 = 0_u8;
+        var t11: u8 = 0_u8;
+        var t12: u8 = 0_u8;
+        var t13: u8 = 0_u8;
+        var t14: u8 = 0_u8;
+        var t15: u8 = 0_u8;
+
+        let nodes = platform_rt.slice_from_addr.[layout.LayoutNode](&mut t0, a_nodes, if a_nodes != 0_u64 { max_n } else { 0_usize });
+        let styles = platform_rt.slice_from_addr.[style.Style](&mut t1, a_styles, if a_styles != 0_u64 { max_n } else { 0_usize });
+        let elems = platform_rt.slice_from_addr.[element.ElemMeta](&mut t2, a_elems, if a_elems != 0_u64 { max_n } else { 0_usize });
+        let rects = platform_rt.slice_from_addr.[math_vec.Bounds](&mut t3, a_rects, if a_rects != 0_u64 { max_n } else { 0_usize });
+        let order_buf = platform_rt.slice_from_addr.[u32](&mut t4, a_order, if a_order != 0_u64 { max_n } else { 0_usize });
+        let prepaint = platform_rt.slice_from_addr.[element.PrepaintItem](&mut t5, a_prepaint, if a_prepaint != 0_u64 { max_n } else { 0_usize });
+        let text_pool = platform_rt.slice_from_addr.[u8](&mut t6, a_text_pool, if a_text_pool != 0_u64 { 16384_usize } else { 0_usize });
+        let out_quads = platform_rt.slice_from_addr.[scene.Quad](&mut t7, a_quads, if a_quads != 0_u64 { 512_usize } else { 0_usize });
+        let out_shadows = platform_rt.slice_from_addr.[scene.Shadow](&mut t8, a_shadows, if a_shadows != 0_u64 { 256_usize } else { 0_usize });
+        let out_underlines = platform_rt.slice_from_addr.[scene.Underline](&mut t9, a_underlines, if a_underlines != 0_u64 { 64_usize } else { 0_usize });
+        let out_sprites = platform_rt.slice_from_addr.[scene.MonoSprite](&mut t10, a_sprites, if a_sprites != 0_u64 { 2048_usize } else { 0_usize });
+        let sans_ttf = platform_rt.slice_from_addr.[u8](&mut t11, a_sans, if a_sans != 0_u64 { embedded_font.FONT_UI_SANS_LEN } else { 0_usize });
+        let mono_ttf = platform_rt.slice_from_addr.[u8](&mut t12, a_mono, if a_mono != 0_u64 { embedded_font.FONT_UI_MONO_LEN } else { 0_usize });
+        let atlas_pixels = platform_rt.slice_from_addr.[u8](&mut t13, a_atlas_px, if a_atlas_px != 0_u64 { atlas_px_n } else { 0_usize });
+        let atlas_entries = platform_rt.slice_from_addr.[atlas.GlyphEntry](&mut t14, a_atlas_ent, if a_atlas_ent != 0_u64 { 2048_usize } else { 0_usize });
+        let soft_fb = platform_rt.slice_from_addr.[u8](&mut t15, a_soft_fb, if a_soft_fb != 0_u64 { fb_bytes_n } else { 0_usize });
 
         _ = embedded_font.decode_b64(embedded_font.FONT_UI_SANS_B64, sans_ttf);
         _ = embedded_font.decode_b64(embedded_font.FONT_UI_MONO_B64, mono_ttf);
         var text_core = text_lib.TextEngineCore.new(sans_ttf, mono_ttf, atlas_w, atlas_h);
-
-        var win = win_lib.PlatformWindow.uninit();
-        let opts = cfg.to_window_options();
-        _ = win.open_in_place(&opts);
 
         var cx = context.UiContextCore.new(fb_w, fb_h);
         on_init(&mut cx, state);
@@ -558,10 +637,14 @@ pub fn run_app[S](
                 let ev = win.next_event() orelse break;
                 _ = cx.input.handle_event(ev, &mut cx.focus, &cx.keymap);
             }
-            let acts = cx.input.dispatched_actions();
             var ai: usize = 0_usize;
-            while ai < acts.len {
-                _ = on_action(&mut cx, state, &acts[ai]);
+            while ai < cx.input.action_len {
+                let acts = cx.input.dispatched_actions();
+                if ai >= acts.len {
+                    break;
+                }
+                let ev_copy = acts[ai];
+                _ = on_action(&mut cx, state, &ev_copy);
                 ai = ai +% 1_usize;
             }
             _ = cx.tick_animations(1.0_f32 / 60.0_f32);
@@ -587,12 +670,16 @@ pub fn run_app[S](
                 out_quads, out_shadows, out_underlines, out_sprites,
                 &mut text_core, sans_ttf, mono_ttf, atlas_pixels, atlas_entries,
             );
+            let nq = if cnt.quads <= out_quads.len { cnt.quads } else { out_quads.len };
+            let ns = if cnt.shadows <= out_shadows.len { cnt.shadows } else { out_shadows.len };
+            let nu = if cnt.underlines <= out_underlines.len { cnt.underlines } else { out_underlines.len };
+            let nsp = if cnt.sprites <= out_sprites.len { cnt.sprites } else { out_sprites.len };
             soft.render_batches(
                 soft_fb, fb_w, fb_h, cx.theme.bg_window,
-                out_quads[0_usize..cnt.quads],
-                out_shadows[0_usize..cnt.shadows],
-                out_underlines[0_usize..cnt.underlines],
-                out_sprites[0_usize..cnt.sprites],
+                out_quads[0_usize..nq],
+                out_shadows[0_usize..ns],
+                out_underlines[0_usize..nu],
+                out_sprites[0_usize..nsp],
                 &empty_poly,
                 &empty_path,
                 atlas_pixels, atlas_w, atlas_h,
@@ -605,6 +692,7 @@ pub fn run_app[S](
         win_lib.nostd_exit(true);
         return 0_i32;
     } else {
+        var cfg = cfg_in.*;
         _ = embedded_font.FONT_UI_SANS_LEN;
         _ = atlas.GlyphEntry.empty();
         apply_runtime_args(&env.args, &mut cfg);
@@ -625,7 +713,11 @@ pub fn run_app[S](
             _ = host.poll_events();
             var ai: usize = 0_usize;
             while ai < host.app.core.input.action_len {
-                let ev_copy = host.app.core.input.dispatched_actions()[ai];
+                let acts = host.app.core.input.dispatched_actions();
+                if ai >= acts.len {
+                    break;
+                }
+                let ev_copy = acts[ai];
                 if on_action(&mut host.app.core, state, &ev_copy) {
                     host.app.core.mark_dirty(0_u32);
                 }
@@ -641,7 +733,20 @@ pub fn run_app[S](
             _ = host.app.core.tick_animations(dt_sec);
 
             if host.app.core.needs_frame() || cfg.max_frames > 0_u64 {
-                _ = render_host_frame.[S](&mut host, alloc, state, on_render) catch { return 3_i32; };
+                host.tree.meta.clear();
+                var canvas = UiCanvas.{
+                    meta: &mut host.tree.meta,
+                    nodes: host.tree.nodes.as_mut_slice(),
+                    styles: host.tree.styles.as_mut_slice(),
+                    elems: host.tree.elems.as_mut_slice(),
+                    text_pool: host.tree.text_pool.as_mut_slice(),
+                    sans: &host.text.sans,
+                    mono: &host.text.mono,
+                    sans_data: host.text.sans_data.as_slice(),
+                    mono_data: host.text.mono_data.as_slice(),
+                };
+                on_render(&mut canvas, &mut host.app.core, state);
+                _ = host.finish_and_render(alloc) catch { return 3_i32; };
                 frame = frame +% 1_u64;
             } else {
                 // Idle scheduler: ~0% CPU until next OS event or animation

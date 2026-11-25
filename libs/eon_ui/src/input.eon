@@ -305,6 +305,11 @@ impl InputState {
         return self.actions[0_usize..n];
     }
 
+    pub view fn all_hitboxes(self: *Self) -> *[Hitbox] {
+        let n = if self.hitbox_len <= MAX_HITBOXES { self.hitbox_len } else { MAX_HITBOXES };
+        return self.hitboxes[0_usize..n];
+    }
+
     /// Find the topmost hitbox under `p` respecting `z_index` and paint order.
     pub fn find_top_hitbox(self: *Self, p: math_vec.Point) -> ?usize {
         var best_found = false;

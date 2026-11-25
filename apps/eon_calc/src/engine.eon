@@ -1,0 +1,1340 @@
+module eon_calc.engine;
+
+import core.math;
+import core.fmt;
+
+// ============================================================================
+// Pure-Eon Cross-Platform Calculator Engine (`apps/eon_calc/src/engine.eon`)
+// 100% safe, `core/`-only, ZERO `@hal`/`raw`, ZERO `@target_*`, ZERO heap
+// allocations, ZERO panics — identical behavior on all 10 targets!
+//
+// Features:
+//   - Standard & Scientific recursive-descent expression parser with full
+//     operator precedence, right-associative `^`, unary `+/-`, postfix `!`,
+//     nested parentheses, implicit multiplication (`2(3+4)`, `2pi`), DEG/RAD,
+//     trig (`sin`/`cos`/`tan`/`asin`/`acos`/`atan`), `sqrt`/`cbrt`/`ln`/`log10`/
+//     `exp`/`abs`/`1/x`/`x^2`/`pi`/`e`.
+//   - Programmer 64-bit integer mode (`HEX`/`DEC`/`OCT`/`BIN`, bitwise `AND`,
+//     `OR`, `XOR`, `NOT`, `<<`, `>>`, `+`, `-`, `*`, `/`, `%`, parentheses).
+//   - Memory register (`MC`/`MR`/`M+`/`M-`/`MS`) & scrollable History (64 entries).
+// ============================================================================
+
+pub const PI: f64 = 3.14159265358979323846_f64;
+pub const E_CONST: f64 = 2.71828182845904523536_f64;
+pub const EXPR_CAP: usize = 160_usize;
+pub const RES_CAP: usize = 96_usize;
+pub const HISTORY_CAP: usize = 64_usize;
+
+pub enum CalcMode : u8 {
+    Standard = 0,
+    Scientific = 1,
+    Programmer = 2,
+}
+
+pub enum AngleUnit : u8 {
+    Deg = 0,
+    Rad = 1,
+}
+
+pub enum Radix : u8 {
+    Hex = 0,
+    Dec = 1,
+    Oct = 2,
+    Bin = 3,
+}
+
+pub enum CalcError : u8 {
+    None = 0,
+    DivByZero = 1,
+    DomainError = 2,
+    Overflow = 3,
+    SyntaxError = 4,
+}
+
+pub struct EvalResultF64 {
+    pub value: f64;
+    pub err: CalcError;
+}
+
+pub struct EvalResultI64 {
+    pub value: i64;
+    pub err: CalcError;
+}
+
+pub struct HistoryEntry {
+    pub expr: [160]u8;
+    pub expr_len: usize;
+    pub result: [96]u8;
+    pub result_len: usize;
+    pub mode: CalcMode;
+    pub value_f64: f64;
+    pub value_i64: i64;
+}
+
+impl HistoryEntry {
+    pub fn empty() -> HistoryEntry {
+        return HistoryEntry.{
+            expr: [0_u8; 160],
+            expr_len: 0_usize,
+            result: [0_u8; 96],
+            result_len: 0_usize,
+            mode: .Standard,
+            value_f64: 0.0_f64,
+            value_i64: 0_i64,
+        };
+    }
+
+    pub view fn expr_bytes(self: *Self) -> *[u8] {
+        let n = if self.expr_len <= EXPR_CAP { self.expr_len } else { EXPR_CAP };
+        return self.expr[0_usize..n];
+    }
+
+    pub view fn result_bytes(self: *Self) -> *[u8] {
+        let n = if self.result_len <= RES_CAP { self.result_len } else { RES_CAP };
+        return self.result[0_usize..n];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Extended pure-Eon scientific math functions over `core.math`
+// ---------------------------------------------------------------------------
+
+pub fn asin_f64(x: f64) -> EvalResultF64 {
+    if x < -1.0_f64 || x > 1.0_f64 || math.is_nan_f64(x) {
+        return EvalResultF64.{ value: 0.0_f64, err: .DomainError };
+    }
+    if x == 1.0_f64 {
+        return EvalResultF64.{ value: PI * 0.5_f64, err: .None };
+    }
+    if x == -1.0_f64 {
+        return EvalResultF64.{ value: -PI * 0.5_f64, err: .None };
+    }
+    let den = math.sqrt_f64(1.0_f64 - x * x);
+    return EvalResultF64.{ value: math.atan2(x, den), err: .None };
+}
+
+pub fn acos_f64(x: f64) -> EvalResultF64 {
+    if x < -1.0_f64 || x > 1.0_f64 || math.is_nan_f64(x) {
+        return EvalResultF64.{ value: 0.0_f64, err: .DomainError };
+    }
+    let r = asin_f64(x);
+    if r.err != .None {
+        return r;
+    }
+    return EvalResultF64.{ value: PI * 0.5_f64 - r.value, err: .None };
+}
+
+pub fn cbrt_f64(x: f64) -> f64 {
+    if x == 0.0_f64 {
+        return 0.0_f64;
+    }
+    if x < 0.0_f64 {
+        return -math.pow(-x, 1.0_f64 / 3.0_f64);
+    }
+    return math.pow(x, 1.0_f64 / 3.0_f64);
+}
+
+pub fn factorial_f64(x: f64) -> EvalResultF64 {
+    if !math.is_finite_f64(x) || x < 0.0_f64 {
+        return EvalResultF64.{ value: 0.0_f64, err: .DomainError };
+    }
+    let fl = math.floor_f64(x);
+    if math.abs_f64(x - fl) > 1.0e-9_f64 {
+        return EvalResultF64.{ value: 0.0_f64, err: .DomainError };
+    }
+    if fl > 170.0_f64 {
+        return EvalResultF64.{ value: 0.0_f64, err: .Overflow };
+    }
+    let n = fl.trunc_to_int.[i64]();
+    var acc: f64 = 1.0_f64;
+    var k: i64 = 2_i64;
+    while k <= n {
+        acc = acc * k.to_float.[f64]();
+        k = k +% 1_i64;
+    }
+    return EvalResultF64.{ value: acc, err: .None };
+}
+
+@inline
+fn is_space(b: u8) -> bool {
+    return b == b' ' || b == b'\t' || b == b'\n' || b == b'\r';
+}
+
+@inline
+fn is_digit(b: u8) -> bool {
+    return b >= b'0' && b <= b'9';
+}
+
+@inline
+fn is_alpha(b: u8) -> bool {
+    return (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') || b == b'_';
+}
+
+@inline
+fn to_lower(b: u8) -> u8 {
+    return if b >= b'A' && b <= b'Z' { b +% 32_u8 } else { b };
+}
+
+@inline
+fn digit_val(b: u8) -> i32 {
+    if b >= b'0' && b <= b'9' {
+        return (b - b'0').widen.[i32]();
+    }
+    if b >= b'a' && b <= b'f' {
+        return (b - b'a').widen.[i32]() +% 10_i32;
+    }
+    if b >= b'A' && b <= b'F' {
+        return (b - b'A').widen.[i32]() +% 10_i32;
+    }
+    return -1_i32;
+}
+
+fn match_ident(src: *[u8], start: usize, end: usize, lit: *str) -> bool {
+    let lb = lit.as_bytes();
+    if end < start || (end - start) != lb.len {
+        return false;
+    }
+    var i: usize = 0_usize;
+    while i < lb.len {
+        let si = start +% i;
+        if si >= src.len {
+            return false;
+        }
+        if to_lower(src[si]) != lb[i] {
+            return false;
+        }
+        i = i +% 1_usize;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Recursive-Descent Floating-Point Expression Parser (Standard & Scientific)
+// Grammar:
+//   expr     := term (('+' | '-') term)*
+//   term     := unary (('*' | '/' | '%' | implicit_mul) unary)*
+//   unary    := ('+' | '-') unary | power
+//   power    := postfix ('^' unary)?       // right-associative
+//   postfix  := primary ('!')*
+//   primary  := number | const ('pi','e') | func '(' expr ')' | '(' expr ')'
+// ---------------------------------------------------------------------------
+
+struct FloatParser {
+    pos: usize;
+    angle: AngleUnit;
+    err: CalcError;
+    depth: u32;
+}
+
+impl FloatParser {
+    fn skip_ws(self: *mut Self, src: *[u8]) {
+        while self.pos < src.len && is_space(src[self.pos]) {
+            self.pos = self.pos +% 1_usize;
+        }
+    }
+
+    fn peek(self: *mut Self, src: *[u8]) -> u8 {
+        self.skip_ws(src);
+        if self.pos < src.len {
+            return src[self.pos];
+        }
+        return 0_u8;
+    }
+
+    fn set_err(self: *mut Self, e: CalcError) -> f64 {
+        if self.err == .None {
+            self.err = e;
+        }
+        return 0.0_f64;
+    }
+
+    fn parse_number(self: *mut Self, src: *[u8]) -> f64 {
+        self.skip_ws(src);
+        var val: f64 = 0.0_f64;
+        var has_digits = false;
+        while self.pos < src.len && is_digit(src[self.pos]) {
+            val = val * 10.0_f64 + (src[self.pos] -% b'0').to_float.[f64]();
+            self.pos = self.pos +% 1_usize;
+            has_digits = true;
+        }
+        if self.pos < src.len && src[self.pos] == b'.' {
+            self.pos = self.pos +% 1_usize;
+            var frac: f64 = 0.1_f64;
+            while self.pos < src.len && is_digit(src[self.pos]) {
+                val = val + (src[self.pos] -% b'0').to_float.[f64]() * frac;
+                frac = frac * 0.1_f64;
+                self.pos = self.pos +% 1_usize;
+                has_digits = true;
+            }
+        }
+        if !has_digits {
+            return self.set_err(.SyntaxError);
+        }
+        // Optional scientific exponent `e+N` / `E-N`
+        if self.pos < src.len && (src[self.pos] == b'e' || src[self.pos] == b'E') {
+            let save = self.pos;
+            self.pos = self.pos +% 1_usize;
+            var exp_neg = false;
+            if self.pos < src.len && (src[self.pos] == b'+' || src[self.pos] == b'-') {
+                exp_neg = src[self.pos] == b'-';
+                self.pos = self.pos +% 1_usize;
+            }
+            var exp_v: i32 = 0_i32;
+            var has_exp = false;
+            while self.pos < src.len && is_digit(src[self.pos]) {
+                if exp_v < 1000_i32 {
+                    exp_v = exp_v *% 10_i32 +% (src[self.pos] -% b'0').widen.[i32]();
+                }
+                self.pos = self.pos +% 1_usize;
+                has_exp = true;
+            }
+            if has_exp {
+                let signed_exp = if exp_neg { 0_i32 -% exp_v } else { exp_v };
+                val = val * math.pow(10.0_f64, signed_exp.to_float.[f64]());
+            } else {
+                // Rewind so `2e` works as implicit multiplication `2 * e`!
+                self.pos = save;
+            }
+        }
+        if !math.is_finite_f64(val) {
+            return self.set_err(.Overflow);
+        }
+        return val;
+    }
+
+    fn apply_func(self: *mut Self, src: *[u8], s0: usize, s1: usize, arg: f64) -> f64 {
+        let to_rad: f64 = if self.angle == .Deg { PI / 180.0_f64 } else { 1.0_f64 };
+        let from_rad: f64 = if self.angle == .Deg { 180.0_f64 / PI } else { 1.0_f64 };
+
+        if match_ident(src, s0, s1, "sin") {
+            let r = math.sin(arg * to_rad);
+            return if math.abs_f64(r) < 1.0e-15_f64 { 0.0_f64 } else { r };
+        }
+        if match_ident(src, s0, s1, "cos") {
+            let r = math.cos(arg * to_rad);
+            return if math.abs_f64(r) < 1.0e-15_f64 { 0.0_f64 } else { r };
+        }
+        if match_ident(src, s0, s1, "tan") {
+            let rad = arg * to_rad;
+            let c = math.cos(rad);
+            if math.abs_f64(c) < 1.0e-14_f64 {
+                return self.set_err(.DomainError);
+            }
+            let r = math.tan(rad);
+            return if math.abs_f64(r) < 1.0e-15_f64 { 0.0_f64 } else { r };
+        }
+        if match_ident(src, s0, s1, "asin") {
+            let r = asin_f64(arg);
+            if r.err != .None { return self.set_err(r.err); }
+            return r.value * from_rad;
+        }
+        if match_ident(src, s0, s1, "acos") {
+            let r = acos_f64(arg);
+            if r.err != .None { return self.set_err(r.err); }
+            return r.value * from_rad;
+        }
+        if match_ident(src, s0, s1, "atan") {
+            return math.atan(arg) * from_rad;
+        }
+        if match_ident(src, s0, s1, "sqrt") {
+            if arg < 0.0_f64 { return self.set_err(.DomainError); }
+            return math.sqrt_f64(arg);
+        }
+        if match_ident(src, s0, s1, "cbrt") {
+            return cbrt_f64(arg);
+        }
+        if match_ident(src, s0, s1, "ln") {
+            if arg <= 0.0_f64 { return self.set_err(.DomainError); }
+            return math.log(arg);
+        }
+        if match_ident(src, s0, s1, "log") || match_ident(src, s0, s1, "log10") {
+            if arg <= 0.0_f64 { return self.set_err(.DomainError); }
+            return math.log(arg) / math.log(10.0_f64);
+        }
+        if match_ident(src, s0, s1, "log2") {
+            if arg <= 0.0_f64 { return self.set_err(.DomainError); }
+            return math.log(arg) / math.log(2.0_f64);
+        }
+        if match_ident(src, s0, s1, "exp") {
+            let r = math.exp(arg);
+            if !math.is_finite_f64(r) { return self.set_err(.Overflow); }
+            return r;
+        }
+        if match_ident(src, s0, s1, "abs") {
+            return math.abs_f64(arg);
+        }
+        if match_ident(src, s0, s1, "inv") {
+            if arg == 0.0_f64 { return self.set_err(.DivByZero); }
+            return 1.0_f64 / arg;
+        }
+        if match_ident(src, s0, s1, "sq") {
+            let r = arg * arg;
+            if !math.is_finite_f64(r) { return self.set_err(.Overflow); }
+            return r;
+        }
+        if match_ident(src, s0, s1, "fact") {
+            let r = factorial_f64(arg);
+            if r.err != .None { return self.set_err(r.err); }
+            return r.value;
+        }
+        return self.set_err(.SyntaxError);
+    }
+
+    @recursive
+    fn parse_primary(self: *mut Self, src: *[u8]) -> f64 {
+        if self.err != .None { return 0.0_f64; }
+        if self.depth > 48_u32 { return self.set_err(.SyntaxError); }
+        let ch = self.peek(src);
+        if ch == 0_u8 {
+            return self.set_err(.SyntaxError);
+        }
+        if ch == b'(' {
+            self.pos = self.pos +% 1_usize;
+            self.depth = self.depth +% 1_u32;
+            let v = self.parse_expr(src);
+            self.depth = self.depth -% 1_u32;
+            if self.err != .None { return 0.0_f64; }
+            if self.peek(src) != b')' {
+                return self.set_err(.SyntaxError);
+            }
+            self.pos = self.pos +% 1_usize;
+            return v;
+        }
+        if is_digit(ch) || ch == b'.' {
+            return self.parse_number(src);
+        }
+        if is_alpha(ch) {
+            let s0 = self.pos;
+            while self.pos < src.len && (is_alpha(src[self.pos]) || is_digit(src[self.pos])) {
+                self.pos = self.pos +% 1_usize;
+            }
+            let s1 = self.pos;
+            if match_ident(src, s0, s1, "pi") {
+                return PI;
+            }
+            if match_ident(src, s0, s1, "e") {
+                return E_CONST;
+            }
+            // Function call `fn(expr)` or shorthand `sin 30`
+            let next_ch = self.peek(src);
+            if next_ch == b'(' {
+                self.pos = self.pos +% 1_usize;
+                self.depth = self.depth +% 1_u32;
+                let arg = self.parse_expr(src);
+                self.depth = self.depth -% 1_u32;
+                if self.err != .None { return 0.0_f64; }
+                if self.peek(src) != b')' {
+                    return self.set_err(.SyntaxError);
+                }
+                self.pos = self.pos +% 1_usize;
+                return self.apply_func(src, s0, s1, arg);
+            }
+            self.depth = self.depth +% 1_u32;
+            let arg = self.parse_unary(src);
+            self.depth = self.depth -% 1_u32;
+            if self.err != .None { return 0.0_f64; }
+            return self.apply_func(src, s0, s1, arg);
+        }
+        return self.set_err(.SyntaxError);
+    }
+
+    @recursive
+    fn parse_postfix(self: *mut Self, src: *[u8]) -> f64 {
+        var v = self.parse_primary(src);
+        if self.err != .None { return 0.0_f64; }
+        while self.peek(src) == b'!' {
+            self.pos = self.pos +% 1_usize;
+            let r = factorial_f64(v);
+            if r.err != .None { return self.set_err(r.err); }
+            v = r.value;
+        }
+        return v;
+    }
+
+    @recursive
+    fn parse_power(self: *mut Self, src: *[u8]) -> f64 {
+        let base = self.parse_postfix(src);
+        if self.err != .None { return 0.0_f64; }
+        if self.peek(src) == b'^' {
+            self.pos = self.pos +% 1_usize;
+            self.depth = self.depth +% 1_u32;
+            let exp = self.parse_unary(src);
+            self.depth = self.depth -% 1_u32;
+            if self.err != .None { return 0.0_f64; }
+            if base < 0.0_f64 && math.abs_f64(exp - math.floor_f64(exp)) > 1.0e-12_f64 {
+                return self.set_err(.DomainError);
+            }
+            if base == 0.0_f64 && exp < 0.0_f64 {
+                return self.set_err(.DivByZero);
+            }
+            let r = math.pow(base, exp);
+            if !math.is_finite_f64(r) {
+                return self.set_err(.Overflow);
+            }
+            return r;
+        }
+        return base;
+    }
+
+    @recursive
+    fn parse_unary(self: *mut Self, src: *[u8]) -> f64 {
+        if self.err != .None { return 0.0_f64; }
+        let ch = self.peek(src);
+        if ch == b'+' {
+            self.pos = self.pos +% 1_usize;
+            return self.parse_unary(src);
+        }
+        if ch == b'-' {
+            self.pos = self.pos +% 1_usize;
+            let v = self.parse_unary(src);
+            return -v;
+        }
+        return self.parse_power(src);
+    }
+
+    @recursive
+    fn parse_term(self: *mut Self, src: *[u8]) -> f64 {
+        var left = self.parse_unary(src);
+        if self.err != .None { return 0.0_f64; }
+        loop {
+            let ch = self.peek(src);
+            if ch == b'*' {
+                self.pos = self.pos +% 1_usize;
+                let right = self.parse_unary(src);
+                if self.err != .None { return 0.0_f64; }
+                left = left * right;
+                if !math.is_finite_f64(left) { return self.set_err(.Overflow); }
+            } else if ch == b'/' {
+                self.pos = self.pos +% 1_usize;
+                let right = self.parse_unary(src);
+                if self.err != .None { return 0.0_f64; }
+                if right == 0.0_f64 { return self.set_err(.DivByZero); }
+                left = left / right;
+                if !math.is_finite_f64(left) { return self.set_err(.Overflow); }
+            } else if ch == b'%' {
+                self.pos = self.pos +% 1_usize;
+                let right = self.parse_unary(src);
+                if self.err != .None { return 0.0_f64; }
+                if right == 0.0_f64 { return self.set_err(.DivByZero); }
+                let q = math.trunc_f64(left / right);
+                left = left - q * right;
+            } else if ch == b'(' || is_alpha(ch) {
+                // Implicit multiplication: `2(3+4)`, `2pi`, `(2+1)(3+1)`
+                let right = self.parse_unary(src);
+                if self.err != .None { return 0.0_f64; }
+                left = left * right;
+                if !math.is_finite_f64(left) { return self.set_err(.Overflow); }
+            } else {
+                break;
+            }
+        }
+        return left;
+    }
+
+    @recursive
+    fn parse_expr(self: *mut Self, src: *[u8]) -> f64 {
+        var left = self.parse_term(src);
+        if self.err != .None { return 0.0_f64; }
+        loop {
+            let ch = self.peek(src);
+            if ch == b'+' {
+                self.pos = self.pos +% 1_usize;
+                let right = self.parse_term(src);
+                if self.err != .None { return 0.0_f64; }
+                left = left + right;
+                if !math.is_finite_f64(left) { return self.set_err(.Overflow); }
+            } else if ch == b'-' {
+                self.pos = self.pos +% 1_usize;
+                let right = self.parse_term(src);
+                if self.err != .None { return 0.0_f64; }
+                left = left - right;
+                if !math.is_finite_f64(left) { return self.set_err(.Overflow); }
+            } else {
+                break;
+            }
+        }
+        return left;
+    }
+}
+
+pub fn eval_f64(expr: *[u8], angle: AngleUnit) -> EvalResultF64 {
+    if expr.len == 0_usize {
+        return EvalResultF64.{ value: 0.0_f64, err: .None };
+    }
+    var p = FloatParser.{ pos: 0_usize, angle: angle, err: .None, depth: 0_u32 };
+    let val = p.parse_expr(expr);
+    if p.err != .None {
+        return EvalResultF64.{ value: 0.0_f64, err: p.err };
+    }
+    if p.peek(expr) != 0_u8 {
+        return EvalResultF64.{ value: 0.0_f64, err: .SyntaxError };
+    }
+    if !math.is_finite_f64(val) {
+        return EvalResultF64.{ value: 0.0_f64, err: .Overflow };
+    }
+    let clean = if val == 0.0_f64 { 0.0_f64 } else { val };
+    return EvalResultF64.{ value: clean, err: .None };
+}
+
+// ---------------------------------------------------------------------------
+// 64-Bit Programmer Integer Expression Parser (HEX/DEC/OCT/BIN + Bitwise)
+// Precedence (C-like):
+//   bit_or  := bit_xor ('|' bit_xor)*
+//   bit_xor := bit_and ('^' bit_and)*
+//   bit_and := shift   ('&' shift)*
+//   shift   := add     (('<<' | '>>') add)*
+//   add     := mul     (('+' | '-') mul)*
+//   mul     := unary   (('*' | '/' | '%') unary)*
+//   unary   := ('~' | '-' | '+') unary | primary
+//   primary := int_lit (0x/0o/0b or active radix) | '(' bit_or ')'
+// ---------------------------------------------------------------------------
+
+struct IntParser {
+    pos: usize;
+    radix: Radix;
+    err: CalcError;
+    depth: u32;
+}
+
+impl IntParser {
+    fn skip_ws(self: *mut Self, src: *[u8]) {
+        while self.pos < src.len && is_space(src[self.pos]) {
+            self.pos = self.pos +% 1_usize;
+        }
+    }
+
+    fn peek(self: *mut Self, src: *[u8]) -> u8 {
+        self.skip_ws(src);
+        if self.pos < src.len {
+            return src[self.pos];
+        }
+        return 0_u8;
+    }
+
+    fn set_err(self: *mut Self, e: CalcError) -> i64 {
+        if self.err == .None {
+            self.err = e;
+        }
+        return 0_i64;
+    }
+
+    fn parse_int(self: *mut Self, src: *[u8]) -> i64 {
+        self.skip_ws(src);
+        var base: i32 = match self.radix {
+            .Hex => 16_i32,
+            .Dec => 10_i32,
+            .Oct => 8_i32,
+            .Bin => 2_i32,
+        };
+        // Explicit `0x`, `0b`, `0o` prefixes override current radix
+        let p0 = self.pos;
+        let p1 = p0 +% 1_usize;
+        if p0 < src.len && p1 < src.len && src[p0] == b'0' {
+            let nxt = to_lower(src[p1]);
+            if nxt == b'x' {
+                base = 16_i32;
+                self.pos = self.pos +% 2_usize;
+            } else if nxt == b'b' {
+                base = 2_i32;
+                self.pos = self.pos +% 2_usize;
+            } else if nxt == b'o' {
+                base = 8_i32;
+                self.pos = self.pos +% 2_usize;
+            }
+        }
+        var acc: u64 = 0_u64;
+        var has_digit = false;
+        let base_u = base.widen.[i64]().bitcast.[u64]();
+        while self.pos < src.len {
+            let b = src[self.pos];
+            if b == b'_' {
+                self.pos = self.pos +% 1_usize;
+                continue;
+            }
+            let d = digit_val(b);
+            if d < 0_i32 || d >= base {
+                break;
+            }
+            acc = acc *% base_u +% d.widen.[i64]().bitcast.[u64]();
+            self.pos = self.pos +% 1_usize;
+            has_digit = true;
+        }
+        if !has_digit {
+            return self.set_err(.SyntaxError);
+        }
+        return acc.bitcast.[i64]();
+    }
+
+    fn consume_word(self: *mut Self, src: *[u8], lit: *str) -> bool {
+        self.skip_ws(src);
+        let lb = lit.as_bytes();
+        if self.pos +% lb.len > src.len {
+            return false;
+        }
+        var i: usize = 0_usize;
+        while i < lb.len {
+            let si = self.pos +% i;
+            if si >= src.len || to_lower(src[si]) != lb[i] {
+                return false;
+            }
+            i = i +% 1_usize;
+        }
+        // Ensure word boundary (not followed by alpha/digit)
+        let after = self.pos +% lb.len;
+        if after < src.len && (is_alpha(src[after]) || is_digit(src[after])) {
+            return false;
+        }
+        self.pos = after;
+        return true;
+    }
+
+    @recursive
+    fn parse_primary(self: *mut Self, src: *[u8]) -> i64 {
+        if self.err != .None { return 0_i64; }
+        if self.depth > 48_u32 { return self.set_err(.SyntaxError); }
+        let ch = self.peek(src);
+        if ch == b'(' {
+            self.pos = self.pos +% 1_usize;
+            self.depth = self.depth +% 1_u32;
+            let v = self.parse_or(src);
+            self.depth = self.depth -% 1_u32;
+            if self.err != .None { return 0_i64; }
+            if self.peek(src) != b')' {
+                return self.set_err(.SyntaxError);
+            }
+            self.pos = self.pos +% 1_usize;
+            return v;
+        }
+        return self.parse_int(src);
+    }
+
+    @recursive
+    fn parse_unary(self: *mut Self, src: *[u8]) -> i64 {
+        if self.err != .None { return 0_i64; }
+        let ch = self.peek(src);
+        if ch == b'~' {
+            self.pos = self.pos +% 1_usize;
+            return ~self.parse_unary(src);
+        }
+        if self.consume_word(src, "not") {
+            return ~self.parse_unary(src);
+        }
+        if ch == b'-' {
+            self.pos = self.pos +% 1_usize;
+            return 0_i64 -% self.parse_unary(src);
+        }
+        if ch == b'+' {
+            self.pos = self.pos +% 1_usize;
+            return self.parse_unary(src);
+        }
+        return self.parse_primary(src);
+    }
+
+    @recursive
+    fn parse_mul(self: *mut Self, src: *[u8]) -> i64 {
+        var left = self.parse_unary(src);
+        if self.err != .None { return 0_i64; }
+        loop {
+            let ch = self.peek(src);
+            if ch == b'*' {
+                self.pos = self.pos +% 1_usize;
+                let r = self.parse_unary(src);
+                left = left *% r;
+            } else if ch == b'/' {
+                self.pos = self.pos +% 1_usize;
+                let r = self.parse_unary(src);
+                if r == 0_i64 { return self.set_err(.DivByZero); }
+                if left == (-9223372036854775807_i64 -% 1_i64) && r == -1_i64 {
+                    return self.set_err(.Overflow);
+                }
+                left = (left /? r) catch { return self.set_err(.Overflow); };
+            } else if ch == b'%' || self.consume_word(src, "mod") {
+                if ch == b'%' { self.pos = self.pos +% 1_usize; }
+                let r = self.parse_unary(src);
+                if r == 0_i64 { return self.set_err(.DivByZero); }
+                if left == (-9223372036854775807_i64 -% 1_i64) && r == -1_i64 {
+                    left = 0_i64;
+                } else {
+                    left = (left %? r) catch { 0_i64 };
+                }
+            } else {
+                break;
+            }
+        }
+        return left;
+    }
+
+    @recursive
+    fn parse_add(self: *mut Self, src: *[u8]) -> i64 {
+        var left = self.parse_mul(src);
+        if self.err != .None { return 0_i64; }
+        loop {
+            let ch = self.peek(src);
+            if ch == b'+' {
+                self.pos = self.pos +% 1_usize;
+                left = left +% self.parse_mul(src);
+            } else if ch == b'-' {
+                self.pos = self.pos +% 1_usize;
+                left = left -% self.parse_mul(src);
+            } else {
+                break;
+            }
+        }
+        return left;
+    }
+
+    @recursive
+    fn parse_shift(self: *mut Self, src: *[u8]) -> i64 {
+        var left = self.parse_add(src);
+        if self.err != .None { return 0_i64; }
+        loop {
+            self.skip_ws(src);
+            let p0 = self.pos;
+            let p1 = p0 +% 1_usize;
+            if p0 < src.len && p1 < src.len && src[p0] == b'<' && src[p1] == b'<' {
+                self.pos = self.pos +% 2_usize;
+                let r = self.parse_add(src);
+                let sh = (r.bitcast.[u64]() & 63_u64);
+                left = (left.bitcast.[u64]() <<% sh).bitcast.[i64]();
+            } else if p0 < src.len && p1 < src.len && src[p0] == b'>' && src[p1] == b'>' {
+                self.pos = self.pos +% 2_usize;
+                let r = self.parse_add(src);
+                let sh = (r.bitcast.[u64]() & 63_u64);
+                left = (left.bitcast.[u64]() >> sh).bitcast.[i64]();
+            } else {
+                break;
+            }
+        }
+        return left;
+    }
+
+    @recursive
+    fn parse_and(self: *mut Self, src: *[u8]) -> i64 {
+        var left = self.parse_shift(src);
+        if self.err != .None { return 0_i64; }
+        loop {
+            let ch = self.peek(src);
+            if ch == b'&' {
+                self.pos = self.pos +% 1_usize;
+                left = left & self.parse_shift(src);
+            } else if self.consume_word(src, "and") {
+                left = left & self.parse_shift(src);
+            } else {
+                break;
+            }
+        }
+        return left;
+    }
+
+    @recursive
+    fn parse_xor(self: *mut Self, src: *[u8]) -> i64 {
+        var left = self.parse_and(src);
+        if self.err != .None { return 0_i64; }
+        loop {
+            let ch = self.peek(src);
+            if ch == b'^' {
+                self.pos = self.pos +% 1_usize;
+                left = left ^ self.parse_and(src);
+            } else if self.consume_word(src, "xor") {
+                left = left ^ self.parse_and(src);
+            } else {
+                break;
+            }
+        }
+        return left;
+    }
+
+    @recursive
+    fn parse_or(self: *mut Self, src: *[u8]) -> i64 {
+        var left = self.parse_xor(src);
+        if self.err != .None { return 0_i64; }
+        loop {
+            let ch = self.peek(src);
+            if ch == b'|' {
+                self.pos = self.pos +% 1_usize;
+                left = left | self.parse_xor(src);
+            } else if self.consume_word(src, "or") {
+                left = left | self.parse_xor(src);
+            } else {
+                break;
+            }
+        }
+        return left;
+    }
+}
+
+pub fn eval_i64(expr: *[u8], radix: Radix) -> EvalResultI64 {
+    if expr.len == 0_usize {
+        return EvalResultI64.{ value: 0_i64, err: .None };
+    }
+    var p = IntParser.{ pos: 0_usize, radix: radix, err: .None, depth: 0_u32 };
+    let val = p.parse_or(expr);
+    if p.err != .None {
+        return EvalResultI64.{ value: 0_i64, err: p.err };
+    }
+    if p.peek(expr) != 0_u8 {
+        return EvalResultI64.{ value: 0_i64, err: .SyntaxError };
+    }
+    return EvalResultI64.{ value: val, err: .None };
+}
+
+// ---------------------------------------------------------------------------
+// Stateful Interactive Calculator Engine (UI-Agnostic, 100% Safe, Zero Heap)
+// ---------------------------------------------------------------------------
+
+pub struct CalcEngine {
+    pub mode: CalcMode;
+    pub angle: AngleUnit;
+    pub radix: Radix;
+    pub expr: [160]u8;
+    pub expr_len: usize;
+    pub last_expr: [160]u8;
+    pub last_expr_len: usize;
+    pub display: [96]u8;
+    pub display_len: usize;
+    pub value_f64: f64;
+    pub value_i64: i64;
+    pub err: CalcError;
+    pub just_evaluated: bool;
+
+    // Memory register
+    pub mem_f64: f64;
+    pub mem_set: bool;
+
+    // Scrollable history (newest at index 0)
+    pub history: [64]HistoryEntry;
+    pub history_len: usize;
+}
+
+impl CalcEngine {
+    pub fn new() -> CalcEngine {
+        var e = CalcEngine.{
+            mode: .Standard,
+            angle: .Deg,
+            radix: .Dec,
+            expr: [0_u8; 160],
+            expr_len: 0_usize,
+            last_expr: [0_u8; 160],
+            last_expr_len: 0_usize,
+            display: [0_u8; 96],
+            display_len: 1_usize,
+            value_f64: 0.0_f64,
+            value_i64: 0_i64,
+            err: .None,
+            just_evaluated: false,
+            mem_f64: 0.0_f64,
+            mem_set: false,
+            history: [HistoryEntry.empty(); 64],
+            history_len: 0_usize,
+        };
+        e.display[0_usize] = b'0';
+        return e;
+    }
+
+    pub view fn expr_bytes(self: *Self) -> *[u8] {
+        let n = if self.expr_len <= EXPR_CAP { self.expr_len } else { EXPR_CAP };
+        return self.expr[0_usize..n];
+    }
+
+    pub view fn last_expr_bytes(self: *Self) -> *[u8] {
+        let n = if self.last_expr_len <= EXPR_CAP { self.last_expr_len } else { EXPR_CAP };
+        return self.last_expr[0_usize..n];
+    }
+
+    pub view fn display_bytes(self: *Self) -> *[u8] {
+        let n = if self.display_len <= RES_CAP { self.display_len } else { RES_CAP };
+        return self.display[0_usize..n];
+    }
+
+    fn set_display_str(self: *mut Self, s: *str) {
+        let bs = s.as_bytes();
+        let n = if bs.len <= RES_CAP { bs.len } else { RES_CAP };
+        var i: usize = 0_usize;
+        while i < n {
+            self.display[i] = bs[i];
+            i = i +% 1_usize;
+        }
+        self.display_len = n;
+    }
+
+    fn format_current_value(self: *mut Self) {
+        if self.err != .None {
+            match self.err {
+                .DivByZero => { self.set_display_str("Cannot divide by zero"); }
+                .DomainError => { self.set_display_str("Domain error"); }
+                .Overflow => { self.set_display_str("Overflow"); }
+                .SyntaxError => { self.set_display_str("Syntax error"); }
+                .None => {}
+            }
+            return;
+        }
+        if self.mode == .Programmer {
+            let u = self.value_i64.bitcast.[u64]();
+            match self.radix {
+                .Hex => { self.display_len = fmt.format_hex_u64(&mut self.display, u, true, 1_usize); }
+                .Dec => { self.display_len = fmt.format_i64(&mut self.display, self.value_i64); }
+                .Oct => { self.display_len = fmt.format_oct_u64(&mut self.display, u, 1_usize); }
+                .Bin => { self.display_len = fmt.format_bin_u64(&mut self.display, u, 1_usize, true); }
+            }
+            return;
+        }
+        self.display_len = fmt.format_f64_compact(&mut self.display, self.value_f64, 10_usize);
+    }
+
+    pub fn set_mode(self: *mut Self, m: CalcMode) {
+        if self.mode == m {
+            return;
+        }
+        self.mode = m;
+        self.err = .None;
+        if m == .Programmer {
+            self.value_i64 = self.value_f64.trunc_to_int.[i64]();
+            self.expr_len = 0_usize;
+            self.just_evaluated = true;
+        } else {
+            self.value_f64 = self.value_i64.to_float.[f64]();
+            self.expr_len = 0_usize;
+            self.just_evaluated = true;
+        }
+        self.format_current_value();
+    }
+
+    pub fn set_radix(self: *mut Self, r: Radix) {
+        self.radix = r;
+        if self.mode == .Programmer && self.err == .None {
+            if self.expr_len == 0_usize || self.just_evaluated {
+                self.format_current_value();
+            }
+        }
+    }
+
+    pub fn toggle_angle(self: *mut Self) {
+        self.angle = if self.angle == .Deg { .Rad } else { .Deg };
+    }
+
+    pub fn clear_all(self: *mut Self) {
+        self.expr_len = 0_usize;
+        self.last_expr_len = 0_usize;
+        self.value_f64 = 0.0_f64;
+        self.value_i64 = 0_i64;
+        self.err = .None;
+        self.just_evaluated = false;
+        self.set_display_str("0");
+    }
+
+    pub fn clear_entry(self: *mut Self) {
+        self.expr_len = 0_usize;
+        self.err = .None;
+        self.just_evaluated = false;
+        self.set_display_str("0");
+    }
+
+    pub fn backspace(self: *mut Self) {
+        if self.err != .None {
+            self.clear_entry();
+            return;
+        }
+        if self.just_evaluated {
+            self.clear_entry();
+            return;
+        }
+        if self.expr_len > 0_usize {
+            self.expr_len = self.expr_len - 1_usize;
+        }
+        self.sync_live_display();
+    }
+
+    fn sync_live_display(self: *mut Self) {
+        if self.expr_len == 0_usize {
+            self.set_display_str("0");
+            return;
+        }
+        let n = if self.expr_len <= RES_CAP { self.expr_len } else { RES_CAP };
+        let start = if self.expr_len > RES_CAP { self.expr_len - RES_CAP } else { 0_usize };
+        var i: usize = 0_usize;
+        while i < n {
+            let si = start +% i;
+            if si < EXPR_CAP {
+                self.display[i] = self.expr[si];
+            }
+            i = i +% 1_usize;
+        }
+        self.display_len = n;
+    }
+
+    fn append_raw_bytes(self: *mut Self, bs: *[u8]) {
+        var i: usize = 0_usize;
+        while i < bs.len && self.expr_len < EXPR_CAP {
+            self.expr[self.expr_len] = bs[i];
+            self.expr_len = self.expr_len +% 1_usize;
+            i = i +% 1_usize;
+        }
+    }
+
+    /// Push a digit, identifier, function, or operator token into the active expression.
+    pub fn push_token(self: *mut Self, tok: *str, is_operator: bool) {
+        if self.err != .None {
+            self.clear_all();
+        }
+        if self.just_evaluated {
+            self.just_evaluated = false;
+            self.expr_len = 0_usize;
+            if is_operator {
+                // Chain operator directly onto previous answer!
+                var tmp: [96]u8 = [0_u8; 96];
+                var n: usize = 0_usize;
+                if self.mode == .Programmer {
+                    let u = self.value_i64.bitcast.[u64]();
+                    match self.radix {
+                        .Hex => { n = fmt.format_hex_u64(&mut tmp, u, true, 1_usize); }
+                        .Dec => { n = fmt.format_i64(&mut tmp, self.value_i64); }
+                        .Oct => { n = fmt.format_oct_u64(&mut tmp, u, 1_usize); }
+                        .Bin => { n = fmt.format_bin_u64(&mut tmp, u, 1_usize, false); }
+                    }
+                } else {
+                    n = fmt.format_f64_compact(&mut tmp, self.value_f64, 10_usize);
+                }
+                if n <= 96_usize {
+                    self.append_raw_bytes(tmp[0_usize..n]);
+                }
+            }
+        }
+        self.append_raw_bytes(tok.as_bytes());
+        self.sync_live_display();
+    }
+
+    /// Check if a hex/decimal digit (`0..15`) is valid in the active Programmer radix.
+    pub fn digit_allowed(self: *Self, d: u8) -> bool {
+        if self.mode != .Programmer {
+            return d < 10_u8;
+        }
+        match self.radix {
+            .Hex => { return d < 16_u8; }
+            .Dec => { return d < 10_u8; }
+            .Oct => { return d < 8_u8; }
+            .Bin => { return d < 2_u8; }
+        }
+    }
+
+    pub fn negate(self: *mut Self) {
+        if self.err != .None {
+            return;
+        }
+        if self.just_evaluated || self.expr_len == 0_usize {
+            if self.mode == .Programmer {
+                self.value_i64 = 0_i64 -% self.value_i64;
+            } else {
+                self.value_f64 = if self.value_f64 == 0.0_f64 { 0.0_f64 } else { -self.value_f64 };
+            }
+            self.format_current_value();
+            return;
+        }
+        // Toggle leading '-' on current expression
+        if self.expr[0_usize] == b'-' {
+            let n = if self.expr_len <= EXPR_CAP { self.expr_len } else { EXPR_CAP };
+            var i: usize = 0_usize;
+            while i < EXPR_CAP {
+                let nxt = i +% 1_usize;
+                if nxt >= n || nxt >= EXPR_CAP {
+                    break;
+                }
+                self.expr[i] = self.expr[nxt];
+                i = nxt;
+            }
+            self.expr_len = n -% 1_usize;
+        } else if self.expr_len < EXPR_CAP {
+            var i = self.expr_len;
+            while i > 0_usize {
+                self.expr[i] = self.expr[i - 1_usize];
+                i = i - 1_usize;
+            }
+            self.expr[0_usize] = b'-';
+            self.expr_len = self.expr_len +% 1_usize;
+        }
+        self.sync_live_display();
+    }
+
+    /// Apply an immediate unary operation (`inv`, `sq`, `sqrt`, `not`) to the active expression or value.
+    pub fn apply_unary_op(self: *mut Self, fn_name: *str) {
+        if self.err != .None {
+            return;
+        }
+        var cur_expr: [160]u8 = [0_u8; 160];
+        var c = fmt.FmtCursor.new();
+        c.write_str(&mut cur_expr, fn_name);
+        c.write_byte(&mut cur_expr, b'(');
+        if self.expr_len > 0_usize && !self.just_evaluated {
+            c.write_bytes(&mut cur_expr, self.expr_bytes());
+        } else {
+            c.write_bytes(&mut cur_expr, self.display_bytes());
+        }
+        c.write_byte(&mut cur_expr, b')');
+        let n = if c.pos <= EXPR_CAP { c.pos } else { EXPR_CAP };
+        var i: usize = 0_usize;
+        while i < n {
+            self.expr[i] = cur_expr[i];
+            i = i +% 1_usize;
+        }
+        self.expr_len = n;
+        self.just_evaluated = false;
+        self.evaluate();
+    }
+
+    fn push_history(self: *mut Self) {
+        // Shift existing entries down by 1 (newest at index 0)
+        var i: usize = if self.history_len < HISTORY_CAP { self.history_len } else { HISTORY_CAP - 1_usize };
+        while i > 0_usize {
+            self.history[i] = self.history[i - 1_usize];
+            i = i - 1_usize;
+        }
+        var ent = HistoryEntry.empty();
+        let el = if self.last_expr_len <= EXPR_CAP { self.last_expr_len } else { EXPR_CAP };
+        var k: usize = 0_usize;
+        while k < el {
+            ent.expr[k] = self.last_expr[k];
+            k = k +% 1_usize;
+        }
+        ent.expr_len = el;
+        let rl = if self.display_len <= RES_CAP { self.display_len } else { RES_CAP };
+        k = 0_usize;
+        while k < rl {
+            ent.result[k] = self.display[k];
+            k = k +% 1_usize;
+        }
+        ent.result_len = rl;
+        ent.mode = self.mode;
+        ent.value_f64 = self.value_f64;
+        ent.value_i64 = self.value_i64;
+        self.history[0_usize] = ent;
+        if self.history_len < HISTORY_CAP {
+            self.history_len = self.history_len +% 1_usize;
+        }
+    }
+
+    pub fn evaluate(self: *mut Self) {
+        if self.expr_len == 0_usize {
+            return;
+        }
+        // Snapshot expression into breadcrumb `last_expr`
+        let n = if self.expr_len <= EXPR_CAP { self.expr_len } else { EXPR_CAP };
+        var i: usize = 0_usize;
+        while i < n {
+            self.last_expr[i] = self.expr[i];
+            i = i +% 1_usize;
+        }
+        self.last_expr_len = n;
+
+        if self.mode == .Programmer {
+            let r = eval_i64(self.expr[0_usize..n], self.radix);
+            self.err = r.err;
+            if r.err == .None {
+                self.value_i64 = r.value;
+                self.value_f64 = r.value.to_float.[f64]();
+            }
+        } else {
+            let r = eval_f64(self.expr[0_usize..n], self.angle);
+            self.err = r.err;
+            if r.err == .None {
+                self.value_f64 = r.value;
+                self.value_i64 = r.value.trunc_to_int.[i64]();
+            }
+        }
+        self.just_evaluated = true;
+        self.format_current_value();
+        if self.err == .None {
+            self.push_history();
+        }
+    }
+
+    pub fn recall_history(self: *mut Self, idx: usize) {
+        if idx >= self.history_len || idx >= HISTORY_CAP {
+            return;
+        }
+        let ent = self.history[idx];
+        self.err = .None;
+        self.value_f64 = ent.value_f64;
+        self.value_i64 = ent.value_i64;
+        let rl = if ent.result_len <= EXPR_CAP { ent.result_len } else { EXPR_CAP };
+        var i: usize = 0_usize;
+        while i < rl {
+            if i < RES_CAP {
+                self.expr[i] = ent.result[i];
+            }
+            i = i +% 1_usize;
+        }
+        self.expr_len = rl;
+        self.last_expr_len = ent.expr_len;
+        var k: usize = 0_usize;
+        while k < ent.expr_len && k < EXPR_CAP {
+            self.last_expr[k] = ent.expr[k];
+            k = k +% 1_usize;
+        }
+        self.just_evaluated = true;
+        self.format_current_value();
+    }
+
+    // Memory register (`MC`, `MR`, `M+`, `M-`, `MS`)
+    fn active_number_f64(self: *Self) -> f64 {
+        if self.expr_len > 0_usize && !self.just_evaluated {
+            let r = eval_f64(self.expr_bytes(), self.angle);
+            if r.err == .None {
+                return r.value;
+            }
+        }
+        return self.value_f64;
+    }
+
+    pub fn mem_clear(self: *mut Self) {
+        self.mem_f64 = 0.0_f64;
+        self.mem_set = false;
+    }
+
+    pub fn mem_store(self: *mut Self) {
+        self.mem_f64 = self.active_number_f64();
+        self.mem_set = true;
+    }
+
+    pub fn mem_add(self: *mut Self) {
+        self.mem_f64 = self.mem_f64 + self.active_number_f64();
+        self.mem_set = true;
+    }
+
+    pub fn mem_sub(self: *mut Self) {
+        self.mem_f64 = self.mem_f64 - self.active_number_f64();
+        self.mem_set = true;
+    }
+
+    pub fn mem_recall(self: *mut Self) {
+        if !self.mem_set {
+            return;
+        }
+        var tmp: [96]u8 = [0_u8; 96];
+        let n = fmt.format_f64_compact(&mut tmp, self.mem_f64, 10_usize);
+        if self.just_evaluated {
+            self.expr_len = 0_usize;
+            self.just_evaluated = false;
+        }
+        if n <= 96_usize {
+            self.append_raw_bytes(tmp[0_usize..n]);
+        }
+        self.sync_live_display();
+    }
+
+    /// Format current 64-bit programmer integer in all 4 bases (`HEX`/`DEC`/`OCT`/`BIN`).
+    pub fn format_radix_value(self: *Self, r: Radix, dst: *mut [u8]) -> usize {
+        var val = self.value_i64;
+        if self.mode == .Programmer && self.expr_len > 0_usize && !self.just_evaluated {
+            let res = eval_i64(self.expr_bytes(), self.radix);
+            if res.err == .None {
+                val = res.value;
+            }
+        }
+        let u = val.bitcast.[u64]();
+        match r {
+            .Hex => { return fmt.format_hex_u64(dst, u, true, 1_usize); }
+            .Dec => { return fmt.format_i64(dst, val); }
+            .Oct => { return fmt.format_oct_u64(dst, u, 1_usize); }
+            .Bin => { return fmt.format_bin_u64(dst, u, 1_usize, true); }
+        }
+    }
+}

@@ -1,0 +1,23 @@
+module eon_calc.build;
+
+pub fn build(b: *mut BuildCap) {
+    b.add_dep("eon_win", "../../libs/eon_win");
+    b.add_dep("eon_gpu", "../../libs/eon_gpu");
+    b.add_dep("eon_text", "../../libs/eon_text");
+    b.add_dep("eon_ui", "../../libs/eon_ui");
+    // Only the library HAL boundary modules are authorized; apps/eon_calc/src/ has ZERO @hal / raw!
+    b.allow_hal("eon_win.platform.wayland");
+    b.allow_hal("eon_win.platform.x11");
+    b.allow_hal("eon_win.platform.win32");
+    b.allow_hal("eon_win.platform.macos");
+    b.allow_hal("eon_win.platform.android");
+    b.allow_hal("eon_win.platform.ios");
+    b.allow_hal("eon_win.platform.nostd_fb");
+    b.allow_hal("eon_gpu.backends.vulkan");
+    b.allow_hal("eon_gpu.backends.metal");
+    b.allow_hal("eon_text.sys_font");
+    b.allow_hal("eon_ui.platform_rt");
+    b.link_lib("libc.so.6");
+    b.set_out_dir("out");
+    b.add_exe("eon_calc", "src");
+}

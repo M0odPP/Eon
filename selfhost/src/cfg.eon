@@ -2527,6 +2527,14 @@ impl CfgBuilder {
                     );
                     return try self.emit_bin_tmp(.Eq, cfg_ir.op_copy(tag_dst), c, types.TY_BOOL, sp);
                 }
+                if sk == .Enum {
+                    let tv = self.enum_variant_discriminant(scrut_ty, p_ident.sym);
+                    let c = try self.cfg.add_const_op(
+                        self.alloc,
+                        cfg_ir.const_enum_tag(scrut_ty, p_ident.sym, tv),
+                    );
+                    return try self.emit_bin_tmp(.Eq, cfg_ir.op_copy(scrut_place), c, types.TY_BOOL, sp);
+                }
                 let tv = self.variant_tag_index(scrut_ty, p_ident.sym) orelse 0_u32;
                 let c = try self.cfg.add_const_op(
                     self.alloc,
@@ -5006,6 +5014,23 @@ impl CfgBuilder {
             return try self.cfg.add_const_op(self.alloc, cfg_ir.const_fn_ref(d, fn_ty));
         }
         return try self.cfg.add_const_op(self.alloc, cfg_ir.const_null(expected_ty));
+    }
+
+    fn enum_variant_discriminant(self: *Self, ty: types.TyId, sym: u32) -> types.IntVal {
+        let tn = self.env.get(ty);
+        if tn.kind == .Enum {
+            if let meta = self.env.get_enum(tn.primary) {
+                let vs = self.env.enum_variants_range(meta.variants);
+                var vi: usize = 0_usize;
+                while vi < vs.len {
+                    if vs[vi].name == sym {
+                        return vs[vi].val;
+                    }
+                    vi = vi +% 1_usize;
+                }
+            }
+        }
+        return types.int_val_zero();
     }
 
     @recursive

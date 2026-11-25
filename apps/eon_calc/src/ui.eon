@@ -1,0 +1,694 @@
+module eon_calc.ui;
+
+import eon_text.lib as text_lib;
+import eon_ui.theme;
+import eon_ui.keymap;
+import eon_ui.input;
+import eon_ui.context;
+import eon_ui.div;
+import eon_ui.components.button;
+import eon_ui.components.toggle;
+import eon_ui.components.scroll_view;
+import eon_ui.components.overlay;
+import eon_ui.lib as ui_lib;
+import eon_calc.engine;
+
+// ============================================================================
+// Cross-Platform GPUI-Class Calculator UI (`apps/eon_calc/src/ui.eon`)
+// 100% safe Eon — ZERO `@hal`, ZERO `raw`, ZERO `@target_*`!
+// Runs identically on Linux (Wayland/X11+Vulkan), Windows (Win32+Vulkan),
+// macOS/iOS (Cocoa/UIKit+Metal), Android (Vulkan), headless tests, and `nostd`!
+// ============================================================================
+
+// Typed UI Actions
+pub const ACT_DIGIT_0: u32 = 10_u32;
+pub const ACT_DIGIT_1: u32 = 11_u32;
+pub const ACT_DIGIT_2: u32 = 12_u32;
+pub const ACT_DIGIT_3: u32 = 13_u32;
+pub const ACT_DIGIT_4: u32 = 14_u32;
+pub const ACT_DIGIT_5: u32 = 15_u32;
+pub const ACT_DIGIT_6: u32 = 16_u32;
+pub const ACT_DIGIT_7: u32 = 17_u32;
+pub const ACT_DIGIT_8: u32 = 18_u32;
+pub const ACT_DIGIT_9: u32 = 19_u32;
+pub const ACT_HEX_A: u32 = 20_u32;
+pub const ACT_HEX_B: u32 = 21_u32;
+pub const ACT_HEX_C: u32 = 22_u32;
+pub const ACT_HEX_D: u32 = 23_u32;
+pub const ACT_HEX_E: u32 = 24_u32;
+pub const ACT_HEX_F: u32 = 25_u32;
+
+pub const ACT_DOT: u32 = 30_u32;
+pub const ACT_ADD: u32 = 31_u32;
+pub const ACT_SUB: u32 = 32_u32;
+pub const ACT_MUL: u32 = 33_u32;
+pub const ACT_DIV: u32 = 34_u32;
+pub const ACT_MOD: u32 = 35_u32;
+pub const ACT_POW: u32 = 36_u32;
+pub const ACT_LPAREN: u32 = 37_u32;
+pub const ACT_RPAREN: u32 = 38_u32;
+pub const ACT_EQ: u32 = 39_u32;
+pub const ACT_BS: u32 = 40_u32;
+pub const ACT_CE: u32 = 41_u32;
+pub const ACT_CA: u32 = 42_u32;
+pub const ACT_NEG: u32 = 43_u32;
+
+pub const ACT_INV: u32 = 50_u32;
+pub const ACT_SQ: u32 = 51_u32;
+pub const ACT_SQRT: u32 = 52_u32;
+pub const ACT_SIN: u32 = 53_u32;
+pub const ACT_COS: u32 = 54_u32;
+pub const ACT_TAN: u32 = 55_u32;
+pub const ACT_LN: u32 = 56_u32;
+pub const ACT_LOG10: u32 = 57_u32;
+pub const ACT_EXP: u32 = 58_u32;
+pub const ACT_FACT: u32 = 59_u32;
+pub const ACT_PI: u32 = 60_u32;
+pub const ACT_E: u32 = 61_u32;
+pub const ACT_ABS: u32 = 62_u32;
+pub const ACT_ANGLE: u32 = 63_u32;
+
+pub const ACT_BIT_AND: u32 = 70_u32;
+pub const ACT_BIT_OR: u32 = 71_u32;
+pub const ACT_BIT_XOR: u32 = 72_u32;
+pub const ACT_BIT_NOT: u32 = 73_u32;
+pub const ACT_BIT_LSH: u32 = 74_u32;
+pub const ACT_BIT_RSH: u32 = 75_u32;
+pub const ACT_RADIX_HEX: u32 = 76_u32;
+pub const ACT_RADIX_DEC: u32 = 77_u32;
+pub const ACT_RADIX_OCT: u32 = 78_u32;
+pub const ACT_RADIX_BIN: u32 = 79_u32;
+
+pub const ACT_MC: u32 = 80_u32;
+pub const ACT_MR: u32 = 81_u32;
+pub const ACT_MADD: u32 = 82_u32;
+pub const ACT_MSUB: u32 = 83_u32;
+pub const ACT_MS: u32 = 84_u32;
+
+pub const ACT_MODE_STD: u32 = 90_u32;
+pub const ACT_MODE_SCI: u32 = 91_u32;
+pub const ACT_MODE_PROG: u32 = 92_u32;
+pub const ACT_TOGGLE_THEME: u32 = 93_u32;
+pub const ACT_TOGGLE_HISTORY: u32 = 94_u32;
+pub const ACT_CLOSE_OVERLAY: u32 = 95_u32;
+pub const ACT_CLEAR_HISTORY: u32 = 96_u32;
+
+pub const ACT_HISTORY_BASE: u32 = 200_u32;
+pub const SCROLL_HISTORY_ID: u32 = 1_u32;
+
+pub struct CalcAppState {
+    pub calc: engine.CalcEngine;
+    pub show_history: bool;
+    pub history_scroll: scroll_view.ScrollState;
+}
+
+impl CalcAppState {
+    pub fn new() -> CalcAppState {
+        return CalcAppState.{
+            calc: engine.CalcEngine.new(),
+            show_history: true,
+            history_scroll: scroll_view.ScrollState.new(SCROLL_HISTORY_ID),
+        };
+    }
+}
+
+/// Register complete keyboard shortcuts & keybindings for desktop/mobile/bare-metal input.
+pub fn on_init(cx: *mut context.UiContextCore, _state: *mut CalcAppState) {
+    let km = &mut cx.keymap;
+    km.clear();
+    _ = km.bind_key(.Digit0, ACT_DIGIT_0);
+    _ = km.bind_key(.Digit1, ACT_DIGIT_1);
+    _ = km.bind_key(.Digit2, ACT_DIGIT_2);
+    _ = km.bind_key(.Digit3, ACT_DIGIT_3);
+    _ = km.bind_key(.Digit4, ACT_DIGIT_4);
+    _ = km.bind_key(.Digit5, ACT_DIGIT_5);
+    _ = km.bind_key(.Digit6, ACT_DIGIT_6);
+    _ = km.bind_key(.Digit7, ACT_DIGIT_7);
+    _ = km.bind_key(.Digit8, ACT_DIGIT_8);
+    _ = km.bind_key(.Digit9, ACT_DIGIT_9);
+
+    _ = km.bind_key(.A, ACT_HEX_A);
+    _ = km.bind_key(.B, ACT_HEX_B);
+    _ = km.bind_key(.C, ACT_HEX_C);
+    _ = km.bind_key(.D, ACT_HEX_D);
+    _ = km.bind_key(.E, ACT_HEX_E);
+    _ = km.bind_key(.F, ACT_HEX_F);
+
+    _ = km.bind_key(.Period, ACT_DOT);
+    _ = km.bind_key(.Plus, ACT_ADD);
+    _ = km.bind_key(.Minus, ACT_SUB);
+    _ = km.bind_key(.Multiply, ACT_MUL);
+    _ = km.bind_key(.Divide, ACT_DIV);
+    _ = km.bind_key(.Slash, ACT_DIV);
+    _ = km.bind_key(.Percent, ACT_MOD);
+    _ = km.bind_key(.Caret, ACT_POW);
+    _ = km.bind_key(.LParen, ACT_LPAREN);
+    _ = km.bind_key(.RParen, ACT_RPAREN);
+    _ = km.bind_key(.Enter, ACT_EQ);
+    _ = km.bind_key(.Equal, ACT_EQ);
+    _ = km.bind_key(.Backspace, ACT_BS);
+    _ = km.bind_key(.Delete, ACT_CE);
+    _ = km.bind_key(.Escape, ACT_CA);
+
+    // Primary modifier shortcuts (Ctrl on Linux/Windows, Cmd on macOS)
+    _ = km.bind_primary(.Digit1, ACT_MODE_STD);
+    _ = km.bind_primary(.Digit2, ACT_MODE_SCI);
+    _ = km.bind_primary(.Digit3, ACT_MODE_PROG);
+    _ = km.bind_primary(.T, ACT_TOGGLE_THEME);
+    _ = km.bind_primary(.H, ACT_TOGGLE_HISTORY);
+    _ = km.bind_primary(.R, ACT_MR);
+}
+
+fn push_digit_action(st: *mut CalcAppState, d: u8, lit: *str) -> bool {
+    if !st.calc.digit_allowed(d) {
+        return false;
+    }
+    st.calc.push_token(lit, false);
+    return true;
+}
+
+pub fn apply_action(cx: *mut context.UiContextCore, st: *mut CalcAppState, act: u32) -> bool {
+    if act >= ACT_HISTORY_BASE && act < ACT_HISTORY_BASE +% 64_u32 {
+        let idx = (act - ACT_HISTORY_BASE).widen.[usize]();
+        st.calc.recall_history(idx);
+        return true;
+    }
+    if act == ACT_DIGIT_0 { return push_digit_action(st, 0_u8, "0"); }
+    if act == ACT_DIGIT_1 { return push_digit_action(st, 1_u8, "1"); }
+    if act == ACT_DIGIT_2 { return push_digit_action(st, 2_u8, "2"); }
+    if act == ACT_DIGIT_3 { return push_digit_action(st, 3_u8, "3"); }
+    if act == ACT_DIGIT_4 { return push_digit_action(st, 4_u8, "4"); }
+    if act == ACT_DIGIT_5 { return push_digit_action(st, 5_u8, "5"); }
+    if act == ACT_DIGIT_6 { return push_digit_action(st, 6_u8, "6"); }
+    if act == ACT_DIGIT_7 { return push_digit_action(st, 7_u8, "7"); }
+    if act == ACT_DIGIT_8 { return push_digit_action(st, 8_u8, "8"); }
+    if act == ACT_DIGIT_9 { return push_digit_action(st, 9_u8, "9"); }
+    if act == ACT_HEX_A { return push_digit_action(st, 10_u8, "A"); }
+    if act == ACT_HEX_B { return push_digit_action(st, 11_u8, "B"); }
+    if act == ACT_HEX_C {
+        if st.calc.mode == .Programmer {
+            return push_digit_action(st, 12_u8, "C");
+        }
+        st.calc.clear_all();
+        return true;
+    }
+    if act == ACT_HEX_D { return push_digit_action(st, 13_u8, "D"); }
+    if act == ACT_HEX_E {
+        if st.calc.mode == .Programmer {
+            return push_digit_action(st, 14_u8, "E");
+        }
+        st.calc.push_token("e", false);
+        return true;
+    }
+    if act == ACT_HEX_F { return push_digit_action(st, 15_u8, "F"); }
+
+    if act == ACT_DOT {
+        if st.calc.mode == .Programmer { return false; }
+        st.calc.push_token(".", false);
+        return true;
+    }
+    if act == ACT_ADD { st.calc.push_token("+", true); return true; }
+    if act == ACT_SUB { st.calc.push_token("-", true); return true; }
+    if act == ACT_MUL { st.calc.push_token("*", true); return true; }
+    if act == ACT_DIV { st.calc.push_token("/", true); return true; }
+    if act == ACT_MOD { st.calc.push_token("%", true); return true; }
+    if act == ACT_POW {
+        if st.calc.mode == .Programmer {
+            st.calc.push_token(" XOR ", true);
+        } else {
+            st.calc.push_token("^", true);
+        }
+        return true;
+    }
+    if act == ACT_LPAREN { st.calc.push_token("(", false); return true; }
+    if act == ACT_RPAREN { st.calc.push_token(")", false); return true; }
+    if act == ACT_EQ { st.calc.evaluate(); return true; }
+    if act == ACT_BS { st.calc.backspace(); return true; }
+    if act == ACT_CE { st.calc.clear_entry(); return true; }
+    if act == ACT_CA { st.calc.clear_all(); return true; }
+    if act == ACT_NEG { st.calc.negate(); return true; }
+
+    if act == ACT_INV { st.calc.apply_unary_op("inv"); return true; }
+    if act == ACT_SQ { st.calc.apply_unary_op("sq"); return true; }
+    if act == ACT_SQRT { st.calc.push_token("sqrt(", false); return true; }
+    if act == ACT_SIN { st.calc.push_token("sin(", false); return true; }
+    if act == ACT_COS { st.calc.push_token("cos(", false); return true; }
+    if act == ACT_TAN { st.calc.push_token("tan(", false); return true; }
+    if act == ACT_LN { st.calc.push_token("ln(", false); return true; }
+    if act == ACT_LOG10 { st.calc.push_token("log(", false); return true; }
+    if act == ACT_EXP { st.calc.push_token("exp(", false); return true; }
+    if act == ACT_FACT { st.calc.push_token("!", true); return true; }
+    if act == ACT_PI { st.calc.push_token("pi", false); return true; }
+    if act == ACT_E { st.calc.push_token("e", false); return true; }
+    if act == ACT_ABS { st.calc.push_token("abs(", false); return true; }
+    if act == ACT_ANGLE { st.calc.toggle_angle(); return true; }
+
+    if act == ACT_BIT_AND { st.calc.push_token(" AND ", true); return true; }
+    if act == ACT_BIT_OR { st.calc.push_token(" OR ", true); return true; }
+    if act == ACT_BIT_XOR { st.calc.push_token(" XOR ", true); return true; }
+    if act == ACT_BIT_NOT { st.calc.push_token("~", false); return true; }
+    if act == ACT_BIT_LSH { st.calc.push_token("<<", true); return true; }
+    if act == ACT_BIT_RSH { st.calc.push_token(">>", true); return true; }
+
+    if act == ACT_RADIX_HEX { st.calc.set_radix(.Hex); return true; }
+    if act == ACT_RADIX_DEC { st.calc.set_radix(.Dec); return true; }
+    if act == ACT_RADIX_OCT { st.calc.set_radix(.Oct); return true; }
+    if act == ACT_RADIX_BIN { st.calc.set_radix(.Bin); return true; }
+
+    if act == ACT_MC { st.calc.mem_clear(); return true; }
+    if act == ACT_MR { st.calc.mem_recall(); return true; }
+    if act == ACT_MADD { st.calc.mem_add(); return true; }
+    if act == ACT_MSUB { st.calc.mem_sub(); return true; }
+    if act == ACT_MS { st.calc.mem_store(); return true; }
+
+    if act == ACT_MODE_STD { st.calc.set_mode(.Standard); return true; }
+    if act == ACT_MODE_SCI { st.calc.set_mode(.Scientific); return true; }
+    if act == ACT_MODE_PROG { st.calc.set_mode(.Programmer); return true; }
+    if act == ACT_TOGGLE_THEME { cx.toggle_theme(); return true; }
+    if act == ACT_TOGGLE_HISTORY { st.show_history = !st.show_history; return true; }
+    if act == ACT_CLOSE_OVERLAY { st.show_history = false; return true; }
+    if act == ACT_CLEAR_HISTORY {
+        st.calc.history_len = 0_usize;
+        st.history_scroll.scroll_to_top();
+        return true;
+    }
+    return false;
+}
+
+pub fn on_action(cx: *mut context.UiContextCore, st: *mut CalcAppState, ev: *input.DispatchedEvent) -> bool {
+    if ev.scroll_id == SCROLL_HISTORY_ID {
+        st.history_scroll.scroll_by(-ev.scroll_dy * 32.0_f32);
+        return true;
+    }
+    if ev.action_id != keymap.ACTION_NONE {
+        return apply_action(cx, st, ev.action_id);
+    }
+    // Support shifted punctuation typed via TextInput (`+`, `*`, `(`, `)`, `^`, `%`, `&`, `|`, `~`, `!`)
+    if ev.text_codepoint != 0_u32 {
+        match ev.text_codepoint {
+            43_u32 => { return apply_action(cx, st, ACT_ADD); }      // '+'
+            42_u32 => { return apply_action(cx, st, ACT_MUL); }      // '*'
+            40_u32 => { return apply_action(cx, st, ACT_LPAREN); }   // '('
+            41_u32 => { return apply_action(cx, st, ACT_RPAREN); }   // ')'
+            94_u32 => { return apply_action(cx, st, ACT_POW); }      // '^'
+            37_u32 => { return apply_action(cx, st, ACT_MOD); }      // '%'
+            38_u32 => { return apply_action(cx, st, ACT_BIT_AND); }  // '&'
+            124_u32 => { return apply_action(cx, st, ACT_BIT_OR); }  // '|'
+            126_u32 => { return apply_action(cx, st, ACT_BIT_NOT); } // '~'
+            33_u32 => { return apply_action(cx, st, ACT_FACT); }     // '!'
+            _ => { return false; }
+        }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Declarative GPUI-Style View Tree (`on_render`)
+// ---------------------------------------------------------------------------
+
+fn push_key(
+    ui: *mut ui_lib.UiCanvas,
+    grid: u32,
+    th: *theme.Theme,
+    variant: button.ButtonVariant,
+    id: u64,
+    act: u32,
+    label: *str,
+    font_px: f32,
+    disabled: bool,
+) {
+    let d = button.button(th, variant, id, act)
+        .text_size(font_px)
+        .disabled(disabled);
+    _ = ui.push_text(grid, d, label);
+}
+
+fn push_radix_row(
+    ui: *mut ui_lib.UiCanvas,
+    parent: u32,
+    th: *theme.Theme,
+    st: *CalcAppState,
+    r: engine.Radix,
+    tag: *str,
+    id: u64,
+    act: u32,
+) {
+    let selected = st.calc.radix == r;
+    var row_d = div.div()
+        .id(id)
+        .on_click(act)
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(8.0_f32)
+        .h(22.0_f32)
+        .px(8.0_f32)
+        .rounded(th.radius_sm);
+    if selected {
+        row_d = row_d.bg(th.accent.with_alpha(0.18_f32)).border(1.0_f32, th.accent);
+    } else {
+        row_d = row_d.hover_bg(th.btn_secondary_hover);
+    }
+    let row = ui.push(parent, row_d);
+    let tag_col = if selected { th.accent } else { th.text_muted };
+    _ = ui.push_text(row, div.div().w(34.0_f32).text_size(11.0_f32).text_color(tag_col).font_mono().text_left(), tag);
+
+    var val_buf: [96]u8 = [0_u8; 96];
+    let n = st.calc.format_radix_value(r, &mut val_buf);
+    let sl = if n <= 96_usize { val_buf[0_usize..n] } else { val_buf[0_usize..96_usize] };
+    let val_col = if selected { th.text_primary } else { th.text_secondary };
+    _ = ui.push_text_bytes(
+        row,
+        div.div().flex_1().text_size(12.0_f32).text_color(val_col).font_mono().text_right().text_ellipsis(),
+        sl,
+    );
+}
+
+fn render_history_contents(
+    ui: *mut ui_lib.UiCanvas,
+    parent: u32,
+    th: *theme.Theme,
+    st: *mut CalcAppState,
+    panel_h: f32,
+) {
+    let hdr = ui.push(parent, div.div().flex_row().justify_between().items_center().h(30.0_f32));
+    _ = ui.push_text(hdr, div.div().text_size(14.0_f32).text_color(th.text_primary), "History");
+    if st.calc.history_len > 0_usize {
+        _ = ui.push_text(
+            hdr,
+            button.button(th, .Ghost, 501_u64, ACT_CLEAR_HISTORY).px(8.0_f32).h(24.0_f32).text_size(12.0_f32),
+            "Clear",
+        );
+    }
+
+    let list_h = if panel_h > 70.0_f32 { panel_h - 60.0_f32 } else { 120.0_f32 };
+    let item_h: f32 = 54.0_f32;
+    let total_h = st.calc.history_len.to_float.[f32]() * (item_h + 6.0_f32);
+    st.history_scroll.set_metrics(total_h, list_h);
+
+    let sc_box = ui.push(
+        parent,
+        pr_pad(st.history_scroll.container_div().flex_1().w_full().gap(6.0_f32)),
+    );
+
+    if st.calc.history_len == 0_usize {
+        _ = ui.push_text(
+            sc_box,
+            div.div().w_full().h(48.0_f32).text_size(13.0_f32).text_color(th.text_muted).text_center(),
+            "No calculations yet",
+        );
+        return;
+    }
+
+    var i: usize = 0_usize;
+    while i < st.calc.history_len && i < 32_usize {
+        let eid = 1000_u64 +% i.widen.[u64]();
+        let act = ACT_HISTORY_BASE +% i.trunc.[u32]();
+        let card = ui.push(
+            sc_box,
+            div.div()
+                .id(eid)
+                .on_click(act)
+                .flex_col()
+                .gap(2.0_f32)
+                .w_full()
+                .h(item_h)
+                .px(10.0_f32)
+                .py(6.0_f32)
+                .rounded(th.radius_sm)
+                .bg(th.bg_elevated)
+                .hover_bg(th.btn_hover)
+                .active_bg(th.btn_active)
+                .border(1.0_f32, th.border_subtle),
+        );
+        let ent = &st.calc.history[i];
+        _ = ui.push_text_bytes(
+            card,
+            div.div().w_full().h(16.0_f32).text_size(11.0_f32).text_color(th.text_muted).font_mono().text_right().text_ellipsis(),
+            ent.expr_bytes(),
+        );
+        _ = ui.push_text_bytes(
+            card,
+            div.div().w_full().h(24.0_f32).text_size(16.0_f32).text_color(th.text_primary).font_mono().text_right().text_ellipsis(),
+            ent.result_bytes(),
+        );
+        i = i +% 1_usize;
+    }
+    _ = ui.push(sc_box, st.history_scroll.scrollbar_thumb_div(th, list_h));
+}
+
+fn pr_pad(mut d: div.Div) -> div.Div {
+    d.style.padding.right = 8.0_f32;
+    return d;
+}
+
+pub fn on_render(ui: *mut ui_lib.UiCanvas, cx: *mut context.UiContextCore, st: *mut CalcAppState) {
+    let th = &cx.theme;
+    let vw = cx.viewport_width();
+    let vh = cx.viewport_height();
+    let compact = vw < 680.0_f32;
+    let dock_history = st.show_history && !compact;
+
+    let pad_outer: f32 = if compact { 10.0_f32 } else { 14.0_f32 };
+    let root = ui.push_root(
+        div.div()
+            .flex_row()
+            .gap(12.0_f32)
+            .p(pad_outer)
+            .w_full()
+            .h_full()
+            .bg(th.bg_window),
+    );
+
+    // Main left/primary calculator column
+    let main_col = ui.push(root, div.div().flex_col().gap(10.0_f32).flex_1().h_full());
+
+    // 1. Top Header Bar: Mode Segmented Control + History Toggle + Dark/Light Theme Toggle
+    let hdr = ui.push(main_col, div.div().flex_row().justify_between().items_center().h(36.0_f32).gap(8.0_f32));
+    let seg = ui.push(hdr, toggle.segmented_group(th));
+    _ = ui.push_text(seg, toggle.segment_item(th, 101_u64, ACT_MODE_STD, st.calc.mode == .Standard), if compact { "Std" } else { "Standard" });
+    _ = ui.push_text(seg, toggle.segment_item(th, 102_u64, ACT_MODE_SCI, st.calc.mode == .Scientific), if compact { "Sci" } else { "Scientific" });
+    _ = ui.push_text(seg, toggle.segment_item(th, 103_u64, ACT_MODE_PROG, st.calc.mode == .Programmer), if compact { "Prog" } else { "Programmer" });
+
+    let tools = ui.push(hdr, div.div().flex_row().items_center().gap(6.0_f32));
+    _ = ui.push_text(
+        tools,
+        button.button(th, if st.show_history { .Operator } else { .Secondary }, 104_u64, ACT_TOGGLE_HISTORY)
+            .px(10.0_f32).h(30.0_f32).text_size(12.0_f32),
+        "Hist",
+    );
+    _ = ui.push_text(
+        tools,
+        button.button(th, .Secondary, 105_u64, ACT_TOGGLE_THEME)
+            .px(10.0_f32).h(30.0_f32).text_size(12.0_f32),
+        if th.is_dark() { "Light" } else { "Dark" },
+    );
+
+    // 2. Display Card (Expression breadcrumb + Auto-scaling Mono result + Programmer 4-Base Panel)
+    let disp_h: f32 = if st.calc.mode == .Programmer { 196.0_f32 } else { 108.0_f32 };
+    let disp_card = ui.push(
+        main_col,
+        div.div()
+            .flex_col()
+            .justify_between()
+            .gap(4.0_f32)
+            .w_full()
+            .h(disp_h)
+            .px(16.0_f32)
+            .py(12.0_f32)
+            .bg(th.bg_panel)
+            .border(1.0_f32, th.border)
+            .rounded(th.radius_lg)
+            .shadow(12.0_f32, 3.0_f32, th.shadow_color),
+    );
+
+    // Top metadata row inside display: Memory / Angle badges + expression breadcrumb
+    let meta_row = ui.push(disp_card, div.div().flex_row().justify_between().items_center().h(20.0_f32).gap(8.0_f32));
+    let badges = ui.push(meta_row, div.div().flex_row().items_center().gap(6.0_f32));
+    if st.calc.mem_set {
+        _ = ui.push_text(
+            badges,
+            div.div().px(6.0_f32).py(2.0_f32).rounded(4.0_f32).bg(th.accent.with_alpha(0.22_f32))
+                .text_size(11.0_f32).text_color(th.accent).font_mono(),
+            "M",
+        );
+    }
+    if st.calc.mode == .Scientific {
+        _ = ui.push_text(
+            badges,
+            div.div().id(108_u64).on_click(ACT_ANGLE).px(6.0_f32).py(2.0_f32).rounded(4.0_f32)
+                .bg(th.btn_operator_bg).hover_bg(th.btn_operator_hover)
+                .text_size(11.0_f32).text_color(th.text_primary).font_mono(),
+            if st.calc.angle == .Deg { "DEG" } else { "RAD" },
+        );
+    }
+    let crumb = if st.calc.just_evaluated { st.calc.last_expr_bytes() } else { st.calc.expr_bytes() };
+    _ = ui.push_text_bytes(
+        meta_row,
+        div.div().flex_1().h(20.0_f32).text_size(13.0_f32).text_color(th.text_secondary).font_mono().text_right().text_ellipsis(),
+        crumb,
+    );
+
+    // Auto-shrinking primary result readout
+    let disp_avail_w = (if dock_history { vw - 290.0_f32 } else { vw }) - 64.0_f32;
+    let disp_bytes = st.calc.display_bytes();
+    let max_px: f32 = if st.calc.err != .None { 22.0_f32 } else if compact { 34.0_f32 } else { 42.0_f32 };
+    let fit_px = ui.fit_font_size(text_lib.FONT_UI_MONO, disp_bytes, disp_avail_w, max_px, 16.0_f32);
+    let disp_col = if st.calc.err != .None { th.danger } else { th.text_primary };
+    _ = ui.push_text_bytes(
+        disp_card,
+        div.div().w_full().h(52.0_f32).text_size(fit_px).text_color(disp_col).font_mono().text_right().text_ellipsis(),
+        disp_bytes,
+    );
+
+    // Synchronized HEX/DEC/OCT/BIN live base selector panel in Programmer mode
+    if st.calc.mode == .Programmer {
+        let base_box = ui.push(disp_card, div.div().flex_col().gap(3.0_f32).w_full());
+        push_radix_row(ui, base_box, th, st, .Hex, "HEX", 120_u64, ACT_RADIX_HEX);
+        push_radix_row(ui, base_box, th, st, .Dec, "DEC", 121_u64, ACT_RADIX_DEC);
+        push_radix_row(ui, base_box, th, st, .Oct, "OCT", 122_u64, ACT_RADIX_OCT);
+        push_radix_row(ui, base_box, th, st, .Bin, "BIN", 123_u64, ACT_RADIX_BIN);
+    }
+
+    // 3. Memory Strip (`MC`, `MR`, `M+`, `M-`, `MS`)
+    let mem_row = ui.push(main_col, div.div().grid_cols(5_u8).gap(6.0_f32).w_full().h(30.0_f32));
+    push_key(ui, mem_row, th, .Ghost, 130_u64, ACT_MC, "MC", 12.0_f32, !st.calc.mem_set);
+    push_key(ui, mem_row, th, .Ghost, 131_u64, ACT_MR, "MR", 12.0_f32, !st.calc.mem_set);
+    push_key(ui, mem_row, th, .Ghost, 132_u64, ACT_MADD, "M+", 12.0_f32, false);
+    push_key(ui, mem_row, th, .Ghost, 133_u64, ACT_MSUB, "M-", 12.0_f32, false);
+    push_key(ui, mem_row, th, .Ghost, 134_u64, ACT_MS, "MS", 12.0_f32, false);
+
+    // 4. Adaptive 2D CSS Grid Keypad (`4x6` Standard / `5x6` Scientific / `6x5` Programmer)
+    let k_gap: f32 = if compact { 6.0_f32 } else { 8.0_f32 };
+    let k_font: f32 = if compact { 16.0_f32 } else { 18.0_f32 };
+    let k_sm: f32 = if compact { 13.0_f32 } else { 15.0_f32 };
+
+    if st.calc.mode == .Standard {
+        let grid = ui.push(main_col, div.div().grid_cols(4_u8).grid_rows(6_u8).gap(k_gap).flex_1().w_full());
+        push_key(ui, grid, th, .Secondary, 200_u64, ACT_LPAREN, "(", k_sm, false);
+        push_key(ui, grid, th, .Secondary, 201_u64, ACT_RPAREN, ")", k_sm, false);
+        push_key(ui, grid, th, .Secondary, 202_u64, ACT_CE, "CE", k_sm, false);
+        push_key(ui, grid, th, .Danger, 203_u64, ACT_CA, "C", k_sm, false);
+
+        push_key(ui, grid, th, .Secondary, 204_u64, ACT_INV, "1/x", k_sm, false);
+        push_key(ui, grid, th, .Secondary, 205_u64, ACT_SQ, "x²", k_sm, false);
+        push_key(ui, grid, th, .Secondary, 206_u64, ACT_SQRT, "√", k_font, false);
+        push_key(ui, grid, th, .Operator, 207_u64, ACT_DIV, "÷", k_font, false);
+
+        push_key(ui, grid, th, .Primary, 208_u64, ACT_DIGIT_7, "7", k_font, false);
+        push_key(ui, grid, th, .Primary, 209_u64, ACT_DIGIT_8, "8", k_font, false);
+        push_key(ui, grid, th, .Primary, 210_u64, ACT_DIGIT_9, "9", k_font, false);
+        push_key(ui, grid, th, .Operator, 211_u64, ACT_MUL, "×", k_font, false);
+
+        push_key(ui, grid, th, .Primary, 212_u64, ACT_DIGIT_4, "4", k_font, false);
+        push_key(ui, grid, th, .Primary, 213_u64, ACT_DIGIT_5, "5", k_font, false);
+        push_key(ui, grid, th, .Primary, 214_u64, ACT_DIGIT_6, "6", k_font, false);
+        push_key(ui, grid, th, .Operator, 215_u64, ACT_SUB, "−", k_font, false);
+
+        push_key(ui, grid, th, .Primary, 216_u64, ACT_DIGIT_1, "1", k_font, false);
+        push_key(ui, grid, th, .Primary, 217_u64, ACT_DIGIT_2, "2", k_font, false);
+        push_key(ui, grid, th, .Primary, 218_u64, ACT_DIGIT_3, "3", k_font, false);
+        push_key(ui, grid, th, .Operator, 219_u64, ACT_ADD, "+", k_font, false);
+
+        push_key(ui, grid, th, .Secondary, 220_u64, ACT_NEG, "±", k_font, false);
+        push_key(ui, grid, th, .Primary, 221_u64, ACT_DIGIT_0, "0", k_font, false);
+        push_key(ui, grid, th, .Primary, 222_u64, ACT_DOT, ".", k_font, false);
+        push_key(ui, grid, th, .Accent, 223_u64, ACT_EQ, "=", k_font, false);
+    } else if st.calc.mode == .Scientific {
+        let grid = ui.push(main_col, div.div().grid_cols(5_u8).grid_rows(6_u8).gap(k_gap).flex_1().w_full());
+        push_key(ui, grid, th, .Secondary, 300_u64, ACT_SIN, "sin", k_sm, false);
+        push_key(ui, grid, th, .Secondary, 301_u64, ACT_COS, "cos", k_sm, false);
+        push_key(ui, grid, th, .Secondary, 302_u64, ACT_TAN, "tan", k_sm, false);
+        push_key(ui, grid, th, .Secondary, 303_u64, ACT_BS, "←", k_font, false);
+        push_key(ui, grid, th, .Danger, 304_u64, ACT_CA, "C", k_sm, false);
+
+        push_key(ui, grid, th, .Secondary, 305_u64, ACT_LN, "ln", k_sm, false);
+        push_key(ui, grid, th, .Secondary, 306_u64, ACT_LOG10, "log", k_sm, false);
+        push_key(ui, grid, th, .Secondary, 307_u64, ACT_EXP, "exp", k_sm, false);
+        push_key(ui, grid, th, .Secondary, 308_u64, ACT_LPAREN, "(", k_sm, false);
+        push_key(ui, grid, th, .Secondary, 309_u64, ACT_RPAREN, ")", k_sm, false);
+
+        push_key(ui, grid, th, .Secondary, 310_u64, ACT_PI, "π", k_font, false);
+        push_key(ui, grid, th, .Primary, 311_u64, ACT_DIGIT_7, "7", k_font, false);
+        push_key(ui, grid, th, .Primary, 312_u64, ACT_DIGIT_8, "8", k_font, false);
+        push_key(ui, grid, th, .Primary, 313_u64, ACT_DIGIT_9, "9", k_font, false);
+        push_key(ui, grid, th, .Operator, 314_u64, ACT_DIV, "÷", k_font, false);
+
+        push_key(ui, grid, th, .Secondary, 315_u64, ACT_POW, "x^y", k_sm, false);
+        push_key(ui, grid, th, .Primary, 316_u64, ACT_DIGIT_4, "4", k_font, false);
+        push_key(ui, grid, th, .Primary, 317_u64, ACT_DIGIT_5, "5", k_font, false);
+        push_key(ui, grid, th, .Primary, 318_u64, ACT_DIGIT_6, "6", k_font, false);
+        push_key(ui, grid, th, .Operator, 319_u64, ACT_MUL, "×", k_font, false);
+
+        push_key(ui, grid, th, .Secondary, 320_u64, ACT_SQRT, "√", k_font, false);
+        push_key(ui, grid, th, .Primary, 321_u64, ACT_DIGIT_1, "1", k_font, false);
+        push_key(ui, grid, th, .Primary, 322_u64, ACT_DIGIT_2, "2", k_font, false);
+        push_key(ui, grid, th, .Primary, 323_u64, ACT_DIGIT_3, "3", k_font, false);
+        push_key(ui, grid, th, .Operator, 324_u64, ACT_SUB, "−", k_font, false);
+
+        push_key(ui, grid, th, .Secondary, 325_u64, ACT_FACT, "n!", k_sm, false);
+        push_key(ui, grid, th, .Primary, 326_u64, ACT_DIGIT_0, "0", k_font, false);
+        push_key(ui, grid, th, .Primary, 327_u64, ACT_DOT, ".", k_font, false);
+        push_key(ui, grid, th, .Operator, 328_u64, ACT_ADD, "+", k_font, false);
+        push_key(ui, grid, th, .Accent, 329_u64, ACT_EQ, "=", k_font, false);
+    } else {
+        // Programmer 6x5 Grid (HEX A..F, digits 0..9 gated by radix, AND/OR/XOR/NOT/<</>>/MOD)
+        let grid = ui.push(main_col, div.div().grid_cols(6_u8).grid_rows(5_u8).gap(k_gap).flex_1().w_full());
+        push_key(ui, grid, th, .Secondary, 400_u64, ACT_HEX_A, "A", k_sm, !st.calc.digit_allowed(10_u8));
+        push_key(ui, grid, th, .Secondary, 401_u64, ACT_BIT_LSH, "<<", k_sm, false);
+        push_key(ui, grid, th, .Secondary, 402_u64, ACT_BIT_RSH, ">>", k_sm, false);
+        push_key(ui, grid, th, .Secondary, 403_u64, ACT_BIT_NOT, "NOT", k_sm, false);
+        push_key(ui, grid, th, .Secondary, 404_u64, ACT_BS, "←", k_font, false);
+        push_key(ui, grid, th, .Danger, 405_u64, ACT_CA, "C", k_sm, false);
+
+        push_key(ui, grid, th, .Secondary, 406_u64, ACT_HEX_B, "B", k_sm, !st.calc.digit_allowed(11_u8));
+        push_key(ui, grid, th, .Primary, 407_u64, ACT_DIGIT_7, "7", k_font, !st.calc.digit_allowed(7_u8));
+        push_key(ui, grid, th, .Primary, 408_u64, ACT_DIGIT_8, "8", k_font, !st.calc.digit_allowed(8_u8));
+        push_key(ui, grid, th, .Primary, 409_u64, ACT_DIGIT_9, "9", k_font, !st.calc.digit_allowed(9_u8));
+        push_key(ui, grid, th, .Operator, 410_u64, ACT_BIT_AND, "AND", k_sm, false);
+        push_key(ui, grid, th, .Operator, 411_u64, ACT_DIV, "÷", k_font, false);
+
+        push_key(ui, grid, th, .Secondary, 412_u64, ACT_HEX_C, "C", k_sm, !st.calc.digit_allowed(12_u8));
+        push_key(ui, grid, th, .Primary, 413_u64, ACT_DIGIT_4, "4", k_font, !st.calc.digit_allowed(4_u8));
+        push_key(ui, grid, th, .Primary, 414_u64, ACT_DIGIT_5, "5", k_font, !st.calc.digit_allowed(5_u8));
+        push_key(ui, grid, th, .Primary, 415_u64, ACT_DIGIT_6, "6", k_font, !st.calc.digit_allowed(6_u8));
+        push_key(ui, grid, th, .Operator, 416_u64, ACT_BIT_OR, "OR", k_sm, false);
+        push_key(ui, grid, th, .Operator, 417_u64, ACT_MUL, "×", k_font, false);
+
+        push_key(ui, grid, th, .Secondary, 418_u64, ACT_HEX_D, "D", k_sm, !st.calc.digit_allowed(13_u8));
+        push_key(ui, grid, th, .Primary, 419_u64, ACT_DIGIT_1, "1", k_font, !st.calc.digit_allowed(1_u8));
+        push_key(ui, grid, th, .Primary, 420_u64, ACT_DIGIT_2, "2", k_font, !st.calc.digit_allowed(2_u8));
+        push_key(ui, grid, th, .Primary, 421_u64, ACT_DIGIT_3, "3", k_font, !st.calc.digit_allowed(3_u8));
+        push_key(ui, grid, th, .Operator, 422_u64, ACT_BIT_XOR, "XOR", k_sm, false);
+        push_key(ui, grid, th, .Operator, 423_u64, ACT_SUB, "−", k_font, false);
+
+        push_key(ui, grid, th, .Secondary, 424_u64, ACT_HEX_E, "E", k_sm, !st.calc.digit_allowed(14_u8));
+        push_key(ui, grid, th, .Secondary, 425_u64, ACT_HEX_F, "F", k_sm, !st.calc.digit_allowed(15_u8));
+        push_key(ui, grid, th, .Primary, 426_u64, ACT_DIGIT_0, "0", k_font, !st.calc.digit_allowed(0_u8));
+        push_key(ui, grid, th, .Operator, 427_u64, ACT_MOD, "MOD", k_sm, false);
+        push_key(ui, grid, th, .Operator, 428_u64, ACT_ADD, "+", k_font, false);
+        push_key(ui, grid, th, .Accent, 429_u64, ACT_EQ, "=", k_font, false);
+    }
+
+    // 5. History Panel (Docked on Desktop / Slide-Over Overlay Drawer on Compact Mobile Screens)
+    if dock_history {
+        let hist_panel = ui.push(
+            root,
+            div.div()
+                .flex_col()
+                .gap(8.0_f32)
+                .w(240.0_f32)
+                .h_full()
+                .p(12.0_f32)
+                .bg(th.bg_panel)
+                .border(1.0_f32, th.border)
+                .rounded(th.radius_lg),
+        );
+        render_history_contents(ui, hist_panel, th, st, vh - 28.0_f32);
+    } else if st.show_history && compact {
+        let scrim = ui.push(root, overlay.backdrop(th, 550_u64, ACT_CLOSE_OVERLAY));
+        _ = scrim;
+        let drawer = ui.push(root, overlay.side_drawer(th, 260.0_f32));
+        render_history_contents(ui, drawer, th, st, vh - 28.0_f32);
+    }
+}

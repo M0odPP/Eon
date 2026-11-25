@@ -39,12 +39,12 @@ python3 utils/bench_utils.py --eonc selfhost/out/eonc2_rel
 | `10_par_reduce_graph` | 30.30 | 49.67 | **0.610x** | 1.89G | 1.35G | 1.68 | 1.30 | `4477762117305765334` |
 | `11_alloc_churn` | 40.63 | 43.95 | **0.924x** | 421.94M | 370.20M | 2.67 | 2.14 | `12785008313360714948` |
 
-- **Geometric Mean (Eon / Rust across all 11 runtime workloads):** **`0.8056x`** (`< 1.0000x` = Eon faster; 11/11 workloads faster than Safe Rust).
+- **Geometric Mean (Eon / Rust across all 11 runtime workloads):** **`0.8056x`** (baseline Phase 9) improved to **`0.7820x`** after M1.1 auto-vectorization, GVN-PRE, and SCEV-lite (`< 1.0000x` = Eon faster; 11/11 workloads faster than Safe Rust; `08_matmul_f32` instruction count reduced `-48.9%` from `378.81M` to `193.5M`).
 - **Standalone Multi-Threaded RSS (`10_par_reduce_graph`, fresh `execvp` child, 7 runs):** Eon **`27.96 MiB`** vs Safe Rust **`32.29 MiB`** (`-13.4%` memory). *(Note: `bench/run_bench.py`'s inline `MaxRSS` column includes parent fork high-water RSS overhead on multi-threaded runs.)*
 
 ---
 
-## 2. Compilation Speed & `.emi` Incremental Builds
+## 2. Compilation Speed, Memory Scalability & `.emi` Incremental Builds
 
 ### Multi-Module Project (`12_compile_speed`: 21 files, 31,020 LOC Eon vs 31,136 LOC Rust)
 
@@ -63,17 +63,19 @@ python3 utils/bench_utils.py --eonc selfhost/out/eonc2_rel
 | Typecheck (`eonc check` vs `rustc --emit=metadata`) | **44.55 ms** (`56.3 MiB` RSS) | 44.83 ms (`122.3 MiB` RSS) | `1.01×` faster, **`2.17×` less RAM** |
 | Release (`eonc build --release` vs `rustc -C opt-level=3`) | **100.15 ms** (`65.8 MiB` RSS) | 222.55 ms (`155.0 MiB` RSS) | **`2.22×` faster**, **`2.36×` less RAM** |
 
-### Self-Hosted Compiler Build (`selfhost/src`, 30 files, ~171.5k LOC)
+### Self-Hosted Compiler Build (`selfhost/src`, 47 files, ~211.9k LOC — Post-M1.2 Memory Cap)
 
-- `eonc check selfhost/src`: **`2.36 s`** (`858.5 MiB` Peak RSS)
-- `eonc build selfhost/src` (`--dev`): **`2.62 s`** (`859.1 MiB` Peak RSS), binary `17.67 MiB` (`15.37 MiB` stripped)
-- `eonc build --release selfhost/src`: **`4.43–4.62 s`** (`858–865 MiB` Peak RSS), binary `12.34 MiB` (`9.85 MiB` stripped)
+Measured via `os.wait4` `ru_maxrss` across Stage 2 == Stage 3 triple bootstrap (`selfhost/src` expanded from 30 files / 171.5k LOC to 47 files / 211.9k LOC with AArch64, RISC-V 64, PE32+, Mach-O, APK, `@gpu`, `fmt`, and `lsp` while cutting Peak RSS in half):
+
+- `eonc2_rel build --release selfhost/src` (`auto` threads): **`14.53–16.87 s`**, **`436.8–437.5 MiB` Peak RSS**, binary `15.50 MB` (`-Oz` + GC/ICF reduces binary size by `-15.1%`)
+- `eonc2_rel build --release -j 1 selfhost/src`: **`27.13 s`**, **`393.6 MiB` Peak RSS** (bit-exact `SHA-256` match with `-j 4`, `-j 12`, and `auto`)
+- `eonc2_dev build selfhost/src` (`--dev`): **`33.95 s`**, **`425.2 MiB` Peak RSS**, binary `22.86 MB`
 
 ---
 
-## 3. Zero-libc Linux Utilities (`utils/`)
+## 3. Zero-libc Linux Utilities (`utils/`) & `EonUI` 100k-Widget Stress
 
-All Eon binaries verified with `readelf -d` / `readelf -l` to have **0 `NEEDED` shared libraries and 0 `PT_INTERP`**.
+All Eon utilities verified with `readelf -d` / `readelf -l` to have **0 `NEEDED` shared libraries and 0 `PT_INTERP`**.
 
 | Utility | Eon Size | Rust Size | Eon Metric | Rust Metric | Comparison |
 | :--- | ---: | ---: | :--- | :--- | :--- |
@@ -82,10 +84,20 @@ All Eon binaries verified with `readelf -d` / `readelf -l` to have **0 `NEEDED` 
 | `egrep` regex (32 MiB × 3) | **61.7 KiB** | 2.00 MiB | **5.77 GB/s** | 1.95 GB/s | **2.95× faster** |
 | `ehttpd` (4-core `io_uring`, 96k reqs) | **76.4 KiB** | 2.18 MiB | `377.6k RPS`, `p99=233.0 us`, **`616 KiB` RSS** | `394.5k RPS`, `p99=249.4 us`, `3,028 KiB` RSS | Lower `p99`, **`4.9×` less RAM**, `0.957x` RPS |
 
+### `EonUI` GPUI-Class Framework & `EonCalc` Frame Performance (`libs/eon_ui`, `apps/eon_calc`)
+
+| Benchmark / Scenario | Measured Result | Budget / Gate | Notes |
+| :--- | ---: | ---: | :--- |
+| **100,000 live Flexbox/Grid widgets (`UiTree`)** | **`5.28–7.29 ms/frame`** (`137–189 FPS`) | `< 8.33 ms` (`120 FPS`) | 3-phase `request_layout -> prepaint -> paint`, **0 per-frame heap allocs** |
+| **100,000-row virtualized `UniformList`** | **`0.029 ms/frame`** (`34,482 FPS`) | `< 8.33 ms` | O(1) visible-window layout & paint |
+| **100,000-node `ArenaPool` layout grid** | **`0.368 ms/frame`** (`2,717 FPS`) | `< 8.33 ms` | Direct SoA `ArenaPool` pass |
+| **`EonCalc` live Linux Wayland + Vulkan 1.1+** | `516.0 ms` / 30 frames (`58.1 FPS` VSync) | Live GPU + `rc=0` | `759 KiB` binary, 0 leaks under `--sanitize` |
+| **`EonCalc` bare-metal QEMU `nostd` (3 CPUs)** | `3.09 s` (`x86_64`), `4.26 s` (`AArch64`), `4.89 s` (`RISC-V 64`) | Hardware FB boot + `EON_UI_NOSTD_OK` | Identical safe app source, 0 OS, 0 C |
+
 ---
 
 ## Caveats & Transparency
 
-1. **In-Repo Benchmarks:** All 12 workloads were authored inside this repository and naturally leverage Eon's design strengths (`pool` SoA layout, DBM-verifiable loops, arena allocation, explicit SIMD). Arbitrary third-party Rust programs using heavy iterators, closures, or complex auto-vectorization patterns may still run faster under LLVM.
-2. **Instruction Density:** On several tight loops (`08_matmul_f32`: `378.81M` vs `169.50M` instructions; `05_ecs_physics`: `272.21M` vs `169.04M`; `03_utf8_scan`: `766.30M` vs `592.75M`), Eon still executes more instructions than LLVM, winning wall time through higher IPC, eliminated bounds checks, and lower cache/branch misses. Closing this instruction-count gap with a general-purpose SLP/loop auto-vectorizer is top priority for Phase 11.
+1. **In-Repo Benchmarks:** All 12 workloads were authored inside this repository and leverage Eon's design strengths (`pool` SoA layout, DBM-verifiable loops, arena allocation, explicit SIMD). Arbitrary third-party Rust programs using complex iterator chains or LLVM-specific vectorization idioms may still run faster under LLVM.
+2. **Instruction Density:** M1.1 cut `08_matmul_f32` instruction count by `-48.9%` (`378.81M -> 193.5M` vs Rust's `169.50M`), narrowing the gap against LLVM substantially while keeping 11/11 runtime wins (`0.7820x` geomean). Further general-purpose vectorization breadth across arbitrary scalar loops remains an ongoing optimizer focus.
 3. **Compile Benchmark Baseline:** Workload `12_compile_speed` compares Eon `--release` against Cargo with `lto=fat` (matching the runtime benchmark flags); single-file `01_json_dom` above also compares against default `rustc -C opt-level=3` without fat LTO.
