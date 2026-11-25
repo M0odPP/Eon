@@ -10594,16 +10594,34 @@ fn emit_builtin_math(
             let av = try load_val_float(alloc, ctx, mf, eir_prog, env, args[0_usize], sp);
             let bv = try load_val_float(alloc, ctx, mf, eir_prog, env, args[1_usize], sp);
             let cv = try load_val_float(alloc, ctx, mf, eir_prog, env, args[2_usize], sp);
-            let res = try mf.new_vreg(alloc, .Vec128);
-            var m = mach_ir.inst_empty(if is_f64 { .VFmadd231SD } else { .VFmadd231SS }, sp);
-            m.dst = res;
-            m.src0 = cv;
-            m.src1 = av;
-            m.src2 = bv;
-            m.tied_src0 = true;
-            m.size_bytes = if is_f64 { 8_u8 } else { 4_u8 };
-            try mf.emit_inst(alloc, m);
-            try store_float_to_val(alloc, ctx, mf, eir_prog, env, dst, res, sp);
+            if mf.target_avx2 {
+                let res = try mf.new_vreg(alloc, .Vec128);
+                var m = mach_ir.inst_empty(if is_f64 { .VFmadd231SD } else { .VFmadd231SS }, sp);
+                m.dst = res;
+                m.src0 = cv;
+                m.src1 = av;
+                m.src2 = bv;
+                m.tied_src0 = true;
+                m.size_bytes = if is_f64 { 8_u8 } else { 4_u8 };
+                try mf.emit_inst(alloc, m);
+                try store_float_to_val(alloc, ctx, mf, eir_prog, env, dst, res, sp);
+            } else {
+                let prod = try mf.new_vreg(alloc, .Vec128);
+                var mm = mach_ir.inst_empty(if is_f64 { .VMulSD } else { .VMulSS }, sp);
+                mm.dst = prod;
+                mm.src0 = av;
+                mm.src1 = bv;
+                mm.size_bytes = if is_f64 { 8_u8 } else { 4_u8 };
+                try mf.emit_inst(alloc, mm);
+                let res = try mf.new_vreg(alloc, .Vec128);
+                var ma = mach_ir.inst_empty(if is_f64 { .VAddSD } else { .VAddSS }, sp);
+                ma.dst = res;
+                ma.src0 = prod;
+                ma.src1 = cv;
+                ma.size_bytes = if is_f64 { 8_u8 } else { 4_u8 };
+                try mf.emit_inst(alloc, ma);
+                try store_float_to_val(alloc, ctx, mf, eir_prog, env, dst, res, sp);
+            }
         }
         .MathLzcnt => {
             var sv = try load_val_gpr(alloc, ctx, mf, eir_prog, env, args[0_usize], false, sp);
@@ -11222,7 +11240,7 @@ fn emit_builtin_vec(
             let elem = vn.primary;
             let en = env.get(elem);
             let total_sz = env.x64_layout(op.ty0).size;
-            if en.kind == .Float && (total_sz == 16_usize || total_sz == 32_usize) && (en.u8_val == 32_u8 || en.u8_val == 64_u8) {
+            if mf.target_avx2 && en.kind == .Float && (total_sz == 16_usize || total_sz == 32_usize) && (en.u8_val == 32_u8 || en.u8_val == 64_u8) {
                 let l256 = total_sz == 32_usize;
                 let is_f64 = en.u8_val == 64_u8;
                 let va = try load_val_vec(alloc, ctx, mf, args[0_usize], l256, sp);

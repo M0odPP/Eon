@@ -1,0 +1,516 @@
+module eon_gpu.shaders;
+
+import eon_gpu.scene;
+
+// ============================================================================
+// Unified GPUI `@gpu` Shaders (Single Eon Source -> SPIR-V 1.3 + MSL 2.4)
+// Shared by Vulkan 1.1+ and Metal backends; exact math parity with `soft.eon`.
+// ============================================================================
+
+fn select_corner_radius(p: f32x2, radii: f32x4) -> f32 {
+    // radii = (top_left, top_right, bottom_right, bottom_left)
+    let is_right = p.x > 0.0_f32;
+    let is_bottom = p.y > 0.0_f32;
+    if is_bottom {
+        return if is_right { radii.z } else { radii.w };
+    }
+    return if is_right { radii.y } else { radii.x };
+}
+
+fn rounded_rect_sdf(p: f32x2, half_size: f32x2, radii: f32x4) -> f32 {
+    let max_r = @gpu_min(half_size.x, half_size.y);
+    let r = @gpu_clamp(select_corner_radius(p, radii), 0.0_f32, max_r);
+    let qx = @gpu_abs(p.x) - half_size.x + r;
+    let qy = @gpu_abs(p.y) - half_size.y + r;
+    let ox = @gpu_max(qx, 0.0_f32);
+    let oy = @gpu_max(qy, 0.0_f32);
+    let outside = @gpu_length(f32x2.{ ox, oy });
+    let inside = @gpu_min(@gpu_max(qx, qy), 0.0_f32);
+    return outside + inside - r;
+}
+
+/// Fast analytical `erf(x)` approximation (max error < 1.5e-4) used by Zed GPUI shadows.
+fn erf_approx(x: f32) -> f32 {
+    let ax = @gpu_abs(x);
+    let s: f32 = if x < 0.0_f32 { -1.0_f32 } else { 1.0_f32 };
+    let t = 1.0_f32 + ax * (0.278393_f32 + ax * (0.230389_f32 + ax * (0.000972_f32 + ax * 0.078108_f32)));
+    let t2 = t * t;
+    let t4 = t2 * t2;
+    return s * (1.0_f32 - 1.0_f32 / t4);
+}
+
+/// Analytical 1D Gaussian blur integral across an interval `[lo, hi]` with standard deviation `sigma`.
+fn blur_along_x(x: f32, y: f32, sigma: f32, corner: f32, half_size: f32x2) -> f32 {
+    let delta = @gpu_min(half_size.y - corner - @gpu_abs(y), 0.0_f32);
+    let curved = half_size.x - corner + @gpu_sqrt(@gpu_max(0.0_f32, corner * corner - delta * delta));
+    let inv = 1.0_f32 / (@gpu_max(sigma, 0.25_f32) * 1.41421356_f32);
+    let e0 = erf_approx((x + curved) * inv);
+    let e1 = erf_approx((x - curved) * inv);
+    return 0.5_f32 * (e0 - e1);
+}
+
+fn shadow_rounded_box_alpha(p: f32x2, half_size: f32x2, corner: f32, sigma: f32) -> f32 {
+    let s = @gpu_max(sigma, 0.5_f32);
+    let r = @gpu_clamp(corner, 0.0_f32, @gpu_min(half_size.x, half_size.y));
+    let low = p.y - half_size.y;
+    let high = p.y + half_size.y;
+    let start = @gpu_clamp(-3.0_f32 * s, low, high);
+    let end_y = @gpu_clamp(3.0_f32 * s, low, high);
+    let step = (end_y - start) * 0.25_f32;
+    let y0 = start + step * 0.5_f32;
+    let inv_s2 = 1.0_f32 / (2.0_f32 * s * s);
+    let norm = 0.39894228_f32 / s;
+    var acc: f32 = 0.0_f32;
+    var i: u32 = 0_u32;
+    while i < 4_u32 {
+        let fi = i.to_float.[f32]();
+        let sample_y = y0 + fi * step;
+        let g = norm * @gpu_exp(-(sample_y * sample_y) * inv_s2);
+        let bx = blur_along_x(p.x, p.y - sample_y, s, r, half_size);
+        acc = acc + bx * g * step;
+        i = i +% 1_u32;
+    }
+    return @gpu_clamp(acc, 0.0_f32, 1.0_f32);
+}
+
+fn unit_quad_uv(vi: u32) -> f32x2 {
+    let ux: f32 = if (vi == 1_u32) || (vi == 2_u32) || (vi == 5_u32) { 1.0_f32 } else { 0.0_f32 };
+    let uy: f32 = if (vi == 2_u32) || (vi == 4_u32) || (vi == 5_u32) { 1.0_f32 } else { 0.0_f32 };
+    return f32x2.{ ux, uy };
+}
+
+fn px_to_ndc(px: f32, py: f32, viewport: f32x4) -> f32x4 {
+    let vw = @gpu_max(viewport.x, 1.0_f32);
+    let vh = @gpu_max(viewport.y, 1.0_f32);
+    let ndc_x = (px / vw) * 2.0_f32 - 1.0_f32;
+    let ndc_y = (py / vh) * 2.0_f32 - 1.0_f32;
+    return f32x4.{ ndc_x, ndc_y, 0.0_f32, 1.0_f32 };
+}
+
+// ----------------------------------------------------------------------------
+// 1. Quad Shader (SDF Rounded Rect + Gradient + Per-Edge Border + Clip Mask)
+// ----------------------------------------------------------------------------
+
+@layout(std430)
+pub struct QuadVsOut {
+    @position pub pos: f32x4;
+    @location(0) pub local_pos: f32x2;
+    @location(1) pub half_size: f32x2;
+    @location(2) pub clip_mask: f32x4;
+    @location(3) pub bg_color: f32x4;
+    @location(4) pub bg_color_end: f32x4;
+    @location(5) pub border_color: f32x4;
+    @location(6) pub corner_radii: f32x4;
+    @location(7) pub border_widths: f32x4;
+    @location(8) pub uv: f32x2;
+    @location(9) pub flags: u32;
+}
+
+@gpu(.Vertex)
+pub fn quad_vs(
+    @binding(0, 0) quads: read GpuBuf[scene.Quad],
+    @push_const viewport: f32x4,
+) -> QuadVsOut {
+    let vi = @gpu_vertex_index();
+    let ii = @gpu_instance_index();
+    let q = quads[ii];
+    let u = unit_quad_uv(vi);
+    let px = q.bounds.x + u.x * q.bounds.z;
+    let py = q.bounds.y + u.y * q.bounds.w;
+    let hs = f32x2.{ q.bounds.z * 0.5_f32, q.bounds.w * 0.5_f32 };
+    let lp = f32x2.{ (u.x - 0.5_f32) * q.bounds.z, (u.y - 0.5_f32) * q.bounds.w };
+    return QuadVsOut.{
+        pos: px_to_ndc(px, py, viewport),
+        local_pos: lp,
+        half_size: hs,
+        clip_mask: q.clip_mask,
+        bg_color: q.bg_color,
+        bg_color_end: q.bg_color_end,
+        border_color: q.border_color,
+        corner_radii: q.corner_radii,
+        border_widths: q.border_widths,
+        uv: u,
+        flags: q.flags,
+    };
+}
+
+@gpu(.Fragment)
+pub fn quad_fs(
+    @location(0) local_pos: f32x2,
+    @location(1) half_size: f32x2,
+    @location(2) clip_mask: f32x4,
+    @location(3) bg_color: f32x4,
+    @location(4) bg_color_end: f32x4,
+    @location(5) border_color: f32x4,
+    @location(6) corner_radii: f32x4,
+    @location(7) border_widths: f32x4,
+    @location(8) uv: f32x2,
+    @location(9) flags: u32,
+) -> f32x4 {
+    let fc = @gpu_frag_coord();
+    if fc.x < clip_mask.x || fc.y < clip_mask.y || fc.x > clip_mask.z || fc.y > clip_mask.w {
+        @gpu_discard();
+    }
+    let outer_d = rounded_rect_sdf(local_pos, half_size, corner_radii);
+    let outer_alpha = 1.0_f32 - @gpu_smoothstep(-0.5_f32, 0.5_f32, outer_d);
+    if outer_alpha <= 0.001_f32 {
+        @gpu_discard();
+    }
+
+    let gmode = flags & 3_u32;
+    let t: f32 = if gmode == 1_u32 {
+        uv.y
+    } else if gmode == 2_u32 {
+        uv.x
+    } else if gmode == 3_u32 {
+        (uv.x + uv.y) * 0.5_f32
+    } else {
+        0.0_f32
+    };
+    let fill = @gpu_mix(bg_color, bg_color_end, t);
+
+    let max_bw = @gpu_max(@gpu_max(border_widths.x, border_widths.y), @gpu_max(border_widths.z, border_widths.w));
+    var col = fill;
+    if max_bw > 0.001_f32 && border_color.w > 0.001_f32 {
+        let bx = if local_pos.x < 0.0_f32 { border_widths.w } else { border_widths.y };
+        let by = if local_pos.y < 0.0_f32 { border_widths.x } else { border_widths.z };
+        let bw = @gpu_max(bx, by);
+        let inner_hs = f32x2.{
+            @gpu_max(half_size.x - (border_widths.w + border_widths.y) * 0.5_f32, 0.0_f32),
+            @gpu_max(half_size.y - (border_widths.x + border_widths.z) * 0.5_f32, 0.0_f32),
+        };
+        let inner_lp = f32x2.{
+            local_pos.x + (border_widths.y - border_widths.w) * 0.5_f32,
+            local_pos.y + (border_widths.z - border_widths.x) * 0.5_f32,
+        };
+        let inner_r = f32x4.{
+            @gpu_max(corner_radii.x - bw, 0.0_f32),
+            @gpu_max(corner_radii.y - bw, 0.0_f32),
+            @gpu_max(corner_radii.z - bw, 0.0_f32),
+            @gpu_max(corner_radii.w - bw, 0.0_f32),
+        };
+        let inner_d = rounded_rect_sdf(inner_lp, inner_hs, inner_r);
+        let border_mix = @gpu_smoothstep(-0.5_f32, 0.5_f32, inner_d);
+        let ba = border_color.w * border_mix;
+        let fa = fill.w * (1.0_f32 - ba);
+        let oa = ba + fa;
+        if oa > 0.0001_f32 {
+            let inv = 1.0_f32 / oa;
+            col = f32x4.{
+                (border_color.x * ba + fill.x * fa) * inv,
+                (border_color.y * ba + fill.y * fa) * inv,
+                (border_color.z * ba + fill.z * fa) * inv,
+                oa,
+            };
+        }
+    }
+
+    let a = col.w * outer_alpha;
+    return f32x4.{ col.x * a, col.y * a, col.z * a, a };
+}
+
+// ----------------------------------------------------------------------------
+// 2. Shadow Shader (Analytical Rounded-Rect Gaussian Blur)
+// ----------------------------------------------------------------------------
+
+@layout(std430)
+pub struct ShadowVsOut {
+    @position pub pos: f32x4;
+    @location(0) pub local_pos: f32x2;
+    @location(1) pub half_size: f32x2;
+    @location(2) pub clip_mask: f32x4;
+    @location(3) pub color: f32x4;
+    @location(4) pub corner_radii: f32x4;
+    @location(5) pub blur_radius: f32;
+}
+
+@gpu(.Vertex)
+pub fn shadow_vs(
+    @binding(0, 0) shadows: read GpuBuf[scene.Shadow],
+    @push_const viewport: f32x4,
+) -> ShadowVsOut {
+    let vi = @gpu_vertex_index();
+    let ii = @gpu_instance_index();
+    let s = shadows[ii];
+    let u = unit_quad_uv(vi);
+    let pad = s.blur_radius * 3.0_f32 + s.spread;
+    let ex = s.bounds.x - pad;
+    let ey = s.bounds.y - pad;
+    let ew = s.bounds.z + pad * 2.0_f32;
+    let eh = s.bounds.w + pad * 2.0_f32;
+    let px = ex + u.x * ew;
+    let py = ey + u.y * eh;
+    let hs = f32x2.{
+        @gpu_max(s.bounds.z * 0.5_f32 + s.spread, 0.5_f32),
+        @gpu_max(s.bounds.w * 0.5_f32 + s.spread, 0.5_f32),
+    };
+    let cx = s.bounds.x + s.bounds.z * 0.5_f32;
+    let cy = s.bounds.y + s.bounds.w * 0.5_f32;
+    return ShadowVsOut.{
+        pos: px_to_ndc(px, py, viewport),
+        local_pos: f32x2.{ px - cx, py - cy },
+        half_size: hs,
+        clip_mask: s.clip_mask,
+        color: s.color,
+        corner_radii: s.corner_radii,
+        blur_radius: s.blur_radius,
+    };
+}
+
+@gpu(.Fragment)
+pub fn shadow_fs(
+    @location(0) local_pos: f32x2,
+    @location(1) half_size: f32x2,
+    @location(2) clip_mask: f32x4,
+    @location(3) color: f32x4,
+    @location(4) corner_radii: f32x4,
+    @location(5) blur_radius: f32,
+) -> f32x4 {
+    let fc = @gpu_frag_coord();
+    if fc.x < clip_mask.x || fc.y < clip_mask.y || fc.x > clip_mask.z || fc.y > clip_mask.w {
+        @gpu_discard();
+    }
+    let r = select_corner_radius(local_pos, corner_radii);
+    let alpha = shadow_rounded_box_alpha(local_pos, half_size, r, blur_radius * 0.5_f32);
+    let a = color.w * alpha;
+    if a <= 0.001_f32 {
+        @gpu_discard();
+    }
+    return f32x4.{ color.x * a, color.y * a, color.z * a, a };
+}
+
+// ----------------------------------------------------------------------------
+// 3. Underline Shader (Solid + Anti-Aliased Wavy Sine)
+// ----------------------------------------------------------------------------
+
+@layout(std430)
+pub struct UnderlineVsOut {
+    @position pub pos: f32x4;
+    @location(0) pub local_px: f32x2;
+    @location(1) pub size_px: f32x2;
+    @location(2) pub clip_mask: f32x4;
+    @location(3) pub color: f32x4;
+    @location(4) pub thickness: f32;
+    @location(5) pub wavy: u32;
+}
+
+@gpu(.Vertex)
+pub fn underline_vs(
+    @binding(0, 0) underlines: read GpuBuf[scene.Underline],
+    @push_const viewport: f32x4,
+) -> UnderlineVsOut {
+    let vi = @gpu_vertex_index();
+    let ii = @gpu_instance_index();
+    let ul = underlines[ii];
+    let u = unit_quad_uv(vi);
+    let px = ul.bounds.x + u.x * ul.bounds.z;
+    let py = ul.bounds.y + u.y * ul.bounds.w;
+    return UnderlineVsOut.{
+        pos: px_to_ndc(px, py, viewport),
+        local_px: f32x2.{ u.x * ul.bounds.z, u.y * ul.bounds.w },
+        size_px: f32x2.{ ul.bounds.z, ul.bounds.w },
+        clip_mask: ul.clip_mask,
+        color: ul.color,
+        thickness: ul.thickness,
+        wavy: ul.wavy,
+    };
+}
+
+@gpu(.Fragment)
+pub fn underline_fs(
+    @location(0) local_px: f32x2,
+    @location(1) size_px: f32x2,
+    @location(2) clip_mask: f32x4,
+    @location(3) color: f32x4,
+    @location(4) thickness: f32,
+    @location(5) wavy: u32,
+) -> f32x4 {
+    let fc = @gpu_frag_coord();
+    if fc.x < clip_mask.x || fc.y < clip_mask.y || fc.x > clip_mask.z || fc.y > clip_mask.w {
+        @gpu_discard();
+    }
+    let half_t = @gpu_max(thickness, 1.0_f32) * 0.5_f32;
+    let mid_y = size_px.y * 0.5_f32;
+    let target_y: f32 = if wavy != 0_u32 {
+        let amp = @gpu_max(mid_y - half_t, 0.5_f32);
+        mid_y + @gpu_sin(local_px.x * 1.256637_f32) * amp
+    } else {
+        mid_y
+    };
+    let d = @gpu_abs(local_px.y - target_y) - half_t;
+    let alpha = 1.0_f32 - @gpu_smoothstep(-0.5_f32, 0.5_f32, d);
+    let a = color.w * alpha;
+    if a <= 0.001_f32 {
+        @gpu_discard();
+    }
+    return f32x4.{ color.x * a, color.y * a, color.z * a, a };
+}
+
+// ----------------------------------------------------------------------------
+// 4. MonoSprite Shader (R8 Glyph Atlas Text & Icons)
+// ----------------------------------------------------------------------------
+
+@layout(std430)
+pub struct MonoVsOut {
+    @position pub pos: f32x4;
+    @location(0) pub uv: f32x2;
+    @location(1) pub clip_mask: f32x4;
+    @location(2) pub color: f32x4;
+}
+
+@gpu(.Vertex)
+pub fn mono_vs(
+    @binding(0, 0) sprites: read GpuBuf[scene.MonoSprite],
+    @push_const viewport: f32x4,
+) -> MonoVsOut {
+    let vi = @gpu_vertex_index();
+    let ii = @gpu_instance_index();
+    let s = sprites[ii];
+    let u = unit_quad_uv(vi);
+    let px = s.bounds.x + u.x * s.bounds.z;
+    let py = s.bounds.y + u.y * s.bounds.w;
+    let uv = f32x2.{
+        @gpu_mix(s.uv_bounds.x, s.uv_bounds.z, u.x),
+        @gpu_mix(s.uv_bounds.y, s.uv_bounds.w, u.y),
+    };
+    return MonoVsOut.{
+        pos: px_to_ndc(px, py, viewport),
+        uv: uv,
+        clip_mask: s.clip_mask,
+        color: s.color,
+    };
+}
+
+@gpu(.Fragment)
+pub fn mono_fs(
+    @binding(0, 1) atlas: read GpuImage2D[f32x4],
+    @location(0) uv: f32x2,
+    @location(1) clip_mask: f32x4,
+    @location(2) color: f32x4,
+) -> f32x4 {
+    let fc = @gpu_frag_coord();
+    if fc.x < clip_mask.x || fc.y < clip_mask.y || fc.x > clip_mask.z || fc.y > clip_mask.w {
+        @gpu_discard();
+    }
+    let cov = atlas.sample(uv).x;
+    let a = color.w * cov;
+    if a <= 0.001_f32 {
+        @gpu_discard();
+    }
+    return f32x4.{ color.x * a, color.y * a, color.z * a, a };
+}
+
+// ----------------------------------------------------------------------------
+// 5. PolySprite Shader (RGBA8 Atlas + Rounded-Corner Clip)
+// ----------------------------------------------------------------------------
+
+@layout(std430)
+pub struct PolyVsOut {
+    @position pub pos: f32x4;
+    @location(0) pub uv: f32x2;
+    @location(1) pub local_pos: f32x2;
+    @location(2) pub half_size: f32x2;
+    @location(3) pub clip_mask: f32x4;
+    @location(4) pub tint: f32x4;
+    @location(5) pub corner_radii: f32x4;
+}
+
+@gpu(.Vertex)
+pub fn poly_vs(
+    @binding(0, 0) sprites: read GpuBuf[scene.PolySprite],
+    @push_const viewport: f32x4,
+) -> PolyVsOut {
+    let vi = @gpu_vertex_index();
+    let ii = @gpu_instance_index();
+    let s = sprites[ii];
+    let u = unit_quad_uv(vi);
+    let px = s.bounds.x + u.x * s.bounds.z;
+    let py = s.bounds.y + u.y * s.bounds.w;
+    let uv = f32x2.{
+        @gpu_mix(s.uv_bounds.x, s.uv_bounds.z, u.x),
+        @gpu_mix(s.uv_bounds.y, s.uv_bounds.w, u.y),
+    };
+    let hs = f32x2.{ s.bounds.z * 0.5_f32, s.bounds.w * 0.5_f32 };
+    let lp = f32x2.{ (u.x - 0.5_f32) * s.bounds.z, (u.y - 0.5_f32) * s.bounds.w };
+    return PolyVsOut.{
+        pos: px_to_ndc(px, py, viewport),
+        uv: uv,
+        local_pos: lp,
+        half_size: hs,
+        clip_mask: s.clip_mask,
+        tint: s.tint,
+        corner_radii: s.corner_radii,
+    };
+}
+
+@gpu(.Fragment)
+pub fn poly_fs(
+    @binding(0, 1) atlas: read GpuImage2D[f32x4],
+    @location(0) uv: f32x2,
+    @location(1) local_pos: f32x2,
+    @location(2) half_size: f32x2,
+    @location(3) clip_mask: f32x4,
+    @location(4) tint: f32x4,
+    @location(5) corner_radii: f32x4,
+) -> f32x4 {
+    let fc = @gpu_frag_coord();
+    if fc.x < clip_mask.x || fc.y < clip_mask.y || fc.x > clip_mask.z || fc.y > clip_mask.w {
+        @gpu_discard();
+    }
+    let d = rounded_rect_sdf(local_pos, half_size, corner_radii);
+    let mask_a = 1.0_f32 - @gpu_smoothstep(-0.5_f32, 0.5_f32, d);
+    if mask_a <= 0.001_f32 {
+        @gpu_discard();
+    }
+    let tex = atlas.sample(uv);
+    let r = tex.x * tint.x;
+    let g = tex.y * tint.y;
+    let b = tex.z * tint.z;
+    let a = tex.w * tint.w * mask_a;
+    return f32x4.{ r * a, g * a, b * a, a };
+}
+
+// ----------------------------------------------------------------------------
+// 6. Path Shader (Tessellated 2D Vector Geometry)
+// ----------------------------------------------------------------------------
+
+@layout(std430)
+pub struct PathVsOut {
+    @position pub pos: f32x4;
+    @location(0) pub color: f32x4;
+    @location(1) pub clip_mask: f32x4;
+}
+
+@gpu(.Vertex)
+pub fn path_vs(
+    @binding(0, 0) verts: read GpuBuf[scene.PathVertex],
+    @push_const viewport: f32x4,
+) -> PathVsOut {
+    let vi = @gpu_vertex_index();
+    let v = verts[vi];
+    return PathVsOut.{
+        pos: px_to_ndc(v.pos.x, v.pos.y, viewport),
+        color: v.color,
+        clip_mask: v.clip_mask,
+    };
+}
+
+@gpu(.Fragment)
+pub fn path_fs(
+    @location(0) color: f32x4,
+    @location(1) clip_mask: f32x4,
+) -> f32x4 {
+    let fc = @gpu_frag_coord();
+    if fc.x < clip_mask.x || fc.y < clip_mask.y || fc.x > clip_mask.z || fc.y > clip_mask.w {
+        @gpu_discard();
+    }
+    let a = color.w;
+    if a <= 0.001_f32 {
+        @gpu_discard();
+    }
+    return f32x4.{ color.x * a, color.y * a, color.z * a, a };
+}
+
+// Entry points (`quad_vs`/`quad_fs`, `shadow_vs`/`shadow_fs`, `underline_vs`/`underline_fs`,
+// `mono_vs`/`mono_fs`, `poly_vs`/`poly_fs`, `path_vs`/`path_fs`) are embedded directly by
+// callers via `@embed_gpu_spirv(shaders.<entry>)` and `@embed_gpu_msl(shaders.<entry>)`.

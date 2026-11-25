@@ -2304,6 +2304,31 @@ fn emit_sse2_xor(
     return;
 }
 
+fn emit_sse2_packed3(
+    alloc: *mut AllocCap,
+    buf: *mut x64_asm.X64Buf,
+    use_66: bool,
+    opcode: u8,
+    xd: x64_asm.Xmm,
+    xs0: x64_asm.Xmm,
+    xs1: x64_asm.Xmm,
+) -> !OutOfMemory {
+    var rhs = xs1;
+    if xd.id() == xs1.id() && xd.id() != xs0.id() {
+        try buf.sse_ps_bin(alloc, 0x28_u8, .Xmm15, xs1);
+        try buf.sse_ps_bin(alloc, 0x28_u8, xd, xs0);
+        rhs = .Xmm15;
+    } else if xd.id() != xs0.id() {
+        try buf.sse_ps_bin(alloc, 0x28_u8, xd, xs0);
+    }
+    if use_66 {
+        try buf.sse_66_bin(alloc, opcode, xd, rhs);
+    } else {
+        try buf.sse_ps_bin(alloc, opcode, xd, rhs);
+    }
+    return;
+}
+
 fn emit_sse2_vec_inst(
     alloc: *mut AllocCap,
     buf: *mut x64_asm.X64Buf,
@@ -2314,6 +2339,7 @@ fn emit_sse2_vec_inst(
     let xs1 = mach_ir.phys_to_xmm(inst.src1_phys);
     let gd = mach_ir.phys_to_reg(inst.dst_phys);
     let gs0 = mach_ir.phys_to_reg(inst.src0_phys);
+    let imm8 = (inst.imm & 0xFF_i64).trunc.[u8]();
     match inst.op {
         .VMovSSLoad => { try emit_sse2_load_mem(alloc, buf, .VMovSSLoad, xd, &inst.mem); }
         .VMovSDLoad => { try emit_sse2_load_mem(alloc, buf, .VMovSDLoad, xd, &inst.mem); }
@@ -2340,6 +2366,24 @@ fn emit_sse2_vec_inst(
         .VMinSD => { try emit_sse2_bin3(alloc, buf, true, 0x5D_u8, xd, xs0, xs1); }
         .VMaxSD => { try emit_sse2_bin3(alloc, buf, true, 0x5F_u8, xd, xs0, xs1); }
         .VSqrtSD => { try buf.sqrt_f(alloc, true, xd, xs0); }
+        .VAddPS => { try emit_sse2_packed3(alloc, buf, false, 0x58_u8, xd, xs0, xs1); }
+        .VSubPS => { try emit_sse2_packed3(alloc, buf, false, 0x5C_u8, xd, xs0, xs1); }
+        .VMulPS => { try emit_sse2_packed3(alloc, buf, false, 0x59_u8, xd, xs0, xs1); }
+        .VDivPS => { try emit_sse2_packed3(alloc, buf, false, 0x5E_u8, xd, xs0, xs1); }
+        .VMinPS => { try emit_sse2_packed3(alloc, buf, false, 0x5D_u8, xd, xs0, xs1); }
+        .VMaxPS => { try emit_sse2_packed3(alloc, buf, false, 0x5F_u8, xd, xs0, xs1); }
+        .VSqrtPS => { try buf.sse_ps_bin(alloc, 0x51_u8, xd, xs0); }
+        .VAddPD => { try emit_sse2_packed3(alloc, buf, true, 0x58_u8, xd, xs0, xs1); }
+        .VSubPD => { try emit_sse2_packed3(alloc, buf, true, 0x5C_u8, xd, xs0, xs1); }
+        .VMulPD => { try emit_sse2_packed3(alloc, buf, true, 0x59_u8, xd, xs0, xs1); }
+        .VDivPD => { try emit_sse2_packed3(alloc, buf, true, 0x5E_u8, xd, xs0, xs1); }
+        .VMinPD => { try emit_sse2_packed3(alloc, buf, true, 0x5D_u8, xd, xs0, xs1); }
+        .VMaxPD => { try emit_sse2_packed3(alloc, buf, true, 0x5F_u8, xd, xs0, xs1); }
+        .VSqrtPD => { try buf.sse_66_bin(alloc, 0x51_u8, xd, xs0); }
+        .VShufPS => {
+            try emit_sse2_packed3(alloc, buf, false, 0xC6_u8, xd, xs0, xs1);
+            try buf.emit_u8(alloc, imm8);
+        }
         .VUcomiSS => { try buf.ucomi(alloc, false, xs0, xs1); }
         .VUcomiSD => { try buf.ucomi(alloc, true, xs0, xs1); }
         .VCvtSI2SS => {
@@ -2358,6 +2402,8 @@ fn emit_sse2_vec_inst(
         .VMovDFromXmm => { try buf.movd_r32_xmm(alloc, gd, xs0); }
         .VMovQToXmm => { try buf.movq_xmm_r64(alloc, xd, gs0); }
         .VMovQFromXmm => { try buf.movq_r64_xmm(alloc, gd, xs0); }
+        .VAndPS => { try emit_sse2_xor(alloc, buf, false, 0x54_u8, xd, xs0, xs1); }
+        .VOrPS => { try emit_sse2_xor(alloc, buf, false, 0x56_u8, xd, xs0, xs1); }
         .VXorPS => { try emit_sse2_xor(alloc, buf, false, 0x57_u8, xd, xs0, xs1); }
         .VXorPD => { try emit_sse2_xor(alloc, buf, true, 0x57_u8, xd, xs0, xs1); }
         _ => { try emit_vec_inst(alloc, buf, inst); }

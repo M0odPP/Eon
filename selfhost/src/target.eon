@@ -291,28 +291,11 @@ impl TargetRegFile {
     }
 
     pub fn x86_64_win64() -> TargetRegFile {
-        // Win64 ABI: caller-saved GPRs = RAX,RCX,RDX,R8,R9,R10,R11 (0x0F07);
-        // callee-saved GPRs = RBX,RDI,RSI,R12..R15 (0xF0C8);
-        // caller-saved XMMs = XMM0..XMM5 (0x003F); callee-saved XMMs = XMM6..XMM15 (0xFFC0).
-        var rf = TargetRegFile.x86_64_sysv();
-        rf.gpr_order[0_usize] = 0_u8;  // RAX
-        rf.gpr_order[1_usize] = 1_u8;  // RCX
-        rf.gpr_order[2_usize] = 2_u8;  // RDX
-        rf.gpr_order[3_usize] = 8_u8;  // R8
-        rf.gpr_order[4_usize] = 9_u8;  // R9
-        rf.gpr_order[5_usize] = 3_u8;  // RBX
-        rf.gpr_order[6_usize] = 6_u8;  // RSI
-        rf.gpr_order[7_usize] = 7_u8;  // RDI
-        rf.gpr_order[8_usize] = 12_u8; // R12
-        rf.gpr_order[9_usize] = 13_u8; // R13
-        rf.gpr_order[10_usize] = 14_u8;// R14
-        rf.gpr_order[11_usize] = 15_u8;// R15
-        rf.caller_saved_gprs = 0x00000F07_u32;
-        rf.callee_saved_gprs = 0x0000F0C8_u32;
-        rf.eon_call_err_clobber_gprs = 0x00008F07_u32;
-        rf.caller_saved_vecs = 0x0000003F_u32;
-        rf.callee_saved_vecs = 0x0000FFC0_u32;
-        return rf;
+        // Internal Eon functions on Windows x86_64 use the EonCall register convention
+        // (matching `plan_frame_layout` in `mach_opt_x64.eon`, which saves RBX and R12..R15,
+        // and treating RDI/RSI/XMM0..XMM15 as caller-saved; Win64 C callbacks use the
+        // `@export_c` baseline path in `mach_x64.eon` which additionally saves RDI/RSI/R15).
+        return TargetRegFile.x86_64_sysv();
     }
 
     pub fn aarch64_aapcs64() -> TargetRegFile {

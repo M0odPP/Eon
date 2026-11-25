@@ -1,0 +1,180 @@
+module eon_gpu.lib;
+
+import core.color;
+import eon_win.events;
+import eon_win.lib;
+import eon_gpu.scene;
+import eon_gpu.backends.soft;
+import eon_gpu.backends.vulkan;
+import eon_gpu.backends.metal;
+
+// ============================================================================
+// Safe Unified GPUI UI-RHI Facade (`libs/eon_gpu/src/lib.eon`)
+// Exactly 3 backends: Vulkan 1.1+, Metal, and Pure-Eon Software Rasterizer.
+// ZERO OpenGL, ZERO C toolchain, ZERO `@hal`/`raw` in this safe facade.
+// ============================================================================
+
+pub enum GpuBackendKind : u8 {
+    Software = 0,
+    Vulkan = 1,
+    Metal = 2,
+}
+
+pub struct Renderer {
+    pub backend: GpuBackendKind;
+    pub width: u32;
+    pub height: u32;
+    pub frame_count: u64;
+    pub vk: vulkan.VulkanRenderer;
+    pub mtl: metal.MetalRenderer;
+}
+
+impl Renderer {
+    pub fn uninit() -> Renderer {
+        return Renderer.{
+            backend: .Software,
+            width: 0_u32,
+            height: 0_u32,
+            frame_count: 0_u64,
+            vk: vulkan.VulkanRenderer.empty(),
+            mtl: metal.MetalRenderer.empty(),
+        };
+    }
+
+    /// Initialize the best available backend for `surf` (Vulkan 1.1+ / Metal / Software fallback).
+    pub fn init_in_place(self: *mut Self, surf: *events.SurfaceInfo, force_software: bool) {
+        self.width = surf.width;
+        self.height = surf.height;
+        self.frame_count = 0_u64;
+        self.backend = .Software;
+        if force_software {
+            return;
+        }
+        comptime if @target_os() == .Linux || @target_os() == .Windows || @target_os() == .Android {
+            if self.vk.init(surf) {
+                self.backend = .Vulkan;
+                self.width = self.vk.swap_w;
+                self.height = self.vk.swap_h;
+                return;
+            }
+        } else comptime if @target_os() == .MacOS || @target_os() == .IOS {
+            if self.mtl.init(surf) {
+                self.backend = .Metal;
+                return;
+            }
+        }
+    }
+
+    /// Render a GPUI `Scene` frame. When using the software backend, renders into `soft_fb`
+    /// (`width * height * 4` RGBA8 bytes) and presents directly via `win.present_rgba8(...)`.
+    pub fn render_scene(
+        self: *mut Self,
+        win: *mut lib.PlatformWindow,
+        sc: *scene.Scene,
+        soft_fb: *mut [u8],
+        atlas_r8: *[u8],
+        atlas_r8_w: u32,
+        atlas_r8_h: u32,
+        atlas_r8_gen: u64,
+        atlas_rgba: *[u8],
+        atlas_rgba_w: u32,
+        atlas_rgba_h: u32,
+        atlas_rgba_gen: u64,
+    ) -> bool {
+        return self.render_batches(
+            win,
+            sc.clear_color,
+            sc.quads.as_slice(),
+            sc.shadows.as_slice(),
+            sc.underlines.as_slice(),
+            sc.mono_sprites.as_slice(),
+            sc.poly_sprites.as_slice(),
+            sc.path_verts.as_slice(),
+            soft_fb,
+            atlas_r8, atlas_r8_w, atlas_r8_h, atlas_r8_gen,
+            atlas_rgba, atlas_rgba_w, atlas_rgba_h, atlas_rgba_gen,
+        );
+    }
+
+    /// Render zero-copy primitive slices (works identically on hosted & bare-metal `nostd`!).
+    pub fn render_batches(
+        self: *mut Self,
+        win: *mut lib.PlatformWindow,
+        clear_col: color.Rgba,
+        quads: *[scene.Quad],
+        shadows: *[scene.Shadow],
+        underlines: *[scene.Underline],
+        mono_sprites: *[scene.MonoSprite],
+        poly_sprites: *[scene.PolySprite],
+        path_verts: *[scene.PathVertex],
+        soft_fb: *mut [u8],
+        atlas_r8: *[u8],
+        atlas_r8_w: u32,
+        atlas_r8_h: u32,
+        atlas_r8_gen: u64,
+        atlas_rgba: *[u8],
+        atlas_rgba_w: u32,
+        atlas_rgba_h: u32,
+        atlas_rgba_gen: u64,
+    ) -> bool {
+        let w = if self.width > 0_u32 { self.width } else { win.width };
+        let h = if self.height > 0_u32 { self.height } else { win.height };
+        match self.backend {
+            .Vulkan => {
+                let ok = self.vk.render_batches(
+                    clear_col,
+                    quads, shadows, underlines, mono_sprites, poly_sprites, path_verts,
+                    atlas_r8, atlas_r8_w, atlas_r8_h, atlas_r8_gen,
+                    atlas_rgba, atlas_rgba_w, atlas_rgba_h, atlas_rgba_gen,
+                );
+                if ok {
+                    self.frame_count = self.frame_count +% 1_u64;
+                    return true;
+                }
+                // Seamless runtime fallback to software rasterizer if swapchain lost
+                soft.render_batches(
+                    soft_fb, w, h, clear_col,
+                    quads, shadows, underlines, mono_sprites, poly_sprites, path_verts,
+                    atlas_r8, atlas_r8_w, atlas_r8_h,
+                    atlas_rgba, atlas_rgba_w, atlas_rgba_h,
+                );
+                win.present_rgba8(soft_fb, w, h);
+                self.frame_count = self.frame_count +% 1_u64;
+                return true;
+            }
+            .Metal => {
+                let ok = self.mtl.render_batches(w, h, quads, shadows, underlines, mono_sprites, poly_sprites, path_verts);
+                if ok {
+                    self.frame_count = self.frame_count +% 1_u64;
+                    return true;
+                }
+                soft.render_batches(
+                    soft_fb, w, h, clear_col,
+                    quads, shadows, underlines, mono_sprites, poly_sprites, path_verts,
+                    atlas_r8, atlas_r8_w, atlas_r8_h,
+                    atlas_rgba, atlas_rgba_w, atlas_rgba_h,
+                );
+                win.present_rgba8(soft_fb, w, h);
+                self.frame_count = self.frame_count +% 1_u64;
+                return true;
+            }
+            .Software => {
+                soft.render_batches(
+                    soft_fb, w, h, clear_col,
+                    quads, shadows, underlines, mono_sprites, poly_sprites, path_verts,
+                    atlas_r8, atlas_r8_w, atlas_r8_h,
+                    atlas_rgba, atlas_rgba_w, atlas_rgba_h,
+                );
+                win.present_rgba8(soft_fb, w, h);
+                self.frame_count = self.frame_count +% 1_u64;
+                return true;
+            }
+        }
+    }
+
+    pub fn destroy(self: *mut Self) {
+        self.vk.destroy();
+        self.mtl.destroy();
+        self.backend = .Software;
+    }
+}

@@ -1,0 +1,319 @@
+module eon_gpu.backends.metal @hal;
+
+import eon_win.events;
+import eon_gpu.scene;
+
+// ============================================================================
+// Metal UI-RHI Backend for macOS & iOS (`libs/eon_gpu/src/backends/metal.hal.eon`)
+// Zero C toolchain — calls `MTLCreateSystemDefaultDevice` & `objc_msgSend`
+// directly and compiles `@embed_gpu_msl(...)` shaders into native pipelines.
+// ============================================================================
+
+extern "C" fn MTLCreateSystemDefaultDevice() -> u64;
+extern "C" fn objc_getClass(name: u64) -> u64;
+extern "C" fn sel_registerName(name: u64) -> u64;
+extern "C" fn objc_msgSend(obj: u64, sel: u64) -> u64;
+
+@naked
+pub fn slice_ptr(_s: *[u8]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn f32x4_ptr(_p: *f32x4) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn fn_ptr_u64(_f: fn(u64, u64) -> u64) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call1(_fp: u64, _a0: u64, _a1: u64, _a2: u64) -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x16, x0; mov x0, x1; mov x1, x2; mov x2, x3; br x16", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t0, a0; mv a0, a1; mv a1, a2; mv a2, a3; jr t0", options(noreturn)); }
+    } else {
+        raw { asm("mov r10, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; jmp r10", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call2(_fp: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64) -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x16, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; br x16", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t0, a0; mv a0, a1; mv a1, a2; mv a2, a3; mv a3, a4; jr t0", options(noreturn)); }
+    } else {
+        raw { asm("mov r10, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; jmp r10", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call3(_fp: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x16, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; mov x4, x5; br x16", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t0, a0; mv a0, a1; mv a1, a2; mv a2, a3; mv a3, a4; mv a4, a5; jr t0", options(noreturn)); }
+    } else {
+        raw { asm("mov r10, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; mov r8, r9; jmp r10", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call4(_fp: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x16, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; mov x4, x5; mov x5, x6; br x16", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t0, a0; mv a0, a1; mv a1, a2; mv a2, a3; mv a3, a4; mv a4, a5; mv a5, a6; jr t0", options(noreturn)); }
+    } else {
+        raw { asm("mov r10, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; mov r8, r9; jmp r10", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+pub fn objc_cls(name_z: *[u8]) -> u64 {
+    comptime if @target_os() == .MacOS || @target_os() == .IOS {
+        raw { return objc_getClass(slice_ptr(name_z)); }
+    } else { _ = name_z; return 0_u64; }
+}
+
+pub fn objc_sel(name_z: *[u8]) -> u64 {
+    comptime if @target_os() == .MacOS || @target_os() == .IOS {
+        raw { return sel_registerName(slice_ptr(name_z)); }
+    } else { _ = name_z; return 0_u64; }
+}
+
+pub fn msg0(obj: u64, sel: u64) -> u64 {
+    comptime if @target_os() == .MacOS || @target_os() == .IOS {
+        if obj == 0_u64 || sel == 0_u64 { return 0_u64; }
+        raw { return objc_msgSend(obj, sel); }
+    } else { _ = obj; _ = sel; return 0_u64; }
+}
+
+pub fn msg1(obj: u64, sel: u64, a0: u64) -> u64 {
+    comptime if @target_os() == .MacOS || @target_os() == .IOS {
+        if obj == 0_u64 || sel == 0_u64 { return 0_u64; }
+        raw { return call1(fn_ptr_u64(objc_msgSend), obj, sel, a0); }
+    } else { _ = obj; _ = sel; _ = a0; return 0_u64; }
+}
+
+pub fn msg2(obj: u64, sel: u64, a0: u64, a1: u64) -> u64 {
+    comptime if @target_os() == .MacOS || @target_os() == .IOS {
+        if obj == 0_u64 || sel == 0_u64 { return 0_u64; }
+        raw { return call2(fn_ptr_u64(objc_msgSend), obj, sel, a0, a1); }
+    } else { _ = obj; _ = sel; _ = a0; _ = a1; return 0_u64; }
+}
+
+pub fn msg3(obj: u64, sel: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    comptime if @target_os() == .MacOS || @target_os() == .IOS {
+        if obj == 0_u64 || sel == 0_u64 { return 0_u64; }
+        raw { return call3(fn_ptr_u64(objc_msgSend), obj, sel, a0, a1, a2); }
+    } else { _ = obj; _ = sel; _ = a0; _ = a1; _ = a2; return 0_u64; }
+}
+
+pub fn msg4(obj: u64, sel: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    comptime if @target_os() == .MacOS || @target_os() == .IOS {
+        if obj == 0_u64 || sel == 0_u64 { return 0_u64; }
+        raw { return call4(fn_ptr_u64(objc_msgSend), obj, sel, a0, a1, a2, a3); }
+    } else { _ = obj; _ = sel; _ = a0; _ = a1; _ = a2; _ = a3; return 0_u64; }
+}
+
+pub fn nsstring_from_bytes(bs: *[u8]) -> u64 {
+    let cls = objc_cls("NSString\0".as_bytes());
+    let s_alloc = objc_sel("alloc\0".as_bytes());
+    let s_init = objc_sel("initWithBytes:length:encoding:\0".as_bytes());
+    let inst = msg0(cls, s_alloc);
+    return msg3(inst, s_init, slice_ptr(bs), bs.len.widen.[u64](), 4_u64); // NSUTF8StringEncoding = 4
+}
+
+pub fn compile_pipeline(dev: u64, vs_msl: *[u8], vs_name_z: *[u8], fs_msl: *[u8], fs_name_z: *[u8]) -> u64 {
+    comptime if @target_os() == .MacOS || @target_os() == .IOS {
+        if dev == 0_u64 { return 0_u64; }
+        let s_new_lib = objc_sel("newLibraryWithSource:options:error:\0".as_bytes());
+        let s_new_fn = objc_sel("newFunctionWithName:\0".as_bytes());
+        let vsrc = nsstring_from_bytes(vs_msl);
+        let fsrc = nsstring_from_bytes(fs_msl);
+        let vlib = msg3(dev, s_new_lib, vsrc, 0_u64, 0_u64);
+        let flib = msg3(dev, s_new_lib, fsrc, 0_u64, 0_u64);
+        if vlib == 0_u64 || flib == 0_u64 { return 0_u64; }
+        let vfn = msg1(vlib, s_new_fn, nsstring_from_bytes(vs_name_z));
+        let ffn = msg1(flib, s_new_fn, nsstring_from_bytes(fs_name_z));
+        let desc_cls = objc_cls("MTLRenderPipelineDescriptor\0".as_bytes());
+        let desc = msg0(msg0(desc_cls, objc_sel("alloc\0".as_bytes())), objc_sel("init\0".as_bytes()));
+        _ = msg1(desc, objc_sel("setVertexFunction:\0".as_bytes()), vfn);
+        _ = msg1(desc, objc_sel("setFragmentFunction:\0".as_bytes()), ffn);
+        let att_arr = msg0(desc, objc_sel("colorAttachments\0".as_bytes()));
+        let att0 = msg1(att_arr, objc_sel("objectAtIndexedSubscript:\0".as_bytes()), 0_u64);
+        _ = msg1(att0, objc_sel("setPixelFormat:\0".as_bytes()), 80_u64); // MTLPixelFormatBGRA8Unorm = 80
+        _ = msg1(att0, objc_sel("setBlendingEnabled:\0".as_bytes()), 1_u64);
+        _ = msg1(att0, objc_sel("setSourceRGBBlendFactor:\0".as_bytes()), 1_u64); // One (premultiplied)
+        _ = msg1(att0, objc_sel("setDestinationRGBBlendFactor:\0".as_bytes()), 5_u64); // OneMinusSourceAlpha
+        _ = msg1(att0, objc_sel("setSourceAlphaBlendFactor:\0".as_bytes()), 1_u64);
+        _ = msg1(att0, objc_sel("setDestinationAlphaBlendFactor:\0".as_bytes()), 5_u64);
+        return msg2(dev, objc_sel("newRenderPipelineStateWithDescriptor:error:\0".as_bytes()), desc, 0_u64);
+    } else {
+        _ = dev; _ = vs_msl; _ = vs_name_z; _ = fs_msl; _ = fs_name_z;
+        return 0_u64;
+    }
+}
+
+pub struct MetalRenderer {
+    pub device: u64;
+    pub queue: u64;
+    pub layer: u64;
+    pub pipe_quad: u64;
+    pub pipe_shadow: u64;
+    pub pipe_underline: u64;
+    pub pipe_mono: u64;
+    pub pipe_poly: u64;
+    pub pipe_path: u64;
+    pub width: u32;
+    pub height: u32;
+    pub frame_count: u64;
+    pub ready: bool;
+}
+
+impl MetalRenderer {
+    pub fn empty() -> MetalRenderer {
+        return MetalRenderer.{
+            device: 0_u64,
+            queue: 0_u64,
+            layer: 0_u64,
+            pipe_quad: 0_u64,
+            pipe_shadow: 0_u64,
+            pipe_underline: 0_u64,
+            pipe_mono: 0_u64,
+            pipe_poly: 0_u64,
+            pipe_path: 0_u64,
+            width: 0_u32,
+            height: 0_u32,
+            frame_count: 0_u64,
+            ready: false,
+        };
+    }
+
+    pub fn init(self: *mut Self, surf: *events.SurfaceInfo) -> bool {
+        self.width = surf.width;
+        self.height = surf.height;
+        comptime if @target_os() == .MacOS || @target_os() == .IOS {
+            if surf.kind != .Metal || surf.extra_handle == 0_u64 {
+                return false;
+            }
+            var dev: u64 = 0_u64;
+            raw { dev = MTLCreateSystemDefaultDevice(); }
+            if dev == 0_u64 { return false; }
+            self.device = dev;
+            self.layer = surf.extra_handle;
+            _ = msg1(self.layer, objc_sel("setDevice:\0".as_bytes()), dev);
+            _ = msg1(self.layer, objc_sel("setPixelFormat:\0".as_bytes()), 80_u64);
+            self.queue = msg0(dev, objc_sel("newCommandQueue\0".as_bytes()));
+            self.pipe_quad = compile_pipeline(dev, @embed_gpu_msl("quad_vs"), "quad_vs".as_bytes(), @embed_gpu_msl("quad_fs"), "quad_fs".as_bytes());
+            self.pipe_shadow = compile_pipeline(dev, @embed_gpu_msl("shadow_vs"), "shadow_vs".as_bytes(), @embed_gpu_msl("shadow_fs"), "shadow_fs".as_bytes());
+            self.pipe_underline = compile_pipeline(dev, @embed_gpu_msl("underline_vs"), "underline_vs".as_bytes(), @embed_gpu_msl("underline_fs"), "underline_fs".as_bytes());
+            self.pipe_mono = compile_pipeline(dev, @embed_gpu_msl("mono_vs"), "mono_vs".as_bytes(), @embed_gpu_msl("mono_fs"), "mono_fs".as_bytes());
+            self.pipe_poly = compile_pipeline(dev, @embed_gpu_msl("poly_vs"), "poly_vs".as_bytes(), @embed_gpu_msl("poly_fs"), "poly_fs".as_bytes());
+            self.pipe_path = compile_pipeline(dev, @embed_gpu_msl("path_vs"), "path_vs".as_bytes(), @embed_gpu_msl("path_fs"), "path_fs".as_bytes());
+            self.ready = self.queue != 0_u64 && self.pipe_quad != 0_u64;
+            return self.ready;
+        } else {
+            _ = surf;
+            return false;
+        }
+    }
+
+    pub fn render_batches(
+        self: *mut Self,
+        w: u32,
+        h: u32,
+        quads: *[scene.Quad],
+        shadows: *[scene.Shadow],
+        underlines: *[scene.Underline],
+        mono_sprites: *[scene.MonoSprite],
+        poly_sprites: *[scene.PolySprite],
+        path_verts: *[scene.PathVertex],
+    ) -> bool {
+        comptime if @target_os() == .MacOS || @target_os() == .IOS {
+            if !self.ready || self.layer == 0_u64 { return false; }
+            self.width = w;
+            self.height = h;
+            let drawable = msg0(self.layer, objc_sel("nextDrawable\0".as_bytes()));
+            if drawable == 0_u64 { return false; }
+            let tex = msg0(drawable, objc_sel("texture\0".as_bytes()));
+            let rpd_cls = objc_cls("MTLRenderPassDescriptor\0".as_bytes());
+            let rpd = msg0(rpd_cls, objc_sel("renderPassDescriptor\0".as_bytes()));
+            let ca = msg1(msg0(rpd, objc_sel("colorAttachments\0".as_bytes())), objc_sel("objectAtIndexedSubscript:\0".as_bytes()), 0_u64);
+            _ = msg1(ca, objc_sel("setTexture:\0".as_bytes()), tex);
+            _ = msg1(ca, objc_sel("setLoadAction:\0".as_bytes()), 2_u64); // MTLLoadActionClear
+            _ = msg1(ca, objc_sel("setStoreAction:\0".as_bytes()), 1_u64); // MTLStoreActionStore
+
+            let cmd = msg0(self.queue, objc_sel("commandBuffer\0".as_bytes()));
+            let enc = msg1(cmd, objc_sel("renderCommandEncoderWithDescriptor:\0".as_bytes()), rpd);
+            let vp: f32x4 = .{ w.to_float.[f32](), h.to_float.[f32](), 1.0_f32, 0.0_f32 };
+            let s_set_pipe = objc_sel("setRenderPipelineState:\0".as_bytes());
+            let s_set_vb = objc_sel("setVertexBytes:length:atIndex:\0".as_bytes());
+            let s_draw_inst = objc_sel("drawPrimitives:vertexStart:vertexCount:instanceCount:\0".as_bytes());
+            _ = msg3(enc, s_set_vb, f32x4_ptr(&vp), 16_u64, 30_u64);
+
+            if shadows.len > 0_usize && self.pipe_shadow != 0_u64 {
+                _ = msg1(enc, s_set_pipe, self.pipe_shadow);
+                _ = msg4(enc, s_draw_inst, 3_u64, 0_u64, 6_u64, shadows.len.widen.[u64]());
+            }
+            if quads.len > 0_usize && self.pipe_quad != 0_u64 {
+                _ = msg1(enc, s_set_pipe, self.pipe_quad);
+                _ = msg4(enc, s_draw_inst, 3_u64, 0_u64, 6_u64, quads.len.widen.[u64]());
+            }
+            if underlines.len > 0_usize && self.pipe_underline != 0_u64 {
+                _ = msg1(enc, s_set_pipe, self.pipe_underline);
+                _ = msg4(enc, s_draw_inst, 3_u64, 0_u64, 6_u64, underlines.len.widen.[u64]());
+            }
+            if mono_sprites.len > 0_usize && self.pipe_mono != 0_u64 {
+                _ = msg1(enc, s_set_pipe, self.pipe_mono);
+                _ = msg4(enc, s_draw_inst, 3_u64, 0_u64, 6_u64, mono_sprites.len.widen.[u64]());
+            }
+            if poly_sprites.len > 0_usize && self.pipe_poly != 0_u64 {
+                _ = msg1(enc, s_set_pipe, self.pipe_poly);
+                _ = msg4(enc, s_draw_inst, 3_u64, 0_u64, 6_u64, poly_sprites.len.widen.[u64]());
+            }
+            if path_verts.len >= 3_usize && self.pipe_path != 0_u64 {
+                _ = msg1(enc, s_set_pipe, self.pipe_path);
+                _ = msg4(enc, s_draw_inst, 3_u64, 0_u64, path_verts.len.widen.[u64](), 1_u64);
+            }
+            _ = msg0(enc, objc_sel("endEncoding\0".as_bytes()));
+            _ = msg1(cmd, objc_sel("presentDrawable:\0".as_bytes()), drawable);
+            _ = msg0(cmd, objc_sel("commit\0".as_bytes()));
+            self.frame_count = self.frame_count +% 1_u64;
+            return true;
+        } else {
+            _ = self; _ = w; _ = h; _ = quads; _ = shadows; _ = underlines;
+            _ = mono_sprites; _ = poly_sprites; _ = path_verts;
+            return false;
+        }
+    }
+
+    pub fn destroy(self: *mut Self) {
+        self.ready = false;
+        self.device = 0_u64;
+        self.queue = 0_u64;
+    }
+}

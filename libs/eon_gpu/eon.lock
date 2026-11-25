@@ -1,0 +1,7 @@
+# Eon deterministic lockfile v1
+lock_version = 1
+
+[[dep]]
+name = "eon_win"
+path = "../eon_win"
+sha256 = "6049f204ac727c24db6685590f9a321b04dd9e64d596af20d6e11ca5db83bf89"

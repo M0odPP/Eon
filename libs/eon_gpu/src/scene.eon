@@ -1,0 +1,448 @@
+module eon_gpu.scene;
+
+import core.col;
+import core.color;
+import core.math_vec;
+
+// ============================================================================
+// GPUI-Class UI Scene Primitives (`libs/eon_gpu/src/scene.eon`)
+// 100% safe, `core/`-only, `@layout(std430)` matching Vulkan SPIR-V & Metal.
+// ============================================================================
+
+pub const QUAD_FLAG_GRADIENT_V: u32 = 1_u32;
+pub const QUAD_FLAG_GRADIENT_H: u32 = 2_u32;
+pub const QUAD_FLAG_GRADIENT_DIAG: u32 = 3_u32;
+pub const QUAD_FLAG_GRADIENT_MASK: u32 = 3_u32;
+
+/// Rounded rectangle with optional linear gradient, per-edge border, and clip mask.
+@layout(std430)
+pub struct Quad {
+    pub bounds: f32x4;        // (x, y, width, height) in logical/physical px
+    pub clip_mask: f32x4;     // (min_x, min_y, max_x, max_y)
+    pub bg_color: f32x4;      // start sRGB RGBA [0..1]
+    pub bg_color_end: f32x4;  // gradient end sRGB RGBA [0..1]
+    pub border_color: f32x4;  // border sRGB RGBA [0..1]
+    pub corner_radii: f32x4;  // (top_left, top_right, bottom_right, bottom_left)
+    pub border_widths: f32x4; // (top, right, bottom, left)
+    pub order: u32;
+    pub flags: u32;
+    pub _pad0: u32;
+    pub _pad1: u32;
+}
+
+/// Analytical Gaussian-blurred rounded-rectangle drop shadow (Zed GPUI erf algorithm).
+@layout(std430)
+pub struct Shadow {
+    pub bounds: f32x4;        // caster box (x, y, width, height)
+    pub clip_mask: f32x4;     // (min_x, min_y, max_x, max_y)
+    pub color: f32x4;         // shadow RGBA [0..1]
+    pub corner_radii: f32x4;  // (tl, tr, br, bl)
+    pub blur_radius: f32;
+    pub spread: f32;
+    pub order: u32;
+    pub _pad0: u32;
+}
+
+/// Solid or wavy (diagnostic/squiggly) text underline.
+@layout(std430)
+pub struct Underline {
+    pub bounds: f32x4;        // (x, y, width, height)
+    pub clip_mask: f32x4;     // (min_x, min_y, max_x, max_y)
+    pub color: f32x4;         // RGBA [0..1]
+    pub thickness: f32;
+    pub wavy: u32;            // 0 = solid, 1 = wavy sine
+    pub order: u32;
+    pub _pad0: u32;
+}
+
+/// Monochrome R8 glyph atlas sprite (subpixel-coverage text / icon mask).
+@layout(std430)
+pub struct MonoSprite {
+    pub bounds: f32x4;        // (x, y, width, height)
+    pub clip_mask: f32x4;     // (min_x, min_y, max_x, max_y)
+    pub uv_bounds: f32x4;     // (u0, v0, u1, v1) normalized [0..1]
+    pub color: f32x4;         // RGBA tint [0..1]
+    pub order: u32;
+    pub atlas_id: u32;
+    pub _pad0: u32;
+    pub _pad1: u32;
+}
+
+/// Full-color RGBA8 atlas sprite with optional rounded corners and tint.
+@layout(std430)
+pub struct PolySprite {
+    pub bounds: f32x4;        // (x, y, width, height)
+    pub clip_mask: f32x4;     // (min_x, min_y, max_x, max_y)
+    pub uv_bounds: f32x4;     // (u0, v0, u1, v1)
+    pub tint: f32x4;          // RGBA multiplier
+    pub corner_radii: f32x4;  // (tl, tr, br, bl)
+    pub order: u32;
+    pub atlas_id: u32;
+    pub _pad0: u32;
+    pub _pad1: u32;
+}
+
+/// Tessellated 2D vector path vertex (triangles emitted in groups of 3).
+@layout(std430)
+pub struct PathVertex {
+    pub pos: f32x2;           // (x, y)
+    pub uv: f32x2;            // optional barycentric / coverage param
+    pub color: f32x4;         // RGBA [0..1]
+    pub clip_mask: f32x4;     // (min_x, min_y, max_x, max_y)
+}
+
+/// Content clip rectangle pushed/popped by layout containers (`ScrollView`, `overflow: hidden`).
+pub struct ContentMask {
+    pub bounds: math_vec.Bounds;
+}
+
+impl ContentMask {
+    @inline
+    pub fn unbounded() -> ContentMask {
+        return ContentMask.{
+            bounds: math_vec.Bounds.from_xywh(-1.0e6_f32, -1.0e6_f32, 2.0e6_f32, 2.0e6_f32),
+        };
+    }
+
+    @inline
+    pub fn from_bounds(b: math_vec.Bounds) -> ContentMask {
+        return ContentMask.{ bounds: b };
+    }
+
+    @inline
+    pub fn to_clip_f32x4(self: Self) -> f32x4 {
+        return self.bounds.to_clip_f32x4();
+    }
+}
+
+/// Non-owning borrowed atlas descriptor passed into `SceneView`.
+pub struct AtlasSlice {
+    pub width: u32;
+    pub height: u32;
+    pub channels: u8; // 1 = R8 monochrome, 4 = RGBA8 color
+    pub generation: u64;
+}
+
+impl AtlasSlice {
+    @inline
+    pub fn empty(channels: u8) -> AtlasSlice {
+        return AtlasSlice.{ width: 0_u32, height: 0_u32, channels: channels, generation: 0_u64 };
+    }
+}
+
+/// Zero-copy borrowed view over all primitive batches of a single frame.
+/// Accepted uniformly by Vulkan, Metal, and `eon_gpu_soft` (including `nostd`!).
+pub struct SceneBatchMeta {
+    pub clear_color: color.Rgba;
+    pub viewport_w: u32;
+    pub viewport_h: u32;
+    pub scale_factor: f32;
+    pub mono_atlas: AtlasSlice;
+    pub poly_atlas: AtlasSlice;
+}
+
+impl SceneBatchMeta {
+    pub fn new(clear_color: color.Rgba, w: u32, h: u32, scale: f32) -> SceneBatchMeta {
+        return SceneBatchMeta.{
+            clear_color: clear_color,
+            viewport_w: w,
+            viewport_h: h,
+            scale_factor: scale,
+            mono_atlas: AtlasSlice.empty(1_u8),
+            poly_atlas: AtlasSlice.empty(4_u8),
+        };
+    }
+}
+
+/// Dynamically growable GPUI `Scene` backed by `AllocCap` (reusable across frames with 0 allocs after warmup).
+pub linear struct Scene {
+    pub quads: col.DynBuf[Quad];
+    pub shadows: col.DynBuf[Shadow];
+    pub underlines: col.DynBuf[Underline];
+    pub mono_sprites: col.DynBuf[MonoSprite];
+    pub poly_sprites: col.DynBuf[PolySprite];
+    pub path_verts: col.DynBuf[PathVertex];
+    pub clear_color: color.Rgba;
+    pub next_order: u32;
+    pub clip_stack: [16]f32x4;
+    pub clip_depth: usize;
+}
+
+impl Scene {
+    pub fn init(alloc: *mut AllocCap) -> Scene ! OutOfMemory {
+        let quads = try col.DynBuf.[Quad].init(alloc, 128_usize);
+        errdefer quads.destroy(alloc);
+        let shadows = try col.DynBuf.[Shadow].init(alloc, 32_usize);
+        errdefer shadows.destroy(alloc);
+        let underlines = try col.DynBuf.[Underline].init(alloc, 16_usize);
+        errdefer underlines.destroy(alloc);
+        let mono_sprites = try col.DynBuf.[MonoSprite].init(alloc, 256_usize);
+        errdefer mono_sprites.destroy(alloc);
+        let poly_sprites = try col.DynBuf.[PolySprite].init(alloc, 16_usize);
+        errdefer poly_sprites.destroy(alloc);
+        let path_verts = try col.DynBuf.[PathVertex].init(alloc, 64_usize);
+        errdefer path_verts.destroy(alloc);
+        let unc = ContentMask.unbounded().to_clip_f32x4();
+        return Scene.{
+            quads: quads,
+            shadows: shadows,
+            underlines: underlines,
+            mono_sprites: mono_sprites,
+            poly_sprites: poly_sprites,
+            path_verts: path_verts,
+            clear_color: color.Rgba.from_hex_rgb(0x111318_u32),
+            next_order: 0_u32,
+            clip_stack: [unc; 16],
+            clip_depth: 1_usize,
+        };
+    }
+
+    pub fn destroy(self: Scene, alloc: *mut AllocCap) {
+        let Scene.{
+            quads,
+            shadows,
+            underlines,
+            mono_sprites,
+            poly_sprites,
+            path_verts,
+            clear_color: _,
+            next_order: _,
+            clip_stack: _,
+            clip_depth: _,
+        } = self;
+        quads.destroy(alloc);
+        shadows.destroy(alloc);
+        underlines.destroy(alloc);
+        mono_sprites.destroy(alloc);
+        poly_sprites.destroy(alloc);
+        path_verts.destroy(alloc);
+    }
+
+    pub fn clear(self: *mut Self, clear_col: color.Rgba) {
+        self.quads.clear();
+        self.shadows.clear();
+        self.underlines.clear();
+        self.mono_sprites.clear();
+        self.poly_sprites.clear();
+        self.path_verts.clear();
+        self.clear_color = clear_col;
+        self.next_order = 0_u32;
+        self.clip_stack[0_usize] = ContentMask.unbounded().to_clip_f32x4();
+        self.clip_depth = 1_usize;
+    }
+
+    pub fn current_clip(self: *Self) -> f32x4 {
+        if self.clip_depth == 0_usize {
+            return ContentMask.unbounded().to_clip_f32x4();
+        }
+        let idx = if self.clip_depth <= 16_usize { self.clip_depth - 1_usize } else { 15_usize };
+        return self.clip_stack[idx];
+    }
+
+    pub fn push_clip(self: *mut Self, bounds: math_vec.Bounds) {
+        let cur = self.current_clip();
+        let nx = bounds.to_clip_f32x4();
+        let inter: f32x4 = .{
+            math_vec.max_f32(cur[0_usize], nx[0_usize]),
+            math_vec.max_f32(cur[1_usize], nx[1_usize]),
+            math_vec.min_f32(cur[2_usize], nx[2_usize]),
+            math_vec.min_f32(cur[3_usize], nx[3_usize]),
+        };
+        if self.clip_depth < 16_usize {
+            let idx = self.clip_depth;
+            self.clip_stack[idx] = inter;
+            self.clip_depth = idx +% 1_usize;
+        }
+    }
+
+    pub fn pop_clip(self: *mut Self) {
+        if self.clip_depth > 1_usize {
+            self.clip_depth = self.clip_depth - 1_usize;
+        }
+    }
+
+    pub fn push_quad(self: *mut Self, alloc: *mut AllocCap, mut q: Quad) -> !OutOfMemory {
+        q.order = self.next_order;
+        self.next_order = self.next_order +% 1_u32;
+        if q.clip_mask[2_usize] <= q.clip_mask[0_usize] && q.clip_mask[3_usize] <= q.clip_mask[1_usize] {
+            q.clip_mask = self.current_clip();
+        }
+        try self.quads.push(alloc, q);
+        return;
+    }
+
+    pub fn push_rect(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        bounds: math_vec.Bounds,
+        bg: color.Rgba,
+        radii: math_vec.Corners,
+        border_col: color.Rgba,
+        border_w: math_vec.Edges,
+    ) -> !OutOfMemory {
+        let c = bg.to_f32x4();
+        let q = Quad.{
+            bounds: bounds.to_f32x4(),
+            clip_mask: self.current_clip(),
+            bg_color: c,
+            bg_color_end: c,
+            border_color: border_col.to_f32x4(),
+            corner_radii: radii.to_f32x4(),
+            border_widths: border_w.to_f32x4(),
+            order: self.next_order,
+            flags: 0_u32,
+            _pad0: 0_u32,
+            _pad1: 0_u32,
+        };
+        self.next_order = self.next_order +% 1_u32;
+        try self.quads.push(alloc, q);
+        return;
+    }
+
+    pub fn push_gradient_rect(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        bounds: math_vec.Bounds,
+        bg_start: color.Rgba,
+        bg_end: color.Rgba,
+        gradient_flag: u32,
+        radii: math_vec.Corners,
+        border_col: color.Rgba,
+        border_w: math_vec.Edges,
+    ) -> !OutOfMemory {
+        let q = Quad.{
+            bounds: bounds.to_f32x4(),
+            clip_mask: self.current_clip(),
+            bg_color: bg_start.to_f32x4(),
+            bg_color_end: bg_end.to_f32x4(),
+            border_color: border_col.to_f32x4(),
+            corner_radii: radii.to_f32x4(),
+            border_widths: border_w.to_f32x4(),
+            order: self.next_order,
+            flags: gradient_flag & QUAD_FLAG_GRADIENT_MASK,
+            _pad0: 0_u32,
+            _pad1: 0_u32,
+        };
+        self.next_order = self.next_order +% 1_u32;
+        try self.quads.push(alloc, q);
+        return;
+    }
+
+    pub fn push_shadow(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        bounds: math_vec.Bounds,
+        col_rgba: color.Rgba,
+        radii: math_vec.Corners,
+        blur_radius: f32,
+        spread: f32,
+    ) -> !OutOfMemory {
+        let s = Shadow.{
+            bounds: bounds.to_f32x4(),
+            clip_mask: self.current_clip(),
+            color: col_rgba.to_f32x4(),
+            corner_radii: radii.to_f32x4(),
+            blur_radius: blur_radius,
+            spread: spread,
+            order: self.next_order,
+            _pad0: 0_u32,
+        };
+        self.next_order = self.next_order +% 1_u32;
+        try self.shadows.push(alloc, s);
+        return;
+    }
+
+    pub fn push_underline(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        bounds: math_vec.Bounds,
+        col_rgba: color.Rgba,
+        thickness: f32,
+        wavy: bool,
+    ) -> !OutOfMemory {
+        let u = Underline.{
+            bounds: bounds.to_f32x4(),
+            clip_mask: self.current_clip(),
+            color: col_rgba.to_f32x4(),
+            thickness: thickness,
+            wavy: if wavy { 1_u32 } else { 0_u32 },
+            order: self.next_order,
+            _pad0: 0_u32,
+        };
+        self.next_order = self.next_order +% 1_u32;
+        try self.underlines.push(alloc, u);
+        return;
+    }
+
+    pub fn push_mono_sprite(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        bounds: math_vec.Bounds,
+        uv: f32x4,
+        col_rgba: color.Rgba,
+    ) -> !OutOfMemory {
+        let ms = MonoSprite.{
+            bounds: bounds.to_f32x4(),
+            clip_mask: self.current_clip(),
+            uv_bounds: uv,
+            color: col_rgba.to_f32x4(),
+            order: self.next_order,
+            atlas_id: 0_u32,
+            _pad0: 0_u32,
+            _pad1: 0_u32,
+        };
+        self.next_order = self.next_order +% 1_u32;
+        try self.mono_sprites.push(alloc, ms);
+        return;
+    }
+
+    pub fn push_poly_sprite(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        bounds: math_vec.Bounds,
+        uv: f32x4,
+        tint: color.Rgba,
+        radii: math_vec.Corners,
+    ) -> !OutOfMemory {
+        let ps = PolySprite.{
+            bounds: bounds.to_f32x4(),
+            clip_mask: self.current_clip(),
+            uv_bounds: uv,
+            tint: tint.to_f32x4(),
+            corner_radii: radii.to_f32x4(),
+            order: self.next_order,
+            atlas_id: 0_u32,
+            _pad0: 0_u32,
+            _pad1: 0_u32,
+        };
+        self.next_order = self.next_order +% 1_u32;
+        try self.poly_sprites.push(alloc, ps);
+        return;
+    }
+
+    pub fn push_path_tri(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        p0: math_vec.Point,
+        p1: math_vec.Point,
+        p2: math_vec.Point,
+        col_rgba: color.Rgba,
+    ) -> !OutOfMemory {
+        let clip = self.current_clip();
+        let c = col_rgba.to_f32x4();
+        try self.path_verts.push(alloc, PathVertex.{ pos: .{ p0.x, p0.y }, uv: .{ 0.0_f32, 0.0_f32 }, color: c, clip_mask: clip });
+        try self.path_verts.push(alloc, PathVertex.{ pos: .{ p1.x, p1.y }, uv: .{ 1.0_f32, 0.0_f32 }, color: c, clip_mask: clip });
+        try self.path_verts.push(alloc, PathVertex.{ pos: .{ p2.x, p2.y }, uv: .{ 0.0_f32, 1.0_f32 }, color: c, clip_mask: clip });
+        self.next_order = self.next_order +% 1_u32;
+        return;
+    }
+
+    pub fn total_primitives(self: *Self) -> usize {
+        return self.quads.len()
+            +% self.shadows.len()
+            +% self.underlines.len()
+            +% self.mono_sprites.len()
+            +% self.poly_sprites.len()
+            +% (self.path_verts.len() / 3_usize);
+    }
+}

@@ -1,0 +1,1710 @@
+module eon_gpu.backends.vulkan @hal;
+
+import core.color;
+import eon_win.events;
+import eon_gpu.scene;
+
+// ============================================================================
+// Native Vulkan 1.1+ UI-RHI Backend (`libs/eon_gpu/src/backends/vulkan.hal.eon`)
+// Zero C toolchain, ZERO OpenGL — dynamic `libvulkan.so.1` / `vulkan-1.dll` /
+// `libvulkan.so` loading, real platform WSI surfaces (Wayland/XCB/Xlib/Win32/
+// Android), real swapchain & render pass, all 6 GPUI pipelines directly from
+// `@embed_gpu_spirv(...)`, persistent mapped SSBOs, R8/RGBA8 atlas textures,
+// and instanced draw submission.
+// ============================================================================
+
+extern "C" fn dlopen(filename: u64, flags: i32) -> u64;
+extern "C" fn dlsym(handle: u64, symbol: u64) -> u64;
+extern "C" fn dlclose(handle: u64) -> i32;
+
+extern "C" fn LoadLibraryA(name: u64) -> u64;
+extern "C" fn GetProcAddress(mod_h: u64, name: u64) -> u64;
+extern "C" fn FreeLibrary(mod_h: u64) -> i32;
+
+const RTLD_NOW: i32 = 2_i32;
+
+// Vulkan constants
+const VK_API_VERSION_1_1: u32 = (1_u32 << 22_u32) | (1_u32 << 12_u32);
+const VK_STRUCTURE_TYPE_APPLICATION_INFO: u32 = 0_u32;
+const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: u32 = 1_u32;
+const VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO: u32 = 2_u32;
+const VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO: u32 = 3_u32;
+const VK_STRUCTURE_TYPE_SUBMIT_INFO: u32 = 4_u32;
+const VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO: u32 = 5_u32;
+const VK_STRUCTURE_TYPE_FENCE_CREATE_INFO: u32 = 8_u32;
+const VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO: u32 = 9_u32;
+const VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO: u32 = 12_u32;
+const VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO: u32 = 14_u32;
+const VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO: u32 = 15_u32;
+const VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO: u32 = 16_u32;
+const VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO: u32 = 18_u32;
+const VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO: u32 = 19_u32;
+const VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO: u32 = 20_u32;
+const VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO: u32 = 22_u32;
+const VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO: u32 = 23_u32;
+const VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO: u32 = 24_u32;
+const VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO: u32 = 26_u32;
+const VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO: u32 = 27_u32;
+const VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO: u32 = 28_u32;
+const VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO: u32 = 30_u32;
+const VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO: u32 = 31_u32;
+const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO: u32 = 32_u32;
+const VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO: u32 = 33_u32;
+const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO: u32 = 34_u32;
+const VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET: u32 = 35_u32;
+const VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO: u32 = 37_u32;
+const VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO: u32 = 38_u32;
+const VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO: u32 = 39_u32;
+const VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO: u32 = 40_u32;
+const VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO: u32 = 42_u32;
+const VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO: u32 = 43_u32;
+const VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER: u32 = 45_u32;
+const VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR: u32 = 1000001000_u32;
+const VK_STRUCTURE_TYPE_PRESENT_INFO_KHR: u32 = 1000001001_u32;
+const VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR: u32 = 1000004000_u32;
+const VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR: u32 = 1000005000_u32;
+const VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR: u32 = 1000006000_u32;
+const VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR: u32 = 1000008000_u32;
+const VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR: u32 = 1000009000_u32;
+
+const VK_FORMAT_R8_UNORM: u32 = 9_u32;
+const VK_FORMAT_R8G8B8A8_UNORM: u32 = 37_u32;
+const VK_FORMAT_B8G8R8A8_UNORM: u32 = 44_u32;
+
+const VK_IMAGE_LAYOUT_UNDEFINED: u32 = 0_u32;
+const VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: u32 = 5_u32;
+const VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: u32 = 7_u32;
+const VK_IMAGE_LAYOUT_PRESENT_SRC_KHR: u32 = 1000001002_u32;
+const VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: u32 = 2_u32;
+
+const VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: u32 = 1_u32;
+const VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: u32 = 7_u32;
+const VK_SHADER_STAGE_VERTEX_BIT: u32 = 1_u32;
+const VK_SHADER_STAGE_FRAGMENT_BIT: u32 = 16_u32;
+
+const VK_BUFFER_USAGE_TRANSFER_SRC_BIT: u32 = 1_u32;
+const VK_BUFFER_USAGE_STORAGE_BUFFER_BIT: u32 = 32_u32;
+const VK_IMAGE_USAGE_TRANSFER_DST_BIT: u32 = 2_u32;
+const VK_IMAGE_USAGE_SAMPLED_BIT: u32 = 4_u32;
+const VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT: u32 = 16_u32;
+
+const VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT: u32 = 2_u32;
+const VK_MEMORY_PROPERTY_HOST_COHERENT_BIT: u32 = 4_u32;
+
+const VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT: u32 = 1_u32;
+const VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT: u32 = 128_u32;
+const VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT: u32 = 1024_u32;
+const VK_PIPELINE_STAGE_TRANSFER_BIT: u32 = 4096_u32;
+
+const SSBO_CAPACITY_BYTES: u64 = 131072_u64; // 128 KiB per layer (~1024 quads/shadows/sprites)
+
+// ----------------------------------------------------------------------------
+// ABI-exact C-call trampolines (SysV x86_64, AAPCS64, RV64 LP64D, Win64)
+// ----------------------------------------------------------------------------
+
+@naked
+pub fn ptr_u8(_s: *[u8]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn ptr_mut_u8(_s: *mut [u8]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn ptr_u32(_p: *mut u32) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn ptr_u64(_p: *mut u64) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn ptr_quads(_s: *[scene.Quad]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn ptr_shadows(_s: *[scene.Shadow]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn ptr_underlines(_s: *[scene.Underline]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn ptr_monos(_s: *[scene.MonoSprite]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn ptr_polys(_s: *[scene.PolySprite]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn ptr_paths(_s: *[scene.PathVertex]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn vk_c1(_fp: u64, _a0: u64) -> u64 {
+    comptime if @target_os() == .Windows {
+        raw { asm("mov rax, rdi; mov rcx, rsi; push r11; push r11; push r11; push r11; push r11; call rax; pop r11; pop r11; pop r11; pop r11; pop r11; ret", options(noreturn)); }
+    } else comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x16, x0; mov x0, x1; br x16", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t0, a0; mv a0, a1; jr t0", options(noreturn)); }
+    } else {
+        raw { asm("mov r10, rdi; mov rdi, rsi; jmp r10", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn vk_c2(_fp: u64, _a0: u64, _a1: u64) -> u64 {
+    comptime if @target_os() == .Windows {
+        raw { asm("mov rax, rdi; mov rcx, rsi; push r11; push r11; push r11; push r11; push r11; call rax; pop r11; pop r11; pop r11; pop r11; pop r11; ret", options(noreturn)); }
+    } else comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x16, x0; mov x0, x1; mov x1, x2; br x16", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t0, a0; mv a0, a1; mv a1, a2; jr t0", options(noreturn)); }
+    } else {
+        raw { asm("mov r10, rdi; mov rdi, rsi; mov rsi, rdx; jmp r10", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn vk_c3(_fp: u64, _a0: u64, _a1: u64, _a2: u64) -> u64 {
+    comptime if @target_os() == .Windows {
+        raw { asm("mov rax, rdi; mov r8, rcx; mov rcx, rsi; push r11; push r11; push r11; push r11; push r11; call rax; pop r11; pop r11; pop r11; pop r11; pop r11; ret", options(noreturn)); }
+    } else comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x16, x0; mov x0, x1; mov x1, x2; mov x2, x3; br x16", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t0, a0; mv a0, a1; mv a1, a2; mv a2, a3; jr t0", options(noreturn)); }
+    } else {
+        raw { asm("mov r10, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; jmp r10", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn vk_c4(_fp: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64) -> u64 {
+    comptime if @target_os() == .Windows {
+        raw { asm("mov rax, rdi; mov r9, r8; mov r8, rcx; mov rcx, rsi; push r11; push r11; push r11; push r11; push r11; call rax; pop r11; pop r11; pop r11; pop r11; pop r11; ret", options(noreturn)); }
+    } else comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x16, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; br x16", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t0, a0; mv a0, a1; mv a1, a2; mv a2, a3; mv a3, a4; jr t0", options(noreturn)); }
+    } else {
+        raw { asm("mov r10, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; jmp r10", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn vk_c5(_fp: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
+    comptime if @target_os() == .Windows {
+        raw { asm("mov rax, rdi; push r9; push r11; push r11; push r11; push r11; mov r9, r8; mov r8, rcx; mov rcx, rsi; call rax; pop r11; pop r11; pop r11; pop r11; pop r11; ret", options(noreturn)); }
+    } else comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x16, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; mov x4, x5; br x16", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t0, a0; mv a0, a1; mv a1, a2; mv a2, a3; mv a3, a4; mv a4, a5; jr t0", options(noreturn)); }
+    } else {
+        raw { asm("mov r10, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; mov r8, r9; jmp r10", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn vk_c6(_fp: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
+    comptime if @target_os() == .Windows {
+        raw { asm("mov rax, rdi; push r11; push r10; push r9; push r11; push r11; push r11; push r11; mov r9, r8; mov r8, rcx; mov rcx, rsi; call rax; pop r11; pop r11; pop r11; pop r11; pop r11; pop r11; pop r11; ret", options(noreturn)); }
+    } else comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x16, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; mov x4, x5; mov x5, x6; br x16", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t0, a0; mv a0, a1; mv a1, a2; mv a2, a3; mv a3, a4; mv a4, a5; mv a5, a6; jr t0", options(noreturn)); }
+    } else {
+        raw { asm("mov r11, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; mov r8, r9; mov r9, r10; jmp r11", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+// 8-argument C call (for `vkCmdBindDescriptorSets` & `vkCmdCopyBufferToImage` & `vkCreateGraphicsPipelines`)
+@naked
+pub fn vk_c8_sysv(_a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _fp: u64, _pad: u64, _a6: u64, _a7: u64) -> u64 {
+    comptime if @target_arch() == .X86_64 {
+        raw { asm("jmp r10", options(noreturn)); }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn vk_c8_reg(_fp: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64, _a7: u64) -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x16, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; mov x4, x5; mov x5, x6; mov x6, x7; br x16", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t0, a0; mv a0, a1; mv a1, a2; mv a2, a3; mv a3, a4; mv a4, a5; mv a5, a6; mv a6, a7; jr t0", options(noreturn)); }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn vk_call_win64_buf(_fp: u64, _args_ptr: u64) -> u64 {
+    comptime if @target_os() == .Windows {
+        raw {
+            asm("mov rax, rdi; push r11; .byte 0xff, 0x76, 0x48; .byte 0xff, 0x76, 0x40; .byte 0xff, 0x76, 0x38; .byte 0xff, 0x76, 0x30; .byte 0xff, 0x76, 0x28; .byte 0xff, 0x76, 0x20; push r11; push r11; push r11; push r11; .byte 0x4c, 0x8b, 0x4e, 0x18; .byte 0x4c, 0x8b, 0x46, 0x10; .byte 0x48, 0x8b, 0x56, 0x08; .byte 0x48, 0x8b, 0x0e; call rax; .byte 0x48, 0x83, 0xc4, 0x58; ret", options(noreturn));
+        }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+pub fn vk_c8(fp: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64, a7: u64) -> u64 {
+    comptime if @target_os() == .Windows {
+        var buf: [80]u8 = [0_u8; 80];
+        w64(&mut buf, 0_usize, a0);
+        w64(&mut buf, 8_usize, a1);
+        w64(&mut buf, 16_usize, a2);
+        w64(&mut buf, 24_usize, a3);
+        w64(&mut buf, 32_usize, a4);
+        w64(&mut buf, 40_usize, a5);
+        w64(&mut buf, 48_usize, a6);
+        w64(&mut buf, 56_usize, a7);
+        return vk_call_win64_buf(fp, ptr_mut_u8(&mut buf));
+    } else comptime if @target_arch() == .X86_64 {
+        return vk_c8_sysv(a0, a1, a2, a3, a4, a5, fp, 0_u64, a6, a7);
+    } else {
+        return vk_c8_reg(fp, a0, a1, a2, a3, a4, a5, a6, a7);
+    }
+}
+
+// 10-argument C call (for `vkCmdPipelineBarrier`)
+@naked
+pub fn vk_c10_sysv(_a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _fp: u64, _pad: u64, _a6: u64, _a7: u64, _a8: u64, _a9: u64) -> u64 {
+    comptime if @target_arch() == .X86_64 {
+        raw { asm("jmp r10", options(noreturn)); }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+pub fn vk_c10(fp: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64, a7: u64, a8: u64, a9: u64) -> u64 {
+    comptime if @target_os() == .Windows {
+        var buf: [80]u8 = [0_u8; 80];
+        w64(&mut buf, 0_usize, a0);
+        w64(&mut buf, 8_usize, a1);
+        w64(&mut buf, 16_usize, a2);
+        w64(&mut buf, 24_usize, a3);
+        w64(&mut buf, 32_usize, a4);
+        w64(&mut buf, 40_usize, a5);
+        w64(&mut buf, 48_usize, a6);
+        w64(&mut buf, 56_usize, a7);
+        w64(&mut buf, 64_usize, a8);
+        w64(&mut buf, 72_usize, a9);
+        return vk_call_win64_buf(fp, ptr_mut_u8(&mut buf));
+    } else comptime if @target_arch() == .X86_64 {
+        return vk_c10_sysv(a0, a1, a2, a3, a4, a5, fp, 0_u64, a6, a7, a8, a9);
+    } else {
+        _ = fp; _ = a0; _ = a1; _ = a2; _ = a3; _ = a4; _ = a5; _ = a6; _ = a7; _ = a8; _ = a9;
+        return 0_u64;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Binary Struct Writer Helpers (Exact Little-Endian C Struct Packing!)
+// ----------------------------------------------------------------------------
+
+pub fn zero_buf(b: *mut [u8]) {
+    var i: usize = 0_usize;
+    while i < b.len {
+        b[i] = 0_u8;
+        i = i +% 1_usize;
+    }
+}
+
+pub fn w32(b: *mut [u8], off: usize, v: u32) {
+    if b.len >= 4_usize && off <= b.len - 4_usize {
+        b[off] = (v & 0xFF_u32).trunc.[u8]();
+        b[off + 1_usize] = ((v >> 8_u32) & 0xFF_u32).trunc.[u8]();
+        b[off + 2_usize] = ((v >> 16_u32) & 0xFF_u32).trunc.[u8]();
+        b[off + 3_usize] = ((v >> 24_u32) & 0xFF_u32).trunc.[u8]();
+    }
+}
+
+pub fn w64(b: *mut [u8], off: usize, v: u64) {
+    w32(b, off, (v & 0xFFFFFFFF_u64).trunc.[u32]());
+    w32(b, off +% 4_usize, ((v >> 32_u64) & 0xFFFFFFFF_u64).trunc.[u32]());
+}
+
+pub fn wf32(b: *mut [u8], off: usize, v: f32) {
+    w32(b, off, v.bitcast.[u32]());
+}
+
+pub fn r32(b: *[u8], off: usize) -> u32 {
+    if b.len >= 4_usize && off <= b.len - 4_usize {
+        return b[off].widen.[u32]()
+            | (b[off + 1_usize].widen.[u32]() << 8_u32)
+            | (b[off + 2_usize].widen.[u32]() << 16_u32)
+            | (b[off + 3_usize].widen.[u32]() << 24_u32);
+    }
+    return 0_u32;
+}
+
+pub fn r64(b: *[u8], off: usize) -> u64 {
+    return r32(b, off).widen.[u64]() | (r32(b, off +% 4_usize).widen.[u64]() << 32_u64);
+}
+
+pub fn memcpy_raw(dst: u64, src: u64, nbytes: usize) {
+    if dst == 0_u64 || src == 0_u64 || nbytes == 0_usize { return; }
+    var i: usize = 0_usize;
+    raw {
+        while i +% 8_usize <= nbytes {
+            let v = rawptr.[u64].from_usize((src +% i.widen.[u64]()).trunc.[usize]()).*;
+            rawptr_mut.[u64].from_usize((dst +% i.widen.[u64]()).trunc.[usize]()).* = v;
+            i = i +% 8_usize;
+        }
+        while i < nbytes {
+            let b = rawptr.[u8].from_usize((src +% i.widen.[u64]()).trunc.[usize]()).*;
+            rawptr_mut.[u8].from_usize((dst +% i.widen.[u64]()).trunc.[usize]()).* = b;
+            i = i +% 1_usize;
+        }
+    }
+}
+
+pub fn load_vk_lib() -> u64 {
+    comptime if @target_os() == .Linux {
+        raw {
+            var h = dlopen(ptr_u8("libvulkan.so.1\0".as_bytes()), RTLD_NOW);
+            if h == 0_u64 { h = dlopen(ptr_u8("libvulkan.so\0".as_bytes()), RTLD_NOW); }
+            return h;
+        }
+    } else comptime if @target_os() == .Android {
+        raw { return dlopen(ptr_u8("libvulkan.so\0".as_bytes()), RTLD_NOW); }
+    } else comptime if @target_os() == .Windows {
+        raw { return LoadLibraryA(ptr_u8("vulkan-1.dll\0".as_bytes())); }
+    } else {
+        return 0_u64;
+    }
+}
+
+pub fn unload_vk_lib(h: u64) {
+    if h == 0_u64 { return; }
+    comptime if @target_os() == .Linux || @target_os() == .Android {
+        raw { _ = dlclose(h); }
+    } else comptime if @target_os() == .Windows {
+        raw { _ = FreeLibrary(h); }
+    } else {
+        _ = h;
+    }
+}
+
+pub fn load_vk_sym(lib: u64, name_z: *[u8]) -> u64 {
+    if lib == 0_u64 { return 0_u64; }
+    comptime if @target_os() == .Linux || @target_os() == .Android {
+        raw { return dlsym(lib, ptr_u8(name_z)); }
+    } else comptime if @target_os() == .Windows {
+        raw { return GetProcAddress(lib, ptr_u8(name_z)); }
+    } else {
+        _ = name_z;
+        return 0_u64;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Vulkan 1.1+ Renderer State (Zero Allocations Per Frame!)
+// ----------------------------------------------------------------------------
+
+pub struct VulkanRenderer {
+    pub lib_vk: u64;
+    pub fn_get_inst_proc: u64;
+    pub fn_get_dev_proc: u64;
+
+    // Core handles
+    pub instance: u64;
+    pub surface: u64;
+    pub phys_dev: u64;
+    pub device: u64;
+    pub queue: u64;
+    pub queue_family: u32;
+    pub swap_format: u32;
+    pub swapchain: u64;
+    pub swap_w: u32;
+    pub swap_h: u32;
+    pub swap_count: u32;
+    pub swap_images: [8]u64;
+    pub swap_views: [8]u64;
+    pub framebuffers: [8]u64;
+    pub render_pass: u64;
+
+    // Descriptors & Pipelines (0=quad, 1=shadow, 2=underline, 3=mono, 4=poly, 5=path)
+    pub desc_layout: u64;
+    pub pipe_layout: u64;
+    pub desc_pool: u64;
+    pub desc_sets: [6]u64;
+    pub pipelines: [6]u64;
+    pub ssbo_bufs: [6]u64;
+    pub ssbo_mems: [6]u64;
+    pub ssbo_ptrs: [6]u64;
+
+    // Atlas textures (0 = R8 mono, 1 = RGBA8 poly)
+    pub sampler: u64;
+    pub atlas_imgs: [2]u64;
+    pub atlas_mems: [2]u64;
+    pub atlas_views: [2]u64;
+    pub atlas_w: [2]u32;
+    pub atlas_h: [2]u32;
+    pub atlas_gen: [2]u64;
+    pub staging_buf: u64;
+    pub staging_mem: u64;
+    pub staging_ptr: u64;
+    pub staging_cap: u64;
+
+    // Command & sync
+    pub cmd_pool: u64;
+    pub cmd_buf: u64;
+    pub sem_avail: u64;
+    pub sem_done: u64;
+    pub fence: u64;
+
+    // Function pointers
+    pub fn_destroy_inst: u64;
+    pub fn_destroy_surf: u64;
+    pub fn_destroy_dev: u64;
+    pub fn_dev_wait_idle: u64;
+    pub fn_destroy_swap: u64;
+    pub fn_destroy_view: u64;
+    pub fn_destroy_fb: u64;
+    pub fn_destroy_rp: u64;
+    pub fn_destroy_pipe: u64;
+    pub fn_destroy_playout: u64;
+    pub fn_destroy_dlayout: u64;
+    pub fn_destroy_dpool: u64;
+    pub fn_destroy_buf: u64;
+    pub fn_free_mem: u64;
+    pub fn_destroy_img: u64;
+    pub fn_destroy_smp: u64;
+    pub fn_destroy_cpool: u64;
+    pub fn_destroy_sem: u64;
+    pub fn_destroy_fence: u64;
+    pub fn_acquire: u64;
+    pub fn_present: u64;
+    pub fn_wait_fences: u64;
+    pub fn_reset_fences: u64;
+    pub fn_reset_cmd: u64;
+    pub fn_begin_cmd: u64;
+    pub fn_end_cmd: u64;
+    pub fn_begin_rp: u64;
+    pub fn_end_rp: u64;
+    pub fn_set_vp: u64;
+    pub fn_set_sc: u64;
+    pub fn_bind_pipe: u64;
+    pub fn_bind_ds: u64;
+    pub fn_push_const: u64;
+    pub fn_draw: u64;
+    pub fn_submit: u64;
+    pub fn_update_ds: u64;
+    pub fn_pipeline_barrier: u64;
+    pub fn_copy_buf_to_img: u64;
+    pub fn_create_img: u64;
+    pub fn_get_img_req: u64;
+    pub fn_alloc_mem: u64;
+    pub fn_bind_img_mem: u64;
+    pub fn_create_view: u64;
+    pub fn_get_mem_props: u64;
+
+    pub frame_count: u64;
+    pub ready: bool;
+}
+
+impl VulkanRenderer {
+    pub fn empty() -> VulkanRenderer {
+        return VulkanRenderer.{
+            lib_vk: 0_u64, fn_get_inst_proc: 0_u64, fn_get_dev_proc: 0_u64,
+            instance: 0_u64, surface: 0_u64, phys_dev: 0_u64, device: 0_u64, queue: 0_u64,
+            queue_family: 0_u32, swap_format: VK_FORMAT_B8G8R8A8_UNORM, swapchain: 0_u64,
+            swap_w: 0_u32, swap_h: 0_u32, swap_count: 0_u32,
+            swap_images: [0_u64; 8], swap_views: [0_u64; 8], framebuffers: [0_u64; 8],
+            render_pass: 0_u64,
+            desc_layout: 0_u64, pipe_layout: 0_u64, desc_pool: 0_u64,
+            desc_sets: [0_u64; 6], pipelines: [0_u64; 6],
+            ssbo_bufs: [0_u64; 6], ssbo_mems: [0_u64; 6], ssbo_ptrs: [0_u64; 6],
+            sampler: 0_u64, atlas_imgs: [0_u64; 2], atlas_mems: [0_u64; 2], atlas_views: [0_u64; 2],
+            atlas_w: [0_u32; 2], atlas_h: [0_u32; 2], atlas_gen: [0_u64; 2],
+            staging_buf: 0_u64, staging_mem: 0_u64, staging_ptr: 0_u64, staging_cap: 0_u64,
+            cmd_pool: 0_u64, cmd_buf: 0_u64, sem_avail: 0_u64, sem_done: 0_u64, fence: 0_u64,
+            fn_destroy_inst: 0_u64, fn_destroy_surf: 0_u64, fn_destroy_dev: 0_u64,
+            fn_dev_wait_idle: 0_u64, fn_destroy_swap: 0_u64, fn_destroy_view: 0_u64,
+            fn_destroy_fb: 0_u64, fn_destroy_rp: 0_u64, fn_destroy_pipe: 0_u64,
+            fn_destroy_playout: 0_u64, fn_destroy_dlayout: 0_u64, fn_destroy_dpool: 0_u64,
+            fn_destroy_buf: 0_u64, fn_free_mem: 0_u64, fn_destroy_img: 0_u64,
+            fn_destroy_smp: 0_u64, fn_destroy_cpool: 0_u64, fn_destroy_sem: 0_u64,
+            fn_destroy_fence: 0_u64, fn_acquire: 0_u64, fn_present: 0_u64,
+            fn_wait_fences: 0_u64, fn_reset_fences: 0_u64, fn_reset_cmd: 0_u64,
+            fn_begin_cmd: 0_u64, fn_end_cmd: 0_u64, fn_begin_rp: 0_u64, fn_end_rp: 0_u64,
+            fn_set_vp: 0_u64, fn_set_sc: 0_u64, fn_bind_pipe: 0_u64, fn_bind_ds: 0_u64,
+            fn_push_const: 0_u64, fn_draw: 0_u64, fn_submit: 0_u64, fn_update_ds: 0_u64,
+            fn_pipeline_barrier: 0_u64, fn_copy_buf_to_img: 0_u64, fn_create_img: 0_u64,
+            fn_get_img_req: 0_u64, fn_alloc_mem: 0_u64, fn_bind_img_mem: 0_u64,
+            fn_create_view: 0_u64, fn_get_mem_props: 0_u64,
+            frame_count: 0_u64,
+            ready: false,
+        };
+    }
+
+    pub fn inst_proc(self: *Self, name_z: *[u8]) -> u64 {
+        if self.fn_get_inst_proc == 0_u64 { return 0_u64; }
+        return vk_c2(self.fn_get_inst_proc, self.instance, ptr_u8(name_z));
+    }
+
+    pub fn dev_proc(self: *Self, name_z: *[u8]) -> u64 {
+        if self.fn_get_dev_proc == 0_u64 || self.device == 0_u64 { return 0_u64; }
+        return vk_c2(self.fn_get_dev_proc, self.device, ptr_u8(name_z));
+    }
+
+    pub fn find_mem_type(self: *Self, type_bits: u32, req_flags: u32) -> u32 {
+        var props: [528]u8 = [0_u8; 528];
+        _ = vk_c2(self.fn_get_mem_props, self.phys_dev, ptr_mut_u8(&mut props));
+        let count = r32(&props, 0_usize);
+        var i: u32 = 0_u32;
+        while i < count && i < 32_u32 {
+            let bit = 1_u32 <<% (i & 31_u32);
+            if (type_bits & bit) != 0_u32 {
+                let flags = r32(&props, 4_usize +% i.widen.[usize]() *% 8_usize);
+                if (flags & req_flags) == req_flags {
+                    return i;
+                }
+            }
+            i = i +% 1_u32;
+        }
+        return 0_u32;
+    }
+
+    pub fn create_shader_mod(self: *Self, fn_create_sm: u64, spv: *[u8]) -> u64 {
+        if spv.len < 20_usize || fn_create_sm == 0_u64 { return 0_u64; }
+        var ci: [40]u8 = [0_u8; 40];
+        w32(&mut ci, 0_usize, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
+        w64(&mut ci, 24_usize, spv.len.widen.[u64]());
+        w64(&mut ci, 32_usize, ptr_u8(spv));
+        var sm: u64 = 0_u64;
+        let rc = vk_c4(fn_create_sm, self.device, ptr_mut_u8(&mut ci), 0_u64, ptr_u64(&mut sm)).trunc.[i32]();
+        if rc != 0_i32 { return 0_u64; }
+        return sm;
+    }
+
+    pub fn create_gpui_pipeline(
+        self: *Self,
+        fn_create_sm: u64,
+        fn_destroy_sm: u64,
+        fn_create_gp: u64,
+        vs_spv: *[u8],
+        vs_entry_z: *[u8],
+        fs_spv: *[u8],
+        fs_entry_z: *[u8],
+    ) -> u64 {
+        let vs_mod = self.create_shader_mod(fn_create_sm, vs_spv);
+        let fs_mod = self.create_shader_mod(fn_create_sm, fs_spv);
+        if vs_mod == 0_u64 || fs_mod == 0_u64 {
+            if vs_mod != 0_u64 { _ = vk_c3(fn_destroy_sm, self.device, vs_mod, 0_u64); }
+            if fs_mod != 0_u64 { _ = vk_c3(fn_destroy_sm, self.device, fs_mod, 0_u64); }
+            return 0_u64;
+        }
+
+        // 2x VkPipelineShaderStageCreateInfo (48 bytes each)
+        var stages: [96]u8 = [0_u8; 96];
+        w32(&mut stages, 0_usize, VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO);
+        w32(&mut stages, 20_usize, VK_SHADER_STAGE_VERTEX_BIT);
+        w64(&mut stages, 24_usize, vs_mod);
+        w64(&mut stages, 32_usize, ptr_u8(vs_entry_z));
+
+        w32(&mut stages, 48_usize, VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO);
+        w32(&mut stages, 68_usize, VK_SHADER_STAGE_FRAGMENT_BIT);
+        w64(&mut stages, 72_usize, fs_mod);
+        w64(&mut stages, 80_usize, ptr_u8(fs_entry_z));
+
+        // Vertex input (0 bindings — all vertex data fetched via SSBO + VertexIndex/InstanceIndex!)
+        var vi: [48]u8 = [0_u8; 48];
+        w32(&mut vi, 0_usize, VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO);
+
+        // Input assembly: TRIANGLE_LIST (3)
+        var ia: [32]u8 = [0_u8; 32];
+        w32(&mut ia, 0_usize, VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO);
+        w32(&mut ia, 20_usize, 3_u32);
+
+        // Viewport state (1 dynamic viewport + 1 dynamic scissor)
+        var vp: [48]u8 = [0_u8; 48];
+        w32(&mut vp, 0_usize, VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO);
+        w32(&mut vp, 20_usize, 1_u32);
+        w32(&mut vp, 32_usize, 1_u32);
+
+        // Rasterization: FILL (0), CULL_NONE (0), lineWidth = 1.0
+        var rs: [64]u8 = [0_u8; 64];
+        w32(&mut rs, 0_usize, VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO);
+        wf32(&mut rs, 60_usize, 1.0_f32);
+
+        // Multisample: 1 sample
+        var ms: [48]u8 = [0_u8; 48];
+        w32(&mut ms, 0_usize, VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO);
+        w32(&mut ms, 20_usize, 1_u32);
+
+        // Color blend attachment (32 bytes): Premultiplied SrcOver (ONE, ONE_MINUS_SRC_ALPHA)
+        var cba: [32]u8 = [0_u8; 32];
+        w32(&mut cba, 0_usize, 1_u32);  // blendEnable = VK_TRUE
+        w32(&mut cba, 4_usize, 1_u32);  // srcColorBlendFactor = VK_BLEND_FACTOR_ONE
+        w32(&mut cba, 8_usize, 7_u32);  // dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+        w32(&mut cba, 12_usize, 0_u32); // colorBlendOp = ADD
+        w32(&mut cba, 16_usize, 1_u32); // srcAlphaBlendFactor = ONE
+        w32(&mut cba, 20_usize, 7_u32); // dstAlphaBlendFactor = ONE_MINUS_SRC_ALPHA
+        w32(&mut cba, 24_usize, 0_u32); // alphaBlendOp = ADD
+        w32(&mut cba, 28_usize, 15_u32); // colorWriteMask = RGBA
+
+        var cb: [56]u8 = [0_u8; 56];
+        w32(&mut cb, 0_usize, VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO);
+        w32(&mut cb, 28_usize, 1_u32);
+        w64(&mut cb, 32_usize, ptr_mut_u8(&mut cba));
+
+        // Dynamic states: VIEWPORT (0), SCISSOR (1)
+        var dyn_arr: [8]u8 = [0_u8; 8];
+        w32(&mut dyn_arr, 0_usize, 0_u32);
+        w32(&mut dyn_arr, 4_usize, 1_u32);
+        var ds: [32]u8 = [0_u8; 32];
+        w32(&mut ds, 0_usize, VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO);
+        w32(&mut ds, 20_usize, 2_u32);
+        w64(&mut ds, 24_usize, ptr_mut_u8(&mut dyn_arr));
+
+        // VkGraphicsPipelineCreateInfo (144 bytes)
+        var gp: [144]u8 = [0_u8; 144];
+        w32(&mut gp, 0_usize, VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO);
+        w32(&mut gp, 20_usize, 2_u32);
+        w64(&mut gp, 24_usize, ptr_mut_u8(&mut stages));
+        w64(&mut gp, 32_usize, ptr_mut_u8(&mut vi));
+        w64(&mut gp, 40_usize, ptr_mut_u8(&mut ia));
+        w64(&mut gp, 56_usize, ptr_mut_u8(&mut vp));
+        w64(&mut gp, 64_usize, ptr_mut_u8(&mut rs));
+        w64(&mut gp, 72_usize, ptr_mut_u8(&mut ms));
+        w64(&mut gp, 88_usize, ptr_mut_u8(&mut cb));
+        w64(&mut gp, 96_usize, ptr_mut_u8(&mut ds));
+        w64(&mut gp, 104_usize, self.pipe_layout);
+        w64(&mut gp, 112_usize, self.render_pass);
+
+        var pipe: u64 = 0_u64;
+        let rc = vk_c6(fn_create_gp, self.device, 0_u64, 1_u64, ptr_mut_u8(&mut gp), 0_u64, ptr_u64(&mut pipe)).trunc.[i32]();
+        _ = vk_c3(fn_destroy_sm, self.device, vs_mod, 0_u64);
+        _ = vk_c3(fn_destroy_sm, self.device, fs_mod, 0_u64);
+        if rc != 0_i32 { return 0_u64; }
+        return pipe;
+    }
+
+    pub fn create_host_buffer(
+        self: *Self,
+        fn_create_buf: u64,
+        fn_get_req: u64,
+        fn_bind_mem: u64,
+        fn_map_mem: u64,
+        size: u64,
+        usage: u32,
+        out_buf: *mut u64,
+        out_mem: *mut u64,
+        out_ptr: *mut u64,
+    ) -> bool {
+        var bci: [56]u8 = [0_u8; 56];
+        w32(&mut bci, 0_usize, VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
+        w64(&mut bci, 24_usize, size);
+        w32(&mut bci, 32_usize, usage);
+        var buf: u64 = 0_u64;
+        if vk_c4(fn_create_buf, self.device, ptr_mut_u8(&mut bci), 0_u64, ptr_u64(&mut buf)).trunc.[i32]() != 0_i32 {
+            return false;
+        }
+        var req: [24]u8 = [0_u8; 24];
+        _ = vk_c3(fn_get_req, self.device, buf, ptr_mut_u8(&mut req));
+        let alloc_sz = r64(&req, 0_usize);
+        let mem_bits = r32(&req, 16_usize);
+        let mt = self.find_mem_type(mem_bits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        var mai: [32]u8 = [0_u8; 32];
+        w32(&mut mai, 0_usize, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
+        w64(&mut mai, 16_usize, alloc_sz);
+        w32(&mut mai, 24_usize, mt);
+        var mem: u64 = 0_u64;
+        if vk_c4(self.fn_alloc_mem, self.device, ptr_mut_u8(&mut mai), 0_u64, ptr_u64(&mut mem)).trunc.[i32]() != 0_i32 {
+            _ = vk_c3(self.fn_destroy_buf, self.device, buf, 0_u64);
+            return false;
+        }
+        if vk_c4(fn_bind_mem, self.device, buf, mem, 0_u64).trunc.[i32]() != 0_i32 {
+            return false;
+        }
+        var mapped: u64 = 0_u64;
+        if vk_c6(fn_map_mem, self.device, mem, 0_u64, size, 0_u64, ptr_u64(&mut mapped)).trunc.[i32]() != 0_i32 {
+            return false;
+        }
+        out_buf.* = buf;
+        out_mem.* = mem;
+        out_ptr.* = mapped;
+        return true;
+    }
+
+    pub fn ensure_atlas_texture(self: *mut Self, slot: usize, w: u32, h: u32, is_r8: bool) -> bool {
+        if slot >= 2_usize || w == 0_u32 || h == 0_u32 { return false; }
+        if self.atlas_imgs[slot] != 0_u64 && self.atlas_w[slot] == w && self.atlas_h[slot] == h {
+            return true;
+        }
+        if self.atlas_views[slot] != 0_u64 {
+            _ = vk_c3(self.fn_destroy_view, self.device, self.atlas_views[slot], 0_u64);
+            self.atlas_views[slot] = 0_u64;
+        }
+        if self.atlas_imgs[slot] != 0_u64 {
+            _ = vk_c3(self.fn_destroy_img, self.device, self.atlas_imgs[slot], 0_u64);
+            self.atlas_imgs[slot] = 0_u64;
+        }
+        if self.atlas_mems[slot] != 0_u64 {
+            _ = vk_c3(self.fn_free_mem, self.device, self.atlas_mems[slot], 0_u64);
+            self.atlas_mems[slot] = 0_u64;
+        }
+        let fmt: u32 = if is_r8 { VK_FORMAT_R8_UNORM } else { VK_FORMAT_R8G8B8A8_UNORM };
+        var ici: [88]u8 = [0_u8; 88];
+        w32(&mut ici, 0_usize, VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
+        w32(&mut ici, 20_usize, 1_u32); // VK_IMAGE_TYPE_2D
+        w32(&mut ici, 24_usize, fmt);
+        w32(&mut ici, 28_usize, w);
+        w32(&mut ici, 32_usize, h);
+        w32(&mut ici, 36_usize, 1_u32); // depth
+        w32(&mut ici, 40_usize, 1_u32); // mipLevels
+        w32(&mut ici, 44_usize, 1_u32); // arrayLayers
+        w32(&mut ici, 48_usize, 1_u32); // samples = 1
+        w32(&mut ici, 52_usize, 0_u32); // tiling = OPTIMAL
+        w32(&mut ici, 56_usize, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        var img: u64 = 0_u64;
+        if vk_c4(self.fn_create_img, self.device, ptr_mut_u8(&mut ici), 0_u64, ptr_u64(&mut img)).trunc.[i32]() != 0_i32 {
+            return false;
+        }
+        var req: [24]u8 = [0_u8; 24];
+        _ = vk_c3(self.fn_get_img_req, self.device, img, ptr_mut_u8(&mut req));
+        let mt = self.find_mem_type(r32(&req, 16_usize), 0_u32);
+        var mai: [32]u8 = [0_u8; 32];
+        w32(&mut mai, 0_usize, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
+        w64(&mut mai, 16_usize, r64(&req, 0_usize));
+        w32(&mut mai, 24_usize, mt);
+        var mem: u64 = 0_u64;
+        if vk_c4(self.fn_alloc_mem, self.device, ptr_mut_u8(&mut mai), 0_u64, ptr_u64(&mut mem)).trunc.[i32]() != 0_i32 {
+            return false;
+        }
+        _ = vk_c4(self.fn_bind_img_mem, self.device, img, mem, 0_u64);
+        var ivci: [80]u8 = [0_u8; 80];
+        w32(&mut ivci, 0_usize, VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO);
+        w64(&mut ivci, 24_usize, img);
+        w32(&mut ivci, 32_usize, 1_u32); // VK_IMAGE_VIEW_TYPE_2D
+        w32(&mut ivci, 36_usize, fmt);
+        w32(&mut ivci, 56_usize, 1_u32); // aspectMask = COLOR
+        w32(&mut ivci, 64_usize, 1_u32); // levelCount
+        w32(&mut ivci, 72_usize, 1_u32); // layerCount
+        var view_h: u64 = 0_u64;
+        if vk_c4(self.fn_create_view, self.device, ptr_mut_u8(&mut ivci), 0_u64, ptr_u64(&mut view_h)).trunc.[i32]() != 0_i32 {
+            return false;
+        }
+        self.atlas_imgs[slot] = img;
+        self.atlas_mems[slot] = mem;
+        self.atlas_views[slot] = view_h;
+        self.atlas_w[slot] = w;
+        self.atlas_h[slot] = h;
+        return true;
+    }
+
+    pub fn update_descriptor_sets(self: *Self) {
+        var si: usize = 0_usize;
+        while si < 6_usize {
+            var bi: [24]u8 = [0_u8; 24];
+            w64(&mut bi, 0_usize, self.ssbo_bufs[si]);
+            w64(&mut bi, 8_usize, 0_u64);
+            w64(&mut bi, 16_usize, SSBO_CAPACITY_BYTES);
+
+            let img_slot: usize = if si == 4_usize { 1_usize } else { 0_usize };
+            var ii: [24]u8 = [0_u8; 24];
+            w64(&mut ii, 0_usize, self.sampler);
+            w64(&mut ii, 8_usize, self.atlas_views[img_slot]);
+            w32(&mut ii, 16_usize, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+            var writes: [128]u8 = [0_u8; 128];
+            // Write 0: binding 0 = SSBO
+            w32(&mut writes, 0_usize, VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
+            w64(&mut writes, 16_usize, self.desc_sets[si]);
+            w32(&mut writes, 24_usize, 0_u32);
+            w32(&mut writes, 32_usize, 1_u32);
+            w32(&mut writes, 36_usize, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+            w64(&mut writes, 48_usize, ptr_mut_u8(&mut bi));
+
+            // Write 1: binding 1 = COMBINED_IMAGE_SAMPLER
+            w32(&mut writes, 64_usize, VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
+            w64(&mut writes, 80_usize, self.desc_sets[si]);
+            w32(&mut writes, 88_usize, 1_u32);
+            w32(&mut writes, 96_usize, 1_u32);
+            w32(&mut writes, 100_usize, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+            w64(&mut writes, 104_usize, ptr_mut_u8(&mut ii));
+
+            _ = vk_c5(self.fn_update_ds, self.device, 2_u64, ptr_mut_u8(&mut writes), 0_u64, 0_u64);
+            si = si +% 1_usize;
+        }
+    }
+
+    pub fn init(self: *mut Self, surf: *events.SurfaceInfo) -> bool {
+        comptime if @target_os() == .Linux || @target_os() == .Windows || @target_os() == .Android {
+            if surf.kind != .Wayland && surf.kind != .Xcb && surf.kind != .Xlib && surf.kind != .Win32 && surf.kind != .Android {
+                return false;
+            }
+            if surf.window_handle == 0_u64 { return false; }
+
+            let lib = load_vk_lib();
+            if lib == 0_u64 { return false; }
+            self.lib_vk = lib;
+            self.fn_get_inst_proc = load_vk_sym(lib, "vkGetInstanceProcAddr\0".as_bytes());
+            if self.fn_get_inst_proc == 0_u64 { self.destroy(); return false; }
+
+            let fn_create_inst = vk_c2(self.fn_get_inst_proc, 0_u64, ptr_u8("vkCreateInstance\0".as_bytes()));
+            if fn_create_inst == 0_u64 { self.destroy(); return false; }
+
+            // Platform WSI extension selection
+            let surf_ext_ptr: u64 = match surf.kind {
+                .Wayland => ptr_u8("VK_KHR_wayland_surface\0".as_bytes()),
+                .Xcb => ptr_u8("VK_KHR_xcb_surface\0".as_bytes()),
+                .Xlib => ptr_u8("VK_KHR_xlib_surface\0".as_bytes()),
+                .Win32 => ptr_u8("VK_KHR_win32_surface\0".as_bytes()),
+                .Android => ptr_u8("VK_KHR_android_surface\0".as_bytes()),
+                _ => 0_u64,
+            };
+            if surf_ext_ptr == 0_u64 { self.destroy(); return false; }
+
+            var app_info: [48]u8 = [0_u8; 48];
+            w32(&mut app_info, 0_usize, VK_STRUCTURE_TYPE_APPLICATION_INFO);
+            w64(&mut app_info, 16_usize, ptr_u8("EonUI\0".as_bytes()));
+            w32(&mut app_info, 24_usize, 1_u32);
+            w64(&mut app_info, 32_usize, ptr_u8("eon_gpu\0".as_bytes()));
+            w32(&mut app_info, 40_usize, 1_u32);
+            w32(&mut app_info, 44_usize, VK_API_VERSION_1_1);
+
+            var exts: [16]u8 = [0_u8; 16];
+            w64(&mut exts, 0_usize, ptr_u8("VK_KHR_surface\0".as_bytes()));
+            w64(&mut exts, 8_usize, surf_ext_ptr);
+
+            var ici: [64]u8 = [0_u8; 64];
+            w32(&mut ici, 0_usize, VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO);
+            w64(&mut ici, 24_usize, ptr_mut_u8(&mut app_info));
+            w32(&mut ici, 48_usize, 2_u32);
+            w64(&mut ici, 56_usize, ptr_mut_u8(&mut exts));
+
+            var inst: u64 = 0_u64;
+            if vk_c3(fn_create_inst, ptr_mut_u8(&mut ici), 0_u64, ptr_u64(&mut inst)).trunc.[i32]() != 0_i32 || inst == 0_u64 {
+                self.destroy();
+                return false;
+            }
+            self.instance = inst;
+            self.fn_destroy_inst = self.inst_proc("vkDestroyInstance\0".as_bytes());
+            self.fn_destroy_surf = self.inst_proc("vkDestroySurfaceKHR\0".as_bytes());
+            self.fn_get_dev_proc = self.inst_proc("vkGetDeviceProcAddr\0".as_bytes());
+            self.fn_get_mem_props = self.inst_proc("vkGetPhysicalDeviceMemoryProperties\0".as_bytes());
+
+            // Create platform VkSurfaceKHR (40 bytes: sType@0, pNext@8, flags@16, handle0@24, handle1@32)
+            var sci: [40]u8 = [0_u8; 40];
+            var fn_create_surf: u64 = 0_u64;
+            match surf.kind {
+                .Wayland => {
+                    w32(&mut sci, 0_usize, VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR);
+                    w64(&mut sci, 24_usize, surf.display_handle);
+                    w64(&mut sci, 32_usize, surf.window_handle);
+                    fn_create_surf = self.inst_proc("vkCreateWaylandSurfaceKHR\0".as_bytes());
+                }
+                .Xcb => {
+                    w32(&mut sci, 0_usize, VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR);
+                    w64(&mut sci, 24_usize, surf.extra_handle);
+                    w32(&mut sci, 32_usize, surf.window_handle.trunc.[u32]());
+                    fn_create_surf = self.inst_proc("vkCreateXcbSurfaceKHR\0".as_bytes());
+                }
+                .Xlib => {
+                    w32(&mut sci, 0_usize, VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR);
+                    w64(&mut sci, 24_usize, surf.display_handle);
+                    w64(&mut sci, 32_usize, surf.window_handle);
+                    fn_create_surf = self.inst_proc("vkCreateXlibSurfaceKHR\0".as_bytes());
+                }
+                .Win32 => {
+                    w32(&mut sci, 0_usize, VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR);
+                    w64(&mut sci, 24_usize, surf.display_handle);
+                    w64(&mut sci, 32_usize, surf.window_handle);
+                    fn_create_surf = self.inst_proc("vkCreateWin32SurfaceKHR\0".as_bytes());
+                }
+                .Android => {
+                    w32(&mut sci, 0_usize, VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR);
+                    w64(&mut sci, 24_usize, surf.window_handle);
+                    fn_create_surf = self.inst_proc("vkCreateAndroidSurfaceKHR\0".as_bytes());
+                }
+                _ => {}
+            }
+            if fn_create_surf == 0_u64 { self.destroy(); return false; }
+            var vk_surf: u64 = 0_u64;
+            if vk_c4(fn_create_surf, self.instance, ptr_mut_u8(&mut sci), 0_u64, ptr_u64(&mut vk_surf)).trunc.[i32]() != 0_i32 || vk_surf == 0_u64 {
+                self.destroy();
+                return false;
+            }
+            self.surface = vk_surf;
+
+            // Enumerate physical devices & find Graphics + Present queue
+            let fn_enum_pd = self.inst_proc("vkEnumeratePhysicalDevices\0".as_bytes());
+            let fn_qfp = self.inst_proc("vkGetPhysicalDeviceQueueFamilyProperties\0".as_bytes());
+            let fn_surf_sup = self.inst_proc("vkGetPhysicalDeviceSurfaceSupportKHR\0".as_bytes());
+            let fn_create_dev = self.inst_proc("vkCreateDevice\0".as_bytes());
+            let fn_surf_caps = self.inst_proc("vkGetPhysicalDeviceSurfaceCapabilitiesKHR\0".as_bytes());
+            let fn_surf_fmts = self.inst_proc("vkGetPhysicalDeviceSurfaceFormatsKHR\0".as_bytes());
+            if fn_enum_pd == 0_u64 || fn_create_dev == 0_u64 { self.destroy(); return false; }
+
+            var pd_count: u32 = 8_u32;
+            var pds: [64]u8 = [0_u8; 64];
+            let ep_rc = vk_c3(fn_enum_pd, self.instance, ptr_u32(&mut pd_count), ptr_mut_u8(&mut pds)).trunc.[i32]();
+            if (ep_rc != 0_i32 && ep_rc != 5_i32) || pd_count == 0_u32 {
+                self.destroy();
+                return false;
+            }
+
+            var found_dev = false;
+            var pi: u32 = 0_u32;
+            while pi < pd_count && pi < 8_u32 && !found_dev {
+                let pd = r64(&pds, pi.widen.[usize]() *% 8_usize);
+                var qf_count: u32 = 16_u32;
+                var qfs: [384]u8 = [0_u8; 384];
+                _ = vk_c3(fn_qfp, pd, ptr_u32(&mut qf_count), ptr_mut_u8(&mut qfs));
+                var qi: u32 = 0_u32;
+                while qi < qf_count && qi < 16_u32 {
+                    let qflags = r32(&qfs, qi.widen.[usize]() *% 24_usize);
+                    if (qflags & 1_u32) != 0_u32 {
+                        var sup: u32 = 0_u32;
+                        _ = vk_c4(fn_surf_sup, pd, qi.widen.[u64](), self.surface, ptr_u32(&mut sup));
+                        if sup != 0_u32 {
+                            self.phys_dev = pd;
+                            self.queue_family = qi;
+                            found_dev = true;
+                            break;
+                        }
+                    }
+                    qi = qi +% 1_u32;
+                }
+                pi = pi +% 1_u32;
+            }
+            if !found_dev { self.destroy(); return false; }
+
+            // Create logical VkDevice with VK_KHR_swapchain
+            var prio: [4]u8 = [0_u8; 4];
+            wf32(&mut prio, 0_usize, 1.0_f32);
+            var dqci: [40]u8 = [0_u8; 40];
+            w32(&mut dqci, 0_usize, VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
+            w32(&mut dqci, 20_usize, self.queue_family);
+            w32(&mut dqci, 24_usize, 1_u32);
+            w64(&mut dqci, 32_usize, ptr_mut_u8(&mut prio));
+
+            var dexts: [8]u8 = [0_u8; 8];
+            w64(&mut dexts, 0_usize, ptr_u8("VK_KHR_swapchain\0".as_bytes()));
+
+            var dci: [72]u8 = [0_u8; 72];
+            w32(&mut dci, 0_usize, VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
+            w32(&mut dci, 20_usize, 1_u32);
+            w64(&mut dci, 24_usize, ptr_mut_u8(&mut dqci));
+            w32(&mut dci, 48_usize, 1_u32);
+            w64(&mut dci, 56_usize, ptr_mut_u8(&mut dexts));
+
+            var dev: u64 = 0_u64;
+            if vk_c4(fn_create_dev, self.phys_dev, ptr_mut_u8(&mut dci), 0_u64, ptr_u64(&mut dev)).trunc.[i32]() != 0_i32 || dev == 0_u64 {
+                self.destroy();
+                return false;
+            }
+            self.device = dev;
+
+            // Load device procs
+            let fn_get_queue = self.dev_proc("vkGetDeviceQueue\0".as_bytes());
+            let fn_create_swap = self.dev_proc("vkCreateSwapchainKHR\0".as_bytes());
+            let fn_get_swap_imgs = self.dev_proc("vkGetSwapchainImagesKHR\0".as_bytes());
+            let fn_create_rp = self.dev_proc("vkCreateRenderPass\0".as_bytes());
+            let fn_create_fb = self.dev_proc("vkCreateFramebuffer\0".as_bytes());
+            let fn_create_sm = self.dev_proc("vkCreateShaderModule\0".as_bytes());
+            let fn_destroy_sm = self.dev_proc("vkDestroyShaderModule\0".as_bytes());
+            let fn_create_dlayout = self.dev_proc("vkCreateDescriptorSetLayout\0".as_bytes());
+            let fn_create_playout = self.dev_proc("vkCreatePipelineLayout\0".as_bytes());
+            let fn_create_gp = self.dev_proc("vkCreateGraphicsPipelines\0".as_bytes());
+            let fn_create_dpool = self.dev_proc("vkCreateDescriptorPool\0".as_bytes());
+            let fn_alloc_ds = self.dev_proc("vkAllocateDescriptorSets\0".as_bytes());
+            let fn_create_buf = self.dev_proc("vkCreateBuffer\0".as_bytes());
+            let fn_get_buf_req = self.dev_proc("vkGetBufferMemoryRequirements\0".as_bytes());
+            let fn_bind_buf_mem = self.dev_proc("vkBindBufferMemory\0".as_bytes());
+            let fn_map_mem = self.dev_proc("vkMapMemory\0".as_bytes());
+            let fn_create_smp = self.dev_proc("vkCreateSampler\0".as_bytes());
+            let fn_create_cpool = self.dev_proc("vkCreateCommandPool\0".as_bytes());
+            let fn_alloc_cmd = self.dev_proc("vkAllocateCommandBuffers\0".as_bytes());
+            let fn_create_sem = self.dev_proc("vkCreateSemaphore\0".as_bytes());
+            let fn_create_fence = self.dev_proc("vkCreateFence\0".as_bytes());
+
+            self.fn_destroy_dev = self.dev_proc("vkDestroyDevice\0".as_bytes());
+            self.fn_dev_wait_idle = self.dev_proc("vkDeviceWaitIdle\0".as_bytes());
+            self.fn_destroy_swap = self.dev_proc("vkDestroySwapchainKHR\0".as_bytes());
+            self.fn_destroy_view = self.dev_proc("vkDestroyImageView\0".as_bytes());
+            self.fn_destroy_fb = self.dev_proc("vkDestroyFramebuffer\0".as_bytes());
+            self.fn_destroy_rp = self.dev_proc("vkDestroyRenderPass\0".as_bytes());
+            self.fn_destroy_pipe = self.dev_proc("vkDestroyPipeline\0".as_bytes());
+            self.fn_destroy_playout = self.dev_proc("vkDestroyPipelineLayout\0".as_bytes());
+            self.fn_destroy_dlayout = self.dev_proc("vkDestroyDescriptorSetLayout\0".as_bytes());
+            self.fn_destroy_dpool = self.dev_proc("vkDestroyDescriptorPool\0".as_bytes());
+            self.fn_destroy_buf = self.dev_proc("vkDestroyBuffer\0".as_bytes());
+            self.fn_free_mem = self.dev_proc("vkFreeMemory\0".as_bytes());
+            self.fn_destroy_img = self.dev_proc("vkDestroyImage\0".as_bytes());
+            self.fn_destroy_smp = self.dev_proc("vkDestroySampler\0".as_bytes());
+            self.fn_destroy_cpool = self.dev_proc("vkDestroyCommandPool\0".as_bytes());
+            self.fn_destroy_sem = self.dev_proc("vkDestroySemaphore\0".as_bytes());
+            self.fn_destroy_fence = self.dev_proc("vkDestroyFence\0".as_bytes());
+            self.fn_acquire = self.dev_proc("vkAcquireNextImageKHR\0".as_bytes());
+            self.fn_present = self.dev_proc("vkQueuePresentKHR\0".as_bytes());
+            self.fn_wait_fences = self.dev_proc("vkWaitForFences\0".as_bytes());
+            self.fn_reset_fences = self.dev_proc("vkResetFences\0".as_bytes());
+            self.fn_reset_cmd = self.dev_proc("vkResetCommandBuffer\0".as_bytes());
+            self.fn_begin_cmd = self.dev_proc("vkBeginCommandBuffer\0".as_bytes());
+            self.fn_end_cmd = self.dev_proc("vkEndCommandBuffer\0".as_bytes());
+            self.fn_begin_rp = self.dev_proc("vkCmdBeginRenderPass\0".as_bytes());
+            self.fn_end_rp = self.dev_proc("vkCmdEndRenderPass\0".as_bytes());
+            self.fn_set_vp = self.dev_proc("vkCmdSetViewport\0".as_bytes());
+            self.fn_set_sc = self.dev_proc("vkCmdSetScissor\0".as_bytes());
+            self.fn_bind_pipe = self.dev_proc("vkCmdBindPipeline\0".as_bytes());
+            self.fn_bind_ds = self.dev_proc("vkCmdBindDescriptorSets\0".as_bytes());
+            self.fn_push_const = self.dev_proc("vkCmdPushConstants\0".as_bytes());
+            self.fn_draw = self.dev_proc("vkCmdDraw\0".as_bytes());
+            self.fn_submit = self.dev_proc("vkQueueSubmit\0".as_bytes());
+            self.fn_update_ds = self.dev_proc("vkUpdateDescriptorSets\0".as_bytes());
+            self.fn_pipeline_barrier = self.dev_proc("vkCmdPipelineBarrier\0".as_bytes());
+            self.fn_copy_buf_to_img = self.dev_proc("vkCmdCopyBufferToImage\0".as_bytes());
+            self.fn_create_img = self.dev_proc("vkCreateImage\0".as_bytes());
+            self.fn_get_img_req = self.dev_proc("vkGetImageMemoryRequirements\0".as_bytes());
+            self.fn_alloc_mem = self.dev_proc("vkAllocateMemory\0".as_bytes());
+            self.fn_bind_img_mem = self.dev_proc("vkBindImageMemory\0".as_bytes());
+            self.fn_create_view = self.dev_proc("vkCreateImageView\0".as_bytes());
+
+            _ = vk_c4(fn_get_queue, self.device, self.queue_family.widen.[u64](), 0_u64, ptr_u64(&mut self.queue));
+
+            // Query surface capabilities & preferred UNORM format
+            var caps: [56]u8 = [0_u8; 56];
+            _ = vk_c3(fn_surf_caps, self.phys_dev, self.surface, ptr_mut_u8(&mut caps));
+            let min_imgs = r32(&caps, 0_usize);
+            let max_imgs = r32(&caps, 4_usize);
+            var img_cnt = min_imgs +% 1_u32;
+            if max_imgs > 0_u32 && img_cnt > max_imgs { img_cnt = max_imgs; }
+            if img_cnt < 2_u32 { img_cnt = 2_u32; }
+            if img_cnt > 4_u32 { img_cnt = 4_u32; }
+            let cur_w = r32(&caps, 8_usize);
+            let cur_h = r32(&caps, 12_usize);
+            self.swap_w = if cur_w != 0xFFFFFFFF_u32 && cur_w > 0_u32 { cur_w } else if surf.width > 0_u32 { surf.width } else { 640_u32 };
+            self.swap_h = if cur_h != 0xFFFFFFFF_u32 && cur_h > 0_u32 { cur_h } else if surf.height > 0_u32 { surf.height } else { 480_u32 };
+            let cur_tf = r32(&caps, 40_usize);
+            let pre_tf: u32 = if cur_tf != 0_u32 { cur_tf } else { 1_u32 };
+
+            var fmt_cnt: u32 = 16_u32;
+            var fmts: [128]u8 = [0_u8; 128];
+            _ = vk_c4(fn_surf_fmts, self.phys_dev, self.surface, ptr_u32(&mut fmt_cnt), ptr_mut_u8(&mut fmts));
+            self.swap_format = VK_FORMAT_B8G8R8A8_UNORM;
+            var swap_cs: u32 = 0_u32;
+            if fmt_cnt > 0_u32 {
+                self.swap_format = r32(&fmts, 0_usize);
+                swap_cs = r32(&fmts, 4_usize);
+                var fi: u32 = 0_u32;
+                while fi < fmt_cnt && fi < 16_u32 {
+                    let f = r32(&fmts, fi.widen.[usize]() *% 8_usize);
+                    if f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_R8G8B8A8_UNORM {
+                        self.swap_format = f;
+                        swap_cs = r32(&fmts, fi.widen.[usize]() *% 8_usize +% 4_usize);
+                        break;
+                    }
+                    fi = fi +% 1_u32;
+                }
+            }
+
+            // Create VkSwapchainKHR (104 bytes)
+            var swci: [104]u8 = [0_u8; 104];
+            w32(&mut swci, 0_usize, VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
+            w64(&mut swci, 24_usize, self.surface);
+            w32(&mut swci, 32_usize, img_cnt);
+            w32(&mut swci, 36_usize, self.swap_format);
+            w32(&mut swci, 40_usize, swap_cs);
+            w32(&mut swci, 44_usize, self.swap_w);
+            w32(&mut swci, 48_usize, self.swap_h);
+            w32(&mut swci, 52_usize, 1_u32); // imageArrayLayers
+            w32(&mut swci, 56_usize, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+            w32(&mut swci, 60_usize, 0_u32); // SHARING_MODE_EXCLUSIVE
+            w32(&mut swci, 80_usize, pre_tf);
+            w32(&mut swci, 84_usize, 1_u32); // COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+            w32(&mut swci, 88_usize, 2_u32); // PRESENT_MODE_FIFO_KHR (guaranteed everywhere)
+            w32(&mut swci, 92_usize, 1_u32); // clipped = VK_TRUE
+
+            if vk_c4(fn_create_swap, self.device, ptr_mut_u8(&mut swci), 0_u64, ptr_u64(&mut self.swapchain)).trunc.[i32]() != 0_i32 {
+                self.destroy();
+                return false;
+            }
+
+            var sc_cnt: u32 = 8_u32;
+            var sc_imgs: [64]u8 = [0_u8; 64];
+            _ = vk_c4(fn_get_swap_imgs, self.device, self.swapchain, ptr_u32(&mut sc_cnt), ptr_mut_u8(&mut sc_imgs));
+            if sc_cnt == 0_u32 { self.destroy(); return false; }
+            self.swap_count = if sc_cnt > 8_u32 { 8_u32 } else { sc_cnt };
+            var si: u32 = 0_u32;
+            while si < self.swap_count {
+                let sidx = si.widen.[usize]();
+                if sidx < 8_usize {
+                    let img = r64(&sc_imgs, sidx *% 8_usize);
+                    self.swap_images[sidx] = img;
+                    var ivci: [80]u8 = [0_u8; 80];
+                    w32(&mut ivci, 0_usize, VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO);
+                    w64(&mut ivci, 24_usize, img);
+                    w32(&mut ivci, 32_usize, 1_u32);
+                    w32(&mut ivci, 36_usize, self.swap_format);
+                    w32(&mut ivci, 56_usize, 1_u32);
+                    w32(&mut ivci, 64_usize, 1_u32);
+                    w32(&mut ivci, 72_usize, 1_u32);
+                    var vh: u64 = 0_u64;
+                    _ = vk_c4(self.fn_create_view, self.device, ptr_mut_u8(&mut ivci), 0_u64, ptr_u64(&mut vh));
+                    self.swap_views[sidx] = vh;
+                }
+                si = si +% 1_u32;
+            }
+
+            // Create RenderPass
+            var att: [36]u8 = [0_u8; 36];
+            w32(&mut att, 4_usize, self.swap_format);
+            w32(&mut att, 8_usize, 1_u32);  // samples = 1
+            w32(&mut att, 12_usize, 1_u32); // loadOp = CLEAR
+            w32(&mut att, 16_usize, 0_u32); // storeOp = STORE
+            w32(&mut att, 20_usize, 2_u32); // stencilLoadOp = DONT_CARE
+            w32(&mut att, 24_usize, 1_u32); // stencilStoreOp = DONT_CARE
+            w32(&mut att, 28_usize, VK_IMAGE_LAYOUT_UNDEFINED);
+            w32(&mut att, 32_usize, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
+            var att_ref: [8]u8 = [0_u8; 8];
+            w32(&mut att_ref, 0_usize, 0_u32);
+            w32(&mut att_ref, 4_usize, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+            var subpass: [72]u8 = [0_u8; 72];
+            w32(&mut subpass, 4_usize, 0_u32); // GRAPHICS
+            w32(&mut subpass, 24_usize, 1_u32);
+            w64(&mut subpass, 32_usize, ptr_mut_u8(&mut att_ref));
+
+            var dep: [28]u8 = [0_u8; 28];
+            w32(&mut dep, 0_usize, 0xFFFFFFFF_u32); // SUBPASS_EXTERNAL
+            w32(&mut dep, 4_usize, 0_u32);
+            w32(&mut dep, 8_usize, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+            w32(&mut dep, 12_usize, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+            w32(&mut dep, 20_usize, 0x100_u32); // COLOR_ATTACHMENT_WRITE
+
+            var rpci: [64]u8 = [0_u8; 64];
+            w32(&mut rpci, 0_usize, VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO);
+            w32(&mut rpci, 20_usize, 1_u32);
+            w64(&mut rpci, 24_usize, ptr_mut_u8(&mut att));
+            w32(&mut rpci, 32_usize, 1_u32);
+            w64(&mut rpci, 40_usize, ptr_mut_u8(&mut subpass));
+            w32(&mut rpci, 48_usize, 1_u32);
+            w64(&mut rpci, 56_usize, ptr_mut_u8(&mut dep));
+            if vk_c4(fn_create_rp, self.device, ptr_mut_u8(&mut rpci), 0_u64, ptr_u64(&mut self.render_pass)).trunc.[i32]() != 0_i32 {
+                self.destroy();
+                return false;
+            }
+
+            // Create Framebuffers
+            si = 0_u32;
+            while si < self.swap_count {
+                let sidx = si.widen.[usize]();
+                if sidx < 8_usize {
+                    var att_h = self.swap_views[sidx];
+                    var fbci: [64]u8 = [0_u8; 64];
+                    w32(&mut fbci, 0_usize, VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO);
+                    w64(&mut fbci, 24_usize, self.render_pass);
+                    w32(&mut fbci, 32_usize, 1_u32);
+                    w64(&mut fbci, 40_usize, ptr_u64(&mut att_h));
+                    w32(&mut fbci, 48_usize, self.swap_w);
+                    w32(&mut fbci, 52_usize, self.swap_h);
+                    w32(&mut fbci, 56_usize, 1_u32);
+                    var fbh: u64 = 0_u64;
+                    _ = vk_c4(fn_create_fb, self.device, ptr_mut_u8(&mut fbci), 0_u64, ptr_u64(&mut fbh));
+                    self.framebuffers[sidx] = fbh;
+                }
+                si = si +% 1_u32;
+            }
+
+            // Descriptor Set Layout: binding 0 = SSBO (Vertex), binding 1 = CombinedImageSampler (Fragment)
+            var binds: [48]u8 = [0_u8; 48];
+            w32(&mut binds, 0_usize, 0_u32);
+            w32(&mut binds, 4_usize, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+            w32(&mut binds, 8_usize, 1_u32);
+            w32(&mut binds, 12_usize, VK_SHADER_STAGE_VERTEX_BIT);
+
+            w32(&mut binds, 24_usize, 1_u32);
+            w32(&mut binds, 28_usize, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+            w32(&mut binds, 32_usize, 1_u32);
+            w32(&mut binds, 36_usize, VK_SHADER_STAGE_FRAGMENT_BIT);
+
+            var dslci: [32]u8 = [0_u8; 32];
+            w32(&mut dslci, 0_usize, VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO);
+            w32(&mut dslci, 20_usize, 2_u32);
+            w64(&mut dslci, 24_usize, ptr_mut_u8(&mut binds));
+            if vk_c4(fn_create_dlayout, self.device, ptr_mut_u8(&mut dslci), 0_u64, ptr_u64(&mut self.desc_layout)).trunc.[i32]() != 0_i32 {
+                self.destroy();
+                return false;
+            }
+
+            // Pipeline Layout (1 descriptor set + 16-byte viewport push constant)
+            var pcr: [12]u8 = [0_u8; 12];
+            w32(&mut pcr, 0_usize, VK_SHADER_STAGE_VERTEX_BIT);
+            w32(&mut pcr, 4_usize, 0_u32);
+            w32(&mut pcr, 8_usize, 16_u32);
+
+            var dsl_h = self.desc_layout;
+            var plci: [48]u8 = [0_u8; 48];
+            w32(&mut plci, 0_usize, VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO);
+            w32(&mut plci, 20_usize, 1_u32);
+            w64(&mut plci, 24_usize, ptr_u64(&mut dsl_h));
+            w32(&mut plci, 32_usize, 1_u32);
+            w64(&mut plci, 40_usize, ptr_mut_u8(&mut pcr));
+            if vk_c4(fn_create_playout, self.device, ptr_mut_u8(&mut plci), 0_u64, ptr_u64(&mut self.pipe_layout)).trunc.[i32]() != 0_i32 {
+                self.destroy();
+                return false;
+            }
+
+            // Create ALL 6 GPUI Graphics Pipelines from `@embed_gpu_spirv(...)`!
+            self.pipelines[0_usize] = self.create_gpui_pipeline(fn_create_sm, fn_destroy_sm, fn_create_gp, @embed_gpu_spirv("quad_vs"), "quad_vs\0".as_bytes(), @embed_gpu_spirv("quad_fs"), "quad_fs\0".as_bytes());
+            self.pipelines[1_usize] = self.create_gpui_pipeline(fn_create_sm, fn_destroy_sm, fn_create_gp, @embed_gpu_spirv("shadow_vs"), "shadow_vs\0".as_bytes(), @embed_gpu_spirv("shadow_fs"), "shadow_fs\0".as_bytes());
+            self.pipelines[2_usize] = self.create_gpui_pipeline(fn_create_sm, fn_destroy_sm, fn_create_gp, @embed_gpu_spirv("underline_vs"), "underline_vs\0".as_bytes(), @embed_gpu_spirv("underline_fs"), "underline_fs\0".as_bytes());
+            self.pipelines[3_usize] = self.create_gpui_pipeline(fn_create_sm, fn_destroy_sm, fn_create_gp, @embed_gpu_spirv("mono_vs"), "mono_vs\0".as_bytes(), @embed_gpu_spirv("mono_fs"), "mono_fs\0".as_bytes());
+            self.pipelines[4_usize] = self.create_gpui_pipeline(fn_create_sm, fn_destroy_sm, fn_create_gp, @embed_gpu_spirv("poly_vs"), "poly_vs\0".as_bytes(), @embed_gpu_spirv("poly_fs"), "poly_fs\0".as_bytes());
+            self.pipelines[5_usize] = self.create_gpui_pipeline(fn_create_sm, fn_destroy_sm, fn_create_gp, @embed_gpu_spirv("path_vs"), "path_vs\0".as_bytes(), @embed_gpu_spirv("path_fs"), "path_fs\0".as_bytes());
+            if self.pipelines[0_usize] == 0_u64 || self.pipelines[1_usize] == 0_u64 || self.pipelines[3_usize] == 0_u64 {
+                self.destroy();
+                return false;
+            }
+
+            // Create 6 persistent mapped SSBOs + staging buffer (1 MiB)
+            var bi: usize = 0_usize;
+            while bi < 6_usize {
+                var bh: u64 = 0_u64;
+                var mh: u64 = 0_u64;
+                var mp: u64 = 0_u64;
+                if !self.create_host_buffer(fn_create_buf, fn_get_buf_req, fn_bind_buf_mem, fn_map_mem, SSBO_CAPACITY_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &mut bh, &mut mh, &mut mp) {
+                    self.destroy();
+                    return false;
+                }
+                self.ssbo_bufs[bi] = bh;
+                self.ssbo_mems[bi] = mh;
+                self.ssbo_ptrs[bi] = mp;
+                bi = bi +% 1_usize;
+            }
+            self.staging_cap = 1048576_u64;
+            var st_buf: u64 = 0_u64;
+            var st_mem: u64 = 0_u64;
+            var st_ptr: u64 = 0_u64;
+            _ = self.create_host_buffer(fn_create_buf, fn_get_buf_req, fn_bind_buf_mem, fn_map_mem, self.staging_cap, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &mut st_buf, &mut st_mem, &mut st_ptr);
+            self.staging_buf = st_buf;
+            self.staging_mem = st_mem;
+            self.staging_ptr = st_ptr;
+
+            // Create linear atlas sampler + initial 2x2 dummy R8 & RGBA8 atlas images
+            var smpci: [80]u8 = [0_u8; 80];
+            w32(&mut smpci, 0_usize, VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);
+            w32(&mut smpci, 20_usize, 1_u32); // LINEAR mag
+            w32(&mut smpci, 24_usize, 1_u32); // LINEAR min
+            w32(&mut smpci, 32_usize, 2_u32); // CLAMP_TO_EDGE U
+            w32(&mut smpci, 36_usize, 2_u32); // CLAMP_TO_EDGE V
+            w32(&mut smpci, 40_usize, 2_u32); // CLAMP_TO_EDGE W
+            _ = vk_c4(fn_create_smp, self.device, ptr_mut_u8(&mut smpci), 0_u64, ptr_u64(&mut self.sampler));
+            _ = self.ensure_atlas_texture(0_usize, 2_u32, 2_u32, true);
+            _ = self.ensure_atlas_texture(1_usize, 2_u32, 2_u32, false);
+
+            // Descriptor pool & 6 descriptor sets
+            var psizes: [16]u8 = [0_u8; 16];
+            w32(&mut psizes, 0_usize, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+            w32(&mut psizes, 4_usize, 6_u32);
+            w32(&mut psizes, 8_usize, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+            w32(&mut psizes, 12_usize, 6_u32);
+
+            var dpci: [40]u8 = [0_u8; 40];
+            w32(&mut dpci, 0_usize, VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO);
+            w32(&mut dpci, 20_usize, 6_u32); // maxSets
+            w32(&mut dpci, 24_usize, 2_u32); // poolSizeCount
+            w64(&mut dpci, 32_usize, ptr_mut_u8(&mut psizes));
+            if vk_c4(fn_create_dpool, self.device, ptr_mut_u8(&mut dpci), 0_u64, ptr_u64(&mut self.desc_pool)).trunc.[i32]() != 0_i32 {
+                self.destroy();
+                return false;
+            }
+            var layouts6: [48]u8 = [0_u8; 48];
+            var di: usize = 0_usize;
+            while di < 6_usize {
+                w64(&mut layouts6, di *% 8_usize, self.desc_layout);
+                di = di +% 1_usize;
+            }
+            var dsai: [32]u8 = [0_u8; 32];
+            w32(&mut dsai, 0_usize, VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO);
+            w64(&mut dsai, 16_usize, self.desc_pool);
+            w32(&mut dsai, 24_usize, 6_u32);
+            w64(&mut dsai, 24_usize, 6_u64); // reset cleanly below
+            w32(&mut dsai, 24_usize, 6_u32);
+            // VkDescriptorSetAllocateInfo: sType(0), pNext(8), descriptorPool(16), descriptorSetCount(24), pSetLayouts(32) -> 40 bytes!
+            var dsai40: [40]u8 = [0_u8; 40];
+            w32(&mut dsai40, 0_usize, VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO);
+            w64(&mut dsai40, 16_usize, self.desc_pool);
+            w32(&mut dsai40, 24_usize, 6_u32);
+            w64(&mut dsai40, 32_usize, ptr_mut_u8(&mut layouts6));
+            var ds_out: [48]u8 = [0_u8; 48];
+            if vk_c3(fn_alloc_ds, self.device, ptr_mut_u8(&mut dsai40), ptr_mut_u8(&mut ds_out)).trunc.[i32]() != 0_i32 {
+                self.destroy();
+                return false;
+            }
+            di = 0_usize;
+            while di < 6_usize {
+                self.desc_sets[di] = r64(&ds_out, di *% 8_usize);
+                di = di +% 1_usize;
+            }
+            self.update_descriptor_sets();
+
+            // Command pool, command buffer, semaphores, signaled fence
+            var cpci: [24]u8 = [0_u8; 24];
+            w32(&mut cpci, 0_usize, VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO);
+            w32(&mut cpci, 16_usize, 2_u32); // RESET_COMMAND_BUFFER_BIT
+            w32(&mut cpci, 20_usize, self.queue_family);
+            _ = vk_c4(fn_create_cpool, self.device, ptr_mut_u8(&mut cpci), 0_u64, ptr_u64(&mut self.cmd_pool));
+
+            var cbai: [32]u8 = [0_u8; 32];
+            w32(&mut cbai, 0_usize, VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO);
+            w64(&mut cbai, 16_usize, self.cmd_pool);
+            w32(&mut cbai, 24_usize, 0_u32); // PRIMARY
+            w32(&mut cbai, 28_usize, 1_u32);
+            _ = vk_c3(fn_alloc_cmd, self.device, ptr_mut_u8(&mut cbai), ptr_u64(&mut self.cmd_buf));
+
+            var semci: [24]u8 = [0_u8; 24];
+            w32(&mut semci, 0_usize, VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO);
+            _ = vk_c4(fn_create_sem, self.device, ptr_mut_u8(&mut semci), 0_u64, ptr_u64(&mut self.sem_avail));
+            _ = vk_c4(fn_create_sem, self.device, ptr_mut_u8(&mut semci), 0_u64, ptr_u64(&mut self.sem_done));
+
+            var fci: [24]u8 = [0_u8; 24];
+            w32(&mut fci, 0_usize, VK_STRUCTURE_TYPE_FENCE_CREATE_INFO);
+            w32(&mut fci, 16_usize, 1_u32); // VK_FENCE_CREATE_SIGNALED_BIT
+            _ = vk_c4(fn_create_fence, self.device, ptr_mut_u8(&mut fci), 0_u64, ptr_u64(&mut self.fence));
+
+            self.ready = self.cmd_buf != 0_u64 && self.fence != 0_u64;
+            return self.ready;
+        } else {
+            _ = self; _ = surf;
+            return false;
+        }
+    }
+
+    pub fn record_atlas_upload(self: *mut Self, slot: usize, pixels: *[u8], w: u32, h: u32, gen: u64, is_r8: bool) {
+        if slot >= 2_usize || w == 0_u32 || h == 0_u32 || pixels.len == 0_usize { return; }
+        if self.atlas_gen[slot] == gen && self.atlas_w[slot] == w && self.atlas_h[slot] == h && gen != 0_u64 {
+            return;
+        }
+        let bpp: usize = if is_r8 { 1_usize } else { 4_usize };
+        let bytes = w.widen.[usize]() *% h.widen.[usize]() *% bpp;
+        if bytes.widen.[u64]() > self.staging_cap || bytes > pixels.len { return; }
+        let resized = self.atlas_w[slot] != w || self.atlas_h[slot] != h;
+        if resized {
+            _ = self.ensure_atlas_texture(slot, w, h, is_r8);
+            self.update_descriptor_sets();
+        }
+        memcpy_raw(self.staging_ptr, ptr_u8(pixels), bytes);
+
+        // Transition UNDEFINED -> TRANSFER_DST_OPTIMAL
+        var bar: [72]u8 = [0_u8; 72];
+        w32(&mut bar, 0_usize, VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER);
+        w32(&mut bar, 16_usize, 0_u32);
+        w32(&mut bar, 20_usize, 0x1000_u32); // TRANSFER_WRITE
+        w32(&mut bar, 24_usize, VK_IMAGE_LAYOUT_UNDEFINED);
+        w32(&mut bar, 28_usize, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        w32(&mut bar, 32_usize, 0xFFFFFFFF_u32);
+        w32(&mut bar, 36_usize, 0xFFFFFFFF_u32);
+        w64(&mut bar, 40_usize, self.atlas_imgs[slot]);
+        w32(&mut bar, 48_usize, 1_u32); // COLOR
+        w32(&mut bar, 56_usize, 1_u32);
+        w32(&mut bar, 64_usize, 1_u32);
+        _ = vk_c10(self.fn_pipeline_barrier, self.cmd_buf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT.widen.[u64](), VK_PIPELINE_STAGE_TRANSFER_BIT.widen.[u64](), 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 1_u64, ptr_mut_u8(&mut bar));
+
+        // Copy staging buffer -> image
+        var reg: [56]u8 = [0_u8; 56];
+        w32(&mut reg, 16_usize, 1_u32); // aspectMask = COLOR
+        w32(&mut reg, 28_usize, 1_u32); // layerCount = 1
+        w32(&mut reg, 44_usize, w);
+        w32(&mut reg, 48_usize, h);
+        w32(&mut reg, 52_usize, 1_u32);
+        _ = vk_c6(self.fn_copy_buf_to_img, self.cmd_buf, self.staging_buf, self.atlas_imgs[slot], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL.widen.[u64](), 1_u64, ptr_mut_u8(&mut reg));
+
+        // Transition TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL
+        w32(&mut bar, 16_usize, 0x1000_u32);
+        w32(&mut bar, 20_usize, 0x20_u32); // SHADER_READ
+        w32(&mut bar, 24_usize, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        w32(&mut bar, 28_usize, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        _ = vk_c10(self.fn_pipeline_barrier, self.cmd_buf, VK_PIPELINE_STAGE_TRANSFER_BIT.widen.[u64](), VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT.widen.[u64](), 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 1_u64, ptr_mut_u8(&mut bar));
+        self.atlas_gen[slot] = gen;
+    }
+
+    pub fn render_batches(
+        self: *mut Self,
+        clear_col: color.Rgba,
+        quads: *[scene.Quad],
+        shadows: *[scene.Shadow],
+        underlines: *[scene.Underline],
+        mono_sprites: *[scene.MonoSprite],
+        poly_sprites: *[scene.PolySprite],
+        path_verts: *[scene.PathVertex],
+        atlas_r8: *[u8],
+        atlas_r8_w: u32,
+        atlas_r8_h: u32,
+        atlas_r8_gen: u64,
+        atlas_rgba: *[u8],
+        atlas_rgba_w: u32,
+        atlas_rgba_h: u32,
+        atlas_rgba_gen: u64,
+    ) -> bool {
+        comptime if @target_os() == .Linux || @target_os() == .Windows || @target_os() == .Android {
+            if !self.ready { return false; }
+
+            var fence_h = self.fence;
+            _ = vk_c5(self.fn_wait_fences, self.device, 1_u64, ptr_u64(&mut fence_h), 1_u64, 0xFFFFFFFFFFFFFFFF_u64);
+            _ = vk_c3(self.fn_reset_fences, self.device, 1_u64, ptr_u64(&mut fence_h));
+
+            var img_idx: u32 = 0_u32;
+            let acq = vk_c6(self.fn_acquire, self.device, self.swapchain, 0xFFFFFFFFFFFFFFFF_u64, self.sem_avail, 0_u64, ptr_u32(&mut img_idx)).trunc.[i32]();
+            if acq < 0_i32 || img_idx >= self.swap_count { return false; }
+
+            // Upload primitive batches into persistent host-mapped SSBOs
+            let n_quads = if quads.len *% 128_usize <= SSBO_CAPACITY_BYTES.trunc.[usize]() { quads.len } else { (SSBO_CAPACITY_BYTES / 128_u64).trunc.[usize]() };
+            let n_shadows = if shadows.len *% 80_usize <= SSBO_CAPACITY_BYTES.trunc.[usize]() { shadows.len } else { (SSBO_CAPACITY_BYTES / 80_u64).trunc.[usize]() };
+            let n_ul = if underlines.len *% 64_usize <= SSBO_CAPACITY_BYTES.trunc.[usize]() { underlines.len } else { (SSBO_CAPACITY_BYTES / 64_u64).trunc.[usize]() };
+            let n_mono = if mono_sprites.len *% 80_usize <= SSBO_CAPACITY_BYTES.trunc.[usize]() { mono_sprites.len } else { (SSBO_CAPACITY_BYTES / 80_u64).trunc.[usize]() };
+            let n_poly = if poly_sprites.len *% 96_usize <= SSBO_CAPACITY_BYTES.trunc.[usize]() { poly_sprites.len } else { (SSBO_CAPACITY_BYTES / 96_u64).trunc.[usize]() };
+            let n_path = if path_verts.len *% 48_usize <= SSBO_CAPACITY_BYTES.trunc.[usize]() { path_verts.len } else { (SSBO_CAPACITY_BYTES / 48_u64).trunc.[usize]() };
+
+            if n_quads > 0_usize { memcpy_raw(self.ssbo_ptrs[0_usize], ptr_quads(quads), n_quads *% 128_usize); }
+            if n_shadows > 0_usize { memcpy_raw(self.ssbo_ptrs[1_usize], ptr_shadows(shadows), n_shadows *% 80_usize); }
+            if n_ul > 0_usize { memcpy_raw(self.ssbo_ptrs[2_usize], ptr_underlines(underlines), n_ul *% 64_usize); }
+            if n_mono > 0_usize { memcpy_raw(self.ssbo_ptrs[3_usize], ptr_monos(mono_sprites), n_mono *% 80_usize); }
+            if n_poly > 0_usize { memcpy_raw(self.ssbo_ptrs[4_usize], ptr_polys(poly_sprites), n_poly *% 96_usize); }
+            if n_path > 0_usize { memcpy_raw(self.ssbo_ptrs[5_usize], ptr_paths(path_verts), n_path *% 48_usize); }
+
+            _ = vk_c2(self.fn_reset_cmd, self.cmd_buf, 0_u64);
+            var cbbi: [32]u8 = [0_u8; 32];
+            w32(&mut cbbi, 0_usize, VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
+            w32(&mut cbbi, 16_usize, 1_u32); // ONE_TIME_SUBMIT
+            _ = vk_c2(self.fn_begin_cmd, self.cmd_buf, ptr_mut_u8(&mut cbbi));
+
+            // Upload dirty glyph/sprite atlas textures before render pass
+            self.record_atlas_upload(0_usize, atlas_r8, atlas_r8_w, atlas_r8_h, atlas_r8_gen, true);
+            self.record_atlas_upload(1_usize, atlas_rgba, atlas_rgba_w, atlas_rgba_h, atlas_rgba_gen, false);
+
+            // Begin RenderPass
+            var clr: [16]u8 = [0_u8; 16];
+            wf32(&mut clr, 0_usize, clear_col.r);
+            wf32(&mut clr, 4_usize, clear_col.g);
+            wf32(&mut clr, 8_usize, clear_col.b);
+            wf32(&mut clr, 12_usize, clear_col.a);
+
+            let fb_idx = img_idx.widen.[usize]();
+            let fb_h = if fb_idx < 8_usize { self.framebuffers[fb_idx] } else { self.framebuffers[0_usize] };
+            var rpbi: [64]u8 = [0_u8; 64];
+            w32(&mut rpbi, 0_usize, VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO);
+            w64(&mut rpbi, 16_usize, self.render_pass);
+            w64(&mut rpbi, 24_usize, fb_h);
+            w32(&mut rpbi, 40_usize, self.swap_w);
+            w32(&mut rpbi, 44_usize, self.swap_h);
+            w32(&mut rpbi, 48_usize, 1_u32);
+            w64(&mut rpbi, 56_usize, ptr_mut_u8(&mut clr));
+            _ = vk_c3(self.fn_begin_rp, self.cmd_buf, ptr_mut_u8(&mut rpbi), 0_u64);
+
+            // Dynamic viewport + scissor
+            var vp: [24]u8 = [0_u8; 24];
+            wf32(&mut vp, 8_usize, self.swap_w.to_float.[f32]());
+            wf32(&mut vp, 12_usize, self.swap_h.to_float.[f32]());
+            wf32(&mut vp, 20_usize, 1.0_f32);
+            _ = vk_c4(self.fn_set_vp, self.cmd_buf, 0_u64, 1_u64, ptr_mut_u8(&mut vp));
+
+            var sc_rect: [16]u8 = [0_u8; 16];
+            w32(&mut sc_rect, 8_usize, self.swap_w);
+            w32(&mut sc_rect, 12_usize, self.swap_h);
+            _ = vk_c4(self.fn_set_sc, self.cmd_buf, 0_u64, 1_u64, ptr_mut_u8(&mut sc_rect));
+
+            // Push viewport push constants (f32x4)
+            var pc: [16]u8 = [0_u8; 16];
+            wf32(&mut pc, 0_usize, self.swap_w.to_float.[f32]());
+            wf32(&mut pc, 4_usize, self.swap_h.to_float.[f32]());
+            wf32(&mut pc, 8_usize, 1.0_f32);
+            _ = vk_c6(self.fn_push_const, self.cmd_buf, self.pipe_layout, VK_SHADER_STAGE_VERTEX_BIT.widen.[u64](), 0_u64, 16_u64, ptr_mut_u8(&mut pc));
+
+            // Draw layers: Shadows(1) -> Quads(0) -> Paths(5) -> PolySprites(4) -> Underlines(2) -> MonoSprites(3)
+            let order_slots: [6]usize = [1_usize, 0_usize, 5_usize, 4_usize, 2_usize, 3_usize];
+            let counts: [6]usize = [n_quads, n_shadows, n_ul, n_mono, n_poly, n_path];
+            var li: usize = 0_usize;
+            while li < 6_usize {
+                let sl = order_slots[li];
+                if sl < 6_usize {
+                    let cnt = counts[sl];
+                    if cnt > 0_usize && self.pipelines[sl] != 0_u64 {
+                        _ = vk_c3(self.fn_bind_pipe, self.cmd_buf, 0_u64, self.pipelines[sl]);
+                        var ds_h = self.desc_sets[sl];
+                        _ = vk_c8(self.fn_bind_ds, self.cmd_buf, 0_u64, self.pipe_layout, 0_u64, 1_u64, ptr_u64(&mut ds_h), 0_u64, 0_u64);
+                        if sl == 5_usize {
+                            _ = vk_c5(self.fn_draw, self.cmd_buf, cnt.widen.[u64](), 1_u64, 0_u64, 0_u64);
+                        } else {
+                            _ = vk_c5(self.fn_draw, self.cmd_buf, 6_u64, cnt.widen.[u64](), 0_u64, 0_u64);
+                        }
+                    }
+                }
+                li = li +% 1_usize;
+            }
+
+            _ = vk_c1(self.fn_end_rp, self.cmd_buf);
+            _ = vk_c1(self.fn_end_cmd, self.cmd_buf);
+
+            // Submit
+            var wait_stage: u32 = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            var wait_sem = self.sem_avail;
+            var sig_sem = self.sem_done;
+            var cb_h = self.cmd_buf;
+            var sub: [72]u8 = [0_u8; 72];
+            w32(&mut sub, 0_usize, VK_STRUCTURE_TYPE_SUBMIT_INFO);
+            w32(&mut sub, 16_usize, 1_u32);
+            w64(&mut sub, 24_usize, ptr_u64(&mut wait_sem));
+            w64(&mut sub, 32_usize, ptr_u32(&mut wait_stage));
+            w32(&mut sub, 40_usize, 1_u32);
+            w64(&mut sub, 48_usize, ptr_u64(&mut cb_h));
+            w32(&mut sub, 56_usize, 1_u32);
+            w64(&mut sub, 64_usize, ptr_u64(&mut sig_sem));
+            if vk_c4(self.fn_submit, self.queue, 1_u64, ptr_mut_u8(&mut sub), self.fence).trunc.[i32]() != 0_i32 {
+                return false;
+            }
+
+            // Present
+            var sw_h = self.swapchain;
+            var pi: [64]u8 = [0_u8; 64];
+            w32(&mut pi, 0_usize, VK_STRUCTURE_TYPE_PRESENT_INFO_KHR);
+            w32(&mut pi, 16_usize, 1_u32);
+            w64(&mut pi, 24_usize, ptr_u64(&mut sig_sem));
+            w32(&mut pi, 32_usize, 1_u32);
+            w64(&mut pi, 40_usize, ptr_u64(&mut sw_h));
+            w64(&mut pi, 48_usize, ptr_u32(&mut img_idx));
+            _ = vk_c2(self.fn_present, self.queue, ptr_mut_u8(&mut pi));
+            self.frame_count = self.frame_count +% 1_u64;
+            return true;
+        } else {
+            _ = self; _ = clear_col; _ = quads; _ = shadows; _ = underlines;
+            _ = mono_sprites; _ = poly_sprites; _ = path_verts;
+            _ = atlas_r8; _ = atlas_r8_w; _ = atlas_r8_h; _ = atlas_r8_gen;
+            _ = atlas_rgba; _ = atlas_rgba_w; _ = atlas_rgba_h; _ = atlas_rgba_gen;
+            return false;
+        }
+    }
+
+    pub fn destroy(self: *mut Self) {
+        if self.device != 0_u64 {
+            if self.fn_dev_wait_idle != 0_u64 { _ = vk_c1(self.fn_dev_wait_idle, self.device); }
+            if self.fence != 0_u64 && self.fn_destroy_fence != 0_u64 { _ = vk_c3(self.fn_destroy_fence, self.device, self.fence, 0_u64); }
+            if self.sem_avail != 0_u64 && self.fn_destroy_sem != 0_u64 { _ = vk_c3(self.fn_destroy_sem, self.device, self.sem_avail, 0_u64); }
+            if self.sem_done != 0_u64 && self.fn_destroy_sem != 0_u64 { _ = vk_c3(self.fn_destroy_sem, self.device, self.sem_done, 0_u64); }
+            if self.cmd_pool != 0_u64 && self.fn_destroy_cpool != 0_u64 { _ = vk_c3(self.fn_destroy_cpool, self.device, self.cmd_pool, 0_u64); }
+            var i: usize = 0_usize;
+            while i < 6_usize {
+                if self.pipelines[i] != 0_u64 && self.fn_destroy_pipe != 0_u64 { _ = vk_c3(self.fn_destroy_pipe, self.device, self.pipelines[i], 0_u64); }
+                if self.ssbo_bufs[i] != 0_u64 && self.fn_destroy_buf != 0_u64 { _ = vk_c3(self.fn_destroy_buf, self.device, self.ssbo_bufs[i], 0_u64); }
+                if self.ssbo_mems[i] != 0_u64 && self.fn_free_mem != 0_u64 { _ = vk_c3(self.fn_free_mem, self.device, self.ssbo_mems[i], 0_u64); }
+                i = i +% 1_usize;
+            }
+            if self.staging_buf != 0_u64 && self.fn_destroy_buf != 0_u64 { _ = vk_c3(self.fn_destroy_buf, self.device, self.staging_buf, 0_u64); }
+            if self.staging_mem != 0_u64 && self.fn_free_mem != 0_u64 { _ = vk_c3(self.fn_free_mem, self.device, self.staging_mem, 0_u64); }
+            var ai: usize = 0_usize;
+            while ai < 2_usize {
+                if self.atlas_views[ai] != 0_u64 && self.fn_destroy_view != 0_u64 { _ = vk_c3(self.fn_destroy_view, self.device, self.atlas_views[ai], 0_u64); }
+                if self.atlas_imgs[ai] != 0_u64 && self.fn_destroy_img != 0_u64 { _ = vk_c3(self.fn_destroy_img, self.device, self.atlas_imgs[ai], 0_u64); }
+                if self.atlas_mems[ai] != 0_u64 && self.fn_free_mem != 0_u64 { _ = vk_c3(self.fn_free_mem, self.device, self.atlas_mems[ai], 0_u64); }
+                ai = ai +% 1_usize;
+            }
+            if self.sampler != 0_u64 && self.fn_destroy_smp != 0_u64 { _ = vk_c3(self.fn_destroy_smp, self.device, self.sampler, 0_u64); }
+            if self.desc_pool != 0_u64 && self.fn_destroy_dpool != 0_u64 { _ = vk_c3(self.fn_destroy_dpool, self.device, self.desc_pool, 0_u64); }
+            if self.pipe_layout != 0_u64 && self.fn_destroy_playout != 0_u64 { _ = vk_c3(self.fn_destroy_playout, self.device, self.pipe_layout, 0_u64); }
+            if self.desc_layout != 0_u64 && self.fn_destroy_dlayout != 0_u64 { _ = vk_c3(self.fn_destroy_dlayout, self.device, self.desc_layout, 0_u64); }
+            var si: usize = 0_usize;
+            while si < 8_usize {
+                if self.framebuffers[si] != 0_u64 && self.fn_destroy_fb != 0_u64 { _ = vk_c3(self.fn_destroy_fb, self.device, self.framebuffers[si], 0_u64); }
+                if self.swap_views[si] != 0_u64 && self.fn_destroy_view != 0_u64 { _ = vk_c3(self.fn_destroy_view, self.device, self.swap_views[si], 0_u64); }
+                si = si +% 1_usize;
+            }
+            if self.render_pass != 0_u64 && self.fn_destroy_rp != 0_u64 { _ = vk_c3(self.fn_destroy_rp, self.device, self.render_pass, 0_u64); }
+            if self.swapchain != 0_u64 && self.fn_destroy_swap != 0_u64 { _ = vk_c3(self.fn_destroy_swap, self.device, self.swapchain, 0_u64); }
+            if self.fn_destroy_dev != 0_u64 { _ = vk_c2(self.fn_destroy_dev, self.device, 0_u64); }
+            self.device = 0_u64;
+        }
+        if self.surface != 0_u64 && self.instance != 0_u64 && self.fn_destroy_surf != 0_u64 {
+            _ = vk_c3(self.fn_destroy_surf, self.instance, self.surface, 0_u64);
+            self.surface = 0_u64;
+        }
+        if self.instance != 0_u64 && self.fn_destroy_inst != 0_u64 {
+            _ = vk_c2(self.fn_destroy_inst, self.instance, 0_u64);
+            self.instance = 0_u64;
+        }
+        if self.lib_vk != 0_u64 {
+            unload_vk_lib(self.lib_vk);
+            self.lib_vk = 0_u64;
+        }
+        self.ready = false;
+    }
+}

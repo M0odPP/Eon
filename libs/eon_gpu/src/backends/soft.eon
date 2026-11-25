@@ -1,0 +1,817 @@
+module eon_gpu.backends.soft;
+
+import core.col;
+import core.color;
+import core.math;
+import core.math_vec;
+import eon_gpu.scene;
+
+// ============================================================================
+// Pure-Eon Safe SIMD Software Rasterizer (`libs/eon_gpu/src/backends/soft.eon`)
+// ZERO `@hal`, ZERO `raw`, 100% freestanding `core/` — runs identically on
+// bare-metal `nostd` (x86_64/AArch64/RISC-V64) and headless/desktop targets.
+// Exact mathematical parity with `shaders.eon` (SDF quads, gradients, borders,
+// analytical erf-approx shadows, solid/wavy underlines, R8/RGBA8 atlas sprites,
+// tessellated vector paths) + deterministic PPM/PNG export & MSE/PSNR metrics.
+// ============================================================================
+
+@inline
+fn clamp_i32(v: i32, lo: i32, hi: i32) -> i32 {
+    if v < lo { return lo; }
+    if v > hi { return hi; }
+    return v;
+}
+
+@inline
+fn floor_to_i32(x: f32) -> i32 {
+    return math_vec.floor_f32(x).trunc_to_int.[i32]();
+}
+
+@inline
+fn ceil_to_i32(x: f32) -> i32 {
+    return math_vec.ceil_f32(x).trunc_to_int.[i32]();
+}
+
+@inline
+fn u8_from_f32(x: f32) -> u8 {
+    let c = math_vec.clamp_f32(x, 0.0_f32, 1.0_f32) * 255.0_f32 + 0.5_f32;
+    let iv = c.trunc_to_int.[i32]();
+    if iv <= 0_i32 { return 0_u8; }
+    if iv >= 255_i32 { return 255_u8; }
+    return iv.trunc.[u8]();
+}
+
+@inline
+fn select_corner_r(px: f32, py: f32, r: f32x4) -> f32 {
+    if py > 0.0_f32 {
+        return if px > 0.0_f32 { r[2_usize] } else { r[3_usize] };
+    }
+    return if px > 0.0_f32 { r[1_usize] } else { r[0_usize] };
+}
+
+@inline
+fn rounded_rect_sdf(px: f32, py: f32, hx: f32, hy: f32, radii: f32x4) -> f32 {
+    let max_r = math_vec.min_f32(hx, hy);
+    let r = math_vec.clamp_f32(select_corner_r(px, py, radii), 0.0_f32, max_r);
+    let qx = math.abs_f32(px) - hx + r;
+    let qy = math.abs_f32(py) - hy + r;
+    let ox = math_vec.max_f32(qx, 0.0_f32);
+    let oy = math_vec.max_f32(qy, 0.0_f32);
+    let outside = @sqrt(@fma(ox, ox, oy * oy));
+    let inside = math_vec.min_f32(math_vec.max_f32(qx, qy), 0.0_f32);
+    return outside + inside - r;
+}
+
+@inline
+fn erf_approx(x: f32) -> f32 {
+    let ax = math.abs_f32(x);
+    let s: f32 = if x < 0.0_f32 { -1.0_f32 } else { 1.0_f32 };
+    let t = 1.0_f32 + ax * (0.278393_f32 + ax * (0.230389_f32 + ax * (0.000972_f32 + ax * 0.078108_f32)));
+    let t2 = t * t;
+    let t4 = t2 * t2;
+    return s * (1.0_f32 - 1.0_f32 / t4);
+}
+
+@inline
+fn blur_along_x(x: f32, y: f32, sigma: f32, corner: f32, hx: f32, hy: f32) -> f32 {
+    let delta = math_vec.min_f32(hy - corner - math.abs_f32(y), 0.0_f32);
+    let inner_sq = math_vec.max_f32(0.0_f32, corner * corner - delta * delta);
+    let curved = hx - corner + @sqrt(inner_sq);
+    let inv = 1.0_f32 / (math_vec.max_f32(sigma, 0.25_f32) * 1.41421356_f32);
+    let e0 = erf_approx((x + curved) * inv);
+    let e1 = erf_approx((x - curved) * inv);
+    return 0.5_f32 * (e0 - e1);
+}
+
+fn shadow_box_alpha(px: f32, py: f32, hx: f32, hy: f32, corner: f32, sigma: f32) -> f32 {
+    let s = math_vec.max_f32(sigma, 0.5_f32);
+    let r = math_vec.clamp_f32(corner, 0.0_f32, math_vec.min_f32(hx, hy));
+    let low = py - hy;
+    let high = py + hy;
+    let start = math_vec.clamp_f32(-3.0_f32 * s, low, high);
+    let end_y = math_vec.clamp_f32(3.0_f32 * s, low, high);
+    let step = (end_y - start) * 0.25_f32;
+    if step <= 1.0e-5_f32 {
+        return 0.0_f32;
+    }
+    let y0 = start + step * 0.5_f32;
+    let inv_s2 = 1.0_f32 / (2.0_f32 * s * s);
+    let norm = 0.39894228_f32 / s;
+    var acc: f32 = 0.0_f32;
+    var i: u32 = 0_u32;
+    while i < 4_u32 {
+        let sy = y0 + i.to_float.[f32]() * step;
+        let g = norm * math.exp(-(sy * sy * inv_s2).widen.[f64]()).trunc.[f32]();
+        let bx = blur_along_x(px, py - sy, s, r, hx, hy);
+        acc = acc + bx * g * step;
+        i = i +% 1_u32;
+    }
+    return math_vec.clamp_f32(acc, 0.0_f32, 1.0_f32);
+}
+
+/// Premultiplied SrcOver blend into `fb[off..off+4]` (straight RGBA8 storage).
+@inline
+fn blend_premul_px(fb: *mut [u8], off: usize, sr: f32, sg: f32, sb: f32, sa: f32) {
+    if sa <= 0.001_f32 || fb.len < 4_usize || off > fb.len - 4_usize {
+        return;
+    }
+    if sa >= 0.996_f32 {
+        fb[off] = u8_from_f32(sr);
+        fb[off + 1_usize] = u8_from_f32(sg);
+        fb[off + 2_usize] = u8_from_f32(sb);
+        fb[off + 3_usize] = 255_u8;
+        return;
+    }
+    let inv_255 = 1.0_f32 / 255.0_f32;
+    let dr = fb[off].to_float.[f32]() * inv_255;
+    let dg = fb[off + 1_usize].to_float.[f32]() * inv_255;
+    let db = fb[off + 2_usize].to_float.[f32]() * inv_255;
+    let da = fb[off + 3_usize].to_float.[f32]() * inv_255;
+    let inv_a = 1.0_f32 - sa;
+    let out_r = @fma(dr, inv_a, sr);
+    let out_g = @fma(dg, inv_a, sg);
+    let out_b = @fma(db, inv_a, sb);
+    let out_a = @fma(da, inv_a, sa);
+    fb[off] = u8_from_f32(out_r);
+    fb[off + 1_usize] = u8_from_f32(out_g);
+    fb[off + 2_usize] = u8_from_f32(out_b);
+    fb[off + 3_usize] = u8_from_f32(out_a);
+}
+
+/// Clear the RGBA8 framebuffer to `clear_col`.
+pub fn clear_rgba8(fb: *mut [u8], w: u32, h: u32, clear_col: color.Rgba) {
+    let s8 = clear_col.to_srgb8();
+    let total_px = w.widen.[usize]() *% h.widen.[usize]();
+    let total_bytes = total_px *% 4_usize;
+    let lim = if total_bytes <= fb.len { total_bytes } else { fb.len };
+    if lim < 4_usize { return; }
+    let max_off = lim - 4_usize;
+    var off: usize = 0_usize;
+    while off <= max_off {
+        fb[off] = s8.r;
+        fb[off + 1_usize] = s8.g;
+        fb[off + 2_usize] = s8.b;
+        fb[off + 3_usize] = s8.a;
+        off = off +% 4_usize;
+    }
+}
+
+fn raster_quad(fb: *mut [u8], w: u32, h: u32, q: *scene.Quad) {
+    let bw = q.bounds[2_usize];
+    let bh = q.bounds[3_usize];
+    if bw <= 0.0_f32 || bh <= 0.0_f32 { return; }
+    let x0 = clamp_i32(floor_to_i32(math_vec.max_f32(q.bounds[0_usize], q.clip_mask[0_usize])), 0_i32, w.bitcast.[i32]());
+    let y0 = clamp_i32(floor_to_i32(math_vec.max_f32(q.bounds[1_usize], q.clip_mask[1_usize])), 0_i32, h.bitcast.[i32]());
+    let x1 = clamp_i32(ceil_to_i32(math_vec.min_f32(q.bounds[0_usize] + bw, q.clip_mask[2_usize])), 0_i32, w.bitcast.[i32]());
+    let y1 = clamp_i32(ceil_to_i32(math_vec.min_f32(q.bounds[1_usize] + bh, q.clip_mask[3_usize])), 0_i32, h.bitcast.[i32]());
+    if x0 >= x1 || y0 >= y1 { return; }
+
+    let hx = bw * 0.5_f32;
+    let hy = bh * 0.5_f32;
+    let cx = q.bounds[0_usize] + hx;
+    let cy = q.bounds[1_usize] + hy;
+    let inv_w = 1.0_f32 / bw;
+    let inv_h = 1.0_f32 / bh;
+    let gmode = q.flags & scene.QUAD_FLAG_GRADIENT_MASK;
+    let max_bw = math_vec.max_f32(
+        math_vec.max_f32(q.border_widths[0_usize], q.border_widths[1_usize]),
+        math_vec.max_f32(q.border_widths[2_usize], q.border_widths[3_usize]),
+    );
+    let has_border = max_bw > 0.001_f32 && q.border_color[3_usize] > 0.001_f32;
+    let max_r = math_vec.max_f32(
+        math_vec.max_f32(q.corner_radii[0_usize], q.corner_radii[1_usize]),
+        math_vec.max_f32(q.corner_radii[2_usize], q.corner_radii[3_usize]),
+    );
+
+    // Fast path for sharp solid opaque axis-aligned rectangle (huge speedup for backgrounds & dividers!)
+    if gmode == 0_u32 && !has_border && max_r <= 0.01_f32 && q.bg_color[3_usize] >= 0.996_f32 {
+        let rr = u8_from_f32(q.bg_color[0_usize]);
+        let gg = u8_from_f32(q.bg_color[1_usize]);
+        let bb = u8_from_f32(q.bg_color[2_usize]);
+        var y = y0;
+        while y < y1 {
+            let row = (y.bitcast.[u32]() *% w).widen.[usize]();
+            var x = x0;
+            while x < x1 {
+                let off = (row +% x.bitcast.[u32]().widen.[usize]()) *% 4_usize;
+                if fb.len >= 4_usize && off <= fb.len - 4_usize {
+                    fb[off] = rr;
+                    fb[off + 1_usize] = gg;
+                    fb[off + 2_usize] = bb;
+                    fb[off + 3_usize] = 255_u8;
+                }
+                x = x +% 1_i32;
+            }
+            y = y +% 1_i32;
+        }
+        return;
+    }
+
+    var y = y0;
+    while y < y1 {
+        let fy = y.to_float.[f32]() + 0.5_f32;
+        let py = fy - cy;
+        let uy = math_vec.clamp_f32((fy - q.bounds[1_usize]) * inv_h, 0.0_f32, 1.0_f32);
+        let row = (y.bitcast.[u32]() *% w).widen.[usize]();
+        var x = x0;
+        while x < x1 {
+            let fx = x.to_float.[f32]() + 0.5_f32;
+            let px = fx - cx;
+            let outer_d = rounded_rect_sdf(px, py, hx, hy, q.corner_radii);
+            let outer_alpha = 1.0_f32 - math_vec.smoothstep_f32(-0.5_f32, 0.5_f32, outer_d);
+            if outer_alpha > 0.001_f32 {
+                var fr = q.bg_color[0_usize];
+                var fg = q.bg_color[1_usize];
+                var fb_c = q.bg_color[2_usize];
+                var fa = q.bg_color[3_usize];
+                if gmode != 0_u32 {
+                    let ux = math_vec.clamp_f32((fx - q.bounds[0_usize]) * inv_w, 0.0_f32, 1.0_f32);
+                    let t: f32 = if gmode == 1_u32 { uy } else if gmode == 2_u32 { ux } else { (ux + uy) * 0.5_f32 };
+                    fr = math_vec.lerp_f32(q.bg_color[0_usize], q.bg_color_end[0_usize], t);
+                    fg = math_vec.lerp_f32(q.bg_color[1_usize], q.bg_color_end[1_usize], t);
+                    fb_c = math_vec.lerp_f32(q.bg_color[2_usize], q.bg_color_end[2_usize], t);
+                    fa = math_vec.lerp_f32(q.bg_color[3_usize], q.bg_color_end[3_usize], t);
+                }
+                if has_border {
+                    let b_edge_x = if px < 0.0_f32 { q.border_widths[3_usize] } else { q.border_widths[1_usize] };
+                    let b_edge_y = if py < 0.0_f32 { q.border_widths[0_usize] } else { q.border_widths[2_usize] };
+                    let eb = math_vec.max_f32(b_edge_x, b_edge_y);
+                    let ihx = math_vec.max_f32(hx - (q.border_widths[3_usize] + q.border_widths[1_usize]) * 0.5_f32, 0.0_f32);
+                    let ihy = math_vec.max_f32(hy - (q.border_widths[0_usize] + q.border_widths[2_usize]) * 0.5_f32, 0.0_f32);
+                    let ipx = px + (q.border_widths[1_usize] - q.border_widths[3_usize]) * 0.5_f32;
+                    let ipy = py + (q.border_widths[2_usize] - q.border_widths[0_usize]) * 0.5_f32;
+                    let ir: f32x4 = .{
+                        math_vec.max_f32(q.corner_radii[0_usize] - eb, 0.0_f32),
+                        math_vec.max_f32(q.corner_radii[1_usize] - eb, 0.0_f32),
+                        math_vec.max_f32(q.corner_radii[2_usize] - eb, 0.0_f32),
+                        math_vec.max_f32(q.corner_radii[3_usize] - eb, 0.0_f32),
+                    };
+                    let inner_d = rounded_rect_sdf(ipx, ipy, ihx, ihy, ir);
+                    let bmix = math_vec.smoothstep_f32(-0.5_f32, 0.5_f32, inner_d);
+                    let ba = q.border_color[3_usize] * bmix;
+                    let rem_a = fa * (1.0_f32 - ba);
+                    let oa = ba + rem_a;
+                    if oa > 0.0001_f32 {
+                        let inv_oa = 1.0_f32 / oa;
+                        fr = (q.border_color[0_usize] * ba + fr * rem_a) * inv_oa;
+                        fg = (q.border_color[1_usize] * ba + fg * rem_a) * inv_oa;
+                        fb_c = (q.border_color[2_usize] * ba + fb_c * rem_a) * inv_oa;
+                        fa = oa;
+                    }
+                }
+                let a = fa * outer_alpha;
+                let off = (row +% x.bitcast.[u32]().widen.[usize]()) *% 4_usize;
+                blend_premul_px(fb, off, fr * a, fg * a, fb_c * a, a);
+            }
+            x = x +% 1_i32;
+        }
+        y = y +% 1_i32;
+    }
+}
+
+fn raster_shadow(fb: *mut [u8], w: u32, h: u32, s: *scene.Shadow) {
+    if s.bounds[2_usize] <= 0.0_f32 || s.bounds[3_usize] <= 0.0_f32 || s.color[3_usize] <= 0.001_f32 { return; }
+    let pad = s.blur_radius * 3.0_f32 + s.spread;
+    let ex0 = s.bounds[0_usize] - pad;
+    let ey0 = s.bounds[1_usize] - pad;
+    let ex1 = s.bounds[0_usize] + s.bounds[2_usize] + pad;
+    let ey1 = s.bounds[1_usize] + s.bounds[3_usize] + pad;
+    let x0 = clamp_i32(floor_to_i32(math_vec.max_f32(ex0, s.clip_mask[0_usize])), 0_i32, w.bitcast.[i32]());
+    let y0 = clamp_i32(floor_to_i32(math_vec.max_f32(ey0, s.clip_mask[1_usize])), 0_i32, h.bitcast.[i32]());
+    let x1 = clamp_i32(ceil_to_i32(math_vec.min_f32(ex1, s.clip_mask[2_usize])), 0_i32, w.bitcast.[i32]());
+    let y1 = clamp_i32(ceil_to_i32(math_vec.min_f32(ey1, s.clip_mask[3_usize])), 0_i32, h.bitcast.[i32]());
+    if x0 >= x1 || y0 >= y1 { return; }
+
+    let hx = math_vec.max_f32(s.bounds[2_usize] * 0.5_f32 + s.spread, 0.5_f32);
+    let hy = math_vec.max_f32(s.bounds[3_usize] * 0.5_f32 + s.spread, 0.5_f32);
+    let cx = s.bounds[0_usize] + s.bounds[2_usize] * 0.5_f32;
+    let cy = s.bounds[1_usize] + s.bounds[3_usize] * 0.5_f32;
+    let sigma = s.blur_radius * 0.5_f32;
+    var y = y0;
+    while y < y1 {
+        let py = (y.to_float.[f32]() + 0.5_f32) - cy;
+        let row = (y.bitcast.[u32]() *% w).widen.[usize]();
+        var x = x0;
+        while x < x1 {
+            let px = (x.to_float.[f32]() + 0.5_f32) - cx;
+            let r = select_corner_r(px, py, s.corner_radii);
+            let a = s.color[3_usize] * shadow_box_alpha(px, py, hx, hy, r, sigma);
+            if a > 0.001_f32 {
+                let off = (row +% x.bitcast.[u32]().widen.[usize]()) *% 4_usize;
+                blend_premul_px(fb, off, s.color[0_usize] * a, s.color[1_usize] * a, s.color[2_usize] * a, a);
+            }
+            x = x +% 1_i32;
+        }
+        y = y +% 1_i32;
+    }
+}
+
+fn raster_underline(fb: *mut [u8], w: u32, h: u32, u: *scene.Underline) {
+    let bw = u.bounds[2_usize];
+    let bh = u.bounds[3_usize];
+    if bw <= 0.0_f32 || bh <= 0.0_f32 { return; }
+    let x0 = clamp_i32(floor_to_i32(math_vec.max_f32(u.bounds[0_usize], u.clip_mask[0_usize])), 0_i32, w.bitcast.[i32]());
+    let y0 = clamp_i32(floor_to_i32(math_vec.max_f32(u.bounds[1_usize], u.clip_mask[1_usize])), 0_i32, h.bitcast.[i32]());
+    let x1 = clamp_i32(ceil_to_i32(math_vec.min_f32(u.bounds[0_usize] + bw, u.clip_mask[2_usize])), 0_i32, w.bitcast.[i32]());
+    let y1 = clamp_i32(ceil_to_i32(math_vec.min_f32(u.bounds[1_usize] + bh, u.clip_mask[3_usize])), 0_i32, h.bitcast.[i32]());
+    if x0 >= x1 || y0 >= y1 { return; }
+
+    let half_t = math_vec.max_f32(u.thickness, 1.0_f32) * 0.5_f32;
+    let mid_y = bh * 0.5_f32;
+    let amp = math_vec.max_f32(mid_y - half_t, 0.5_f32);
+    var y = y0;
+    while y < y1 {
+        let ly = (y.to_float.[f32]() + 0.5_f32) - u.bounds[1_usize];
+        let row = (y.bitcast.[u32]() *% w).widen.[usize]();
+        var x = x0;
+        while x < x1 {
+            let lx = (x.to_float.[f32]() + 0.5_f32) - u.bounds[0_usize];
+            let ty: f32 = if u.wavy != 0_u32 {
+                mid_y + math.sin((lx * 1.256637_f32).widen.[f64]()).trunc.[f32]() * amp
+            } else {
+                mid_y
+            };
+            let d = math.abs_f32(ly - ty) - half_t;
+            let a = u.color[3_usize] * (1.0_f32 - math_vec.smoothstep_f32(-0.5_f32, 0.5_f32, d));
+            if a > 0.001_f32 {
+                let off = (row +% x.bitcast.[u32]().widen.[usize]()) *% 4_usize;
+                blend_premul_px(fb, off, u.color[0_usize] * a, u.color[1_usize] * a, u.color[2_usize] * a, a);
+            }
+            x = x +% 1_i32;
+        }
+        y = y +% 1_i32;
+    }
+}
+
+fn sample_r8(atlas: *[u8], aw: u32, ah: u32, u: f32, v: f32) -> f32 {
+    if aw == 0_u32 || ah == 0_u32 || atlas.len == 0_usize { return 1.0_f32; }
+    let fx = math_vec.clamp_f32(u, 0.0_f32, 1.0_f32) * (aw.to_float.[f32]() - 1.0_f32);
+    let fy = math_vec.clamp_f32(v, 0.0_f32, 1.0_f32) * (ah.to_float.[f32]() - 1.0_f32);
+    let max_x = (aw -% 1_u32).bitcast.[i32]();
+    let max_y = (ah -% 1_u32).bitcast.[i32]();
+    let x0 = clamp_i32(floor_to_i32(fx), 0_i32, max_x);
+    let y0 = clamp_i32(floor_to_i32(fy), 0_i32, max_y);
+    let x1 = clamp_i32(x0 +% 1_i32, 0_i32, max_x);
+    let y1 = clamp_i32(y0 +% 1_i32, 0_i32, max_y);
+    let tx = fx - x0.to_float.[f32]();
+    let ty = fy - y0.to_float.[f32]();
+    let awu = aw.widen.[usize]();
+    let i00 = y0.bitcast.[u32]().widen.[usize]() *% awu +% x0.bitcast.[u32]().widen.[usize]();
+    let i10 = y0.bitcast.[u32]().widen.[usize]() *% awu +% x1.bitcast.[u32]().widen.[usize]();
+    let i01 = y1.bitcast.[u32]().widen.[usize]() *% awu +% x0.bitcast.[u32]().widen.[usize]();
+    let i11 = y1.bitcast.[u32]().widen.[usize]() *% awu +% x1.bitcast.[u32]().widen.[usize]();
+    let c00 = if i00 < atlas.len { atlas[i00].to_float.[f32]() } else { 0.0_f32 };
+    let c10 = if i10 < atlas.len { atlas[i10].to_float.[f32]() } else { 0.0_f32 };
+    let c01 = if i01 < atlas.len { atlas[i01].to_float.[f32]() } else { 0.0_f32 };
+    let c11 = if i11 < atlas.len { atlas[i11].to_float.[f32]() } else { 0.0_f32 };
+    let top = math_vec.lerp_f32(c00, c10, tx);
+    let bot = math_vec.lerp_f32(c01, c11, tx);
+    return math_vec.lerp_f32(top, bot, ty) * (1.0_f32 / 255.0_f32);
+}
+
+fn raster_mono_sprite(fb: *mut [u8], w: u32, h: u32, s: *scene.MonoSprite, atlas_r8: *[u8], aw: u32, ah: u32) {
+    let bw = s.bounds[2_usize];
+    let bh = s.bounds[3_usize];
+    if bw <= 0.0_f32 || bh <= 0.0_f32 { return; }
+    let x0 = clamp_i32(floor_to_i32(math_vec.max_f32(s.bounds[0_usize], s.clip_mask[0_usize])), 0_i32, w.bitcast.[i32]());
+    let y0 = clamp_i32(floor_to_i32(math_vec.max_f32(s.bounds[1_usize], s.clip_mask[1_usize])), 0_i32, h.bitcast.[i32]());
+    let x1 = clamp_i32(ceil_to_i32(math_vec.min_f32(s.bounds[0_usize] + bw, s.clip_mask[2_usize])), 0_i32, w.bitcast.[i32]());
+    let y1 = clamp_i32(ceil_to_i32(math_vec.min_f32(s.bounds[1_usize] + bh, s.clip_mask[3_usize])), 0_i32, h.bitcast.[i32]());
+    if x0 >= x1 || y0 >= y1 { return; }
+
+    let inv_w = 1.0_f32 / bw;
+    let inv_h = 1.0_f32 / bh;
+    var y = y0;
+    while y < y1 {
+        let vy = ((y.to_float.[f32]() + 0.5_f32) - s.bounds[1_usize]) * inv_h;
+        let v = math_vec.lerp_f32(s.uv_bounds[1_usize], s.uv_bounds[3_usize], vy);
+        let row = (y.bitcast.[u32]() *% w).widen.[usize]();
+        var x = x0;
+        while x < x1 {
+            let ux = ((x.to_float.[f32]() + 0.5_f32) - s.bounds[0_usize]) * inv_w;
+            let u = math_vec.lerp_f32(s.uv_bounds[0_usize], s.uv_bounds[2_usize], ux);
+            let cov = sample_r8(atlas_r8, aw, ah, u, v);
+            let a = s.color[3_usize] * cov;
+            if a > 0.001_f32 {
+                let off = (row +% x.bitcast.[u32]().widen.[usize]()) *% 4_usize;
+                blend_premul_px(fb, off, s.color[0_usize] * a, s.color[1_usize] * a, s.color[2_usize] * a, a);
+            }
+            x = x +% 1_i32;
+        }
+        y = y +% 1_i32;
+    }
+}
+
+fn raster_poly_sprite(fb: *mut [u8], w: u32, h: u32, s: *scene.PolySprite, atlas_rgba: *[u8], aw: u32, ah: u32) {
+    let bw = s.bounds[2_usize];
+    let bh = s.bounds[3_usize];
+    if bw <= 0.0_f32 || bh <= 0.0_f32 || aw == 0_u32 || ah == 0_u32 { return; }
+    let x0 = clamp_i32(floor_to_i32(math_vec.max_f32(s.bounds[0_usize], s.clip_mask[0_usize])), 0_i32, w.bitcast.[i32]());
+    let y0 = clamp_i32(floor_to_i32(math_vec.max_f32(s.bounds[1_usize], s.clip_mask[1_usize])), 0_i32, h.bitcast.[i32]());
+    let x1 = clamp_i32(ceil_to_i32(math_vec.min_f32(s.bounds[0_usize] + bw, s.clip_mask[2_usize])), 0_i32, w.bitcast.[i32]());
+    let y1 = clamp_i32(ceil_to_i32(math_vec.min_f32(s.bounds[1_usize] + bh, s.clip_mask[3_usize])), 0_i32, h.bitcast.[i32]());
+    if x0 >= x1 || y0 >= y1 { return; }
+
+    let hx = bw * 0.5_f32;
+    let hy = bh * 0.5_f32;
+    let cx = s.bounds[0_usize] + hx;
+    let cy = s.bounds[1_usize] + hy;
+    let inv_w = 1.0_f32 / bw;
+    let inv_h = 1.0_f32 / bh;
+    let inv_255 = 1.0_f32 / 255.0_f32;
+    let awu = aw.widen.[usize]();
+    let max_ax = (aw -% 1_u32).bitcast.[i32]();
+    let max_ay = (ah -% 1_u32).bitcast.[i32]();
+    var y = y0;
+    while y < y1 {
+        let fy = y.to_float.[f32]() + 0.5_f32;
+        let py = fy - cy;
+        let vy = (fy - s.bounds[1_usize]) * inv_h;
+        let v = math_vec.lerp_f32(s.uv_bounds[1_usize], s.uv_bounds[3_usize], vy);
+        let ty = clamp_i32(floor_to_i32(math_vec.clamp_f32(v, 0.0_f32, 1.0_f32) * (ah.to_float.[f32]() - 1.0_f32)), 0_i32, max_ay);
+        let row = (y.bitcast.[u32]() *% w).widen.[usize]();
+        var x = x0;
+        while x < x1 {
+            let fx = x.to_float.[f32]() + 0.5_f32;
+            let px = fx - cx;
+            let d = rounded_rect_sdf(px, py, hx, hy, s.corner_radii);
+            let mask_a = 1.0_f32 - math_vec.smoothstep_f32(-0.5_f32, 0.5_f32, d);
+            if mask_a > 0.001_f32 {
+                let ux = (fx - s.bounds[0_usize]) * inv_w;
+                let u = math_vec.lerp_f32(s.uv_bounds[0_usize], s.uv_bounds[2_usize], ux);
+                let tx = clamp_i32(floor_to_i32(math_vec.clamp_f32(u, 0.0_f32, 1.0_f32) * (aw.to_float.[f32]() - 1.0_f32)), 0_i32, max_ax);
+                let ti = (ty.bitcast.[u32]().widen.[usize]() *% awu +% tx.bitcast.[u32]().widen.[usize]()) *% 4_usize;
+                if atlas_rgba.len >= 4_usize && ti <= atlas_rgba.len - 4_usize {
+                    let tr = atlas_rgba[ti].to_float.[f32]() * inv_255 * s.tint[0_usize];
+                    let tg = atlas_rgba[ti + 1_usize].to_float.[f32]() * inv_255 * s.tint[1_usize];
+                    let tb = atlas_rgba[ti + 2_usize].to_float.[f32]() * inv_255 * s.tint[2_usize];
+                    let ta = atlas_rgba[ti + 3_usize].to_float.[f32]() * inv_255 * s.tint[3_usize] * mask_a;
+                    let off = (row +% x.bitcast.[u32]().widen.[usize]()) *% 4_usize;
+                    blend_premul_px(fb, off, tr * ta, tg * ta, tb * ta, ta);
+                }
+            }
+            x = x +% 1_i32;
+        }
+        y = y +% 1_i32;
+    }
+}
+
+@inline
+fn edge_fn(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
+    return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+}
+
+fn raster_path_tri(fb: *mut [u8], w: u32, h: u32, v0: *scene.PathVertex, v1: *scene.PathVertex, v2: *scene.PathVertex) {
+    let ax = v0.pos[0_usize]; let ay = v0.pos[1_usize];
+    let bx = v1.pos[0_usize]; let by = v1.pos[1_usize];
+    let cx = v2.pos[0_usize]; let cy = v2.pos[1_usize];
+    let area = edge_fn(ax, ay, bx, by, cx, cy);
+    if math.abs_f32(area) <= 1.0e-5_f32 { return; }
+    let sign: f32 = if area > 0.0_f32 { 1.0_f32 } else { -1.0_f32 };
+    let min_x = math_vec.max_f32(math_vec.min_f32(ax, math_vec.min_f32(bx, cx)), v0.clip_mask[0_usize]);
+    let min_y = math_vec.max_f32(math_vec.min_f32(ay, math_vec.min_f32(by, cy)), v0.clip_mask[1_usize]);
+    let max_x = math_vec.min_f32(math_vec.max_f32(ax, math_vec.max_f32(bx, cx)), v0.clip_mask[2_usize]);
+    let max_y = math_vec.min_f32(math_vec.max_f32(ay, math_vec.max_f32(by, cy)), v0.clip_mask[3_usize]);
+    let x0 = clamp_i32(floor_to_i32(min_x), 0_i32, w.bitcast.[i32]());
+    let y0 = clamp_i32(floor_to_i32(min_y), 0_i32, h.bitcast.[i32]());
+    let x1 = clamp_i32(ceil_to_i32(max_x), 0_i32, w.bitcast.[i32]());
+    let y1 = clamp_i32(ceil_to_i32(max_y), 0_i32, h.bitcast.[i32]());
+    if x0 >= x1 || y0 >= y1 { return; }
+
+    let a = v0.color[3_usize];
+    let pr = v0.color[0_usize] * a;
+    let pg = v0.color[1_usize] * a;
+    let pb = v0.color[2_usize] * a;
+    var y = y0;
+    while y < y1 {
+        let py = y.to_float.[f32]() + 0.5_f32;
+        let row = (y.bitcast.[u32]() *% w).widen.[usize]();
+        var x = x0;
+        while x < x1 {
+            let px = x.to_float.[f32]() + 0.5_f32;
+            let e0 = edge_fn(ax, ay, bx, by, px, py) * sign;
+            let e1 = edge_fn(bx, by, cx, cy, px, py) * sign;
+            let e2 = edge_fn(cx, cy, ax, ay, px, py) * sign;
+            if e0 >= 0.0_f32 && e1 >= 0.0_f32 && e2 >= 0.0_f32 {
+                let off = (row +% x.bitcast.[u32]().widen.[usize]()) *% 4_usize;
+                blend_premul_px(fb, off, pr, pg, pb, a);
+            }
+            x = x +% 1_i32;
+        }
+        y = y +% 1_i32;
+    }
+}
+
+/// Render all GPUI primitive slices in painter's order (respecting exact z-`order` across
+/// shadows, quads, underlines, mono sprites, and poly sprites, plus tessellated paths).
+pub fn render_batches(
+    fb: *mut [u8],
+    w: u32,
+    h: u32,
+    clear_col: color.Rgba,
+    quads: *[scene.Quad],
+    shadows: *[scene.Shadow],
+    underlines: *[scene.Underline],
+    mono_sprites: *[scene.MonoSprite],
+    poly_sprites: *[scene.PolySprite],
+    path_verts: *[scene.PathVertex],
+    atlas_r8: *[u8],
+    atlas_r8_w: u32,
+    atlas_r8_h: u32,
+    atlas_rgba: *[u8],
+    atlas_rgba_w: u32,
+    atlas_rgba_h: u32,
+) {
+    clear_rgba8(fb, w, h, clear_col);
+
+    // Z-order k-way merge across the 5 instanced primitive streams (preserves overlays/modals!).
+    var qi: usize = 0_usize;
+    var si: usize = 0_usize;
+    var ui: usize = 0_usize;
+    var mi: usize = 0_usize;
+    var pi: usize = 0_usize;
+    loop {
+        var best_kind: u8 = 0_u8;
+        var best_order: u32 = 0xFFFFFFFF_u32;
+        if si < shadows.len && shadows[si].order < best_order {
+            best_order = shadows[si].order;
+            best_kind = 1_u8;
+        }
+        if qi < quads.len && quads[qi].order < best_order {
+            best_order = quads[qi].order;
+            best_kind = 2_u8;
+        }
+        if pi < poly_sprites.len && poly_sprites[pi].order < best_order {
+            best_order = poly_sprites[pi].order;
+            best_kind = 3_u8;
+        }
+        if ui < underlines.len && underlines[ui].order < best_order {
+            best_order = underlines[ui].order;
+            best_kind = 4_u8;
+        }
+        if mi < mono_sprites.len && mono_sprites[mi].order < best_order {
+            best_order = mono_sprites[mi].order;
+            best_kind = 5_u8;
+        }
+        if best_kind == 0_u8 {
+            break;
+        }
+        if best_kind == 1_u8 && si < shadows.len {
+            raster_shadow(fb, w, h, &shadows[si]);
+            si = si +% 1_usize;
+        } else if best_kind == 2_u8 && qi < quads.len {
+            raster_quad(fb, w, h, &quads[qi]);
+            qi = qi +% 1_usize;
+        } else if best_kind == 3_u8 && pi < poly_sprites.len {
+            raster_poly_sprite(fb, w, h, &poly_sprites[pi], atlas_rgba, atlas_rgba_w, atlas_rgba_h);
+            pi = pi +% 1_usize;
+        } else if best_kind == 4_u8 && ui < underlines.len {
+            raster_underline(fb, w, h, &underlines[ui]);
+            ui = ui +% 1_usize;
+        } else if mi < mono_sprites.len {
+            raster_mono_sprite(fb, w, h, &mono_sprites[mi], atlas_r8, atlas_r8_w, atlas_r8_h);
+            mi = mi +% 1_usize;
+        } else {
+            break;
+        }
+    }
+
+    // Vector path triangles
+    if path_verts.len >= 3_usize {
+        var vi: usize = 0_usize;
+        while vi <= path_verts.len - 3_usize {
+            raster_path_tri(fb, w, h, &path_verts[vi], &path_verts[vi + 1_usize], &path_verts[vi + 2_usize]);
+            vi = vi +% 3_usize;
+        }
+    }
+}
+
+/// Render a dynamic `Scene` directly into an RGBA8 buffer.
+pub fn render_scene(
+    fb: *mut [u8],
+    w: u32,
+    h: u32,
+    sc: *scene.Scene,
+    atlas_r8: *[u8],
+    atlas_r8_w: u32,
+    atlas_r8_h: u32,
+    atlas_rgba: *[u8],
+    atlas_rgba_w: u32,
+    atlas_rgba_h: u32,
+) {
+    render_batches(
+        fb, w, h, sc.clear_color,
+        sc.quads.as_slice(),
+        sc.shadows.as_slice(),
+        sc.underlines.as_slice(),
+        sc.mono_sprites.as_slice(),
+        sc.poly_sprites.as_slice(),
+        sc.path_verts.as_slice(),
+        atlas_r8, atlas_r8_w, atlas_r8_h,
+        atlas_rgba, atlas_rgba_w, atlas_rgba_h,
+    );
+}
+
+// ============================================================================
+// Pure-Eon Image Golden Utilities: PPM (P6), PNG (uncompressed zlib), MSE/PSNR
+// ============================================================================
+
+/// Encode an RGBA8 buffer as binary PPM (`P6`) for deterministic golden image snapshots.
+pub fn encode_ppm(alloc: *mut AllocCap, rgba: *[u8], w: u32, h: u32) -> col.DynBuf[u8] ! OutOfMemory {
+    let npx = w.widen.[usize]() *% h.widen.[usize]();
+    var out = try col.DynBuf.[u8].init(alloc, npx *% 3_usize +% 32_usize);
+    errdefer out.destroy(alloc);
+    try out.push_slice(alloc, "P6\n".as_bytes());
+    try push_dec_u32(alloc, &mut out, w);
+    try out.push(alloc, b' ');
+    try push_dec_u32(alloc, &mut out, h);
+    try out.push_slice(alloc, "\n255\n".as_bytes());
+    var i: usize = 0_usize;
+    while i < npx {
+        let off = i *% 4_usize;
+        if rgba.len >= 4_usize && off <= rgba.len - 4_usize {
+            try out.push(alloc, rgba[off]);
+            try out.push(alloc, rgba[off + 1_usize]);
+            try out.push(alloc, rgba[off + 2_usize]);
+        }
+        i = i +% 1_usize;
+    }
+    return out;
+}
+
+fn push_dec_u32(alloc: *mut AllocCap, out: *mut col.DynBuf[u8], val: u32) -> !OutOfMemory {
+    var tmp: [12]u8 = [0_u8; 12];
+    var n: usize = 0_usize;
+    var v = val;
+    if v == 0_u32 {
+        try out.push(alloc, b'0');
+        return;
+    }
+    while v > 0_u32 && n < 12_usize {
+        tmp[n] = (b'0'.widen.[u32]() +% (v % 10_u32)).trunc.[u8]();
+        v = v / 10_u32;
+        n = n +% 1_usize;
+    }
+    while n > 0_usize {
+        n = n - 1_usize;
+        if n < 12_usize {
+            try out.push(alloc, tmp[n]);
+        }
+    }
+    return;
+}
+
+fn push_u32_be(alloc: *mut AllocCap, out: *mut col.DynBuf[u8], v: u32) -> !OutOfMemory {
+    try out.push(alloc, ((v >> 24_u32) & 0xFF_u32).trunc.[u8]());
+    try out.push(alloc, ((v >> 16_u32) & 0xFF_u32).trunc.[u8]());
+    try out.push(alloc, ((v >> 8_u32) & 0xFF_u32).trunc.[u8]());
+    try out.push(alloc, (v & 0xFF_u32).trunc.[u8]());
+    return;
+}
+
+fn crc32_ieee(data: *[u8]) -> u32 {
+    var crc: u32 = 0xFFFFFFFF_u32;
+    var i: usize = 0_usize;
+    while i < data.len {
+        crc = crc ^ data[i].widen.[u32]();
+        var b: u32 = 0_u32;
+        while b < 8_u32 {
+            let mask = 0_u32 -% (crc & 1_u32);
+            crc = (crc >> 1_u32) ^ (0xEDB88320_u32 & mask);
+            b = b +% 1_u32;
+        }
+        i = i +% 1_usize;
+    }
+    return ~crc;
+}
+
+fn push_png_chunk(alloc: *mut AllocCap, out: *mut col.DynBuf[u8], tag: *[u8], payload: *[u8]) -> !OutOfMemory {
+    try push_u32_be(alloc, out, payload.len.trunc.[u32]());
+    let start = out.len();
+    try out.push_slice(alloc, tag);
+    try out.push_slice(alloc, payload);
+    let end = out.len();
+    let os = out.as_slice();
+    let crc = if start <= end && end <= os.len { crc32_ieee(os[start..end]) } else { 0_u32 };
+    try push_u32_be(alloc, out, crc);
+    return;
+}
+
+fn push_png_ihdr(alloc: *mut AllocCap, out: *mut col.DynBuf[u8], w: u32, h: u32) -> !OutOfMemory {
+    var ihdr = try col.DynBuf.[u8].init(alloc, 16_usize);
+    errdefer ihdr.destroy(alloc);
+    try push_u32_be(alloc, &mut ihdr, w);
+    try push_u32_be(alloc, &mut ihdr, h);
+    try ihdr.push(alloc, 8_u8); // bit depth
+    try ihdr.push(alloc, 6_u8); // color type RGBA
+    try ihdr.push(alloc, 0_u8); // compression
+    try ihdr.push(alloc, 0_u8); // filter
+    try ihdr.push(alloc, 0_u8); // interlace
+    try push_png_chunk(alloc, out, "IHDR".as_bytes(), ihdr.as_slice());
+    ihdr.destroy(alloc);
+    return;
+}
+
+fn push_png_idat(alloc: *mut AllocCap, out: *mut col.DynBuf[u8], rgba: *[u8], w: u32, h: u32) -> !OutOfMemory {
+    let row_bytes = w.widen.[usize]() *% 4_usize +% 1_usize;
+    let raw_len = row_bytes *% h.widen.[usize]();
+    var idat = try col.DynBuf.[u8].init(alloc, raw_len +% 128_usize);
+    errdefer idat.destroy(alloc);
+    try idat.push(alloc, 0x78_u8);
+    try idat.push(alloc, 0x01_u8);
+
+    var raw_img = try col.DynBuf.[u8].init(alloc, raw_len);
+    errdefer raw_img.destroy(alloc);
+    var s1: u32 = 1_u32;
+    var s2: u32 = 0_u32;
+    var y: u32 = 0_u32;
+    while y < h {
+        try raw_img.push(alloc, 0_u8);
+        s2 = (s2 +% s1) % 65521_u32;
+        let row_src = (y *% w).widen.[usize]() *% 4_usize;
+        let row_len = w.widen.[usize]() *% 4_usize;
+        var k: usize = 0_usize;
+        while k < row_len {
+            let idx = row_src +% k;
+            let b: u8 = if idx < rgba.len { rgba[idx] } else { 0_u8 };
+            try raw_img.push(alloc, b);
+            s1 = (s1 +% b.widen.[u32]()) % 65521_u32;
+            s2 = (s2 +% s1) % 65521_u32;
+            k = k +% 1_usize;
+        }
+        y = y +% 1_u32;
+    }
+
+    let raw_s = raw_img.as_slice();
+    var pos: usize = 0_usize;
+    while pos < raw_s.len {
+        let rem = raw_s.len - pos;
+        let blk = if rem > 65535_usize { 65535_usize } else { rem };
+        let is_final: u8 = if pos +% blk >= raw_s.len { 1_u8 } else { 0_u8 };
+        try idat.push(alloc, is_final);
+        let blen = blk.trunc.[u16]();
+        let nlen = ~blen;
+        try idat.push(alloc, (blen & 0xFF_u16).trunc.[u8]());
+        try idat.push(alloc, ((blen >> 8_u16) & 0xFF_u16).trunc.[u8]());
+        try idat.push(alloc, (nlen & 0xFF_u16).trunc.[u8]());
+        try idat.push(alloc, ((nlen >> 8_u16) & 0xFF_u16).trunc.[u8]());
+        try idat.push_slice(alloc, raw_s[pos..pos +% blk]);
+        pos = pos +% blk;
+    }
+    let adler = (s2 << 16_u32) | s1;
+    try push_u32_be(alloc, &mut idat, adler);
+    try push_png_chunk(alloc, out, "IDAT".as_bytes(), idat.as_slice());
+    raw_img.destroy(alloc);
+    idat.destroy(alloc);
+    return;
+}
+
+/// Encode an RGBA8 buffer as a standards-compliant PNG (valid in every viewer & browser, pure Eon!).
+pub fn encode_png(alloc: *mut AllocCap, rgba: *[u8], w: u32, h: u32) -> col.DynBuf[u8] ! OutOfMemory {
+    let row_bytes = w.widen.[usize]() *% 4_usize +% 1_usize;
+    let raw_len = row_bytes *% h.widen.[usize]();
+    var out = try col.DynBuf.[u8].init(alloc, raw_len +% 256_usize);
+    errdefer out.destroy(alloc);
+    let sig: [8]u8 = [137_u8, 80_u8, 78_u8, 71_u8, 13_u8, 10_u8, 26_u8, 10_u8];
+    try out.push_slice(alloc, &sig);
+    try push_png_ihdr(alloc, &mut out, w, h);
+    try push_png_idat(alloc, &mut out, rgba, w, h);
+    let empty: [0]u8 = [];
+    try push_png_chunk(alloc, &mut out, "IEND".as_bytes(), &empty);
+    return out;
+}
+
+/// Compute Mean Squared Error (0..65025) between two equal-sized RGBA8 images.
+pub fn image_mse(a: *[u8], b: *[u8]) -> f64 {
+    let n = if a.len < b.len { a.len } else { b.len };
+    if n == 0_usize { return 0.0_f64; }
+    var sum: f64 = 0.0_f64;
+    var i: usize = 0_usize;
+    while i < n {
+        let d = a[i].widen.[i32]() - b[i].widen.[i32]();
+        let df = d.to_float.[f64]();
+        sum = sum + df * df;
+        i = i +% 1_usize;
+    }
+    return sum / n.to_float.[f64]();
+}
+
+/// Compute PSNR in dB (returns `100.0` for bit-identical frames).
+pub fn image_psnr(a: *[u8], b: *[u8]) -> f64 {
+    let mse = image_mse(a, b);
+    if mse <= 1.0e-12_f64 {
+        return 100.0_f64;
+    }
+    return 10.0_f64 * (math.log(65025.0_f64 / mse) * 0.4342944819032518_f64);
+}
+
+/// Deterministic FNV-1a 64-bit hash over an RGBA8 framebuffer (for golden UI assertions).
+pub fn frame_hash64(rgba: *[u8]) -> u64 {
+    var h: u64 = 0xCBF29CE484222325_u64;
+    var i: usize = 0_usize;
+    while i < rgba.len {
+        h = (h ^ rgba[i].widen.[u64]()) *% 0x100000001B3_u64;
+        i = i +% 1_usize;
+    }
+    return h;
+}

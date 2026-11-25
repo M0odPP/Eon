@@ -6331,6 +6331,12 @@ fn build_plan_target(
         try join_path(&mut env.alloc, out_dir_path, plan.target_name(ti), &mut out_path);
         if is_emi_lib && !str.ends_with(out_path.as_bytes(), ".emi".as_bytes()) {
             try out_path.push_str_grow(&mut env.alloc, ".emi");
+        } else if !is_emi_lib && eff_target.os == .Windows {
+            if is_shared && !str.ends_with(out_path.as_bytes(), ".dll".as_bytes()) {
+                try out_path.push_str_grow(&mut env.alloc, ".dll");
+            } else if !is_shared && !str.ends_with(out_path.as_bytes(), ".exe".as_bytes()) {
+                try out_path.push_str_grow(&mut env.alloc, ".exe");
+            }
         }
     }
 

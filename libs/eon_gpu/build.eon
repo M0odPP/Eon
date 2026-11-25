@@ -1,0 +1,16 @@
+module eon_gpu.build;
+
+pub fn build(b: *mut BuildCap) {
+    b.add_dep("eon_win", "../eon_win");
+    b.allow_hal("eon_win.platform.wayland");
+    b.allow_hal("eon_win.platform.x11");
+    b.allow_hal("eon_win.platform.win32");
+    b.allow_hal("eon_win.platform.macos");
+    b.allow_hal("eon_win.platform.android");
+    b.allow_hal("eon_win.platform.ios");
+    b.allow_hal("eon_win.platform.nostd_fb");
+    b.allow_hal("eon_gpu.backends.vulkan");
+    b.allow_hal("eon_gpu.backends.metal");
+    b.set_out_dir("out");
+    b.add_lib("eon_gpu", "src");
+}
