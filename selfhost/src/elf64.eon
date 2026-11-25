@@ -3,6 +3,7 @@ module eonc.elf64;
 import core.col;
 import core.str;
 import eonc.span;
+import eonc.target;
 
 // ---------------------------------------------------------------------------
 // Public ELF64 & DWARF5 Data Structures
@@ -16,6 +17,7 @@ pub enum ElfModeKind : u8 {
 
 pub struct ElfMode {
     pub kind: ElfModeKind;
+    pub arch: target.TargetArch;
     pub load_addr: u64;
     pub multiboot2: bool;
     pub soname_off: u32;
@@ -26,6 +28,7 @@ impl ElfMode {
     pub fn linux_pie() -> ElfMode {
         return ElfMode.{
             kind: .LinuxPie,
+            arch: .X86_64,
             load_addr: 0_u64,
             multiboot2: false,
             soname_off: 0_u32,
@@ -36,6 +39,7 @@ impl ElfMode {
     pub fn linux_shared(soname_off: u32, soname_len: u32) -> ElfMode {
         return ElfMode.{
             kind: .LinuxShared,
+            arch: .X86_64,
             load_addr: 0_u64,
             multiboot2: false,
             soname_off: soname_off,
@@ -46,11 +50,18 @@ impl ElfMode {
     pub fn freestanding(load_addr: u64, multiboot2: bool) -> ElfMode {
         return ElfMode.{
             kind: .Freestanding,
+            arch: .X86_64,
             load_addr: load_addr,
             multiboot2: multiboot2,
             soname_off: 0_u32,
             soname_len: 0_u32,
         };
+    }
+
+    pub fn with_arch(self: Self, arch: target.TargetArch) -> ElfMode {
+        var m = self;
+        m.arch = arch;
+        return m;
     }
 }
 
@@ -70,6 +81,22 @@ pub enum RelocKind : u8 {
     GotPcRel32 = 2,
     Plt32 = 3,
     TpOff32 = 4,
+    // AArch64 (ARMv8 ELF64) relocations
+    A64Call26 = 5,
+    A64Jump26 = 6,
+    A64Adrp21 = 7,
+    A64AddLo12 = 8,
+    A64Ldst64Lo12 = 9,
+    A64AdrpGot21 = 10,
+    A64Ld64GotLo12 = 11,
+    A64TpRelHi12 = 12,
+    A64TpRelLo12 = 13,
+    // RISC-V 64 (RV64GC ELF64) relocations
+    RvCallPlt = 14,
+    RvJump20 = 15,
+    RvPcrelPairI = 16,
+    RvGotPair = 17,
+    RvTprelPair = 18,
 }
 
 pub struct ElfSymbol {
@@ -306,6 +333,9 @@ const EV_CURRENT: u8 = 1_u8;
 const ET_EXEC: u16 = 2_u16;
 const ET_DYN: u16 = 3_u16;
 const EM_X86_64: u16 = 62_u16;
+const EM_AARCH64: u16 = 183_u16;
+const EM_RISCV: u16 = 243_u16;
+const EF_RISCV_FLOAT_ABI_DOUBLE: u32 = 0x00000004_u32;
 
 const PT_LOAD: u32 = 1_u32;
 const PT_DYNAMIC: u32 = 2_u32;
@@ -347,6 +377,114 @@ const R_X86_64_64: u32 = 1_u32;
 const R_X86_64_GLOB_DAT: u32 = 6_u32;
 const R_X86_64_JUMP_SLOT: u32 = 7_u32;
 const R_X86_64_RELATIVE: u32 = 8_u32;
+
+const R_AARCH64_ABS64: u32 = 257_u32;
+const R_AARCH64_GLOB_DAT: u32 = 1025_u32;
+const R_AARCH64_JUMP_SLOT: u32 = 1026_u32;
+const R_AARCH64_RELATIVE: u32 = 1027_u32;
+
+const R_RISCV_64: u32 = 2_u32;
+const R_RISCV_RELATIVE: u32 = 3_u32;
+const R_RISCV_JUMP_SLOT: u32 = 5_u32;
+
+fn elf_machine_for(arch: target.TargetArch) -> u16 {
+    match arch {
+        .X86_64 => { return EM_X86_64; }
+        .AArch64 => { return EM_AARCH64; }
+        .RiscV64 => { return EM_RISCV; }
+    }
+    return EM_X86_64;
+}
+
+fn elf_flags_for(arch: target.TargetArch) -> u32 {
+    match arch {
+        .RiscV64 => { return EF_RISCV_FLOAT_ABI_DOUBLE; }
+        _ => { return 0_u32; }
+    }
+    return 0_u32;
+}
+
+fn dyn_reloc_abs64_type(arch: target.TargetArch) -> u32 {
+    match arch {
+        .X86_64 => { return R_X86_64_64; }
+        .AArch64 => { return R_AARCH64_ABS64; }
+        .RiscV64 => { return R_RISCV_64; }
+    }
+    return R_X86_64_64;
+}
+
+fn dyn_reloc_glob_dat_type(arch: target.TargetArch) -> u32 {
+    match arch {
+        .X86_64 => { return R_X86_64_GLOB_DAT; }
+        .AArch64 => { return R_AARCH64_GLOB_DAT; }
+        .RiscV64 => { return R_RISCV_64; }
+    }
+    return R_X86_64_GLOB_DAT;
+}
+
+fn dyn_reloc_jump_slot_type(arch: target.TargetArch) -> u32 {
+    match arch {
+        .X86_64 => { return R_X86_64_JUMP_SLOT; }
+        .AArch64 => { return R_AARCH64_JUMP_SLOT; }
+        .RiscV64 => { return R_RISCV_JUMP_SLOT; }
+    }
+    return R_X86_64_JUMP_SLOT;
+}
+
+fn dyn_reloc_relative_type(arch: target.TargetArch) -> u32 {
+    match arch {
+        .X86_64 => { return R_X86_64_RELATIVE; }
+        .AArch64 => { return R_AARCH64_RELATIVE; }
+        .RiscV64 => { return R_RISCV_RELATIVE; }
+    }
+    return R_X86_64_RELATIVE;
+}
+
+fn interp_len_for(arch: target.TargetArch) -> usize {
+    match arch {
+        .X86_64 => { return 28_usize; }  // "/lib64/ld-linux-x86-64.so.2\0"
+        .AArch64 => { return 27_usize; } // "/lib/ld-linux-aarch64.so.1\0"
+        .RiscV64 => { return 33_usize; } // "/lib/ld-linux-riscv64-lp64d.so.1\0"
+    }
+    return 28_usize;
+}
+
+fn copy_interp_for(dst: *mut [u8], off: usize, arch: target.TargetArch) {
+    match arch {
+        .X86_64 => { copy_into(dst, off, "/lib64/ld-linux-x86-64.so.2".as_bytes()); }
+        .AArch64 => { copy_into(dst, off, "/lib/ld-linux-aarch64.so.1".as_bytes()); }
+        .RiscV64 => { copy_into(dst, off, "/lib/ld-linux-riscv64-lp64d.so.1".as_bytes()); }
+    }
+}
+
+fn plt0_len_for(arch: target.TargetArch) -> usize {
+    match arch {
+        .X86_64 => { return 16_usize; }
+        .AArch64 => { return 32_usize; }
+        .RiscV64 => { return 32_usize; }
+    }
+    return 16_usize;
+}
+
+fn reloc_uses_got(k: RelocKind) -> bool {
+    return k == .GotPcRel32 || k == .A64AdrpGot21 || k == .A64Ld64GotLo12 || k == .RvGotPair;
+}
+
+fn reloc_is_plt_call(k: RelocKind) -> bool {
+    return k == .Plt32 || k == .A64Call26 || k == .A64Jump26 || k == .RvCallPlt;
+}
+
+fn reloc_patch_size(k: RelocKind) -> usize {
+    match k {
+        .Abs64 => { return 8_usize; }
+        .RvCallPlt => { return 8_usize; }
+        .RvPcrelPairI => { return 8_usize; }
+        .RvGotPair => { return 8_usize; }
+        .RvTprelPair => { return 8_usize; }
+        _ => { return 4_usize; }
+    }
+    return 4_usize;
+}
 
 const DT_NULL: i64 = 0_i64;
 const DT_NEEDED: i64 = 1_i64;
@@ -565,14 +703,27 @@ fn push_cstr(buf: *mut col.DynBuf[u8], alloc: *mut AllocCap, s: *[u8]) -> usize 
     return off;
 }
 
-fn write_i32_le_at(dst: *mut [u8], off: usize, v: i32) {
-    let u = v.bitcast.[u32]();
+fn read_u32_le_at(src: *[u8], off: usize) -> u32 {
+    if off < src.len && (src.len - off) >= 4_usize {
+        return src[off].widen.[u32]()
+            | (src[off + 1_usize].widen.[u32]() <<% 8_u32)
+            | (src[off + 2_usize].widen.[u32]() <<% 16_u32)
+            | (src[off + 3_usize].widen.[u32]() <<% 24_u32);
+    }
+    return 0_u32;
+}
+
+fn write_u32_le_at(dst: *mut [u8], off: usize, u: u32) {
     if off < dst.len && (dst.len - off) >= 4_usize {
         dst[off] = (u & 0xFF_u32).trunc.[u8]();
         dst[off + 1_usize] = ((u >> 8_u32) & 0xFF_u32).trunc.[u8]();
         dst[off + 2_usize] = ((u >> 16_u32) & 0xFF_u32).trunc.[u8]();
         dst[off + 3_usize] = ((u >> 24_u32) & 0xFF_u32).trunc.[u8]();
     }
+}
+
+fn write_i32_le_at(dst: *mut [u8], off: usize, v: i32) {
+    write_u32_le_at(dst, off, v.bitcast.[u32]());
 }
 
 fn write_u64_le_at(dst: *mut [u8], off: usize, v: u64) {
@@ -706,6 +857,7 @@ fn write_shdr(out: *mut col.DynBuf[u8], alloc: *mut AllocCap, sh: *Shdr) -> !Out
 
 fn build_ehdr(
     alloc: *mut AllocCap,
+    arch: target.TargetArch,
     e_type: u16,
     e_entry: u64,
     e_phoff: u64,
@@ -723,12 +875,12 @@ fn build_ehdr(
     ];
     try ehdr.push_slice(alloc, &ident);
     try push_u16_le(&mut ehdr, alloc, e_type);
-    try push_u16_le(&mut ehdr, alloc, EM_X86_64);
+    try push_u16_le(&mut ehdr, alloc, elf_machine_for(arch));
     try push_u32_le(&mut ehdr, alloc, EV_CURRENT.widen.[u32]());
     try push_u64_le(&mut ehdr, alloc, e_entry);
     try push_u64_le(&mut ehdr, alloc, e_phoff);
     try push_u64_le(&mut ehdr, alloc, e_shoff);
-    try push_u32_le(&mut ehdr, alloc, 0_u32);
+    try push_u32_le(&mut ehdr, alloc, elf_flags_for(arch));
     try push_u16_le(&mut ehdr, alloc, EHDR_SIZE.trunc.[u16]());
     try push_u16_le(&mut ehdr, alloc, PHDR_SIZE.trunc.[u16]());
     try push_u16_le(&mut ehdr, alloc, e_phnum);
@@ -741,6 +893,7 @@ fn build_ehdr(
 fn stamp_ehdr(
     alloc: *mut AllocCap,
     out: *mut col.DynBuf[u8],
+    arch: target.TargetArch,
     e_type: u16,
     e_entry: u64,
     e_phoff: u64,
@@ -749,7 +902,7 @@ fn stamp_ehdr(
     e_shnum: u16,
     e_shstrndx: u16,
 ) -> !OutOfMemory {
-    let ehdr = try build_ehdr(alloc, e_type, e_entry, e_phoff, e_shoff, e_phnum, e_shnum, e_shstrndx);
+    let ehdr = try build_ehdr(alloc, arch, e_type, e_entry, e_phoff, e_shoff, e_phnum, e_shnum, e_shstrndx);
     errdefer ehdr.destroy(alloc);
     copy_into(out.as_mut_slice(), 0_usize, ehdr.as_slice());
     ehdr.destroy(alloc);
@@ -1524,7 +1677,7 @@ fn collect_got_symbols(
     var i: usize = 0_usize;
     while i < rels.len {
         let r = rels[i];
-        if r.kind == .GotPcRel32 {
+        if reloc_uses_got(r.kind) {
             let key = r.target_sym.widen.[u64]();
             if !seen.contains(key) {
                 try seen.insert(alloc, key, 1_u32);
@@ -1653,6 +1806,210 @@ impl RelocScratch {
         data.destroy(alloc);
         tdata.destroy(alloc);
     }
+}
+
+fn patch_a64_branch26_buf(
+    alloc: *mut AllocCap,
+    buf: *mut [u8],
+    offset: usize,
+    place_vaddr: u64,
+    target_vaddr: u64,
+    addend: i64,
+    sym_bytes: *[u8],
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    if offset +% 4_usize > buf.len {
+        try set_err_sym(err_msg, alloc, "ELF64 linker error: A64 branch26 offset out of range for `", sym_bytes, "`");
+        return false;
+    }
+    let delta = (target_vaddr +% addend.bitcast.[u64]()) -% place_vaddr;
+    let sdelta = delta.bitcast.[i64]();
+    if (sdelta & 3_i64) != 0_i64 || sdelta < -134217728_i64 || sdelta > 134217724_i64 {
+        try set_err_sym(err_msg, alloc, "ELF64 linker error: A64 branch26 out of +/-128MiB range for `", sym_bytes, "`");
+        return false;
+    }
+    let imm26 = ((sdelta >> 2_i64).bitcast.[u64]() & 0x03FFFFFF_u64).trunc.[u32]();
+    let old = read_u32_le_at(buf, offset);
+    write_u32_le_at(buf, offset, (old & 0xFC000000_u32) | imm26);
+    return true;
+}
+
+fn encode_a64_adrp(base_insn: u32, place_vaddr: u64, target_vaddr: u64) -> ?u32 {
+    let tp = target_vaddr & (~0xFFF_u64);
+    let pp = place_vaddr & (~0xFFF_u64);
+    let pdelta = (tp -% pp).bitcast.[i64]();
+    let pages = pdelta >> 12_i64;
+    if pages < -1048576_i64 || pages > 1048575_i64 {
+        return null;
+    }
+    let imm21 = (pages.bitcast.[u64]() & 0x1FFFFF_u64).trunc.[u32]();
+    let immlo = (imm21 & 0x3_u32) <<% 29_u32;
+    let immhi = ((imm21 >> 2_u32) & 0x7FFFF_u32) <<% 5_u32;
+    return (base_insn & 0x9F00001F_u32) | immlo | immhi;
+}
+
+fn patch_a64_adrp21_buf(
+    alloc: *mut AllocCap,
+    buf: *mut [u8],
+    offset: usize,
+    place_vaddr: u64,
+    target_vaddr: u64,
+    addend: i64,
+    sym_bytes: *[u8],
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    if offset +% 4_usize > buf.len {
+        try set_err_sym(err_msg, alloc, "ELF64 linker error: A64 ADRP offset out of range for `", sym_bytes, "`");
+        return false;
+    }
+    let tv = target_vaddr +% addend.bitcast.[u64]();
+    let old = read_u32_le_at(buf, offset);
+    if let patched = encode_a64_adrp(old, place_vaddr, tv) {
+        write_u32_le_at(buf, offset, patched);
+        return true;
+    }
+    try set_err_sym(err_msg, alloc, "ELF64 linker error: A64 ADRP out of +/-4GiB range for `", sym_bytes, "`");
+    return false;
+}
+
+fn patch_a64_lo12_buf(
+    alloc: *mut AllocCap,
+    buf: *mut [u8],
+    offset: usize,
+    target_vaddr: u64,
+    addend: i64,
+    shift_r: u32,
+    sym_bytes: *[u8],
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    if offset +% 4_usize > buf.len {
+        try set_err_sym(err_msg, alloc, "ELF64 linker error: A64 LO12 offset out of range for `", sym_bytes, "`");
+        return false;
+    }
+    let tv = target_vaddr +% addend.bitcast.[u64]();
+    let lo12 = ((tv & 0xFFF_u64).trunc.[u32]() >> (shift_r & 31_u32)) & 0xFFF_u32;
+    let old = read_u32_le_at(buf, offset);
+    write_u32_le_at(buf, offset, (old & 0xFFC003FF_u32) | (lo12 <<% 10_u32));
+    return true;
+}
+
+fn patch_a64_tprel_buf(
+    alloc: *mut AllocCap,
+    buf: *mut [u8],
+    offset: usize,
+    tls_offsets: *col.HashMap[u64],
+    target_sym: u32,
+    addend: i64,
+    is_hi12: bool,
+    interner: *span.SymInterner,
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    let sym_bytes = interner.get(target_sym);
+    if let toff = tls_offsets.get(target_sym.widen.[u64]()) {
+        if offset +% 4_usize > buf.len {
+            try set_err_sym(err_msg, alloc, "ELF64 linker error: A64 TPREL offset out of range for `", sym_bytes, "`");
+            return false;
+        }
+        // Variant I TLS on AArch64: 16-byte TCB precedes .tdata/.tbss at TP + 16
+        let tprel = 16_u64 +% toff +% addend.bitcast.[u64]();
+        let imm12: u32 = if is_hi12 {
+            ((tprel >> 12_u64) & 0xFFF_u64).trunc.[u32]()
+        } else {
+            (tprel & 0xFFF_u64).trunc.[u32]()
+        };
+        let old = read_u32_le_at(buf, offset);
+        write_u32_le_at(buf, offset, (old & 0xFFC003FF_u32) | (imm12 <<% 10_u32));
+        return true;
+    }
+    try set_err_sym(err_msg, alloc, "ELF64 linker error: A64 TPREL unresolved TLS symbol `", sym_bytes, "`");
+    return false;
+}
+
+fn patch_rv_pair_i_buf(
+    alloc: *mut AllocCap,
+    buf: *mut [u8],
+    offset: usize,
+    place_vaddr: u64,
+    target_vaddr: u64,
+    addend: i64,
+    sym_bytes: *[u8],
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    if offset +% 8_usize > buf.len {
+        try set_err_sym(err_msg, alloc, "ELF64 linker error: RV64 AUIPC+I pair offset out of range for `", sym_bytes, "`");
+        return false;
+    }
+    let delta = ((target_vaddr +% addend.bitcast.[u64]()) -% place_vaddr).bitcast.[i64]();
+    if delta < -2147483648_i64 || delta > 2147483647_i64 {
+        try set_err_sym(err_msg, alloc, "ELF64 linker error: RV64 PC-rel pair overflow for `", sym_bytes, "`");
+        return false;
+    }
+    let d32 = delta.bitcast.[u64]().trunc.[u32]();
+    let hi20 = (d32 +% 0x800_u32) & 0xFFFFF000_u32;
+    let lo12 = (d32 & 0xFFF_u32) <<% 20_u32;
+    let w0 = read_u32_le_at(buf, offset);
+    let w1 = read_u32_le_at(buf, offset +% 4_usize);
+    write_u32_le_at(buf, offset, (w0 & 0x00000FFF_u32) | hi20);
+    write_u32_le_at(buf, offset +% 4_usize, (w1 & 0x000FFFFF_u32) | lo12);
+    return true;
+}
+
+fn patch_rv_jump20_buf(
+    alloc: *mut AllocCap,
+    buf: *mut [u8],
+    offset: usize,
+    place_vaddr: u64,
+    target_vaddr: u64,
+    addend: i64,
+    sym_bytes: *[u8],
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    if offset +% 4_usize > buf.len {
+        try set_err_sym(err_msg, alloc, "ELF64 linker error: RV64 JAL offset out of range for `", sym_bytes, "`");
+        return false;
+    }
+    let delta = ((target_vaddr +% addend.bitcast.[u64]()) -% place_vaddr).bitcast.[i64]();
+    if (delta & 1_i64) != 0_i64 || delta < -1048576_i64 || delta > 1048574_i64 {
+        try set_err_sym(err_msg, alloc, "ELF64 linker error: RV64 JAL out of +/-1MiB range for `", sym_bytes, "`");
+        return false;
+    }
+    let u = delta.bitcast.[u64]().trunc.[u32]();
+    let b20 = ((u >> 20_u32) & 1_u32) <<% 31_u32;
+    let b10_1 = ((u >> 1_u32) & 0x3FF_u32) <<% 21_u32;
+    let b11 = ((u >> 11_u32) & 1_u32) <<% 20_u32;
+    let b19_12 = ((u >> 12_u32) & 0xFF_u32) <<% 12_u32;
+    let old = read_u32_le_at(buf, offset);
+    write_u32_le_at(buf, offset, (old & 0x00000FFF_u32) | b20 | b10_1 | b11 | b19_12);
+    return true;
+}
+
+fn patch_rv_tprel_pair_buf(
+    alloc: *mut AllocCap,
+    buf: *mut [u8],
+    offset: usize,
+    tls_offsets: *col.HashMap[u64],
+    target_sym: u32,
+    addend: i64,
+    interner: *span.SymInterner,
+    err_msg: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    let sym_bytes = interner.get(target_sym);
+    if let toff = tls_offsets.get(target_sym.widen.[u64]()) {
+        if offset +% 8_usize > buf.len {
+            try set_err_sym(err_msg, alloc, "ELF64 linker error: RV64 TPREL offset out of range for `", sym_bytes, "`");
+            return false;
+        }
+        let tp = (toff +% addend.bitcast.[u64]()).trunc.[u32]();
+        let hi20 = (tp +% 0x800_u32) & 0xFFFFF000_u32;
+        let lo12 = (tp & 0xFFF_u32) <<% 20_u32;
+        let w0 = read_u32_le_at(buf, offset);
+        let w1 = read_u32_le_at(buf, offset +% 4_usize);
+        write_u32_le_at(buf, offset, (w0 & 0x00000FFF_u32) | hi20);
+        write_u32_le_at(buf, offset +% 4_usize, (w1 & 0x000FFFFF_u32) | lo12);
+        return true;
+    }
+    try set_err_sym(err_msg, alloc, "ELF64 linker error: RV64 TPREL unresolved TLS symbol `", sym_bytes, "`");
+    return false;
 }
 
 fn patch_rel32_buf(
@@ -2227,6 +2584,7 @@ fn build_gnu_hash_section(
 
 fn build_plt_and_got_plt(
     alloc: *mut AllocCap,
+    arch: target.TargetArch,
     plt_vaddr: u64,
     got_plt_vaddr: u64,
     dynamic_vaddr: u64,
@@ -2238,6 +2596,73 @@ fn build_plt_and_got_plt(
     try push_u64_le(got_plt_out, alloc, dynamic_vaddr);
     try push_u64_le(got_plt_out, alloc, 0_u64);
     try push_u64_le(got_plt_out, alloc, 0_u64);
+
+    if arch == .AArch64 {
+        // AArch64 PLT0 (32 bytes) + PLTn (16 bytes each)
+        let got2 = got_plt_vaddr +% 16_u64;
+        try push_u32_le(plt_out, alloc, 0xA9BF7BF0_u32); // stp x16, x30, [sp, #-16]!
+        let adrp0 = encode_a64_adrp(0x90000010_u32, plt_vaddr +% 4_u64, got2) orelse {
+            try set_err(err_msg, alloc, "ELF64 linker error: A64 PLT0 ADRP overflow");
+            return false;
+        };
+        let lo2_s = (((got2 & 0xFFF_u64).trunc.[u32]() >> 3_u32) & 0xFFF_u32) <<% 10_u32;
+        let lo2_b = ((got2 & 0xFFF_u64).trunc.[u32]() & 0xFFF_u32) <<% 10_u32;
+        try push_u32_le(plt_out, alloc, adrp0);
+        try push_u32_le(plt_out, alloc, 0xF9400211_u32 | lo2_s); // ldr x17, [x16, #:lo12:got2]
+        try push_u32_le(plt_out, alloc, 0x91000210_u32 | lo2_b); // add x16, x16, #:lo12:got2
+        try push_u32_le(plt_out, alloc, 0xD61F0220_u32);         // br x17
+        try push_u32_le(plt_out, alloc, 0xD503201F_u32);         // nop
+        try push_u32_le(plt_out, alloc, 0xD503201F_u32);         // nop
+        try push_u32_le(plt_out, alloc, 0xD503201F_u32);         // nop
+        var i: usize = 0_usize;
+        while i < ext_count {
+            let stub_vaddr = plt_vaddr +% (32_usize +% (i *% 16_usize)).widen.[u64]();
+            let slot_vaddr = got_plt_vaddr +% ((3_usize +% i) *% 8_usize).widen.[u64]();
+            let adrp_n = encode_a64_adrp(0x90000010_u32, stub_vaddr, slot_vaddr) orelse {
+                try set_err(err_msg, alloc, "ELF64 linker error: A64 PLTn ADRP overflow");
+                return false;
+            };
+            let lo_s = (((slot_vaddr & 0xFFF_u64).trunc.[u32]() >> 3_u32) & 0xFFF_u32) <<% 10_u32;
+            let lo_b = ((slot_vaddr & 0xFFF_u64).trunc.[u32]() & 0xFFF_u32) <<% 10_u32;
+            try push_u32_le(plt_out, alloc, adrp_n);
+            try push_u32_le(plt_out, alloc, 0xF9400211_u32 | lo_s); // ldr x17, [x16, #:lo12:slot]
+            try push_u32_le(plt_out, alloc, 0x91000210_u32 | lo_b); // add x16, x16, #:lo12:slot
+            try push_u32_le(plt_out, alloc, 0xD61F0220_u32);        // br x17
+            try push_u64_le(got_plt_out, alloc, plt_vaddr);
+            i = i +% 1_usize;
+        }
+        return true;
+    }
+
+    if arch == .RiscV64 {
+        // RISC-V 64 PLT0 (32 bytes) + PLTn (16 bytes each)
+        let d0 = (got_plt_vaddr -% plt_vaddr).trunc.[u32]();
+        let hi0 = (d0 +% 0x800_u32) & 0xFFFFF000_u32;
+        let lo0 = (d0 & 0xFFF_u32) <<% 20_u32;
+        try push_u32_le(plt_out, alloc, 0x00000397_u32 | hi0); // auipc t2, hi0
+        try push_u32_le(plt_out, alloc, 0x41C30333_u32);       // sub t1, t1, t3
+        try push_u32_le(plt_out, alloc, 0x0003BE03_u32 | lo0); // ld t3, lo0(t2)
+        try push_u32_le(plt_out, alloc, 0xFD430313_u32);       // addi t1, t1, -44
+        try push_u32_le(plt_out, alloc, 0x00038293_u32 | lo0); // addi t0, t2, lo0
+        try push_u32_le(plt_out, alloc, 0x00135313_u32);       // srli t1, t1, 1
+        try push_u32_le(plt_out, alloc, 0x0082B283_u32);       // ld t0, 8(t0)
+        try push_u32_le(plt_out, alloc, 0x000E0067_u32);       // jr t3
+        var i: usize = 0_usize;
+        while i < ext_count {
+            let stub_vaddr = plt_vaddr +% (32_usize +% (i *% 16_usize)).widen.[u64]();
+            let slot_vaddr = got_plt_vaddr +% ((3_usize +% i) *% 8_usize).widen.[u64]();
+            let dn = (slot_vaddr -% stub_vaddr).trunc.[u32]();
+            let hin = (dn +% 0x800_u32) & 0xFFFFF000_u32;
+            let lon = (dn & 0xFFF_u32) <<% 20_u32;
+            try push_u32_le(plt_out, alloc, 0x00000E17_u32 | hin); // auipc t3, hin
+            try push_u32_le(plt_out, alloc, 0x000E3E03_u32 | lon); // ld t3, lon(t3)
+            try push_u32_le(plt_out, alloc, 0x000E0367_u32);       // jalr t1, t3
+            try push_u32_le(plt_out, alloc, 0x00000013_u32);       // nop
+            try push_u64_le(got_plt_out, alloc, plt_vaddr);
+            i = i +% 1_usize;
+        }
+        return true;
+    }
 
     let d1_raw = i128_sub(i128_from_u64(got_plt_vaddr +% 8_u64), i128_from_u64(plt_vaddr +% 6_u64));
     let d2_raw = i128_sub(i128_from_u64(got_plt_vaddr +% 16_u64), i128_from_u64(plt_vaddr +% 12_u64));
@@ -2478,7 +2903,7 @@ fn collect_ext_symbols(
         var ri: usize = 0_usize;
         while ri < rels.len {
             let r = rels[ri];
-            if r.kind == .Plt32 || r.kind == .GotPcRel32 || r.kind == .Abs64 {
+            if reloc_is_plt_call(r.kind) || reloc_uses_got(r.kind) || r.kind == .Abs64 {
                 let key = r.target_sym.widen.[u64]();
                 if !plan.local_defs.contains(key) && !is_synthetic_sym(interner, r.target_sym) && !ext_seen.contains(key) {
                     try ext_seen.insert(alloc, key, 1_u32);
@@ -2493,7 +2918,7 @@ fn collect_ext_symbols(
     var ri2: usize = 0_usize;
     while ri2 < rels.len {
         let r = rels[ri2];
-        if r.kind == .Plt32 && ext_seen.contains(r.target_sym.widen.[u64]()) {
+        if reloc_is_plt_call(r.kind) && ext_seen.contains(r.target_sym.widen.[u64]()) {
             try plan.ext_is_func.insert(alloc, r.target_sym.widen.[u64](), 1_u32);
         }
         ri2 = ri2 +% 1_usize;
@@ -2863,7 +3288,7 @@ fn compute_dyn_layout(input: *ElfLinkInput, plan: *DynPlan) -> DynLayout {
     if plan.has_interp {
         cur = align_up(cur, 16_usize);
         interp_off = cur;
-        cur = cur +% INTERP_LEN;
+        cur = cur +% interp_len_for(input.mode.arch);
     }
     cur = align_up(cur, 8_usize);
     let gnu_hash_off = cur;
@@ -2891,7 +3316,7 @@ fn compute_dyn_layout(input: *ElfLinkInput, plan: *DynPlan) -> DynLayout {
     cur = cur +% input.text.len();
 
     var plt_off = cur;
-    let plt_len: usize = if plan.has_plt { 16_usize +% (plan.ext_syms.len() *% 16_usize) } else { 0_usize };
+    let plt_len: usize = if plan.has_plt { plt0_len_for(input.mode.arch) +% (plan.ext_syms.len() *% 16_usize) } else { 0_usize };
     if plan.has_plt {
         cur = align_up(cur, 16_usize);
         plt_off = cur;
@@ -3014,6 +3439,10 @@ fn apply_dyn_relocs(
     var got_index = try col.HashMap.[u32].init(alloc, 16_usize);
     errdefer got_index.destroy(alloc);
 
+    let arch = input.mode.arch;
+    let r_rel = dyn_reloc_relative_type(arch);
+    let r_glob = dyn_reloc_glob_dat_type(arch);
+    let r_abs64 = dyn_reloc_abs64_type(arch);
     let got_vaddr = lay.got_off.widen.[u64]();
     let gots = plan.got_syms.as_slice();
     try push_zeros(got_bytes, alloc, gots.len *% 8_usize);
@@ -3024,9 +3453,9 @@ fn apply_dyn_relocs(
         let slot_vaddr = got_vaddr +% (gi *% 8_usize).widen.[u64]();
         if let tv = sym_vaddrs.get(key) {
             write_u64_le_at(got_bytes.as_mut_slice(), gi *% 8_usize, tv);
-            try write_rela(rela_dyn_bytes, alloc, slot_vaddr, 0_u32, R_X86_64_RELATIVE, tv.bitcast.[i64]());
+            try write_rela(rela_dyn_bytes, alloc, slot_vaddr, 0_u32, r_rel, tv.bitcast.[i64]());
         } else if let didx = plan.ext_dynsym_idx.get(key) {
-            try write_rela(&mut rela_oth_bytes, alloc, slot_vaddr, didx, R_X86_64_GLOB_DAT, 0_i64);
+            try write_rela(&mut rela_oth_bytes, alloc, slot_vaddr, didx, r_glob, 0_i64);
         } else {
             try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved GOT symbol `", interner.get(sid), "`");
             got_index.destroy(alloc);
@@ -3071,12 +3500,12 @@ fn apply_dyn_relocs(
                     let val = tv +% r.addend.bitcast.[u64]();
                     ok = try write_abs64_sec(alloc, scratch, r.section, false, off, val, err_msg);
                     if ok {
-                        try write_rela(rela_dyn_bytes, alloc, place_vaddr, 0_u32, R_X86_64_RELATIVE, val.bitcast.[i64]());
+                        try write_rela(rela_dyn_bytes, alloc, place_vaddr, 0_u32, r_rel, val.bitcast.[i64]());
                     }
                 } else if let didx = plan.ext_dynsym_idx.get(key) {
                     ok = try write_abs64_sec(alloc, scratch, r.section, false, off, 0_u64, err_msg);
                     if ok {
-                        try write_rela(&mut rela_oth_bytes, alloc, place_vaddr, didx, R_X86_64_64, r.addend);
+                        try write_rela(&mut rela_oth_bytes, alloc, place_vaddr, didx, r_abs64, r.addend);
                     }
                 } else {
                     try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
@@ -3094,6 +3523,120 @@ fn apply_dyn_relocs(
             }
             .TpOff32 => {
                 ok = try patch_tpoff32_sec(alloc, scratch, r.section, false, off, tls_offsets, r.target_sym, r.addend, tls_aligned_memsz, interner, err_msg);
+            }
+            .A64Call26 => {
+                let pv = lay.addrs.text +% r.offset;
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_a64_branch26_buf(alloc, scratch.text.as_mut_slice(), off, pv, tv, r.addend, sbytes, err_msg);
+                } else if let plt_stub = ext_plt_vaddr.get(key) {
+                    ok = try patch_a64_branch26_buf(alloc, scratch.text.as_mut_slice(), off, pv, plt_stub, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .A64Jump26 => {
+                let pv = lay.addrs.text +% r.offset;
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_a64_branch26_buf(alloc, scratch.text.as_mut_slice(), off, pv, tv, r.addend, sbytes, err_msg);
+                } else if let plt_stub = ext_plt_vaddr.get(key) {
+                    ok = try patch_a64_branch26_buf(alloc, scratch.text.as_mut_slice(), off, pv, plt_stub, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .A64Adrp21 => {
+                let pv = lay.addrs.text +% r.offset;
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_a64_adrp21_buf(alloc, scratch.text.as_mut_slice(), off, pv, tv, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .A64AddLo12 => {
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_a64_lo12_buf(alloc, scratch.text.as_mut_slice(), off, tv, r.addend, 0_u32, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .A64Ldst64Lo12 => {
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_a64_lo12_buf(alloc, scratch.text.as_mut_slice(), off, tv, r.addend, 3_u32, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .A64AdrpGot21 => {
+                let pv = lay.addrs.text +% r.offset;
+                if let slot_i = got_index.get(key) {
+                    let slot_vaddr = got_vaddr +% (slot_i.widen.[u64]() *% 8_u64);
+                    ok = try patch_a64_adrp21_buf(alloc, scratch.text.as_mut_slice(), off, pv, slot_vaddr, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: missing GOT slot for `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .A64Ld64GotLo12 => {
+                if let slot_i = got_index.get(key) {
+                    let slot_vaddr = got_vaddr +% (slot_i.widen.[u64]() *% 8_u64);
+                    ok = try patch_a64_lo12_buf(alloc, scratch.text.as_mut_slice(), off, slot_vaddr, r.addend, 3_u32, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: missing GOT slot for `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .A64TpRelHi12 => {
+                ok = try patch_a64_tprel_buf(alloc, scratch.text.as_mut_slice(), off, tls_offsets, r.target_sym, r.addend, true, interner, err_msg);
+            }
+            .A64TpRelLo12 => {
+                ok = try patch_a64_tprel_buf(alloc, scratch.text.as_mut_slice(), off, tls_offsets, r.target_sym, r.addend, false, interner, err_msg);
+            }
+            .RvCallPlt => {
+                let pv = lay.addrs.text +% r.offset;
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_rv_pair_i_buf(alloc, scratch.text.as_mut_slice(), off, pv, tv, r.addend, sbytes, err_msg);
+                } else if let plt_stub = ext_plt_vaddr.get(key) {
+                    ok = try patch_rv_pair_i_buf(alloc, scratch.text.as_mut_slice(), off, pv, plt_stub, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .RvJump20 => {
+                let pv = lay.addrs.text +% r.offset;
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_rv_jump20_buf(alloc, scratch.text.as_mut_slice(), off, pv, tv, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .RvPcrelPairI => {
+                let pv = lay.addrs.text +% r.offset;
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_rv_pair_i_buf(alloc, scratch.text.as_mut_slice(), off, pv, tv, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .RvGotPair => {
+                let pv = lay.addrs.text +% r.offset;
+                if let slot_i = got_index.get(key) {
+                    let slot_vaddr = got_vaddr +% (slot_i.widen.[u64]() *% 8_u64);
+                    ok = try patch_rv_pair_i_buf(alloc, scratch.text.as_mut_slice(), off, pv, slot_vaddr, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: missing GOT slot for `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .RvTprelPair => {
+                ok = try patch_rv_tprel_pair_buf(alloc, scratch.text.as_mut_slice(), off, tls_offsets, r.target_sym, r.addend, interner, err_msg);
             }
         }
         if !ok {
@@ -3154,6 +3697,7 @@ fn build_dynamic_section(
 
 fn push_dyn_shdrs_seg01(
     alloc: *mut AllocCap,
+    arch: target.TargetArch,
     plan: *DynPlan,
     lay: *DynLayout,
     text_len: usize,
@@ -3163,7 +3707,7 @@ fn push_dyn_shdrs_seg01(
 ) -> !OutOfMemory {
     if plan.has_interp {
         let n = (try push_cstr(shstrtab, alloc, ".interp".as_bytes())).trunc.[u32]();
-        try shdrs.push(alloc, Shdr.{ name: n, kind: SHT_PROGBITS, flags: SHF_ALLOC, addr: lay.interp_off.widen.[u64](), offset: lay.interp_off.widen.[u64](), size: INTERP_LEN.widen.[u64](), link: 0_u32, info: 0_u32, addralign: 1_u64, entsize: 0_u64 });
+        try shdrs.push(alloc, Shdr.{ name: n, kind: SHT_PROGBITS, flags: SHF_ALLOC, addr: lay.interp_off.widen.[u64](), offset: lay.interp_off.widen.[u64](), size: interp_len_for(arch).widen.[u64](), link: 0_u32, info: 0_u32, addralign: 1_u64, entsize: 0_u64 });
     }
     let n_gh = (try push_cstr(shstrtab, alloc, ".gnu.hash".as_bytes())).trunc.[u32]();
     try shdrs.push(alloc, Shdr.{ name: n_gh, kind: SHT_GNU_HASH, flags: SHF_ALLOC, addr: lay.gnu_hash_off.widen.[u64](), offset: lay.gnu_hash_off.widen.[u64](), size: plan.gnu_hash_bytes.len().widen.[u64](), link: plan.dynsym_shndx.widen.[u32](), info: 0_u32, addralign: 8_u64, entsize: 0_u64 });
@@ -3234,6 +3778,7 @@ fn push_dyn_shdrs_seg2(
 
 fn emit_dyn_phdrs(
     alloc: *mut AllocCap,
+    arch: target.TargetArch,
     plan: *DynPlan,
     lay: *DynLayout,
     tdata_len: usize,
@@ -3245,7 +3790,7 @@ fn emit_dyn_phdrs(
     try write_phdr(&mut phdrs, alloc, PT_PHDR, PF_R, ph_off, ph_off, ph_off, ph_bytes, ph_bytes, 8_u64);
     if plan.has_interp {
         let ioff = lay.interp_off.widen.[u64]();
-        let ilen = INTERP_LEN.widen.[u64]();
+        let ilen = interp_len_for(arch).widen.[u64]();
         try write_phdr(&mut phdrs, alloc, PT_INTERP, PF_R, ioff, ioff, ioff, ilen, ilen, 1_u64);
     }
     let s0 = lay.seg0_filesz.widen.[u64]();
@@ -3335,6 +3880,7 @@ fn build_plt_and_apply_dyn_relocs(
         let exts = plan.ext_syms.as_slice();
         let ok_plt = try build_plt_and_got_plt(
             alloc,
+            input.mode.arch,
             lay.plt_off.widen.[u64](),
             lay.got_plt_off.widen.[u64](),
             lay.dynamic_off.widen.[u64](),
@@ -3347,6 +3893,8 @@ fn build_plt_and_apply_dyn_relocs(
             ext_plt_vaddr.destroy(alloc);
             return false;
         }
+        let p0_len = plt0_len_for(input.mode.arch);
+        let r_jslot = dyn_reloc_jump_slot_type(input.mode.arch);
         var ei: usize = 0_usize;
         while ei < exts.len {
             let sid = exts[ei];
@@ -3355,8 +3903,8 @@ fn build_plt_and_apply_dyn_relocs(
                 didx = d;
             }
             let slot_vaddr = lay.got_plt_off.widen.[u64]() +% ((3_usize +% ei) *% 8_usize).widen.[u64]();
-            try write_rela(&mut art.rela_plt, alloc, slot_vaddr, didx, R_X86_64_JUMP_SLOT, 0_i64);
-            try ext_plt_vaddr.insert(alloc, sid.widen.[u64](), lay.plt_off.widen.[u64]() +% ((1_usize +% ei) *% 16_usize).widen.[u64]());
+            try write_rela(&mut art.rela_plt, alloc, slot_vaddr, didx, r_jslot, 0_i64);
+            try ext_plt_vaddr.insert(alloc, sid.widen.[u64](), lay.plt_off.widen.[u64]() +% (p0_len +% (ei *% 16_usize)).widen.[u64]());
             ei = ei +% 1_usize;
         }
     }
@@ -3410,6 +3958,7 @@ fn build_dyn_artifacts(
 
 fn assemble_dyn_loaded_image(
     alloc: *mut AllocCap,
+    arch: target.TargetArch,
     plan: *DynPlan,
     lay: *DynLayout,
     scratch: *RelocScratch,
@@ -3422,7 +3971,7 @@ fn assemble_dyn_loaded_image(
 
     let dst = out.as_mut_slice();
     if plan.has_interp {
-        copy_into(dst, lay.interp_off, "/lib64/ld-linux-x86-64.so.2".as_bytes());
+        copy_interp_for(dst, lay.interp_off, arch);
     }
     copy_into(dst, lay.gnu_hash_off, plan.gnu_hash_bytes.as_slice());
     copy_into(dst, lay.dynsym_off, art.dynsym.as_slice());
@@ -3458,7 +4007,7 @@ fn finalize_dyn_elf(
     interner: *span.SymInterner,
 ) -> LinkedElf ! OutOfMemory {
     let total_load_filesz = lay.seg2_off +% lay.seg2_filesz;
-    var out = try assemble_dyn_loaded_image(alloc, plan, lay, scratch, art);
+    var out = try assemble_dyn_loaded_image(alloc, input.mode.arch, plan, lay, scratch, art);
     errdefer out.destroy(alloc);
 
     var shstrtab = try col.DynBuf.[u8].init(alloc, 128_usize);
@@ -3468,7 +4017,7 @@ fn finalize_dyn_elf(
     errdefer shdrs.destroy(alloc);
     try shdrs.push(alloc, shdr_null());
 
-    try push_dyn_shdrs_seg01(alloc, plan, lay, scratch.text.len(), scratch.rodata.len(), &mut shstrtab, &mut shdrs);
+    try push_dyn_shdrs_seg01(alloc, input.mode.arch, plan, lay, scratch.text.len(), scratch.rodata.len(), &mut shstrtab, &mut shdrs);
     try push_dyn_shdrs_seg2(alloc, input, plan, lay, total_load_filesz, &mut shstrtab, &mut shdrs);
 
     let tail = try append_debug_and_symtab_sections(
@@ -3487,6 +4036,7 @@ fn finalize_dyn_elf(
     try stamp_ehdr(
         alloc,
         &mut out,
+        input.mode.arch,
         ET_DYN,
         entry_vaddr,
         lay.phdr_off.widen.[u64](),
@@ -3496,7 +4046,7 @@ fn finalize_dyn_elf(
         tail.shstrtab_idx,
     );
 
-    let phdrs = try emit_dyn_phdrs(alloc, plan, lay, scratch.tdata.len());
+    let phdrs = try emit_dyn_phdrs(alloc, input.mode.arch, plan, lay, scratch.tdata.len());
     errdefer phdrs.destroy(alloc);
     copy_into(out.as_mut_slice(), lay.phdr_off, phdrs.as_slice());
     phdrs.destroy(alloc);
@@ -3859,6 +4409,114 @@ fn apply_free_relocs(
             .TpOff32 => {
                 ok = try patch_tpoff32_sec(alloc, scratch, r.section, true, off, tls_offsets, r.target_sym, r.addend, tls_aligned_memsz, interner, err_msg);
             }
+            .A64Call26 => {
+                let pv = lay.addrs.text +% r.offset;
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_a64_branch26_buf(alloc, scratch.text.as_mut_slice(), off, pv, tv, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .A64Jump26 => {
+                let pv = lay.addrs.text +% r.offset;
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_a64_branch26_buf(alloc, scratch.text.as_mut_slice(), off, pv, tv, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .A64Adrp21 => {
+                let pv = lay.addrs.text +% r.offset;
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_a64_adrp21_buf(alloc, scratch.text.as_mut_slice(), off, pv, tv, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .A64AddLo12 => {
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_a64_lo12_buf(alloc, scratch.text.as_mut_slice(), off, tv, r.addend, 0_u32, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .A64Ldst64Lo12 => {
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_a64_lo12_buf(alloc, scratch.text.as_mut_slice(), off, tv, r.addend, 3_u32, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .A64AdrpGot21 => {
+                let pv = lay.addrs.text +% r.offset;
+                if let slot_i = got_index.get(key) {
+                    let slot_vaddr = got_vaddr +% (slot_i.widen.[u64]() *% 8_u64);
+                    ok = try patch_a64_adrp21_buf(alloc, scratch.text.as_mut_slice(), off, pv, slot_vaddr, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: missing GOT slot for `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .A64Ld64GotLo12 => {
+                if let slot_i = got_index.get(key) {
+                    let slot_vaddr = got_vaddr +% (slot_i.widen.[u64]() *% 8_u64);
+                    ok = try patch_a64_lo12_buf(alloc, scratch.text.as_mut_slice(), off, slot_vaddr, r.addend, 3_u32, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: missing GOT slot for `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .A64TpRelHi12 => {
+                ok = try patch_a64_tprel_buf(alloc, scratch.text.as_mut_slice(), off, tls_offsets, r.target_sym, r.addend, true, interner, err_msg);
+            }
+            .A64TpRelLo12 => {
+                ok = try patch_a64_tprel_buf(alloc, scratch.text.as_mut_slice(), off, tls_offsets, r.target_sym, r.addend, false, interner, err_msg);
+            }
+            .RvCallPlt => {
+                let pv = lay.addrs.text +% r.offset;
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_rv_pair_i_buf(alloc, scratch.text.as_mut_slice(), off, pv, tv, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .RvJump20 => {
+                let pv = lay.addrs.text +% r.offset;
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_rv_jump20_buf(alloc, scratch.text.as_mut_slice(), off, pv, tv, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .RvPcrelPairI => {
+                let pv = lay.addrs.text +% r.offset;
+                if let tv = sym_vaddrs.get(key) {
+                    ok = try patch_rv_pair_i_buf(alloc, scratch.text.as_mut_slice(), off, pv, tv, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: unresolved symbol `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .RvGotPair => {
+                let pv = lay.addrs.text +% r.offset;
+                if let slot_i = got_index.get(key) {
+                    let slot_vaddr = got_vaddr +% (slot_i.widen.[u64]() *% 8_u64);
+                    ok = try patch_rv_pair_i_buf(alloc, scratch.text.as_mut_slice(), off, pv, slot_vaddr, r.addend, sbytes, err_msg);
+                } else {
+                    try set_err_sym(err_msg, alloc, "ELF64 linker error: missing GOT slot for `", sbytes, "`");
+                    ok = false;
+                }
+            }
+            .RvTprelPair => {
+                ok = try patch_rv_tprel_pair_buf(alloc, scratch.text.as_mut_slice(), off, tls_offsets, r.target_sym, r.addend, interner, err_msg);
+            }
         }
         if !ok {
             got_index.destroy(alloc);
@@ -3976,6 +4634,7 @@ fn finalize_free_elf(
     try stamp_ehdr(
         alloc,
         &mut out,
+        input.mode.arch,
         ET_EXEC,
         entry_vaddr,
         lay.phdr_off.widen.[u64](),
@@ -4152,7 +4811,22 @@ fn reloc_kind_to_u8(k: RelocKind) -> u8 {
         .GotPcRel32 => { return 2_u8; }
         .Plt32 => { return 3_u8; }
         .TpOff32 => { return 4_u8; }
+        .A64Call26 => { return 5_u8; }
+        .A64Jump26 => { return 6_u8; }
+        .A64Adrp21 => { return 7_u8; }
+        .A64AddLo12 => { return 8_u8; }
+        .A64Ldst64Lo12 => { return 9_u8; }
+        .A64AdrpGot21 => { return 10_u8; }
+        .A64Ld64GotLo12 => { return 11_u8; }
+        .A64TpRelHi12 => { return 12_u8; }
+        .A64TpRelLo12 => { return 13_u8; }
+        .RvCallPlt => { return 14_u8; }
+        .RvJump20 => { return 15_u8; }
+        .RvPcrelPairI => { return 16_u8; }
+        .RvGotPair => { return 17_u8; }
+        .RvTprelPair => { return 18_u8; }
     }
+    return 0_u8;
 }
 
 fn sort_tsym_indices(syms: *[ElfSymbol], idxs: *mut [u32]) {
@@ -4283,7 +4957,7 @@ fn icf_fn_hash(
         while rk < rend && rk < trel_idxs.len {
             let ri = trel_idxs[rk].widen.[usize]();
             if ri < relocs.len {
-                let rsz: usize = if relocs[ri].kind == .Abs64 { 8_usize } else { 4_usize };
+                let rsz = reloc_patch_size(relocs[ri].kind);
                 if relocs[ri].offset.trunc.[usize]() +% rsz <= abs_o {
                     rk = rk +% 1_usize;
                 } else {
@@ -4298,7 +4972,7 @@ fn icf_fn_hash(
             let ri = trel_idxs[rk].widen.[usize]();
             if ri < relocs.len {
                 let ro = relocs[ri].offset.trunc.[usize]();
-                let rsz: usize = if relocs[ri].kind == .Abs64 { 8_usize } else { 4_usize };
+                let rsz = reloc_patch_size(relocs[ri].kind);
                 if abs_o >= ro && abs_o < ro +% rsz {
                     masked = true;
                 }
@@ -4388,7 +5062,7 @@ fn icf_fns_equal(
         while rk < rend_a && rk < trel_idxs.len {
             let idx_r = trel_idxs[rk].widen.[usize]();
             if idx_r < relocs.len {
-                let rsz: usize = if relocs[idx_r].kind == .Abs64 { 8_usize } else { 4_usize };
+                let rsz = reloc_patch_size(relocs[idx_r].kind);
                 if relocs[idx_r].offset.trunc.[usize]() +% rsz <= abs_a {
                     rk = rk +% 1_usize;
                 } else {
@@ -4403,7 +5077,7 @@ fn icf_fns_equal(
             let idx_r = trel_idxs[rk].widen.[usize]();
             if idx_r < relocs.len {
                 let ro = relocs[idx_r].offset.trunc.[usize]();
-                let rsz: usize = if relocs[idx_r].kind == .Abs64 { 8_usize } else { 4_usize };
+                let rsz = reloc_patch_size(relocs[idx_r].kind);
                 if abs_a >= ro && abs_a < ro +% rsz {
                     masked = true;
                 }
@@ -4733,7 +5407,9 @@ pub fn gc_and_icf_link_input(
                             let r = rels_ro[ridx];
                             if let tfi = sym_to_fn.get(r.target_sym.widen.[u64]()) {
                                 var is_direct_call_or_jmp = false;
-                                if (r.kind == .Rel32 || r.kind == .Plt32) && r.addend == 0_i64 && r.offset > 0_u64 {
+                                if r.kind == .A64Call26 || r.kind == .A64Jump26 || r.kind == .RvCallPlt || r.kind == .RvJump20 {
+                                    is_direct_call_or_jmp = r.addend == 0_i64;
+                                } else if (r.kind == .Rel32 || r.kind == .Plt32) && r.addend == 0_i64 && r.offset > 0_u64 {
                                     let prev_o = (r.offset -% 1_u64).trunc.[usize]();
                                     if prev_o < text_ro.len {
                                         let op = text_ro[prev_o];

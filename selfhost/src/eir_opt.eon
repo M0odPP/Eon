@@ -16828,8 +16828,9 @@ fn run_opt_stage1_batched(
     var s1_eir = try eir.EirProgram.init(alloc);
     errdefer s1_eir.destroy(alloc);
     try eir.copy_program_globals(alloc, eir_prog, &mut s1_eir);
-    let chunk_sz: usize = 256_usize;
+    let chunk_sz: usize = 128_usize;
     var s1_c0: usize = 0_usize;
+    var s1_reclaim_acc: usize = 0_usize;
     while s1_c0 < nfns && !failed_oom {
         var s1_c1 = s1_c0 +% chunk_sz;
         if s1_c1 > nfns {
@@ -16864,6 +16865,12 @@ fn run_opt_stage1_batched(
             try release_all_opt_workers(
                 alloc, n_workers, w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11,
             );
+            eir_prog.clear_fn_body_ranges(s1_c0, s1_c1);
+            s1_reclaim_acc = s1_reclaim_acc +% (s1_c1 -% s1_c0);
+            if s1_reclaim_acc >= 1024_usize && s1_c1 < nfns {
+                try eir_prog.compact_pools_inplace(alloc);
+                s1_reclaim_acc = 0_usize;
+            }
         }
         s1_c0 = s1_c1;
     }
@@ -17098,7 +17105,7 @@ fn optimize_program_parallel(
             if !wave_fns.is_empty() {
                 sort_work_order_desc(wave_fns.as_mut_slice(), fn_sizes.as_slice());
                 let w_total = wave_fns.len();
-                let w_chunk: usize = 256_usize;
+                let w_chunk: usize = 64_usize;
                 var w_c0: usize = 0_usize;
                 while w_c0 < w_total && !failed_oom {
                     var w_c1 = w_c0 +% w_chunk;
@@ -17127,6 +17134,19 @@ fn optimize_program_parallel(
                     );
                     failed_oom = any_worker_oom(&w0, &w1, &w2, &w3, &w4, &w5, &w6, &w7, &w8, &w9, &w10, &w11);
                     if !failed_oom {
+                        let add_insts = w0.out.funcs.insts.len() +% w1.out.funcs.insts.len()
+                            +% w2.out.funcs.insts.len() +% w3.out.funcs.insts.len()
+                            +% w4.out.funcs.insts.len() +% w5.out.funcs.insts.len()
+                            +% w6.out.funcs.insts.len() +% w7.out.funcs.insts.len()
+                            +% w8.out.funcs.insts.len() +% w9.out.funcs.insts.len()
+                            +% w10.out.funcs.insts.len() +% w11.out.funcs.insts.len();
+                        if eir_prog.funcs.insts.len() +% add_insts > eir_prog.funcs.insts.cap() {
+                            try eir_prog.compact_insts_and_flags_inplace(alloc);
+                            let need_insts = eir_prog.funcs.insts.len() +% add_insts;
+                            if need_insts > eir_prog.funcs.insts.cap() {
+                                try eir_prog.funcs.insts.reserve_slack(alloc, need_insts);
+                            }
+                        }
                         try commit_inline_wave_results(
                             alloc, eir_prog, w_batch, fn_loc.as_mut_slice(), new_sizes.as_slice(), &mut fn_sizes, &mut merge_sc,
                             &w0, &w1, &w2, &w3, &w4, &w5, &w6, &w7, &w8, &w9, &w10, &w11,
@@ -17136,7 +17156,7 @@ fn optimize_program_parallel(
                             &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5,
                             &mut w6, &mut w7, &mut w8, &mut w9, &mut w10, &mut w11,
                         );
-                        if eir_prog.funcs.insts.len() > live_insts_est +% (live_insts_est >> 2_usize) +% 65536_usize {
+                        if eir_prog.funcs.insts.len() > live_insts_est +% (live_insts_est >> 3_usize) +% 32768_usize {
                             try eir_prog.compact_pools_inplace(alloc);
                             live_insts_est = eir_prog.funcs.insts.len();
                         }
@@ -17145,9 +17165,6 @@ fn optimize_program_parallel(
                 }
             }
             cur_w = cur_w +% 1_u32;
-        }
-        if !failed_oom && eir_prog.funcs.insts.len() > live_insts_est +% 65536_usize {
-            try eir_prog.compact_pools_inplace(alloc);
         }
 
         wave_fns.destroy(alloc);
@@ -17175,8 +17192,9 @@ fn optimize_program_parallel(
         var s3_eir = try eir.EirProgram.init(alloc);
         errdefer s3_eir.destroy(alloc);
         try eir.copy_program_globals(alloc, eir_prog, &mut s3_eir);
-        let chunk_sz3: usize = 256_usize;
+        let chunk_sz3: usize = 128_usize;
         var c0: usize = 0_usize;
+        var s3_reclaim_acc: usize = 0_usize;
         while c0 < nfns && !failed_oom {
             var c1 = c0 +% chunk_sz3;
             if c1 > nfns {
@@ -17214,6 +17232,12 @@ fn optimize_program_parallel(
                     &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5,
                     &mut w6, &mut w7, &mut w8, &mut w9, &mut w10, &mut w11,
                 );
+                eir_prog.clear_fn_body_ranges(c0, c1);
+                s3_reclaim_acc = s3_reclaim_acc +% (c1 -% c0);
+                if s3_reclaim_acc >= 1024_usize && c1 < nfns {
+                    try eir_prog.compact_pools_inplace(alloc);
+                    s3_reclaim_acc = 0_usize;
+                }
             }
             c0 = c1;
         }

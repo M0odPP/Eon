@@ -1,0 +1,1220 @@
+module eonc.mach_opt_a64;
+
+import core.col;
+import eonc.span;
+import eonc.ast;
+import eonc.x64_asm;
+import eonc.a64_asm;
+import eonc.elf64;
+import eonc.mach_ir;
+
+// ============================================================================
+// Post-RA AArch64 Peephole Optimizer & `MachFunc` -> `A64Buf` Machine Emitter
+// ============================================================================
+
+pub linear struct A64EmitOut {
+    pub ok: bool;
+    pub own_stack_bytes: u64;
+    pub code: col.DynBuf[u8];
+    pub relocs: col.DynBuf[a64_asm.A64Reloc];
+    pub rodata_items: col.DynBuf[mach_ir.MachRodataItem];
+    pub rodata_bytes: col.DynBuf[u8];
+    pub rodata_relocs: col.DynBuf[mach_ir.MachRodataReloc];
+    pub used_helpers: col.DynBuf[u32];
+    pub line_entries: col.DynBuf[elf64.LineEntry];
+}
+
+impl A64EmitOut {
+    pub fn init(alloc: *mut AllocCap) -> A64EmitOut ! OutOfMemory {
+        let code = try col.DynBuf.[u8].init(alloc, 128_usize);
+        errdefer code.destroy(alloc);
+        let relocs = try col.DynBuf.[a64_asm.A64Reloc].init(alloc, 8_usize);
+        errdefer relocs.destroy(alloc);
+        let rodata_items = try col.DynBuf.[mach_ir.MachRodataItem].init(alloc, 4_usize);
+        errdefer rodata_items.destroy(alloc);
+        let rodata_bytes = try col.DynBuf.[u8].init(alloc, 32_usize);
+        errdefer rodata_bytes.destroy(alloc);
+        let rodata_relocs = try col.DynBuf.[mach_ir.MachRodataReloc].init(alloc, 4_usize);
+        errdefer rodata_relocs.destroy(alloc);
+        let used_helpers = try col.DynBuf.[u32].init(alloc, 4_usize);
+        errdefer used_helpers.destroy(alloc);
+        let line_entries = try col.DynBuf.[elf64.LineEntry].init(alloc, 16_usize);
+        errdefer line_entries.destroy(alloc);
+        return A64EmitOut.{
+            ok: false,
+            own_stack_bytes: 0_u64,
+            code: code,
+            relocs: relocs,
+            rodata_items: rodata_items,
+            rodata_bytes: rodata_bytes,
+            rodata_relocs: rodata_relocs,
+            used_helpers: used_helpers,
+            line_entries: line_entries,
+        };
+    }
+
+    pub fn destroy(self: A64EmitOut, alloc: *mut AllocCap) {
+        let A64EmitOut.{
+            ok: _,
+            own_stack_bytes: _,
+            code,
+            relocs,
+            rodata_items,
+            rodata_bytes,
+            rodata_relocs,
+            used_helpers,
+            line_entries,
+        } = self;
+        code.destroy(alloc);
+        relocs.destroy(alloc);
+        rodata_items.destroy(alloc);
+        rodata_bytes.destroy(alloc);
+        rodata_relocs.destroy(alloc);
+        used_helpers.destroy(alloc);
+        line_entries.destroy(alloc);
+    }
+}
+
+fn align_up_usize(val: usize, align: usize) -> usize {
+    if align <= 1_usize {
+        return val;
+    }
+    let mask = align -% 1_usize;
+    return (val +% mask) & (~mask);
+}
+
+pub fn cond_x64_to_a64(cc: x64_asm.Cond) -> a64_asm.A64Cond {
+    match cc {
+        .E => { return .Eq; }
+        .Ne => { return .Ne; }
+        .B => { return .Cc; }
+        .Ae => { return .Cs; }
+        .Be => { return .Ls; }
+        .A => { return .Hi; }
+        .L => { return .Lt; }
+        .Ge => { return .Ge; }
+        .Le => { return .Le; }
+        .G => { return .Gt; }
+        .S => { return .Mi; }
+        .Ns => { return .Pl; }
+        .O => { return .Vs; }
+        .No => { return .Vc; }
+        .P => { return .Vs; }
+        .Np => { return .Vc; }
+    }
+    return .Al;
+}
+
+fn invert_x64_cond(cc: x64_asm.Cond) -> x64_asm.Cond {
+    match cc {
+        .O => { return .No; }
+        .No => { return .O; }
+        .B => { return .Ae; }
+        .Ae => { return .B; }
+        .E => { return .Ne; }
+        .Ne => { return .E; }
+        .Be => { return .A; }
+        .A => { return .Be; }
+        .S => { return .Ns; }
+        .Ns => { return .S; }
+        .P => { return .Np; }
+        .Np => { return .P; }
+        .L => { return .Ge; }
+        .Ge => { return .L; }
+        .Le => { return .G; }
+        .G => { return .Le; }
+    }
+    return .E;
+}
+
+// ============================================================================
+// Section 1: Post-RA AArch64 Peephole Pass (Self-Move & Fallthrough Elision)
+// ============================================================================
+
+fn build_emit_order(
+    alloc: *mut AllocCap,
+    mf: *mach_ir.MachFunc,
+    out: *mut col.DynBuf[u32],
+) -> !OutOfMemory {
+    out.clear();
+    let n_blocks = mf.blocks.len();
+    if n_blocks == 0_usize {
+        return;
+    }
+    let rpo = mf.rpo.as_slice();
+    if rpo.len > 0_usize {
+        var seen = try col.BitSet.init(alloc, n_blocks);
+        errdefer seen.destroy(alloc);
+        let eb = mf.entry_block;
+        let eb_idx = eb.widen.[usize]();
+        if eb_idx < n_blocks {
+            seen.set(eb_idx);
+            try out.push(alloc, eb);
+        }
+        var ri: usize = 0_usize;
+        while ri < rpo.len {
+            let bb = rpo[ri];
+            let bidx = bb.widen.[usize]();
+            if bidx < n_blocks && !seen.test(bidx) {
+                seen.set(bidx);
+                try out.push(alloc, bb);
+            }
+            ri = ri +% 1_usize;
+        }
+        seen.destroy(alloc);
+        return;
+    }
+    var bi: usize = 0_usize;
+    while bi < n_blocks {
+        try out.push(alloc, bi.trunc.[u32]());
+        bi = bi +% 1_usize;
+    }
+    return;
+}
+
+pub fn peephole_a64(alloc: *mut AllocCap, mf: *mut mach_ir.MachFunc) -> !OutOfMemory {
+    let n_blocks = mf.blocks.len();
+    if n_blocks == 0_usize {
+        return;
+    }
+    var order = try col.DynBuf.[u32].init(alloc, n_blocks);
+    errdefer order.destroy(alloc);
+    try build_emit_order(alloc, mf, &mut order);
+
+    var new_insts = try col.DynBuf.[mach_ir.MachInst].init(alloc, mf.insts.len());
+    errdefer new_insts.destroy(alloc);
+    var new_ranges = try col.DynBuf.[ast.IdRange].init(alloc, n_blocks);
+    errdefer new_ranges.destroy(alloc);
+    var bi0: usize = 0_usize;
+    while bi0 < n_blocks {
+        try new_ranges.push(alloc, ast.range_empty());
+        bi0 = bi0 +% 1_usize;
+    }
+
+    let ord_s = order.as_slice();
+    let bs_ro = mf.blocks.as_slice();
+    var oi: usize = 0_usize;
+    while oi < ord_s.len {
+        let bb = ord_s[oi];
+        let bidx = bb.widen.[usize]();
+        let next_lbl: u32 = if oi +% 1_usize < ord_s.len {
+            let nidx = ord_s[oi +% 1_usize].widen.[usize]();
+            if nidx < bs_ro.len { bs_ro[nidx].label } else { mach_ir.LABEL_NONE }
+        } else {
+            mach_ir.LABEL_NONE
+        };
+
+        let start = new_insts.len().trunc.[u32]();
+        let blk_insts = mf.block_insts(bb);
+        var ki: usize = 0_usize;
+        while ki < blk_insts.len {
+            let cur = blk_insts[ki];
+            // 1. Elide self-moves
+            if (cur.op == .Mov || cur.op == .Copy || cur.op == .VMovVecReg)
+                && cur.dst_phys < 32_u8 && cur.dst_phys == cur.src0_phys
+            {
+                ki = ki +% 1_usize;
+                continue;
+            }
+            // 2. Elide fallthrough Jmp to immediately following block
+            if cur.op == .Jmp && cur.mem.label == next_lbl && ki +% 1_usize == blk_insts.len {
+                ki = ki +% 1_usize;
+                continue;
+            }
+            // 3. Invert `Jcc next_lbl; Jmp target` -> `Jcc !cc, target`
+            if cur.op == .Jcc && cur.mem.label == next_lbl && ki +% 2_usize == blk_insts.len {
+                let nxt = blk_insts[ki +% 1_usize];
+                if nxt.op == .Jmp {
+                    let cur_cc = cur.cc;
+                    var inv = cur;
+                    inv.cc = invert_x64_cond(cur_cc);
+                    inv.mem.label = nxt.mem.label;
+                    try new_insts.push(alloc, inv);
+                    ki = ki +% 2_usize;
+                    continue;
+                }
+            }
+            // 4. Elide redundant store immediately followed by identical 8B stack reload into same reg
+            if cur.op == .Load && cur.mem.kind == .StackSlot && cur.size_bytes == 8_u8 {
+                let ns = new_insts.as_slice();
+                if ns.len > start.widen.[usize]() && ns.len > 0_usize {
+                    let prev = ns[ns.len - 1_usize];
+                    if prev.op == .Store && prev.mem.kind == .StackSlot && prev.size_bytes == 8_u8
+                        && prev.mem.disp == cur.mem.disp && prev.src0_phys == cur.dst_phys
+                    {
+                        ki = ki +% 1_usize;
+                        continue;
+                    }
+                }
+            }
+            try new_insts.push(alloc, cur);
+            ki = ki +% 1_usize;
+        }
+        let end = new_insts.len().trunc.[u32]();
+        let nr_m = new_ranges.as_mut_slice();
+        if bidx < nr_m.len {
+            nr_m[bidx] = ast.range_new(start, end -% start);
+        }
+        oi = oi +% 1_usize;
+    }
+
+    let nr_ro = new_ranges.as_slice();
+    let bs_m = mf.blocks.as_mut_slice();
+    var bi1: usize = 0_usize;
+    while bi1 < bs_m.len && bi1 < nr_ro.len {
+        bs_m[bi1].insts = nr_ro[bi1];
+        bi1 = bi1 +% 1_usize;
+    }
+    mf.replace_insts(alloc, new_insts);
+    new_ranges.destroy(alloc);
+    order.destroy(alloc);
+    return;
+}
+
+// ============================================================================
+// Section 2: AAPCS64 Frame Layout, Prologue & Flag-Preserving Epilogue
+// ============================================================================
+//
+// Stack Layout (16-byte aligned SP throughout body):
+//   [x29 + 16 ..]             : caller overflow arguments (exact match with x86_64 `[rbp + 16]`!)
+//   [x29 + 0  .. x29 + 16)    : saved x29 (FP), x30 (LR)
+//   [x29 - local_bytes .. x29): local & spill StackSlots (`[x29 + disp]` where `disp < 0`)
+//   [sp .. sp + saved_bytes)  : callee-saved GPRs (x19..x28) & callee-saved FP regs (d8..d15)
+
+struct A64FrameLayout {
+    is_naked: bool;
+    needs_frame: bool;
+    local_bytes: usize;
+    saved_gpr_count: usize;
+    saved_gprs: [12]u8;
+    saved_vec_count: usize;
+    saved_vecs: [8]u8;
+    saved_bytes: usize;
+    total_sub: usize;
+}
+
+fn plan_a64_frame(mf: *mach_ir.MachFunc) -> A64FrameLayout {
+    var fl = A64FrameLayout.{
+        is_naked: mf.is_naked,
+        needs_frame: false,
+        local_bytes: 0_usize,
+        saved_gpr_count: 0_usize,
+        saved_gprs: [0_u8; 12],
+        saved_vec_count: 0_usize,
+        saved_vecs: [0_u8; 8],
+        saved_bytes: 0_usize,
+        total_sub: 0_usize,
+    };
+    if mf.is_naked {
+        return fl;
+    }
+    // Collect callee-saved GPRs in x19..x28
+    var r: u8 = 19_u8;
+    while r <= 28_u8 {
+        if (mf.used_callee_gprs & mach_ir.phys_bit(r)) != 0_u32 {
+            if fl.saved_gpr_count < 12_usize {
+                fl.saved_gprs[fl.saved_gpr_count] = r;
+                fl.saved_gpr_count = fl.saved_gpr_count +% 1_usize;
+            }
+        }
+        r = r +% 1_u8;
+    }
+    // Collect callee-saved FP regs in d8..d15
+    var v: u8 = 8_u8;
+    while v <= 15_u8 {
+        if (mf.used_callee_vecs & mach_ir.phys_bit(v)) != 0_u32 {
+            if fl.saved_vec_count < 8_usize {
+                fl.saved_vecs[fl.saved_vec_count] = v;
+                fl.saved_vec_count = fl.saved_vec_count +% 1_usize;
+            }
+        }
+        v = v +% 1_u8;
+    }
+
+    fl.local_bytes = align_up_usize(mf.frame_cursor, 16_usize);
+    let gpr_bytes = align_up_usize(fl.saved_gpr_count *% 8_usize, 16_usize);
+    let vec_bytes = align_up_usize(fl.saved_vec_count *% 8_usize, 16_usize);
+    fl.saved_bytes = gpr_bytes +% vec_bytes;
+    fl.total_sub = fl.local_bytes +% fl.saved_bytes;
+    fl.needs_frame = !mf.is_leaf || fl.total_sub > 0_usize;
+    return fl;
+}
+
+fn emit_a64_prologue(
+    alloc: *mut AllocCap,
+    buf: *mut a64_asm.A64Buf,
+    fl: *A64FrameLayout,
+) -> !OutOfMemory {
+    if fl.is_naked || !fl.needs_frame {
+        return;
+    }
+    try buf.stp64_pre(alloc, a64_asm.X29_FP, a64_asm.X30_LR, a64_asm.SP, -16_i32);
+    try buf.mov_rr(alloc, a64_asm.X29_FP, a64_asm.SP);
+    if fl.total_sub > 0_usize {
+        try buf.add_signed_imm(alloc, a64_asm.SP, a64_asm.SP, 0_i64 -% fl.total_sub.widen.[u64]().bitcast.[i64](), a64_asm.X16);
+    }
+    var off: i32 = 0_i32;
+    let gpr_lim = if fl.saved_gpr_count <= 12_usize { fl.saved_gpr_count } else { 12_usize };
+    var i: usize = 0_usize;
+    while i + 1_usize < gpr_lim {
+        try buf.stp64(alloc, fl.saved_gprs[i], fl.saved_gprs[i + 1_usize], a64_asm.SP, off);
+        off = off +% 16_i32;
+        i = i + 2_usize;
+    }
+    if i < gpr_lim {
+        try buf.store_mem(alloc, a64_asm.SP, off, fl.saved_gprs[i], 8_u8, a64_asm.X16);
+        off = off +% 16_i32;
+    }
+    let vec_lim = if fl.saved_vec_count <= 8_usize { fl.saved_vec_count } else { 8_usize };
+    var vi: usize = 0_usize;
+    while vi + 1_usize < vec_lim {
+        try buf.stp_d(alloc, fl.saved_vecs[vi], fl.saved_vecs[vi + 1_usize], a64_asm.SP, off);
+        off = off +% 16_i32;
+        vi = vi + 2_usize;
+    }
+    if vi < vec_lim {
+        try buf.store_vec_mem(alloc, a64_asm.SP, off, fl.saved_vecs[vi], 8_u8, a64_asm.X16);
+    }
+    return;
+}
+
+fn emit_a64_epilogue(
+    alloc: *mut AllocCap,
+    buf: *mut a64_asm.A64Buf,
+    fl: *A64FrameLayout,
+) -> !OutOfMemory {
+    if fl.is_naked || !fl.needs_frame {
+        return;
+    }
+    var off: i32 = 0_i32;
+    let gpr_lim = if fl.saved_gpr_count <= 12_usize { fl.saved_gpr_count } else { 12_usize };
+    var i: usize = 0_usize;
+    while i + 1_usize < gpr_lim {
+        try buf.ldp64(alloc, fl.saved_gprs[i], fl.saved_gprs[i + 1_usize], a64_asm.SP, off);
+        off = off +% 16_i32;
+        i = i + 2_usize;
+    }
+    if i < gpr_lim {
+        try buf.load_mem(alloc, fl.saved_gprs[i], a64_asm.SP, off, 8_u8, false, a64_asm.X16);
+        off = off +% 16_i32;
+    }
+    let vec_lim = if fl.saved_vec_count <= 8_usize { fl.saved_vec_count } else { 8_usize };
+    var vi: usize = 0_usize;
+    while vi + 1_usize < vec_lim {
+        try buf.ldp_d(alloc, fl.saved_vecs[vi], fl.saved_vecs[vi + 1_usize], a64_asm.SP, off);
+        off = off +% 16_i32;
+        vi = vi + 2_usize;
+    }
+    if vi < vec_lim {
+        try buf.load_vec_mem(alloc, fl.saved_vecs[vi], a64_asm.SP, off, 8_u8, a64_asm.X16);
+    }
+    if fl.total_sub > 0_usize {
+        try buf.mov_rr(alloc, a64_asm.SP, a64_asm.X29_FP);
+    }
+    try buf.ldp64_post(alloc, a64_asm.X29_FP, a64_asm.X30_LR, a64_asm.SP, 16_i32);
+    return;
+}
+
+// ============================================================================
+// Section 3: Memory Address Materialization & Instruction Emission
+// ============================================================================
+
+fn map_label(lbl_map: *[u32], lbl: u32) -> u32 {
+    let idx = lbl.widen.[usize]();
+    if idx < lbl_map.len {
+        return lbl_map[idx];
+    }
+    return 0_u32;
+}
+
+fn mem_base_a64(m: *mach_ir.MemAddr) -> u8 {
+    if m.kind == .StackSlot {
+        return a64_asm.X29_FP;
+    }
+    return m.base_phys;
+}
+
+/// Materializes effective address of `m` into `dst` (clobbering `scratch` if needed; `dst != scratch`).
+fn emit_addr_into(
+    alloc: *mut AllocCap,
+    buf: *mut a64_asm.A64Buf,
+    lbl_map: *[u32],
+    m: *mach_ir.MemAddr,
+    dst: u8,
+    scratch: u8,
+) -> !OutOfMemory {
+    match m.kind {
+        .StackSlot => {
+            try buf.add_signed_imm(alloc, dst, a64_asm.X29_FP, m.disp.widen.[i64](), scratch);
+        }
+        .BaseDisp => {
+            try buf.add_signed_imm(alloc, dst, m.base_phys, m.disp.widen.[i64](), scratch);
+        }
+        .Sib => {
+            let sh: u8 = if m.scale == 2_u8 { 1_u8 }
+                else if m.scale == 4_u8 { 2_u8 }
+                else if m.scale == 8_u8 { 3_u8 }
+                else { 0_u8 };
+            if dst != m.base_phys && dst != m.idx_phys {
+                try buf.add_rr_lsl(alloc, true, dst, m.base_phys, m.idx_phys, sh);
+            } else {
+                try buf.add_rr_lsl(alloc, true, scratch, m.base_phys, m.idx_phys, sh);
+                try buf.mov_rr(alloc, dst, scratch);
+            }
+            if m.disp != 0_i32 {
+                try buf.add_signed_imm(alloc, dst, dst, m.disp.widen.[i64](), scratch);
+            }
+        }
+        .RipSym => {
+            try buf.lea_sym(alloc, dst, m.sym, m.disp.widen.[i64]());
+        }
+        .RipLabel => {
+            try buf.adr_label(alloc, dst, map_label(lbl_map, m.label));
+        }
+        .None => {
+            try buf.mov_imm64(alloc, dst, 0_u64);
+        }
+    }
+    return;
+}
+
+fn emit_a64_load_mem(
+    alloc: *mut AllocCap,
+    buf: *mut a64_asm.A64Buf,
+    lbl_map: *[u32],
+    rt: u8,
+    m: *mach_ir.MemAddr,
+    sz: u8,
+    signed_ext: bool,
+) -> !OutOfMemory {
+    if m.kind == .StackSlot || m.kind == .BaseDisp {
+        try buf.load_mem(alloc, rt, mem_base_a64(m), m.disp, sz, signed_ext, a64_asm.X16);
+        return;
+    }
+    try emit_addr_into(alloc, buf, lbl_map, m, a64_asm.X16, a64_asm.X17);
+    try buf.ldr_uimm(alloc, rt, a64_asm.X16, 0_u32, sz, signed_ext);
+    return;
+}
+
+fn emit_a64_store_mem(
+    alloc: *mut AllocCap,
+    buf: *mut a64_asm.A64Buf,
+    lbl_map: *[u32],
+    m: *mach_ir.MemAddr,
+    rt: u8,
+    sz: u8,
+) -> !OutOfMemory {
+    if m.kind == .StackSlot || m.kind == .BaseDisp {
+        try buf.store_mem(alloc, mem_base_a64(m), m.disp, rt, sz, a64_asm.X16);
+        return;
+    }
+    try emit_addr_into(alloc, buf, lbl_map, m, a64_asm.X16, a64_asm.X17);
+    try buf.str_uimm(alloc, rt, a64_asm.X16, 0_u32, sz);
+    return;
+}
+
+fn emit_a64_load_vec(
+    alloc: *mut AllocCap,
+    buf: *mut a64_asm.A64Buf,
+    lbl_map: *[u32],
+    vt: u8,
+    m: *mach_ir.MemAddr,
+    bytes: u8,
+) -> !OutOfMemory {
+    if m.kind == .StackSlot || m.kind == .BaseDisp {
+        try buf.load_vec_mem(alloc, vt, mem_base_a64(m), m.disp, bytes, a64_asm.X16);
+        return;
+    }
+    try emit_addr_into(alloc, buf, lbl_map, m, a64_asm.X16, a64_asm.X17);
+    try buf.load_vec_mem(alloc, vt, a64_asm.X16, 0_i32, bytes, a64_asm.X17);
+    return;
+}
+
+fn emit_a64_store_vec(
+    alloc: *mut AllocCap,
+    buf: *mut a64_asm.A64Buf,
+    lbl_map: *[u32],
+    m: *mach_ir.MemAddr,
+    vt: u8,
+    bytes: u8,
+) -> !OutOfMemory {
+    if m.kind == .StackSlot || m.kind == .BaseDisp {
+        try buf.store_vec_mem(alloc, mem_base_a64(m), m.disp, vt, bytes, a64_asm.X16);
+        return;
+    }
+    try emit_addr_into(alloc, buf, lbl_map, m, a64_asm.X16, a64_asm.X17);
+    try buf.store_vec_mem(alloc, a64_asm.X16, 0_i32, vt, bytes, a64_asm.X17);
+    return;
+}
+
+fn emit_a64_alu_imm(
+    alloc: *mut AllocCap,
+    buf: *mut a64_asm.A64Buf,
+    is64: bool,
+    op: mach_ir.MachOp,
+    rd: u8,
+    rn: u8,
+    imm: i64,
+) -> !OutOfMemory {
+    match op {
+        .AddImm => {
+            try buf.add_signed_imm(alloc, rd, rn, imm, a64_asm.X16);
+        }
+        .Add32Imm => {
+            if imm >= 0_i64 && imm <= 4095_i64 {
+                try buf.add_imm(alloc, false, false, rd, rn, imm.trunc.[u16](), false);
+            } else if imm < 0_i64 && imm >= -4095_i64 {
+                try buf.sub_imm(alloc, false, false, rd, rn, (0_i64 -% imm).trunc.[u16](), false);
+            } else {
+                try buf.mov_imm64(alloc, a64_asm.X16, imm.bitcast.[u64]());
+                try buf.add_rr(alloc, false, false, rd, rn, a64_asm.X16);
+            }
+        }
+        .SubImm => {
+            try buf.add_signed_imm(alloc, rd, rn, 0_i64 -% imm, a64_asm.X16);
+        }
+        .Sub32Imm => {
+            if imm >= 0_i64 && imm <= 4095_i64 {
+                try buf.sub_imm(alloc, false, false, rd, rn, imm.trunc.[u16](), false);
+            } else if imm < 0_i64 && imm >= -4095_i64 {
+                try buf.add_imm(alloc, false, false, rd, rn, (0_i64 -% imm).trunc.[u16](), false);
+            } else {
+                try buf.mov_imm64(alloc, a64_asm.X16, imm.bitcast.[u64]());
+                try buf.sub_rr(alloc, false, false, rd, rn, a64_asm.X16);
+            }
+        }
+        .MulImm => {
+            try buf.mov_imm64(alloc, a64_asm.X16, imm.bitcast.[u64]());
+            try buf.mul_rr(alloc, true, rd, rn, a64_asm.X16);
+        }
+        .Mul32Imm => {
+            try buf.mov_imm64(alloc, a64_asm.X16, imm.bitcast.[u64]());
+            try buf.mul_rr(alloc, false, rd, rn, a64_asm.X16);
+        }
+        .AndImm => {
+            try buf.mov_imm64(alloc, a64_asm.X16, imm.bitcast.[u64]());
+            try buf.and_rr(alloc, is64, false, rd, rn, a64_asm.X16);
+        }
+        .And32Imm => {
+            try buf.mov_imm64(alloc, a64_asm.X16, imm.bitcast.[u64]());
+            try buf.and_rr(alloc, false, false, rd, rn, a64_asm.X16);
+        }
+        .OrImm => {
+            try buf.mov_imm64(alloc, a64_asm.X16, imm.bitcast.[u64]());
+            try buf.orr_rr(alloc, is64, rd, rn, a64_asm.X16);
+        }
+        .Or32Imm => {
+            try buf.mov_imm64(alloc, a64_asm.X16, imm.bitcast.[u64]());
+            try buf.orr_rr(alloc, false, rd, rn, a64_asm.X16);
+        }
+        .XorImm => {
+            try buf.mov_imm64(alloc, a64_asm.X16, imm.bitcast.[u64]());
+            try buf.eor_rr(alloc, is64, rd, rn, a64_asm.X16);
+        }
+        .Xor32Imm => {
+            try buf.mov_imm64(alloc, a64_asm.X16, imm.bitcast.[u64]());
+            try buf.eor_rr(alloc, false, rd, rn, a64_asm.X16);
+        }
+        _ => {}
+    }
+    return;
+}
+
+fn emit_a64_inst(
+    alloc: *mut AllocCap,
+    buf: *mut a64_asm.A64Buf,
+    mf: *mach_ir.MachFunc,
+    fl: *A64FrameLayout,
+    lbl_map: *[u32],
+    jt_labels: *[u32],
+    inst: *mach_ir.MachInst,
+) -> !OutOfMemory {
+    let d = inst.dst_phys;
+    let d2 = inst.dst2_phys;
+    let s0 = if inst.tied_src0 && d < 32_u8 { d } else { inst.src0_phys };
+    let s1 = inst.src1_phys;
+    let s2 = inst.src2_phys;
+    let sz = if inst.size_bytes == 0_u8 { 8_u8 } else { inst.size_bytes };
+    let imm8 = (inst.imm & 0xFF_i64).trunc.[u8]();
+    let cc = cond_x64_to_a64(inst.cc);
+
+    match inst.op {
+        // --- Data movement ---
+        .Mov => { if d != s0 { try buf.mov_rr(alloc, d, s0); } }
+        .Copy => { if d != s0 { try buf.mov_rr(alloc, d, s0); } }
+        .Mov32 => { try buf.mov32_rr(alloc, d, s0); }
+        .MovImm => { try buf.mov_imm64(alloc, d, inst.imm.bitcast.[u64]()); }
+        .MovImm32 => { try buf.mov_imm64(alloc, d, inst.imm.bitcast.[u64]() & 0xFFFFFFFF_u64); }
+        .Lea => { try emit_addr_into(alloc, buf, lbl_map, &inst.mem, d, a64_asm.X16); }
+        .Load => { try emit_a64_load_mem(alloc, buf, lbl_map, d, &inst.mem, sz, false); }
+        .LoadSX => { try emit_a64_load_mem(alloc, buf, lbl_map, d, &inst.mem, sz, true); }
+        .Store => { try emit_a64_store_mem(alloc, buf, lbl_map, &inst.mem, s0, sz); }
+        .StoreImm => {
+            if inst.imm == 0_i64 {
+                try emit_a64_store_mem(alloc, buf, lbl_map, &inst.mem, a64_asm.XZR, sz);
+            } else {
+                try buf.mov_imm64(alloc, a64_asm.X17, inst.imm.bitcast.[u64]());
+                try emit_a64_store_mem(alloc, buf, lbl_map, &inst.mem, a64_asm.X17, sz);
+            }
+        }
+        .Extend => {
+            if inst.flag0 {
+                try buf.sxt(alloc, d, s0, sz);
+            } else {
+                try buf.uxt(alloc, d, s0, sz);
+            }
+        }
+        .Push => {
+            try buf.add_signed_imm(alloc, a64_asm.SP, a64_asm.SP, -16_i64, a64_asm.X16);
+            try buf.str_uimm(alloc, s0, a64_asm.SP, 0_u32, 8_u8);
+        }
+        .Pop => {
+            try buf.ldr_uimm(alloc, d, a64_asm.SP, 0_u32, 8_u8, false);
+            try buf.add_signed_imm(alloc, a64_asm.SP, a64_asm.SP, 16_i64, a64_asm.X16);
+        }
+        .MemCopy => {
+            // dst in src0 (X0), src in src1 (X1), count in src2 (X2)
+            let p_dst = if inst.src0_phys < 32_u8 { inst.src0_phys } else { a64_asm.X0 };
+            let p_src = if inst.src1_phys < 32_u8 { inst.src1_phys } else { a64_asm.X1 };
+            let p_cnt = if inst.src2_phys < 32_u8 { inst.src2_phys } else { a64_asm.X2 };
+            let l_lp = try buf.new_label(alloc);
+            let l_done = try buf.new_label(alloc);
+            buf.bind_label(l_lp);
+            try buf.cbz_label(alloc, true, p_cnt, l_done);
+            try buf.ldr_uimm(alloc, a64_asm.X16, p_src, 0_u32, 1_u8, false);
+            try buf.str_uimm(alloc, a64_asm.X16, p_dst, 0_u32, 1_u8);
+            try buf.add_imm(alloc, true, false, p_src, p_src, 1_u16, false);
+            try buf.add_imm(alloc, true, false, p_dst, p_dst, 1_u16, false);
+            try buf.sub_imm(alloc, true, false, p_cnt, p_cnt, 1_u16, false);
+            try buf.b_label(alloc, l_lp);
+            buf.bind_label(l_done);
+        }
+        .MemZero => {
+            let p_dst = if inst.src0_phys < 32_u8 { inst.src0_phys } else { a64_asm.X0 };
+            let p_cnt = if inst.src1_phys < 32_u8 { inst.src1_phys } else { a64_asm.X2 };
+            let l_lp = try buf.new_label(alloc);
+            let l_done = try buf.new_label(alloc);
+            buf.bind_label(l_lp);
+            try buf.cbz_label(alloc, true, p_cnt, l_done);
+            try buf.str_uimm(alloc, a64_asm.XZR, p_dst, 0_u32, 1_u8);
+            try buf.add_imm(alloc, true, false, p_dst, p_dst, 1_u16, false);
+            try buf.sub_imm(alloc, true, false, p_cnt, p_cnt, 1_u16, false);
+            try buf.b_label(alloc, l_lp);
+            buf.bind_label(l_done);
+        }
+
+        // --- GPR ALU ---
+        .Add => { try buf.add_rr(alloc, true, false, d, s0, s1); }
+        .Add32 => { try buf.add_rr(alloc, false, false, d, s0, s1); }
+        .AddImm => { try emit_a64_alu_imm(alloc, buf, true, .AddImm, d, s0, inst.imm); }
+        .Add32Imm => { try emit_a64_alu_imm(alloc, buf, false, .Add32Imm, d, s0, inst.imm); }
+        .AddMem => {
+            try emit_a64_load_mem(alloc, buf, lbl_map, a64_asm.X17, &inst.mem, 8_u8, false);
+            try buf.add_rr(alloc, true, false, d, s0, a64_asm.X17);
+        }
+        .Sub => { try buf.sub_rr(alloc, true, false, d, s0, s1); }
+        .Sub32 => { try buf.sub_rr(alloc, false, false, d, s0, s1); }
+        .SubImm => { try emit_a64_alu_imm(alloc, buf, true, .SubImm, d, s0, inst.imm); }
+        .Sub32Imm => { try emit_a64_alu_imm(alloc, buf, false, .Sub32Imm, d, s0, inst.imm); }
+        .SubMem => {
+            try emit_a64_load_mem(alloc, buf, lbl_map, a64_asm.X17, &inst.mem, 8_u8, false);
+            try buf.sub_rr(alloc, true, false, d, s0, a64_asm.X17);
+        }
+        .Mul => { try buf.mul_rr(alloc, true, d, s0, s1); }
+        .Mul32 => { try buf.mul_rr(alloc, false, d, s0, s1); }
+        .MulImm => { try emit_a64_alu_imm(alloc, buf, true, .MulImm, d, s0, inst.imm); }
+        .Mul32Imm => { try emit_a64_alu_imm(alloc, buf, false, .Mul32Imm, d, s0, inst.imm); }
+        .MulMem => {
+            try emit_a64_load_mem(alloc, buf, lbl_map, a64_asm.X17, &inst.mem, 8_u8, false);
+            try buf.mul_rr(alloc, true, d, s0, a64_asm.X17);
+        }
+        .Mul128 => {
+            try buf.umulh(alloc, a64_asm.X16, s0, s1);
+            try buf.mul_rr(alloc, true, d, s0, s1);
+            if d2 < 32_u8 { try buf.mov_rr(alloc, d2, a64_asm.X16); }
+        }
+        .Imul128 => {
+            try buf.smulh(alloc, a64_asm.X16, s0, s1);
+            try buf.mul_rr(alloc, true, d, s0, s1);
+            if d2 < 32_u8 { try buf.mov_rr(alloc, d2, a64_asm.X16); }
+        }
+        .Div => {
+            try buf.udiv_rr(alloc, true, a64_asm.X16, s0, s1);
+            if d2 < 32_u8 { try buf.msub_rrr(alloc, true, d2, a64_asm.X16, s1, s0); }
+            if d < 32_u8 { try buf.mov_rr(alloc, d, a64_asm.X16); }
+        }
+        .Idiv => {
+            try buf.sdiv_rr(alloc, true, a64_asm.X16, s0, s1);
+            if d2 < 32_u8 { try buf.msub_rrr(alloc, true, d2, a64_asm.X16, s1, s0); }
+            if d < 32_u8 { try buf.mov_rr(alloc, d, a64_asm.X16); }
+        }
+        .Div32 => {
+            try buf.udiv_rr(alloc, false, a64_asm.X16, s0, s1);
+            if d2 < 32_u8 { try buf.msub_rrr(alloc, false, d2, a64_asm.X16, s1, s0); }
+            if d < 32_u8 { try buf.mov32_rr(alloc, d, a64_asm.X16); }
+        }
+        .Idiv32 => {
+            try buf.sdiv_rr(alloc, false, a64_asm.X16, s0, s1);
+            if d2 < 32_u8 { try buf.msub_rrr(alloc, false, d2, a64_asm.X16, s1, s0); }
+            if d < 32_u8 { try buf.mov32_rr(alloc, d, a64_asm.X16); }
+        }
+        .And => { try buf.and_rr(alloc, true, false, d, s0, s1); }
+        .And32 => { try buf.and_rr(alloc, false, false, d, s0, s1); }
+        .AndImm => { try emit_a64_alu_imm(alloc, buf, true, .AndImm, d, s0, inst.imm); }
+        .And32Imm => { try emit_a64_alu_imm(alloc, buf, false, .And32Imm, d, s0, inst.imm); }
+        .AndMem => {
+            try emit_a64_load_mem(alloc, buf, lbl_map, a64_asm.X17, &inst.mem, 8_u8, false);
+            try buf.and_rr(alloc, true, false, d, s0, a64_asm.X17);
+        }
+        .Or => { try buf.orr_rr(alloc, true, d, s0, s1); }
+        .Or32 => { try buf.orr_rr(alloc, false, d, s0, s1); }
+        .OrImm => { try emit_a64_alu_imm(alloc, buf, true, .OrImm, d, s0, inst.imm); }
+        .Or32Imm => { try emit_a64_alu_imm(alloc, buf, false, .Or32Imm, d, s0, inst.imm); }
+        .OrMem => {
+            try emit_a64_load_mem(alloc, buf, lbl_map, a64_asm.X17, &inst.mem, 8_u8, false);
+            try buf.orr_rr(alloc, true, d, s0, a64_asm.X17);
+        }
+        .Xor => { try buf.eor_rr(alloc, true, d, s0, s1); }
+        .Xor32 => { try buf.eor_rr(alloc, false, d, s0, s1); }
+        .XorImm => { try emit_a64_alu_imm(alloc, buf, true, .XorImm, d, s0, inst.imm); }
+        .Xor32Imm => { try emit_a64_alu_imm(alloc, buf, false, .Xor32Imm, d, s0, inst.imm); }
+        .XorMem => {
+            try emit_a64_load_mem(alloc, buf, lbl_map, a64_asm.X17, &inst.mem, 8_u8, false);
+            try buf.eor_rr(alloc, true, d, s0, a64_asm.X17);
+        }
+        .Shl => { try buf.lslv(alloc, true, d, s0, s1); }
+        .ShlImm => { try buf.lsl_imm(alloc, true, d, s0, imm8); }
+        .Shr => { try buf.lsrv(alloc, true, d, s0, s1); }
+        .ShrImm => { try buf.lsr_imm(alloc, true, d, s0, imm8); }
+        .Sar => { try buf.asrv(alloc, true, d, s0, s1); }
+        .SarImm => { try buf.asr_imm(alloc, true, d, s0, imm8); }
+        .Shl32 => { try buf.lslv(alloc, false, d, s0, s1); }
+        .Shl32Imm => { try buf.lsl_imm(alloc, false, d, s0, imm8); }
+        .Shr32 => { try buf.lsrv(alloc, false, d, s0, s1); }
+        .Shr32Imm => { try buf.lsr_imm(alloc, false, d, s0, imm8); }
+        .Sar32 => { try buf.asrv(alloc, false, d, s0, s1); }
+        .Sar32Imm => { try buf.asr_imm(alloc, false, d, s0, imm8); }
+        .RorImm => { try buf.ror_imm(alloc, true, d, s0, imm8); }
+        .Ror32Imm => { try buf.ror_imm(alloc, false, d, s0, imm8); }
+        .Neg => { try buf.neg_rr(alloc, true, false, d, s0); }
+        .Neg32 => { try buf.neg_rr(alloc, false, false, d, s0); }
+        .Not => { try buf.mvn_rr(alloc, true, d, s0); }
+        .Not32 => { try buf.mvn_rr(alloc, false, d, s0); }
+
+        // --- Bit ops & branchless ---
+        .Lzcnt => { try buf.clz(alloc, sz == 8_u8, d, s0); }
+        .Tzcnt => {
+            try buf.rbit(alloc, sz == 8_u8, a64_asm.X16, s0);
+            try buf.clz(alloc, sz == 8_u8, d, a64_asm.X16);
+        }
+        .Popcnt => {
+            if sz < 8_u8 {
+                try buf.uxt(alloc, a64_asm.X16, s0, sz);
+                try buf.fmov_gpr_to_fp(alloc, true, 30_u8, a64_asm.X16);
+            } else {
+                try buf.fmov_gpr_to_fp(alloc, true, 30_u8, s0);
+            }
+            try buf.vcnt_8b(alloc, 30_u8, 30_u8);
+            try buf.vaddv_8b(alloc, 30_u8, 30_u8);
+            try buf.fmov_fp_to_gpr(alloc, false, d, 30_u8);
+        }
+        .Bswap => {
+            if sz == 2_u8 {
+                try buf.rev16(alloc, false, d, s0);
+                try buf.uxt(alloc, d, d, 2_u8);
+            } else if sz == 4_u8 {
+                try buf.rev(alloc, false, d, s0);
+            } else {
+                try buf.rev(alloc, true, d, s0);
+            }
+        }
+        .Cmov => {
+            // MachIR Cmov: dst = if cc { src1 } else { src0 }
+            try buf.csel(alloc, sz != 4_u8, d, s1, s0, cc);
+        }
+        .Setcc => {
+            try buf.cset(alloc, true, d, cc);
+        }
+
+        // --- Comparisons & Control flow ---
+        .Cmp => { try buf.cmp_rr(alloc, true, s0, s1); }
+        .Cmp32 => { try buf.cmp_rr(alloc, false, s0, s1); }
+        .CmpImm => {
+            if inst.imm >= 0_i64 && inst.imm <= 4095_i64 {
+                try buf.cmp_imm(alloc, true, s0, inst.imm.trunc.[u16]());
+            } else if inst.imm < 0_i64 && inst.imm >= -4095_i64 {
+                try buf.cmn_imm(alloc, true, s0, (0_i64 -% inst.imm).trunc.[u16]());
+            } else {
+                try buf.mov_imm64(alloc, a64_asm.X16, inst.imm.bitcast.[u64]());
+                try buf.cmp_rr(alloc, true, s0, a64_asm.X16);
+            }
+        }
+        .Cmp32Imm => {
+            if inst.imm >= 0_i64 && inst.imm <= 4095_i64 {
+                try buf.cmp_imm(alloc, false, s0, inst.imm.trunc.[u16]());
+            } else if inst.imm < 0_i64 && inst.imm >= -4095_i64 {
+                try buf.cmn_imm(alloc, false, s0, (0_i64 -% inst.imm).trunc.[u16]());
+            } else {
+                try buf.mov_imm64(alloc, a64_asm.X16, inst.imm.bitcast.[u64]());
+                try buf.cmp_rr(alloc, false, s0, a64_asm.X16);
+            }
+        }
+        .CmpMem => {
+            try emit_a64_load_mem(alloc, buf, lbl_map, a64_asm.X17, &inst.mem, 8_u8, false);
+            if inst.flag0 {
+                try buf.cmp_rr(alloc, true, a64_asm.X17, s1);
+            } else {
+                try buf.cmp_rr(alloc, true, s0, a64_asm.X17);
+            }
+        }
+        .Test => { try buf.tst_rr(alloc, true, s0, s1); }
+        .Test32 => { try buf.tst_rr(alloc, false, s0, s1); }
+        .TestImm => {
+            try buf.mov_imm64(alloc, a64_asm.X16, inst.imm.bitcast.[u64]());
+            try buf.tst_rr(alloc, true, s0, a64_asm.X16);
+        }
+        .Test32Imm => {
+            try buf.mov_imm64(alloc, a64_asm.X16, inst.imm.bitcast.[u64]());
+            try buf.tst_rr(alloc, false, s0, a64_asm.X16);
+        }
+        .Jmp => { try buf.b_label(alloc, map_label(lbl_map, inst.mem.label)); }
+        .Jcc => { try buf.b_cond_label(alloc, cc, map_label(lbl_map, inst.mem.label)); }
+        .JmpReg => { try buf.br(alloc, s0); }
+        .JmpTable => {
+            let jt_idx = inst.imm.bitcast.[u64]().trunc.[usize]();
+            if jt_idx < jt_labels.len {
+                let base_lbl = jt_labels[jt_idx];
+                try buf.adr_label(alloc, a64_asm.X16, base_lbl);
+                try buf.ldrsw_reg_lsl2(alloc, a64_asm.X17, a64_asm.X16, s0);
+                try buf.add_rr(alloc, true, false, a64_asm.X16, a64_asm.X16, a64_asm.X17);
+                try buf.br(alloc, a64_asm.X16);
+            } else {
+                try buf.brk(alloc, 1_u16);
+            }
+        }
+        .JmpSym => { try buf.b_sym(alloc, inst.mem.sym); }
+        .CallSym => { try buf.bl_sym(alloc, inst.mem.sym); }
+        .CallReg => { try buf.blr(alloc, s0); }
+        .Ret => {
+            try emit_a64_epilogue(alloc, buf, fl);
+            try buf.ret(alloc);
+        }
+        .Ud2 => { try buf.brk(alloc, 1_u16); }
+        .Nop => { try buf.nop(alloc); }
+        .RawBytes => {
+            let bs = mf.raw_bytes_slice(inst.extra_range);
+            try buf.emit_bytes(alloc, bs);
+        }
+        .LabelDef => { buf.bind_label(map_label(lbl_map, inst.mem.label)); }
+
+        // --- Atomics (LL/SC via LDAXR/STLXR; X9/X16/X17 scratch) ---
+        .LockXadd => {
+            try emit_addr_into(alloc, buf, lbl_map, &inst.mem, a64_asm.X16, a64_asm.X17);
+            let addend = if s1 < 32_u8 { s1 } else { s0 };
+            let l_retry = try buf.new_label(alloc);
+            buf.bind_label(l_retry);
+            try buf.ldaxr(alloc, sz, a64_asm.X17, a64_asm.X16);
+            try buf.add_rr(alloc, sz == 8_u8, false, a64_asm.X9, a64_asm.X17, addend);
+            try buf.stlxr(alloc, sz, a64_asm.X10, a64_asm.X9, a64_asm.X16);
+            try buf.cbnz_label(alloc, false, a64_asm.X10, l_retry);
+            if d < 32_u8 { try buf.mov_rr(alloc, d, a64_asm.X17); }
+        }
+
+        // --- Scalar Float & NEON 128-bit ---
+        .VMovSSLoad => { try emit_a64_load_vec(alloc, buf, lbl_map, d, &inst.mem, 4_u8); }
+        .VMovSDLoad => { try emit_a64_load_vec(alloc, buf, lbl_map, d, &inst.mem, 8_u8); }
+        .VMovSSStore => { try emit_a64_store_vec(alloc, buf, lbl_map, &inst.mem, s0, 4_u8); }
+        .VMovSDStore => { try emit_a64_store_vec(alloc, buf, lbl_map, &inst.mem, s0, 8_u8); }
+        .VMovVecReg => { if d != s0 { try buf.vmov_16b(alloc, d, s0); } }
+        .VAddSS => { try buf.fadd_s(alloc, false, d, s0, s1); }
+        .VSubSS => { try buf.fsub_s(alloc, false, d, s0, s1); }
+        .VMulSS => { try buf.fmul_s(alloc, false, d, s0, s1); }
+        .VDivSS => { try buf.fdiv_s(alloc, false, d, s0, s1); }
+        .VMinSS => { try buf.fmin_s(alloc, false, d, s0, s1); }
+        .VMaxSS => { try buf.fmax_s(alloc, false, d, s0, s1); }
+        .VSqrtSS => { try buf.fsqrt_s(alloc, false, d, s0); }
+        .VFmadd231SS => { try buf.fmadd_s(alloc, false, d, s1, s2, s0); }
+        .VAddSD => { try buf.fadd_s(alloc, true, d, s0, s1); }
+        .VSubSD => { try buf.fsub_s(alloc, true, d, s0, s1); }
+        .VMulSD => { try buf.fmul_s(alloc, true, d, s0, s1); }
+        .VDivSD => { try buf.fdiv_s(alloc, true, d, s0, s1); }
+        .VMinSD => { try buf.fmin_s(alloc, true, d, s0, s1); }
+        .VMaxSD => { try buf.fmax_s(alloc, true, d, s0, s1); }
+        .VSqrtSD => { try buf.fsqrt_s(alloc, true, d, s0); }
+        .VFmadd231SD => { try buf.fmadd_s(alloc, true, d, s1, s2, s0); }
+        .VUcomiSS => { try buf.fcmp_s(alloc, false, s0, s1); }
+        .VUcomiSD => { try buf.fcmp_s(alloc, true, s0, s1); }
+        .VCvtSI2SS => { try buf.scvtf(alloc, sz == 8_u8, false, d, s0); }
+        .VCvtSI2SD => { try buf.scvtf(alloc, sz == 8_u8, true, d, s0); }
+        .VCvtTTSS2SI => { try buf.fcvtzs(alloc, sz == 8_u8, false, d, s0); }
+        .VCvtTTSD2SI => { try buf.fcvtzs(alloc, sz == 8_u8, true, d, s0); }
+        .VCvtSS2SD => { try buf.fcvt_s_to_d(alloc, d, s0); }
+        .VCvtSD2SS => { try buf.fcvt_d_to_s(alloc, d, s0); }
+        .VMovDToXmm => { try buf.fmov_gpr_to_fp(alloc, false, d, s0); }
+        .VMovDFromXmm => { try buf.fmov_fp_to_gpr(alloc, false, d, s0); }
+        .VMovQToXmm => { try buf.fmov_gpr_to_fp(alloc, true, d, s0); }
+        .VMovQFromXmm => { try buf.fmov_fp_to_gpr(alloc, true, d, s0); }
+
+        // --- Packed NEON 128-bit Vector Operations ---
+        .VMovUpsLoad => { try emit_a64_load_vec(alloc, buf, lbl_map, d, &inst.mem, 16_u8); }
+        .VMovApsLoad => { try emit_a64_load_vec(alloc, buf, lbl_map, d, &inst.mem, 16_u8); }
+        .VMovDquLoad => { try emit_a64_load_vec(alloc, buf, lbl_map, d, &inst.mem, 16_u8); }
+        .VMovUpsStore => { try emit_a64_store_vec(alloc, buf, lbl_map, &inst.mem, s0, 16_u8); }
+        .VMovApsStore => { try emit_a64_store_vec(alloc, buf, lbl_map, &inst.mem, s0, 16_u8); }
+        .VMovDquStore => { try emit_a64_store_vec(alloc, buf, lbl_map, &inst.mem, s0, 16_u8); }
+        .VBroadcastSS => {
+            if inst.mem.kind != .None {
+                try emit_a64_load_vec(alloc, buf, lbl_map, d, &inst.mem, 4_u8);
+                try buf.vdup_lane(alloc, 4_u8, d, d, 0_u8);
+            } else {
+                try buf.vdup_lane(alloc, 4_u8, d, s0, 0_u8);
+            }
+        }
+        .VBroadcastSD => {
+            if inst.mem.kind != .None {
+                try emit_a64_load_vec(alloc, buf, lbl_map, d, &inst.mem, 8_u8);
+                try buf.vdup_lane(alloc, 8_u8, d, d, 0_u8);
+            } else {
+                try buf.vdup_lane(alloc, 8_u8, d, s0, 0_u8);
+            }
+        }
+        .VAddPS => { try buf.vfadd_vec(alloc, false, d, s0, s1); }
+        .VSubPS => { try buf.vfsub_vec(alloc, false, d, s0, s1); }
+        .VMulPS => { try buf.vfmul_vec(alloc, false, d, s0, s1); }
+        .VDivPS => { try buf.vfdiv_vec(alloc, false, d, s0, s1); }
+        .VMinPS => { try buf.vfmin_vec(alloc, false, d, s0, s1); }
+        .VMaxPS => { try buf.vfmax_vec(alloc, false, d, s0, s1); }
+        .VSqrtPS => { try buf.vfsqrt_vec(alloc, false, d, s0); }
+        .VRsqrtPS => { try buf.vfrsqrte_4s(alloc, d, s0); }
+        .VFmadd231PS => {
+            if d != s0 { try buf.vmov_16b(alloc, d, s0); }
+            try buf.vfmla_vec(alloc, false, d, s1, s2);
+        }
+        .VFnMadd231PS => {
+            if d != s0 { try buf.vmov_16b(alloc, d, s0); }
+            try buf.vfmls_vec(alloc, false, d, s1, s2);
+        }
+        .VAddPD => { try buf.vfadd_vec(alloc, true, d, s0, s1); }
+        .VSubPD => { try buf.vfsub_vec(alloc, true, d, s0, s1); }
+        .VMulPD => { try buf.vfmul_vec(alloc, true, d, s0, s1); }
+        .VDivPD => { try buf.vfdiv_vec(alloc, true, d, s0, s1); }
+        .VMinPD => { try buf.vfmin_vec(alloc, true, d, s0, s1); }
+        .VMaxPD => { try buf.vfmax_vec(alloc, true, d, s0, s1); }
+        .VSqrtPD => { try buf.vfsqrt_vec(alloc, true, d, s0); }
+        .VFmadd231PD => {
+            if d != s0 { try buf.vmov_16b(alloc, d, s0); }
+            try buf.vfmla_vec(alloc, true, d, s1, s2);
+        }
+        .VXorPS => { try buf.veor_16b(alloc, d, s0, s1); }
+        .VAndPS => { try buf.vand_16b(alloc, d, s0, s1); }
+        .VOrPS => { try buf.vorr_16b(alloc, d, s0, s1); }
+        .VXorPD => { try buf.veor_16b(alloc, d, s0, s1); }
+        .VAndPD => { try buf.vand_16b(alloc, d, s0, s1); }
+        .VOrPD => { try buf.vorr_16b(alloc, d, s0, s1); }
+        .VPXor => { try buf.veor_16b(alloc, d, s0, s1); }
+        .VPAnd => { try buf.vand_16b(alloc, d, s0, s1); }
+        .VPOr => { try buf.vorr_16b(alloc, d, s0, s1); }
+        .VPAddB => { try buf.vadd_int(alloc, 0_u8, d, s0, s1); }
+        .VPSubB => { try buf.vsub_int(alloc, 0_u8, d, s0, s1); }
+        .VPAddD => { try buf.vadd_int(alloc, 2_u8, d, s0, s1); }
+        .VPSubD => { try buf.vsub_int(alloc, 2_u8, d, s0, s1); }
+        .VPMullD => { try buf.vmul_4s(alloc, d, s0, s1); }
+        .VPAddQ => { try buf.vadd_int(alloc, 3_u8, d, s0, s1); }
+        .VPSubQ => { try buf.vsub_int(alloc, 3_u8, d, s0, s1); }
+        .VPMinSD => { try buf.vsmin_4s(alloc, d, s0, s1); }
+        .VPMaxSD => { try buf.vsmax_4s(alloc, d, s0, s1); }
+        .VPCmpEqB => { try buf.vcmeq_int(alloc, 0_u8, d, s0, s1); }
+        .VPCmpEqD => { try buf.vcmeq_int(alloc, 2_u8, d, s0, s1); }
+        .VPCmpGtD => { try buf.vcmgt_int(alloc, 2_u8, d, s0, s1); }
+        .VPSllDImm => { try buf.vshl_4s_imm(alloc, d, s0, imm8); }
+        .VPSrlDImm => { try buf.vushr_4s_imm(alloc, d, s0, imm8); }
+        .VPSraDImm => { try buf.vsshr_4s_imm(alloc, d, s0, imm8); }
+        .VPSllWImm => { try buf.vshl_8h_imm(alloc, d, s0, imm8); }
+        .VPBroadcastB => { try buf.vdup_lane(alloc, 1_u8, d, s0, 0_u8); }
+        .VPBroadcastD => { try buf.vdup_lane(alloc, 4_u8, d, s0, 0_u8); }
+        .VHAddPS => { try buf.vaddp_4s(alloc, d, s0, s1); }
+        _ => {}
+    }
+    return;
+}
+
+// ============================================================================
+// Section 4: Public `emit_mach_func_a64` Entry Point
+// ============================================================================
+
+fn find_max_label_a64(mf: *mach_ir.MachFunc) -> usize {
+    var max_lbl: usize = mf.blocks.len();
+    let bs = mf.blocks.as_slice();
+    var bi: usize = 0_usize;
+    while bi < bs.len {
+        let l = bs[bi].label.widen.[usize]();
+        if l < 65536_usize && l +% 1_usize > max_lbl {
+            max_lbl = l +% 1_usize;
+        }
+        bi = bi +% 1_usize;
+    }
+    let insts = mf.insts.as_slice();
+    var ii: usize = 0_usize;
+    while ii < insts.len {
+        let op = insts[ii].op;
+        if op == .Jmp || op == .Jcc || op == .LabelDef || (op == .Lea && insts[ii].mem.kind == .RipLabel) {
+            let l = insts[ii].mem.label.widen.[usize]();
+            if l < 65536_usize && l +% 1_usize > max_lbl {
+                max_lbl = l +% 1_usize;
+            }
+        }
+        ii = ii +% 1_usize;
+    }
+    return max_lbl;
+}
+
+struct A64LineTracker {
+    last_file: u32;
+    last_line: u32;
+}
+
+fn record_debug_line_a64(
+    alloc: *mut AllocCap,
+    sm: *span.SourceMap,
+    buf: *a64_asm.A64Buf,
+    sp: span.Span,
+    tr: *mut A64LineTracker,
+    out: *mut col.DynBuf[elf64.LineEntry],
+) -> !OutOfMemory {
+    if sp.file == span.FILE_DUMMY {
+        return;
+    }
+    let lc = sm.line_col(sp.file, sp.start);
+    if lc.line == 0_u32 {
+        return;
+    }
+    if sp.file == tr.last_file && lc.line == tr.last_line {
+        return;
+    }
+    tr.last_file = sp.file;
+    tr.last_line = lc.line;
+    try out.push(alloc, elf64.LineEntry.{
+        code_offset: buf.pos(),
+        file_idx: sp.file +% 1_u32,
+        line: lc.line,
+        col: lc.col,
+    });
+    return;
+}
+
+pub fn emit_mach_func_a64(
+    alloc: *mut AllocCap,
+    mf: *mach_ir.MachFunc,
+    sm: *span.SourceMap,
+    emit_debug_line: bool,
+) -> A64EmitOut ! OutOfMemory {
+    var out = try A64EmitOut.init(alloc);
+    errdefer out.destroy(alloc);
+
+    var buf = try a64_asm.A64Buf.init(alloc);
+    errdefer buf.destroy(alloc);
+
+    let n_blocks = mf.blocks.len();
+    var order = try col.DynBuf.[u32].init(alloc, if n_blocks > 4_usize { n_blocks } else { 4_usize });
+    errdefer order.destroy(alloc);
+    try build_emit_order(alloc, mf, &mut order);
+
+    let max_lbl = find_max_label_a64(mf);
+    var lbl_map = try col.DynBuf.[u32].init(alloc, if max_lbl > 4_usize { max_lbl } else { 4_usize });
+    errdefer lbl_map.destroy(alloc);
+    var li: usize = 0_usize;
+    while li < max_lbl {
+        let xl = try buf.new_label(alloc);
+        try lbl_map.push(alloc, xl);
+        li = li +% 1_usize;
+    }
+
+    let njt = mf.jump_tables.len();
+    var jt_labels = try col.DynBuf.[u32].init(alloc, if njt > 2_usize { njt } else { 2_usize });
+    errdefer jt_labels.destroy(alloc);
+    var ji: usize = 0_usize;
+    while ji < njt {
+        let jxl = try buf.new_label(alloc);
+        try jt_labels.push(alloc, jxl);
+        ji = ji +% 1_usize;
+    }
+
+    let fl = plan_a64_frame(mf);
+    out.own_stack_bytes = if fl.needs_frame { 16_u64 +% fl.total_sub.widen.[u64]() } else { 0_u64 };
+    try emit_a64_prologue(alloc, &mut buf, &fl);
+
+    var line_tr = A64LineTracker.{ last_file: span.FILE_DUMMY, last_line: 0_u32 };
+    let lm_ro = lbl_map.as_slice();
+    let jtl_ro = jt_labels.as_slice();
+    let ord_s = order.as_slice();
+    let bs = mf.blocks.as_slice();
+
+    var oi: usize = 0_usize;
+    while oi < ord_s.len {
+        let bb = ord_s[oi];
+        let bidx = bb.widen.[usize]();
+        if bidx >= bs.len {
+            oi = oi +% 1_usize;
+            continue;
+        }
+        buf.bind_label(map_label(lm_ro, bs[bidx].label));
+        let insts = mf.block_insts(bb);
+        var ki: usize = 0_usize;
+        while ki < insts.len {
+            let inst = insts[ki];
+            if emit_debug_line {
+                try record_debug_line_a64(alloc, sm, &buf, inst.span, &mut line_tr, &mut out.line_entries);
+            }
+            try emit_a64_inst(alloc, &mut buf, mf, &fl, lm_ro, jtl_ro, &inst);
+            ki = ki +% 1_usize;
+        }
+        oi = oi +% 1_usize;
+    }
+
+    // Emit PC-relative jump tables after all blocks so every target label offset is bound
+    if njt > 0_usize {
+        let jts = mf.jump_tables.as_slice();
+        var jti: usize = 0_usize;
+        while jti < jts.len && jti < jtl_ro.len {
+            try buf.align_nop(alloc, 4_usize);
+            let base_lbl = jtl_ro[jti];
+            buf.bind_label(base_lbl);
+            let base_pos = buf.pos().widen.[u64]().bitcast.[i64]();
+            let targs = mf.jtable_slice(jts[jti].entries);
+            let def_a64 = map_label(lm_ro, jts[jti].default_label);
+            var ti: usize = 0_usize;
+            while ti < targs.len {
+                let t_a64 = map_label(lm_ro, targs[ti]);
+                var tpos = buf.label_pos(t_a64);
+                if tpos == 0xFFFFFFFF_u32 {
+                    tpos = buf.label_pos(def_a64);
+                }
+                let rel: i32 = if tpos != 0xFFFFFFFF_u32 {
+                    (tpos.widen.[u64]().bitcast.[i64]() -% base_pos).trunc.[i32]()
+                } else {
+                    0_i32
+                };
+                try buf.emit_i32(alloc, rel);
+                ti = ti +% 1_usize;
+            }
+            jti = jti +% 1_usize;
+        }
+    }
+
+    let fin_ok = buf.finish();
+    out.ok = fin_ok;
+    if fin_ok {
+        try out.code.push_slice(alloc, buf.code.as_slice());
+        try out.relocs.push_slice(alloc, buf.relocs.as_slice());
+        try out.rodata_items.push_slice(alloc, mf.rodata_items.as_slice());
+        try out.rodata_bytes.push_slice(alloc, mf.rodata_bytes.as_slice());
+        try out.rodata_relocs.push_slice(alloc, mf.rodata_relocs.as_slice());
+        try out.used_helpers.push_slice(alloc, mf.used_helpers.as_slice());
+    }
+
+    jt_labels.destroy(alloc);
+    lbl_map.destroy(alloc);
+    order.destroy(alloc);
+    buf.destroy(alloc);
+    return out;
+}

@@ -13,8 +13,14 @@ extern "C" fn dlclose(handle: u64) -> i32;
 
 @naked
 fn slice_ptr(_s: *[u8]) -> u64 {
-    raw {
-        asm("mov rax, rdi; ret", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw {
+            asm("ret", options(noreturn));
+        }
+    } else {
+        raw {
+            asm("mov rax, rdi; ret", options(noreturn));
+        }
     }
     return 0_u64;
 }
@@ -135,56 +141,98 @@ impl DynLib {
 
 @naked
 pub fn call_c0(_fp: u64) -> u64 {
-    raw {
-        asm("mov rax, rdi; jmp rax", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw {
+            asm("br x0", options(noreturn));
+        }
+    } else {
+        raw {
+            asm("mov rax, rdi; jmp rax", options(noreturn));
+        }
     }
     return 0_u64;
 }
 
 @naked
 pub fn call_c1(_fp: u64, _a0: u64) -> u64 {
-    raw {
-        asm("mov rax, rdi; mov rdi, rsi; jmp rax", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw {
+            asm("mov x9, x0; mov x0, x1; br x9", options(noreturn));
+        }
+    } else {
+        raw {
+            asm("mov rax, rdi; mov rdi, rsi; jmp rax", options(noreturn));
+        }
     }
     return 0_u64;
 }
 
 @naked
 pub fn call_c2(_fp: u64, _a0: u64, _a1: u64) -> u64 {
-    raw {
-        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; jmp rax", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw {
+            asm("mov x9, x0; mov x0, x1; mov x1, x2; br x9", options(noreturn));
+        }
+    } else {
+        raw {
+            asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; jmp rax", options(noreturn));
+        }
     }
     return 0_u64;
 }
 
 @naked
 pub fn call_c3(_fp: u64, _a0: u64, _a1: u64, _a2: u64) -> u64 {
-    raw {
-        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; jmp rax", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw {
+            asm("mov x9, x0; mov x0, x1; mov x1, x2; mov x2, x3; br x9", options(noreturn));
+        }
+    } else {
+        raw {
+            asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; jmp rax", options(noreturn));
+        }
     }
     return 0_u64;
 }
 
 @naked
 pub fn call_c4(_fp: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64) -> u64 {
-    raw {
-        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; jmp rax", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw {
+            asm("mov x9, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; br x9", options(noreturn));
+        }
+    } else {
+        raw {
+            asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; jmp rax", options(noreturn));
+        }
     }
     return 0_u64;
 }
 
 @naked
 pub fn call_c5(_fp: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
-    raw {
-        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; mov r8, r9; jmp rax", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw {
+            asm("mov x9, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; mov x4, x5; br x9", options(noreturn));
+        }
+    } else {
+        raw {
+            asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; mov r8, r9; jmp rax", options(noreturn));
+        }
     }
     return 0_u64;
 }
 
 @naked
 pub fn call_c6(_fp: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
-    raw {
-        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; mov r8, r9; mov r9, r10; jmp rax", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw {
+            asm("mov x9, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; mov x4, x5; mov x5, x6; br x9", options(noreturn));
+        }
+    } else {
+        raw {
+            asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; mov r8, r9; mov r9, r10; jmp rax", options(noreturn));
+        }
     }
     return 0_u64;
 }

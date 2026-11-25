@@ -1275,6 +1275,132 @@ def test_m21_target_spec_and_comptime(eonc: str) -> None:
     print("[PASS] M2.1 TargetSpec (--target=<arch>-<os> across all 10 triples, @target_arch/@target_os/@target_is_nostd, dead comptime pruning)")
 
 
+def test_m22_aarch64_backend(eonc: str) -> None:
+    print("[TEST] M2.2 Native AArch64 Backend (AAPCS64/NEON, ELF64 EM_AARCH64, std/core on qemu-aarch64, shared + nostd)...")
+    qemu = shutil.which("qemu-aarch64")
+    assert qemu is not None, "qemu-aarch64 not found in PATH"
+    with tempfile.TemporaryDirectory(prefix="eon_m22_") as td:
+        p = Path(td)
+        f_tmp = str(p / "a64_io.txt")
+        src = p / "a64_suite.eon"
+        src.write_text(
+            "module demo.a64_suite;\n"
+            "import core.math_vec;\n"
+            "import core.color;\n"
+            "import core.fmt;\n"
+            "import core.sync;\n"
+            "import std.rt;\n"
+            "import std.time;\n"
+            "import std.fs;\n"
+            "import std.sync as os_sync;\n"
+            "import std.net;\n"
+            "\n"
+            "iface Compute { fn eval(self: *Self, x: i64) -> i64; }\n"
+            "struct Affine { m: i64; b: i64; }\n"
+            "impl Compute for Affine {\n"
+            "    fn eval(self: *Self, x: i64) -> i64 { return self.m *% x +% self.b; }\n"
+            "}\n"
+            "fn run_dyn(c: *dyn Compute, x: i64) -> i64 { return c.eval(x); }\n"
+            "\n"
+            "@recursive\n"
+            "fn gcd(a: u64, b: u64) -> u64 {\n"
+            "    if b == 0_u64 { return a; }\n"
+            "    return gcd(b, a % b);\n"
+            "}\n"
+            "\n"
+            "fn check_arch() -> i32 {\n"
+            "    comptime if @target_arch() == .AArch64 { return 183_i32; }\n"
+            "    else { return 0_i32; }\n"
+            "}\n"
+            "\n"
+            "pub fn main(env: *mut Env) -> i32 {\n"
+            "    if check_arch() != 183_i32 { return 1_i32; }\n"
+            "    if gcd(1071_u64, 462_u64) != 21_u64 { return 2_i32; }\n"
+            "    // NEON + core.math_vec + core.color + core.fmt\n"
+            "    let a = math_vec.Vec4.new(1.0_f32, 2.0_f32, 3.0_f32, 4.0_f32);\n"
+            "    let b = math_vec.Vec4.new(4.0_f32, 3.0_f32, 2.0_f32, 1.0_f32);\n"
+            "    if a.dot(b).trunc_to_int.[i32]() != 20_i32 { return 3_i32; }\n"
+            "    let c = color.Srgb8.new(0x33_u8, 0x66_u8, 0x99_u8, 0xFF_u8);\n"
+            "    if c.pack_rgba_u32() != 0xFF996633_u32 { return 4_i32; }\n"
+            "    var fbuf: [64]u8 = [0_u8; 64];\n"
+            "    var fc = fmt.FmtCursor.new();\n"
+            "    fc.write_str(&mut fbuf, \"a64=\");\n"
+            "    fc.write_u64(&mut fbuf, 42_u64);\n"
+            "    if fc.len() != 6_usize || fc.overflowed || fbuf[4_usize] != b'4' || fbuf[5_usize] != b'2' { return 6_i32; }\n"
+            "    // dyn + atomics + futex Mutex + clock\n"
+            "    let af = Affine.{ m: 3_i64, b: 11_i64 };\n"
+            "    if run_dyn(&af, 9_i64) != 38_i64 { return 7_i32; }\n"
+            "    var ac = sync.AtomicCounter.init(100_u64);\n"
+            "    if ac.fetch_add(25_u64, .SeqCst) != 100_u64 || ac.load(.Acquire) != 125_u64 { return 8_i32; }\n"
+            "    var mu = os_sync.Mutex.new();\n"
+            "    let g = mu.lock();\n"
+            "    g.unlock(&mut mu);\n"
+            "    if time.Instant.now(&env.clock).nanos == 0_u64 { return 9_i32; }\n"
+            "    // std.fs file I/O + stat\n"
+            f"    var wf = fs.File.create_write(&env.fs, \"{f_tmp}\") catch {{ return 10_i32; }};\n"
+            "    wf.write_all(\"eon-aarch64\".as_bytes()) catch { wf.close(); return 11_i32; };\n"
+            "    wf.close();\n"
+            f"    let st = fs.stat_path(&env.fs, \"{f_tmp}\") catch {{ return 12_i32; }};\n"
+            "    if !st.is_file || st.is_dir || st.size != 11_u64 { return 13_i32; }\n"
+            f"    fs.remove_file(&env.fs, \"{f_tmp}\") catch {{ return 14_i32; }};\n"
+            "    // std.net UDP loopback over AArch64 asm-generic syscalls\n"
+            "    var srv = net.UdpSocket.bind(&env.net, net.SocketAddrV4.new(net.Ipv4Addr.localhost(), 0_u16)) catch { return 15_i32; };\n"
+            "    let saddr = srv.local_addr() catch { srv.close(); return 16_i32; };\n"
+            "    var cli = net.UdpSocket.bind(&env.net, net.SocketAddrV4.new(net.Ipv4Addr.localhost(), 0_u16)) catch { srv.close(); return 17_i32; };\n"
+            "    let sent = cli.send_to(\"ping\".as_bytes(), saddr) catch { cli.close(); srv.close(); return 18_i32; };\n"
+            "    var rbuf: [16]u8 = [0_u8; 16];\n"
+            "    let rec = srv.recv_from(&mut rbuf) catch { cli.close(); srv.close(); return 19_i32; };\n"
+            "    cli.close();\n"
+            "    srv.close();\n"
+            "    if sent != 4_usize || rec.len != 4_usize || rbuf[0_usize] != b'p' { return 20_i32; }\n"
+            "    rt.print_str(\"M22_AARCH64_ALL_OK\\n\");\n"
+            "    return 0_i32;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        for mode in ("--dev", "--release"):
+            out_bin = p / f"a64_suite_{mode[2:]}"
+            cp_b = run_cmd([eonc, "build", mode, "--target=aarch64-linux", str(src), "-o", str(out_bin)])
+            assert cp_b.returncode == 0, f"AArch64 {mode} build failed:\n{cp_b.stderr}"
+            cp_h = run_cmd(["llvm-readelf", "-h", str(out_bin)])
+            assert "AArch64" in cp_h.stdout, f"Expected EM_AARCH64:\n{cp_h.stdout}"
+            cp_r = run_cmd([qemu, str(out_bin)])
+            assert cp_r.returncode == 0 and "M22_AARCH64_ALL_OK" in cp_r.stdout, (
+                f"qemu-aarch64 {mode} failed rc={cp_r.returncode} out={cp_r.stdout!r} err={cp_r.stderr!r}"
+            )
+
+        # Shared library (--shared) + freestanding (--target=aarch64-nostd) ELF64 checks
+        lib_src = p / "libmath.eon"
+        lib_src.write_text(
+            "module demo.libmath;\n"
+            "@export(\"C\")\n"
+            "pub fn a64_add_mul(a: i64, b: i64, c: i64) -> i64 { return a *% b +% c; }\n",
+            encoding="utf-8",
+        )
+        so_path = p / "libmath_a64.so"
+        cp_so = run_cmd([eonc, "build", "--release", "--shared", "--target=aarch64-linux", str(lib_src), "-o", str(so_path)])
+        assert cp_so.returncode == 0, f"AArch64 --shared build failed:\n{cp_so.stderr}"
+        cp_so_h = run_cmd(["llvm-readelf", "-h", "--dyn-syms", str(so_path)])
+        assert "AArch64" in cp_so_h.stdout and "DYN" in cp_so_h.stdout and "a64_add_mul" in cp_so_h.stdout, cp_so_h.stdout
+
+        nostd_src = p / "kern_a64.eon"
+        nostd_src.write_text(
+            "module demo.kern_a64;\n"
+            "pub fn kmain() -> i64 {\n"
+            "    comptime if @target_arch() == .AArch64 && @target_is_nostd() { return 42_i64; }\n"
+            "    else { @compile_error(\"expected aarch64-nostd\"); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        kern_bin = p / "kern_a64.elf"
+        cp_k = run_cmd([eonc, "build", "--release", "--target=aarch64-nostd", str(nostd_src), "-o", str(kern_bin)])
+        assert cp_k.returncode == 0, f"AArch64 nostd build failed:\n{cp_k.stderr}"
+        cp_k_h = run_cmd(["llvm-readelf", "-h", str(kern_bin)])
+        assert "AArch64" in cp_k_h.stdout and "EXEC" in cp_k_h.stdout, cp_k_h.stdout
+
+    print("[PASS] M2.2 Native AArch64 Backend (AAPCS64/NEON, ELF64 EM_AARCH64, std/core live on qemu-aarch64, --shared & nostd)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--eonc", default=str(ROOT / "selfhost/out/eonc2_rel"))
@@ -1289,6 +1415,7 @@ def main() -> int:
     test_m13_core_and_std(eonc)
     test_m14_fmt_and_lsp(eonc)
     test_m21_target_spec_and_comptime(eonc)
+    test_m22_aarch64_backend(eonc)
     print("ALL SELFHOST SOUNDNESS REGRESSIONS PASSED!")
     return 0
 

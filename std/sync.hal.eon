@@ -10,7 +10,14 @@ import core.sync;
 //   - Channel[T] (bounded heap-backed MPMC ring channel)
 // ---------------------------------------------------------------------------
 
-const SYS_FUTEX: u64 = 202_u64;
+@inline
+fn sys_nr_futex() -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        return 98_u64;
+    } else {
+        return 202_u64;
+    }
+}
 const FUTEX_WAIT_PRIVATE: u64 = 128_u64;
 const FUTEX_WAKE_PRIVATE: u64 = 129_u64;
 
@@ -24,16 +31,28 @@ fn syscall6(
     _a5: u64,
     _a6: u64,
 ) -> i64 {
-    raw {
-        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r11, r10; mov r10, r8; mov r8, r9; mov r9, r11; syscall; ret", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw {
+            asm("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; mov x4, x5; mov x5, x6; svc #0; ret", options(noreturn));
+        }
+    } else {
+        raw {
+            asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r11, r10; mov r10, r8; mov r8, r9; mov r9, r11; syscall; ret", options(noreturn));
+        }
     }
     return 0_i64;
 }
 
 @naked
 fn atomic_u32_addr(_a: *Atomic[u32]) -> u64 {
-    raw {
-        asm("mov rax, rdi; ret", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw {
+            asm("ret", options(noreturn));
+        }
+    } else {
+        raw {
+            asm("mov rax, rdi; ret", options(noreturn));
+        }
     }
     return 0_u64;
 }
@@ -41,7 +60,7 @@ fn atomic_u32_addr(_a: *Atomic[u32]) -> u64 {
 /// Block the calling thread in the kernel while `word.* == expected`.
 pub fn futex_wait(word: *Atomic[u32], expected: u32) {
     _ = syscall6(
-        SYS_FUTEX,
+        sys_nr_futex(),
         atomic_u32_addr(word),
         FUTEX_WAIT_PRIVATE,
         expected.widen.[u64](),
@@ -54,7 +73,7 @@ pub fn futex_wait(word: *Atomic[u32], expected: u32) {
 /// Wake at most `count` threads waiting on `word`.
 pub fn futex_wake(word: *Atomic[u32], count: u32) -> i64 {
     return syscall6(
-        SYS_FUTEX,
+        sys_nr_futex(),
         atomic_u32_addr(word),
         FUTEX_WAKE_PRIVATE,
         count.widen.[u64](),

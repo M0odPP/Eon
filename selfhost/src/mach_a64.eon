@@ -1,0 +1,812 @@
+module eonc.mach_a64;
+
+import core.col;
+import core.str;
+import eonc.span;
+import eonc.resolve;
+import eonc.types;
+import eonc.ctvm;
+import eonc.cfg_ir;
+import eonc.eir;
+import eonc.x64_asm;
+import eonc.a64_asm;
+import eonc.elf64;
+import eonc.mach_ir;
+import eonc.mach_regalloc;
+import eonc.mach_opt_a64;
+import eonc.mach_isel_a64;
+import eonc.mach_x64;
+
+// ============================================================================
+// AArch64 Native Compilation & Linking Driver (`--target=aarch64-*`)
+// ============================================================================
+
+fn pad_dyn_u8(alloc: *mut AllocCap, buf: *mut col.DynBuf[u8], align: usize) -> !OutOfMemory {
+    if align <= 1_usize { return; }
+    let mask = align -% 1_usize;
+    while (buf.len() & mask) != 0_usize {
+        try buf.push(alloc, 0_u8);
+    }
+    return;
+}
+
+fn find_entry_fn_id(
+    eir_prog: *eir.EirProgram,
+    prog: *resolve.ResolvedProgram,
+    interner: *span.SymInterner,
+    mode: elf64.ElfMode,
+) -> ?u32 {
+    let nfns = eir_prog.fn_count();
+    if mode.kind == .Freestanding {
+        var fi: u32 = 0_u32;
+        while fi < nfns {
+            if let f = eir_prog.get_fn(fi) {
+                if !f.sig.effects.is_gpu && f.key.kind == .TopDef && str.bytes_eq(interner.get(f.name), "_start".as_bytes()) {
+                    return fi;
+                }
+            }
+            fi = fi +% 1_u32;
+        }
+        fi = 0_u32;
+        while fi < nfns {
+            if let f = eir_prog.get_fn(fi) {
+                if !f.sig.effects.is_gpu && f.key.kind == .TopDef && str.bytes_eq(interner.get(f.name), "kmain".as_bytes()) {
+                    return fi;
+                }
+            }
+            fi = fi +% 1_u32;
+        }
+    }
+    var fi: u32 = 0_u32;
+    while fi < nfns {
+        if let f = eir_prog.get_fn(fi) {
+            if !f.sig.effects.is_gpu && f.key.kind == .TopDef && str.bytes_eq(interner.get(f.name), "main".as_bytes()) {
+                return fi;
+            }
+        }
+        fi = fi +% 1_u32;
+    }
+    _ = prog;
+    return null;
+}
+
+/// Emits AArch64 Linux `_start`:
+/// - Parses `argc`, `argv`, `envp`, `auxv` (`AT_BASE` -> X20, `AT_SYSINFO_EHDR` -> X21, `envp` -> X22).
+/// - Self-relocates `R_AARCH64_RELATIVE (1027)` in Static PIE mode when `AT_BASE == 0`.
+/// - Stores `__eon_envp`, calls `eon_rt_tls_init()`.
+/// - Constructs `Env` (96B) or `AllocCap` (48B) on 16B-aligned stack if `main` expects one.
+/// - Calls `main`, extracts exit code (checking `CBNZ X8` for `ErrorUnion`), invokes `SYS_exit_group (94)`.
+fn emit_a64_linux_start(
+    alloc: *mut AllocCap,
+    main_fid: u32,
+    eir_prog: *eir.EirProgram,
+    env: *types.TypeEnv,
+    interner: *mut span.SymInterner,
+    needed_libs: *[u32],
+    out_buf: *mut a64_asm.A64Buf,
+    needed_helpers: *mut col.DynBuf[u32],
+) -> bool ! OutOfMemory {
+    out_buf.clear();
+    let mf = eir_prog.get_fn(main_fid) orelse { return false; };
+
+    // X19 = initial SP (&argc)
+    try out_buf.mov_rr(alloc, a64_asm.X19, a64_asm.SP);
+    try out_buf.load_mem(alloc, a64_asm.X0, a64_asm.X19, 0_i32, 8_u8, false, a64_asm.X16); // argc
+    try out_buf.add_imm(alloc, true, false, a64_asm.X9, a64_asm.X0, 2_u16, false);
+    try out_buf.add_rr_lsl(alloc, true, a64_asm.X9, a64_asm.X19, a64_asm.X9, 3_u8); // &envp[0]
+    try out_buf.mov_rr(alloc, a64_asm.X22, a64_asm.X9); // envp
+
+    // Walk envp to find auxv
+    let l_env = try out_buf.new_label(alloc);
+    out_buf.bind_label(l_env);
+    try out_buf.load_mem(alloc, a64_asm.X10, a64_asm.X9, 0_i32, 8_u8, false, a64_asm.X16);
+    try out_buf.add_imm(alloc, true, false, a64_asm.X9, a64_asm.X9, 8_u16, false);
+    try out_buf.cbnz_label(alloc, true, a64_asm.X10, l_env);
+
+    // Walk auxv for AT_BASE (7) -> X20
+    try out_buf.mov_imm64(alloc, a64_asm.X20, 0_u64);
+    let l_aux = try out_buf.new_label(alloc);
+    let l_aux_done = try out_buf.new_label(alloc);
+    let l_aux_next = try out_buf.new_label(alloc);
+    out_buf.bind_label(l_aux);
+    try out_buf.load_mem(alloc, a64_asm.X10, a64_asm.X9, 0_i32, 8_u8, false, a64_asm.X16);
+    try out_buf.cbz_label(alloc, true, a64_asm.X10, l_aux_done);
+    try out_buf.load_mem(alloc, a64_asm.X11, a64_asm.X9, 8_i32, 8_u8, false, a64_asm.X16);
+    try out_buf.cmp_imm(alloc, true, a64_asm.X10, 7_u16);
+    try out_buf.b_cond_label(alloc, .Ne, l_aux_next);
+    try out_buf.mov_rr(alloc, a64_asm.X20, a64_asm.X11);
+    out_buf.bind_label(l_aux_next);
+    try out_buf.add_imm(alloc, true, false, a64_asm.X9, a64_asm.X9, 16_u16, false);
+    try out_buf.b_label(alloc, l_aux);
+    out_buf.bind_label(l_aux_done);
+
+    // Self-relocate Static PIE (R_AARCH64_RELATIVE = 1027) when needed_libs is empty & AT_BASE == 0
+    if needed_libs.len == 0_usize {
+        let l_skip = try out_buf.new_label(alloc);
+        let l_lp = try out_buf.new_label(alloc);
+        let l_nxt = try out_buf.new_label(alloc);
+        let s_ehdr = try interner.intern_str(alloc, "__eon_ehdr_start");
+        let s_rs = try interner.intern_str(alloc, "__eon_rela_dyn_start");
+        let s_re = try interner.intern_str(alloc, "__eon_rela_dyn_end");
+        try out_buf.cbnz_label(alloc, true, a64_asm.X20, l_skip);
+        try out_buf.lea_sym(alloc, a64_asm.X9, s_ehdr, 0_i64);
+        try out_buf.lea_sym(alloc, a64_asm.X10, s_rs, 0_i64);
+        try out_buf.lea_sym(alloc, a64_asm.X11, s_re, 0_i64);
+        out_buf.bind_label(l_lp);
+        try out_buf.cmp_rr(alloc, true, a64_asm.X10, a64_asm.X11);
+        try out_buf.b_cond_label(alloc, .Cs, l_skip);
+        try out_buf.load_mem(alloc, a64_asm.X12, a64_asm.X10, 8_i32, 4_u8, false, a64_asm.X16);
+        try out_buf.cmp_imm(alloc, false, a64_asm.X12, 1027_u16); // R_AARCH64_RELATIVE
+        try out_buf.b_cond_label(alloc, .Ne, l_nxt);
+        try out_buf.load_mem(alloc, a64_asm.X13, a64_asm.X10, 0_i32, 8_u8, false, a64_asm.X16);
+        try out_buf.load_mem(alloc, a64_asm.X14, a64_asm.X10, 16_i32, 8_u8, false, a64_asm.X16);
+        try out_buf.add_rr(alloc, true, false, a64_asm.X13, a64_asm.X13, a64_asm.X9);
+        try out_buf.add_rr(alloc, true, false, a64_asm.X14, a64_asm.X14, a64_asm.X9);
+        try out_buf.store_mem(alloc, a64_asm.X13, 0_i32, a64_asm.X14, 8_u8, a64_asm.X16);
+        out_buf.bind_label(l_nxt);
+        try out_buf.add_imm(alloc, true, false, a64_asm.X10, a64_asm.X10, 24_u16, false);
+        try out_buf.b_label(alloc, l_lp);
+        out_buf.bind_label(l_skip);
+    }
+
+    // Store __eon_envp & init Variant I TLS
+    let s_envp = try interner.intern_str(alloc, "__eon_envp");
+    try out_buf.lea_sym(alloc, a64_asm.X9, s_envp, 0_i64);
+    try out_buf.store_mem(alloc, a64_asm.X9, 0_i32, a64_asm.X22, 8_u8, a64_asm.X16);
+    let s_tls = try interner.intern_str(alloc, "eon_rt_tls_init");
+    try out_buf.bl_sym(alloc, s_tls);
+    try needed_helpers.push(alloc, s_tls);
+
+    // Check if main takes Env or AllocCap
+    let sig_ps = env.params_range(mf.sig.params);
+    var takes_env = false;
+    var takes_alloc = false;
+    if mf.params.len == 1_u32 && sig_ps.len >= 1_usize {
+        var p0_ty = sig_ps[0_usize].ty;
+        let p0n = env.get(p0_ty);
+        if (p0n.kind == .Borrow && p0n.borrow_kind == .Single) || p0n.kind == .RawPtr { p0_ty = p0n.primary; }
+        let dn = env.get(p0_ty);
+        if dn.kind == .Builtin && dn.builtin_kind == .Env { takes_env = true; }
+        else if dn.kind == .Builtin && dn.builtin_kind == .AllocCap { takes_alloc = true; }
+    }
+
+    // Ensure SP is 16-byte aligned before building Env/AllocCap and calling main
+    try out_buf.mov_rr(alloc, a64_asm.X9, a64_asm.SP);
+    try out_buf.mov_imm64(alloc, a64_asm.X10, 0xFFFFFFFFFFFFFFF0_u64);
+    try out_buf.and_rr(alloc, true, false, a64_asm.X9, a64_asm.X9, a64_asm.X10);
+    try out_buf.mov_rr(alloc, a64_asm.SP, a64_asm.X9);
+
+    if takes_env {
+        try out_buf.sub_imm(alloc, true, false, a64_asm.SP, a64_asm.SP, 96_u16, false);
+        var off: i32 = 0_i32;
+        while off < 96_i32 {
+            try out_buf.store_mem(alloc, a64_asm.SP, off, a64_asm.XZR, 8_u8, a64_asm.X16);
+            off = off +% 8_i32;
+        }
+        try out_buf.mov_imm64(alloc, a64_asm.X9, 0xFFFFFFFFFFFFFF9C_u64); // AT_FDCWD = -100
+        try out_buf.store_mem(alloc, a64_asm.SP, 40_i32, a64_asm.X9, 8_u8, a64_asm.X16);
+        try out_buf.mov_imm64(alloc, a64_asm.X9, 1_u64);
+        try out_buf.store_mem(alloc, a64_asm.SP, 56_i32, a64_asm.X9, 8_u8, a64_asm.X16);
+        try out_buf.store_mem(alloc, a64_asm.SP, 64_i32, a64_asm.X9, 8_u8, a64_asm.X16);
+        try out_buf.load_mem(alloc, a64_asm.X9, a64_asm.X19, 0_i32, 8_u8, false, a64_asm.X16); // argc
+        try out_buf.store_mem(alloc, a64_asm.SP, 72_i32, a64_asm.X9, 8_u8, a64_asm.X16);
+        try out_buf.add_imm(alloc, true, false, a64_asm.X9, a64_asm.X19, 8_u16, false); // argv
+        try out_buf.store_mem(alloc, a64_asm.SP, 80_i32, a64_asm.X9, 8_u8, a64_asm.X16);
+        try out_buf.mov_rr(alloc, a64_asm.X0, a64_asm.SP);
+    } else if takes_alloc {
+        try out_buf.sub_imm(alloc, true, false, a64_asm.SP, a64_asm.SP, 48_u16, false);
+        var off: i32 = 0_i32;
+        while off < 48_i32 {
+            try out_buf.store_mem(alloc, a64_asm.SP, off, a64_asm.XZR, 8_u8, a64_asm.X16);
+            off = off +% 8_i32;
+        }
+        try out_buf.mov_rr(alloc, a64_asm.X0, a64_asm.SP);
+    }
+
+    let main_sym = try mach_isel_a64.a64_fn_sym_name_id(alloc, mf.key, eir_prog, interner);
+    try out_buf.bl_sym(alloc, main_sym);
+
+    // Extract exit code into X0
+    let rn = env.get(mf.sig.ret);
+    if rn.kind == .Int {
+        // already in X0
+    } else if rn.kind == .ErrorUnion {
+        let l_err = try out_buf.new_label(alloc);
+        let l_exit = try out_buf.new_label(alloc);
+        try out_buf.cbnz_label(alloc, false, a64_asm.X8, l_err);
+        if rn.primary == types.TY_VOID || rn.primary == types.TY_NEVER {
+            try out_buf.mov_imm64(alloc, a64_asm.X0, 0_u64);
+        }
+        try out_buf.b_label(alloc, l_exit);
+        out_buf.bind_label(l_err);
+        try out_buf.mov_rr(alloc, a64_asm.X0, a64_asm.X8);
+        out_buf.bind_label(l_exit);
+    } else {
+        try out_buf.mov_imm64(alloc, a64_asm.X0, 0_u64);
+    }
+
+    // SYS_exit_group (94) on AArch64 Linux
+    try out_buf.mov_imm64(alloc, a64_asm.X8, a64_asm.SYS_A64_EXIT_GROUP);
+    try out_buf.svc0(alloc);
+    try out_buf.brk(alloc, 1_u16);
+    return out_buf.finish();
+}
+
+fn emit_a64_dyn_vtables(
+    alloc: *mut AllocCap,
+    eir_prog: *eir.EirProgram,
+    env: *types.TypeEnv,
+    interner: *mut span.SymInterner,
+    input: *mut elf64.ElfLinkInput,
+) -> !OutOfMemory {
+    let pairs = eir_prog.dyn_impl_pairs_slice();
+    let impls = env.decls.impls.as_slice();
+    var pi: usize = 0_usize;
+    while pi < pairs.len {
+        let pair = pairs[pi];
+        if let imeta = env.get_iface(pair.iface_def) {
+            let cn = env.get(pair.concrete_ty);
+            var has_t = false;
+            var tkind: types.MethodTargetKind = .Def;
+            var tdef: u32 = 0_u32;
+            var tbk: resolve.BuiltinKind = .Prim;
+            if cn.kind == .Struct || cn.kind == .Pool || cn.kind == .Enum || cn.kind == .Union || cn.kind == .Bitfield {
+                has_t = true; tkind = .Def; tdef = cn.primary;
+            } else if cn.kind == .Builtin {
+                has_t = true; tkind = .Builtin; tbk = cn.builtin_kind;
+            }
+            if has_t {
+                var found_impl: usize = impls.len;
+                var ii: usize = 0_usize;
+                while ii < impls.len {
+                    let im = impls[ii];
+                    if im.has_iface && im.iface_def == pair.iface_def && im.target.kind == tkind {
+                        if (tkind == .Def && im.target.def_id == tdef) || (tkind == .Builtin && im.target.builtin == tbk) {
+                            found_impl = ii;
+                            break;
+                        }
+                    }
+                    ii = ii +% 1_usize;
+                }
+                if found_impl < impls.len {
+                    try pad_dyn_u8(alloc, &mut input.data_rel_ro, 8_usize);
+                    let vt_off = input.data_rel_ro.len().widen.[u64]();
+                    let vt_sym = try mach_isel_a64.intern_sym_u64_2(alloc, interner, "eon_vtable_", pair.iface_def.widen.[u64](), pair.concrete_ty.widen.[u64]());
+                    let imethods = env.iface_methods_range(imeta.methods);
+                    let vt_cnt = if imethods.len == 0_usize { 1_usize } else { imethods.len };
+                    try input.symbols.push(alloc, elf64.ElfSymbol.{
+                        name_sym: vt_sym,
+                        section: .DataRelRo,
+                        offset: vt_off,
+                        size: (vt_cnt *% 8_usize).widen.[u64](),
+                        is_global: true,
+                        is_func: false,
+                    });
+                    if imethods.len == 0_usize {
+                        var zi: usize = 0_usize;
+                        while zi < 8_usize { try input.data_rel_ro.push(alloc, 0_u8); zi = zi +% 1_usize; }
+                    } else {
+                        let impl_ms = env.impl_methods_range(impls[found_impl].methods);
+                        var mi: usize = 0_usize;
+                        while mi < imethods.len {
+                            let mname = imethods[mi].name;
+                            var matched_sub: u32 = eir.EIR_NONE;
+                            var k: usize = 0_usize;
+                            while k < impl_ms.len {
+                                if impl_ms[k].sig.name == mname { matched_sub = impl_ms[k].sub_idx; break; }
+                                k = k +% 1_usize;
+                            }
+                            let slot_off = input.data_rel_ro.len().widen.[u64]();
+                            var zi: usize = 0_usize;
+                            while zi < 8_usize { try input.data_rel_ro.push(alloc, 0_u8); zi = zi +% 1_usize; }
+                            if matched_sub != eir.EIR_NONE {
+                                let target_sym = try mach_isel_a64.a64_fn_sym_name_id(alloc, cfg_ir.fn_key_impl_method(found_impl.trunc.[u32](), matched_sub), eir_prog, interner);
+                                try input.relocs.push(alloc, elf64.ElfReloc.{
+                                    section: .DataRelRo,
+                                    offset: slot_off,
+                                    kind: .Abs64,
+                                    target_sym: target_sym,
+                                    addend: 0_i64,
+                                });
+                            }
+                            mi = mi +% 1_usize;
+                        }
+                    }
+                }
+            }
+        }
+        pi = pi +% 1_usize;
+    }
+    return;
+}
+
+fn emit_a64_fnref_thunks(
+    alloc: *mut AllocCap,
+    eir_prog: *eir.EirProgram,
+    env: *types.TypeEnv,
+    interner: *mut span.SymInterner,
+    reqs: *[mach_x64.FnRefThunkReq],
+    input: *mut elf64.ElfLinkInput,
+) -> !OutOfMemory {
+    var seen = try col.HashMap.[u32].init(alloc, 16_usize);
+    errdefer seen.destroy(alloc);
+    var ri: usize = 0_usize;
+    while ri < reqs.len {
+        let req = reqs[ri];
+        let key = req.target_def.widen.[u64]();
+        if seen.contains(key) { ri = ri +% 1_usize; continue; }
+        try seen.insert(alloc, key, 1_u32);
+
+        let target_sym = try mach_isel_a64.a64_fn_sym_name_id(alloc, cfg_ir.fn_key_top_def(req.target_def), eir_prog, interner);
+        var start_idx: usize = 0_usize;
+        var user_gp: usize = 0_usize;
+        if let fid = eir_prog.find_fn_by_key(cfg_ir.fn_key_top_def(req.target_def)) {
+            if let f = eir_prog.get_fn(fid) {
+                let rc = mach_isel_a64.a64_classify_ret(f.sig.ret, env);
+                if mach_isel_a64.a64_ret_uses_sret(rc) { start_idx = 1_usize; }
+                let ps = env.params_range(f.sig.params);
+                var pi: usize = 0_usize;
+                while pi < ps.len {
+                    let cls = mach_isel_a64.a64_classify_arg(ps[pi].ty, env);
+                    if cls == .IntReg || cls == .ByPtr { user_gp = user_gp +% 1_usize; }
+                    else if cls == .TwoIntRegs { user_gp = user_gp +% 2_usize; }
+                    pi = pi +% 1_usize;
+                }
+            }
+        }
+
+        var tb = try a64_asm.A64Buf.init(alloc);
+        errdefer tb.destroy(alloc);
+        // Shift X(start_idx+1)..X7 down to X(start_idx)..X6 to discard hidden closure env pointer!
+        var gi = start_idx;
+        while gi < 7_usize {
+            try tb.mov_rr(alloc, gi.trunc.[u8](), (gi +% 1_usize).trunc.[u8]());
+            gi = gi +% 1_usize;
+        }
+        if start_idx +% user_gp == 8_usize {
+            // 8th GP arg spilled to [SP + 0] by caller
+            try tb.load_mem(alloc, a64_asm.X7, a64_asm.SP, 0_i32, 8_u8, false, a64_asm.X16);
+        }
+        try tb.b_sym(alloc, target_sym);
+        _ = tb.finish();
+
+        try pad_dyn_u8(alloc, &mut input.text, 4_usize);
+        let toff = input.text.len().widen.[u64]();
+        try input.symbols.push(alloc, elf64.ElfSymbol.{
+            name_sym: req.thunk_sym,
+            section: .Text,
+            offset: toff,
+            size: tb.code.len().widen.[u64](),
+            is_global: true,
+            is_func: true,
+        });
+        let trels = tb.relocs.as_slice();
+        var ti: usize = 0_usize;
+        while ti < trels.len {
+            try input.relocs.push(alloc, elf64.ElfReloc.{
+                section: .Text,
+                offset: toff +% trels[ti].offset.widen.[u64](),
+                kind: trels[ti].kind,
+                target_sym: trels[ti].sym_id,
+                addend: trels[ti].addend,
+            });
+            ti = ti +% 1_usize;
+        }
+        try input.text.push_slice(alloc, tb.code.as_slice());
+        tb.destroy(alloc);
+        ri = ri +% 1_usize;
+    }
+    seen.destroy(alloc);
+    return;
+}
+
+fn append_a64_blob_to_link(
+    alloc: *mut AllocCap,
+    blob: *mach_isel_a64.A64FnBlob,
+    input: *mut elf64.ElfLinkInput,
+    helper_queue: *mut col.DynBuf[u32],
+    helper_seen: *mut col.HashMap[u32],
+    all_fnref_thunks: *mut col.DynBuf[mach_x64.FnRefThunkReq],
+) -> !OutOfMemory {
+    try pad_dyn_u8(alloc, &mut input.text, 4_usize);
+    let fn_off = input.text.len().widen.[u64]();
+    try input.symbols.push(alloc, elf64.ElfSymbol.{
+        name_sym: blob.sym_id,
+        section: .Text,
+        offset: fn_off,
+        size: blob.code.len().widen.[u64](),
+        is_global: true,
+        is_func: true,
+    });
+    let rels = blob.relocs.as_slice();
+    var i: usize = 0_usize;
+    while i < rels.len {
+        try input.relocs.push(alloc, elf64.ElfReloc.{
+            section: .Text,
+            offset: fn_off +% rels[i].offset.widen.[u64](),
+            kind: rels[i].kind,
+            target_sym: rels[i].sym_id,
+            addend: rels[i].addend,
+        });
+        i = i +% 1_usize;
+    }
+    try input.text.push_slice(alloc, blob.code.as_slice());
+
+    let ro_items = blob.rodata_items.as_slice();
+    let ro_bytes = blob.rodata_bytes.as_slice();
+    let ro_rels = blob.rodata_relocs.as_slice();
+    i = 0_usize;
+    while i < ro_items.len {
+        let it = ro_items[i];
+        let al = if it.align == 0_u32 { 1_usize } else { it.align.widen.[usize]() };
+        try pad_dyn_u8(alloc, &mut input.rodata, al);
+        let ro_off = input.rodata.len().widen.[u64]();
+        try input.symbols.push(alloc, elf64.ElfSymbol.{
+            name_sym: it.sym_id,
+            section: .Rodata,
+            offset: ro_off,
+            size: it.data_len.widen.[u64](),
+            is_global: false,
+            is_func: false,
+        });
+        let s = it.data_off.widen.[usize]();
+        let e = s +% it.data_len.widen.[usize]();
+        if e <= ro_bytes.len {
+            let sl = ro_bytes.sub(s, e) catch { return; };
+            try input.rodata.push_slice(alloc, sl);
+        }
+        let rs = it.reloc_start.widen.[usize]();
+        let rl = it.reloc_len.widen.[usize]();
+        var k: usize = 0_usize;
+        while k < rl {
+            let ridx = rs +% k;
+            if ridx >= ro_rels.len { break; }
+            try input.relocs.push(alloc, elf64.ElfReloc.{
+                section: .Rodata,
+                offset: ro_off +% ro_rels[ridx].offset.widen.[u64](),
+                kind: .Abs64,
+                target_sym: ro_rels[ridx].target_sym,
+                addend: ro_rels[ridx].addend,
+            });
+            k = k +% 1_usize;
+        }
+        i = i +% 1_usize;
+    }
+
+    let lines = blob.line_entries.as_slice();
+    i = 0_usize;
+    while i < lines.len {
+        try input.line_entries.push(alloc, elf64.LineEntry.{
+            code_offset: fn_off.trunc.[u32]() +% lines[i].code_offset,
+            file_idx: lines[i].file_idx,
+            line: lines[i].line,
+            col: lines[i].col,
+        });
+        i = i +% 1_usize;
+    }
+
+    let hs = blob.used_helpers.as_slice();
+    i = 0_usize;
+    while i < hs.len {
+        let hk = hs[i].widen.[u64]();
+        if !helper_seen.contains(hk) {
+            try helper_seen.insert(alloc, hk, 1_u32);
+            try helper_queue.push(alloc, hs[i]);
+        }
+        i = i +% 1_usize;
+    }
+    try all_fnref_thunks.push_slice(alloc, blob.fn_ref_thunks.as_slice());
+    return;
+}
+
+fn emit_a64_rt_helpers_and_bss(
+    alloc: *mut AllocCap,
+    interner: *mut span.SymInterner,
+    helper_queue: *mut col.DynBuf[u32],
+    helper_seen: *mut col.HashMap[u32],
+    input: *mut elf64.ElfLinkInput,
+) -> !OutOfMemory {
+    // Emit runtime .bss symbols (shared names with x86_64 runtime)
+    var bss_syms = try col.DynBuf.[x64_asm.RtBssSym].init(alloc, 16_usize);
+    errdefer bss_syms.destroy(alloc);
+    try x64_asm.emit_rt_bss_symbols(alloc, interner, &mut bss_syms);
+    let bs = bss_syms.as_slice();
+    var bi: usize = 0_usize;
+    while bi < bs.len {
+        let b = bs[bi];
+        let al = if b.align == 0_u64 { 1_u64 } else { b.align };
+        input.bss_size = types.align_up_u64(input.bss_size, al);
+        let boff = input.bss_size;
+        input.bss_size = input.bss_size +% b.size;
+        try input.symbols.push(alloc, elf64.ElfSymbol.{
+            name_sym: b.sym_id,
+            section: .Bss,
+            offset: boff,
+            size: b.size,
+            is_global: true,
+            is_func: false,
+        });
+        bi = bi +% 1_usize;
+    }
+
+    // Emit all needed AArch64 runtime helpers (expanding transitive helper calls like print_f32 -> print_i64)
+    var hbuf = try a64_asm.A64Buf.init(alloc);
+    errdefer hbuf.destroy(alloc);
+    var hi: usize = 0_usize;
+    while hi < helper_queue.len() {
+        let hqs = helper_queue.as_slice();
+        if hi >= hqs.len { break; }
+        let hsym = hqs[hi];
+        hi = hi +% 1_usize;
+        hbuf.clear();
+        let ok = try a64_asm.emit_a64_rt_helper_by_name(alloc, interner.get(hsym), interner, &mut hbuf);
+        if ok {
+            try pad_dyn_u8(alloc, &mut input.text, 4_usize);
+            let hoff = input.text.len().widen.[u64]();
+            try input.symbols.push(alloc, elf64.ElfSymbol.{
+                name_sym: hsym,
+                section: .Text,
+                offset: hoff,
+                size: hbuf.code.len().widen.[u64](),
+                is_global: true,
+                is_func: true,
+            });
+            let hrels = hbuf.relocs.as_slice();
+            var ri: usize = 0_usize;
+            while ri < hrels.len {
+                let r = hrels[ri];
+                try input.relocs.push(alloc, elf64.ElfReloc.{
+                    section: .Text,
+                    offset: hoff +% r.offset.widen.[u64](),
+                    kind: r.kind,
+                    target_sym: r.sym_id,
+                    addend: r.addend,
+                });
+                if r.kind == .A64Call26 && mach_isel_a64.a64_is_builtin_rt_helper(interner.get(r.sym_id)) {
+                    let dk = r.sym_id.widen.[u64]();
+                    if !helper_seen.contains(dk) {
+                        try helper_seen.insert(alloc, dk, 1_u32);
+                        try helper_queue.push(alloc, r.sym_id);
+                    }
+                }
+                ri = ri +% 1_usize;
+            }
+            try input.text.push_slice(alloc, hbuf.code.as_slice());
+        }
+    }
+    hbuf.destroy(alloc);
+    bss_syms.destroy(alloc);
+    return;
+}
+
+fn populate_a64_exports_and_externals(
+    alloc: *mut AllocCap,
+    eir_prog: *eir.EirProgram,
+    interner: *mut span.SymInterner,
+    mode: elf64.ElfMode,
+    input: *mut elf64.ElfLinkInput,
+) -> !OutOfMemory {
+    if mode.kind == .LinuxShared {
+        let nfns = eir_prog.fn_count();
+        var fi: u32 = 0_u32;
+        while fi < nfns {
+            if let f = eir_prog.get_fn(fi) {
+                if !f.sig.effects.is_gpu && f.sig.is_pub && f.key.kind == .TopDef {
+                    let sym = try mach_isel_a64.a64_fn_sym_name_id(alloc, f.key, eir_prog, interner);
+                    try input.exported_syms.push(alloc, sym);
+                }
+            }
+            fi = fi +% 1_u32;
+        }
+    }
+
+    var def_set = try col.HashMap.[u32].init(alloc, 64_usize);
+    errdefer def_set.destroy(alloc);
+    let syms = input.symbols.as_slice();
+    var si: usize = 0_usize;
+    while si < syms.len {
+        try def_set.insert(alloc, syms[si].name_sym.widen.[u64](), 1_u32);
+        si = si +% 1_usize;
+    }
+    var ext_seen = try col.HashMap.[u32].init(alloc, 16_usize);
+    errdefer ext_seen.destroy(alloc);
+    let rels = input.relocs.as_slice();
+    var ri: usize = 0_usize;
+    while ri < rels.len {
+        let r = rels[ri];
+        if r.kind == .A64Call26 || r.kind == .A64Jump26 || r.kind == .A64AdrpGot21 || r.kind == .A64Ld64GotLo12 || r.kind == .Abs64 {
+            let tk = r.target_sym.widen.[u64]();
+            if !def_set.contains(tk) && !ext_seen.contains(tk) {
+                let nb = interner.get(r.target_sym);
+                let is_synth = str.bytes_eq(nb, "__eon_ehdr_start".as_bytes())
+                    || str.bytes_eq(nb, "__eon_rela_dyn_start".as_bytes())
+                    || str.bytes_eq(nb, "__eon_rela_dyn_end".as_bytes())
+                    || str.bytes_eq(nb, "__eon_tdata_start".as_bytes())
+                    || str.bytes_eq(nb, "__eon_tdata_end".as_bytes());
+                if !is_synth {
+                    try ext_seen.insert(alloc, tk, 1_u32);
+                    try input.external_syms.push(alloc, r.target_sym);
+                }
+            }
+        }
+        ri = ri +% 1_usize;
+    }
+    ext_seen.destroy(alloc);
+    def_set.destroy(alloc);
+    return;
+}
+
+/// Top-level native AArch64 compilation & ELF64 linking entry point.
+pub fn compile_and_link_a64(
+    alloc: *mut AllocCap,
+    sm: *span.SourceMap,
+    eir_prog: *mut eir.EirProgram,
+    prog: *resolve.ResolvedProgram,
+    env: *types.TypeEnv,
+    ct: *ctvm.CtArena,
+    interner: *mut span.SymInterner,
+    opts: *mach_x64.CompileOptions,
+    needed_libs: *[u32],
+) -> mach_x64.CompileResult ! OutOfMemory {
+    var input = try elf64.ElfLinkInput.init(alloc);
+    errdefer input.destroy(alloc);
+    input.mode = opts.mode.with_arch(.AArch64);
+    input.emit_debug_line = opts.emit_debug_line;
+    try input.needed_libs.push_slice(alloc, needed_libs);
+
+    let nfiles = sm.file_count();
+    var dfi: u32 = 0_u32;
+    while dfi < nfiles {
+        let fsym = try interner.intern(alloc, sm.file_name(dfi));
+        try input.debug_files.push(alloc, fsym);
+        dfi = dfi +% 1_u32;
+    }
+
+    var helper_queue = try col.DynBuf.[u32].init(alloc, 16_usize);
+    errdefer helper_queue.destroy(alloc);
+    var helper_seen = try col.HashMap.[u32].init(alloc, 32_usize);
+    errdefer helper_seen.destroy(alloc);
+    var all_fnref_thunks = try col.DynBuf.[mach_x64.FnRefThunkReq].init(alloc, 8_usize);
+    errdefer all_fnref_thunks.destroy(alloc);
+    var err_msg = try str.StrBuf.init(alloc, 16_usize);
+    errdefer err_msg.destroy(alloc);
+
+    let nfns = eir_prog.fn_count();
+    var cg_ok = true;
+    var fi: u32 = 0_u32;
+    while fi < nfns && cg_ok {
+        if let f = eir_prog.get_fn(fi) {
+            if f.sig.effects.is_gpu || f.is_emi_stub || f.blocks.len == 0_u32 {
+                fi = fi +% 1_u32;
+                continue;
+            }
+            let fn_sym = try mach_isel_a64.a64_fn_sym_name_id(alloc, f.key, eir_prog, interner);
+            var used_opt = false;
+
+            if opts.opt.opt_level > 0_u8 {
+                var mf = try mach_ir.MachFunc.init_for_target(alloc, fn_sym, fi, opts.target_spec);
+                errdefer mf.destroy(alloc);
+                let lowered = try mach_isel_a64.try_lower_eir_to_mach_a64(
+                    alloc, eir_prog, fi, fn_sym, env, interner, opts.target_spec, &mut mf,
+                );
+                if lowered {
+                    try mach_regalloc.allocate_registers(alloc, &mut mf);
+                    try mach_opt_a64.peephole_a64(alloc, &mut mf);
+                    let em = try mach_opt_a64.emit_mach_func_a64(alloc, &mf, sm, opts.emit_debug_line);
+                    errdefer em.destroy(alloc);
+                    if em.ok {
+                        var ob = try mach_isel_a64.A64FnBlob.init(alloc, fn_sym);
+                        errdefer ob.destroy(alloc);
+                        ob.ok = true;
+                        ob.own_stack_bytes = em.own_stack_bytes;
+                        try ob.code.push_slice(alloc, em.code.as_slice());
+                        try ob.relocs.push_slice(alloc, em.relocs.as_slice());
+                        try ob.used_helpers.push_slice(alloc, em.used_helpers.as_slice());
+                        try ob.line_entries.push_slice(alloc, em.line_entries.as_slice());
+                        try append_a64_blob_to_link(alloc, &ob, &mut input, &mut helper_queue, &mut helper_seen, &mut all_fnref_thunks);
+                        ob.destroy(alloc);
+                        used_opt = true;
+                    }
+                    em.destroy(alloc);
+                }
+                mf.destroy(alloc);
+            }
+
+            if !used_opt {
+                let blob = try mach_isel_a64.compile_fn_a64_direct(alloc, sm, eir_prog, fi, fn_sym, env, ct, interner, opts);
+                errdefer blob.destroy(alloc);
+                if !blob.ok {
+                    cg_ok = false;
+                    err_msg.clear();
+                    try err_msg.push_bytes_grow(alloc, blob.err_msg.as_bytes());
+                } else {
+                    try append_a64_blob_to_link(alloc, &blob, &mut input, &mut helper_queue, &mut helper_seen, &mut all_fnref_thunks);
+                }
+                blob.destroy(alloc);
+            }
+        }
+        fi = fi +% 1_u32;
+    }
+
+    if !cg_ok {
+        let empty_elf = try elf64.LinkedElf.empty(alloc);
+        errdefer empty_elf.destroy(alloc);
+        all_fnref_thunks.destroy(alloc);
+        helper_seen.destroy(alloc);
+        helper_queue.destroy(alloc);
+        input.destroy(alloc);
+        return mach_x64.CompileResult.{ ok: false, elf: empty_elf, err_msg: err_msg };
+    }
+
+    // Emit `_start` for LinuxPie or set entry symbol for Freestanding
+    if let entry_fid = find_entry_fn_id(eir_prog, prog, interner, input.mode) {
+        if input.mode.kind == .LinuxPie {
+            var sbuf = try a64_asm.A64Buf.init(alloc);
+            errdefer sbuf.destroy(alloc);
+            var start_helpers = try col.DynBuf.[u32].init(alloc, 8_usize);
+            errdefer start_helpers.destroy(alloc);
+            let s_ok = try emit_a64_linux_start(alloc, entry_fid, eir_prog, env, interner, needed_libs, &mut sbuf, &mut start_helpers);
+            if s_ok {
+                try pad_dyn_u8(alloc, &mut input.text, 4_usize);
+                let soff = input.text.len().widen.[u64]();
+                let start_sym = try interner.intern_str(alloc, "_start");
+                input.entry_sym = start_sym;
+                try input.symbols.push(alloc, elf64.ElfSymbol.{
+                    name_sym: start_sym,
+                    section: .Text,
+                    offset: soff,
+                    size: sbuf.code.len().widen.[u64](),
+                    is_global: true,
+                    is_func: true,
+                });
+                let srels = sbuf.relocs.as_slice();
+                var sri: usize = 0_usize;
+                while sri < srels.len {
+                    try input.relocs.push(alloc, elf64.ElfReloc.{
+                        section: .Text,
+                        offset: soff +% srels[sri].offset.widen.[u64](),
+                        kind: srels[sri].kind,
+                        target_sym: srels[sri].sym_id,
+                        addend: srels[sri].addend,
+                    });
+                    sri = sri +% 1_usize;
+                }
+                try input.text.push_slice(alloc, sbuf.code.as_slice());
+                let shs = start_helpers.as_slice();
+                var shi: usize = 0_usize;
+                while shi < shs.len {
+                    let hk = shs[shi].widen.[u64]();
+                    if !helper_seen.contains(hk) {
+                        try helper_seen.insert(alloc, hk, 1_u32);
+                        try helper_queue.push(alloc, shs[shi]);
+                    }
+                    shi = shi +% 1_usize;
+                }
+            }
+            start_helpers.destroy(alloc);
+            sbuf.destroy(alloc);
+        } else if input.mode.kind == .Freestanding {
+            if let ef = eir_prog.get_fn(entry_fid) {
+                input.entry_sym = try mach_isel_a64.a64_fn_sym_name_id(alloc, ef.key, eir_prog, interner);
+            }
+        }
+    }
+
+    try emit_a64_dyn_vtables(alloc, eir_prog, env, interner, &mut input);
+    try emit_a64_fnref_thunks(alloc, eir_prog, env, interner, all_fnref_thunks.as_slice(), &mut input);
+    try emit_a64_rt_helpers_and_bss(alloc, interner, &mut helper_queue, &mut helper_seen, &mut input);
+    try populate_a64_exports_and_externals(alloc, eir_prog, interner, input.mode, &mut input);
+
+    try eir_prog.release_pools(alloc);
+    try elf64.gc_and_icf_link_input(alloc, &mut input, interner, opts.opt.opt_level >= 2_u8 || opts.opt.opt_size);
+    let link_res = try elf64.link_elf64(alloc, &input, interner);
+
+    err_msg.destroy(alloc);
+    all_fnref_thunks.destroy(alloc);
+    helper_seen.destroy(alloc);
+    helper_queue.destroy(alloc);
+    input.destroy(alloc);
+
+    let elf64.LinkResult.{ ok: lok, elf: lelf, err_msg: lerr } = link_res;
+    return mach_x64.CompileResult.{ ok: lok, elf: lelf, err_msg: lerr };
+}

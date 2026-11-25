@@ -927,6 +927,66 @@ impl EirAuxPools {
     }
 }
 
+struct InplaceCompactRes {
+    done: bool;
+    total: usize;
+}
+
+fn sort_blks_by_inst_start(live_blks: *mut [u32], blks: *[EirBlock]) {
+    let n = live_blks.len;
+    if n <= 1_usize {
+        return;
+    }
+    var gap: usize = 1_usize;
+    let third = n / 3_usize;
+    while gap < third {
+        gap = (gap *% 3_usize) +% 1_usize;
+    }
+    while gap > 0_usize {
+        var i = gap;
+        while i < live_blks.len {
+            let cur_b = live_blks[i];
+            let cur_bi = cur_b.widen.[usize]();
+            let cur_st = if cur_bi < blks.len { blks[cur_bi].insts.start } else { 0_u32 };
+            var j = i;
+            while j >= gap && j < live_blks.len {
+                let prev = j - gap;
+                let prev_b = live_blks[prev];
+                let prev_bi = prev_b.widen.[usize]();
+                let prev_st = if prev_bi < blks.len { blks[prev_bi].insts.start } else { 0_u32 };
+                if prev_st <= cur_st {
+                    break;
+                }
+                live_blks[j] = prev_b;
+                j = prev;
+            }
+            live_blks[j] = cur_b;
+            i = i +% 1_usize;
+        }
+        gap = gap / 3_usize;
+    }
+}
+
+fn check_disjoint_inst_ranges(live_blks: *[u32], blks: *[EirBlock], old_len: usize) -> bool {
+    var prev_end: usize = 0_usize;
+    var i: usize = 0_usize;
+    while i < live_blks.len {
+        let bidx = live_blks[i].widen.[usize]();
+        if bidx >= blks.len {
+            return false;
+        }
+        let ir = blks[bidx].insts;
+        let st = ir.start.widen.[usize]();
+        let en = st +% ir.len.widen.[usize]();
+        if st < prev_end || en > old_len {
+            return false;
+        }
+        prev_end = en;
+        i = i +% 1_usize;
+    }
+    return true;
+}
+
 pub linear struct EirSchedPools {
     pub schedules: col.DynBuf[cfg_ir.ScheduleDag];
     pub sched_waves: col.DynBuf[cfg_ir.ScheduleWave];
@@ -1142,8 +1202,13 @@ impl EirProgram {
         return;
     }
 
-    fn compact_insts_and_flags_inplace(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+    fn try_compact_insts_inplace_shift(self: *mut Self, alloc: *mut AllocCap) -> InplaceCompactRes ! OutOfMemory {
         var total: usize = 0_usize;
+        let old_len = self.funcs.insts.len();
+        let old_cap = self.funcs.insts.cap();
+        let has_flags = self.proven_safe_insts.len() > 0_usize;
+        var live_blks = try col.DynBuf.[u32].init(alloc, 256_usize);
+        errdefer live_blks.destroy(alloc);
         let fns_ro = self.funcs.fns.as_slice();
         let blks_ro = self.funcs.blocks.as_slice();
         var fi: usize = 0_usize;
@@ -1153,15 +1218,80 @@ impl EirProgram {
             while bi < br.len {
                 let bidx = (br.start +% bi).widen.[usize]();
                 if bidx < blks_ro.len {
-                    total = total +% blks_ro[bidx].insts.len.widen.[usize]();
+                    let ilen = blks_ro[bidx].insts.len;
+                    if ilen > 0_u32 {
+                        total = total +% ilen.widen.[usize]();
+                        try live_blks.push(alloc, bidx.trunc.[u32]());
+                    }
                 }
                 bi = bi +% 1_u32;
             }
             fi = fi +% 1_usize;
         }
+        var done_inplace = false;
+        // Zero-allocation in-place compaction when live data >= 50% of capacity:
+        // avoids doubling the ~150 MiB instruction buffer during inlining waves.
+        if total *% 2_usize >= old_cap && live_blks.len() > 0_usize {
+            sort_blks_by_inst_start(live_blks.as_mut_slice(), blks_ro);
+            if check_disjoint_inst_ranges(live_blks.as_slice(), blks_ro, old_len) {
+                let lb = live_blks.as_slice();
+                let insts_mut = self.funcs.insts.as_mut_slice();
+                let flags_mut = self.proven_safe_insts.as_mut_slice();
+                let blks_mut = self.funcs.blocks.as_mut_slice();
+                var write_pos: usize = 0_usize;
+                var k: usize = 0_usize;
+                while k < lb.len {
+                    let bidx = lb[k].widen.[usize]();
+                    if bidx < blks_mut.len {
+                        let ir = blks_mut[bidx].insts;
+                        let st = ir.start.widen.[usize]();
+                        let n = ir.len.widen.[usize]();
+                        if st > write_pos {
+                            var j: usize = 0_usize;
+                            while j < n {
+                                let di = write_pos +% j;
+                                let si = st +% j;
+                                if di < insts_mut.len && si < insts_mut.len {
+                                    insts_mut[di] = insts_mut[si];
+                                }
+                                if has_flags && di < flags_mut.len && si < flags_mut.len {
+                                    flags_mut[di] = flags_mut[si];
+                                }
+                                j = j +% 1_usize;
+                            }
+                        }
+                        blks_mut[bidx].insts = ast.range_new(write_pos.trunc.[u32](), ir.len);
+                        write_pos = write_pos +% n;
+                    }
+                    k = k +% 1_usize;
+                }
+                while self.funcs.insts.len() > write_pos {
+                    _ = self.funcs.insts.pop();
+                }
+                if has_flags {
+                    while self.proven_safe_insts.len() > write_pos {
+                        _ = self.proven_safe_insts.pop();
+                    }
+                }
+                done_inplace = true;
+            }
+        }
+        live_blks.destroy(alloc);
+        return InplaceCompactRes.{ done: done_inplace, total: total };
+    }
+
+    pub fn compact_insts_and_flags_inplace(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        let icr = try self.try_compact_insts_inplace_shift(alloc);
+        if icr.done {
+            return;
+        }
+        let total = icr.total;
+        let has_flags = self.proven_safe_insts.len() > 0_usize;
+        let fns_ro = self.funcs.fns.as_slice();
+        var fi: usize = 0_usize;
+
         var new_insts = try col.DynBuf.[EirInst].init(alloc, if total < 16_usize { 16_usize } else { total });
         errdefer new_insts.destroy(alloc);
-        let has_flags = self.proven_safe_insts.len() > 0_usize;
         var new_flags = try col.DynBuf.[u8].init(alloc, if has_flags && total > 16_usize { total } else { 16_usize });
         errdefer new_flags.destroy(alloc);
 
@@ -1257,6 +1387,9 @@ impl EirProgram {
         while fi < fns_ro.len {
             total = total +% fns_ro[fi].blocks.len.widen.[usize]();
             fi = fi +% 1_usize;
+        }
+        if total +% (total >> 2_usize) +% 4096_usize >= self.funcs.blocks.len() {
+            return;
         }
         var new_blks = try col.DynBuf.[EirBlock].init(alloc, if total < 16_usize { 16_usize } else { total });
         errdefer new_blks.destroy(alloc);
@@ -1354,6 +1487,22 @@ impl EirProgram {
         self.value_facts.destroy(alloc);
         self.value_facts = new_vfacts;
         return;
+    }
+
+    /// Clears body ranges for functions `[fn_start, fn_end)` so `compact_pools_inplace`
+    /// can reclaim their instructions/blocks/slots while streaming into a fresh `EirProgram`.
+    pub fn clear_fn_body_ranges(self: *mut Self, fn_start: usize, fn_end: usize) {
+        let fs = self.funcs.fns.as_mut_slice();
+        var fi = fn_start;
+        while fi < fn_end && fi < fs.len {
+            fs[fi].blocks = ast.range_empty();
+            fs[fi].value_tys = ast.range_empty();
+            fs[fi].slots = ast.range_empty();
+            fs[fi].rpo = ast.range_empty();
+            fs[fi].value_facts = ast.range_empty();
+            fs[fi].val_names = ast.range_empty();
+            fi = fi +% 1_usize;
+        }
     }
 
     /// Compacts dead function/block/instruction pools one pool at a time so Peak RSS

@@ -28,6 +28,7 @@ import eonc.tcb_audit;
 import eonc.emi;
 import eonc.build_sys;
 import eonc.mach_x64;
+import eonc.mach_a64;
 import eonc.ui_test;
 import eonc.fmt;
 import eonc.lsp;
@@ -4880,7 +4881,7 @@ fn stream_check_and_lower_batches(
     errdefer sess.destroy(alloc);
     while true {
         let br_opt = try sess.next_batch(
-            alloc, arena, resolved, tenv, cfg_prog, ct, &ttable, interner, 256_usize,
+            alloc, arena, resolved, tenv, cfg_prog, ct, &ttable, interner, 64_usize,
         );
         let br = br_opt orelse { break; };
         try borrow.analyze_fn_range_with_jobs(
@@ -5062,7 +5063,11 @@ fn compile_loaded_to_elf_file(
                 li = li +% 1_usize;
             }
 
-            let res = if copts.has_emi_cache && emi_cache_dir.len > 0_usize && user_file_count > 0_usize {
+            let res = if copts.target_spec.arch == .AArch64 {
+                try mach_a64.compile_and_link_a64(
+                    alloc, sm, &mut eir_prog, &resolved, &tenv, &ct, interner, copts, lib_syms.as_slice(),
+                )
+            } else if copts.has_emi_cache && emi_cache_dir.len > 0_usize && user_file_count > 0_usize {
                 var cap = try mach_x64.CapturedProgramBlobs.init(alloc);
                 errdefer cap.destroy(alloc);
                 let cr = try mach_x64.compile_and_link_x64_capture(
@@ -6196,24 +6201,33 @@ fn build_plan_target(
     let tkind: build_sys.BuildTargetKind = if ti < ts.len { ts[ti].kind } else { .Exe };
     let is_shared = tkind == .SharedLib;
     let is_emi_lib = tkind == .EmiLib;
-    let mode = if is_shared || is_emi_lib {
-        elf64.ElfMode.linux_shared(0_u32, 0_u32)
-    } else if args.freestanding {
-        elf64.ElfMode.freestanding(0x00100000_u64, true)
-    } else {
-        elf64.ElfMode.linux_pie()
-    };
     let eff_target = if args.freestanding && !args.target_spec.is_nostd {
         args.target_spec.with_freestanding()
     } else {
         args.target_spec
     };
+    let is_nostd = args.freestanding || eff_target.is_nostd;
+    let base_vaddr: u64 = if eff_target.arch == .AArch64 {
+        0x40080000_u64
+    } else if eff_target.arch == .RiscV64 {
+        0x80200000_u64
+    } else {
+        0x00100000_u64
+    };
+    let mode_base = if is_shared || is_emi_lib {
+        elf64.ElfMode.linux_shared(0_u32, 0_u32)
+    } else if is_nostd {
+        elf64.ElfMode.freestanding(base_vaddr, eff_target.arch == .X86_64)
+    } else {
+        elf64.ElfMode.linux_pie()
+    };
+    let mode = mode_base.with_arch(eff_target.arch);
     let copts = mach_x64.CompileOptions.{
         mode: mode,
         target_spec: eff_target,
         sanitize: sanitize,
         emit_debug_line: true,
-        has_emi_cache: args.has_emi_cache,
+        has_emi_cache: args.has_emi_cache && eff_target.arch == .X86_64,
         opt: args.opt,
         jobs: args.jobs,
     };
@@ -6600,34 +6614,43 @@ fn cmd_build(env: *mut Env) -> i32 ! OutOfMemory | Utf8Error {
         try out_path.push_str_grow(&mut env.alloc, "a.out");
     }
 
-    let mode = if args.freestanding {
-        elf64.ElfMode.freestanding(0x00100000_u64, true)
-    } else if args.shared {
-        elf64.ElfMode.linux_shared(0_u32, 0_u32)
-    } else {
-        elf64.ElfMode.linux_pie()
-    };
-    var opt_cfg = args.opt;
-    opt_cfg.incremental_cgu = args.has_emi_cache;
     let eff_target = if args.freestanding && !args.target_spec.is_nostd {
         args.target_spec.with_freestanding()
     } else {
         args.target_spec
     };
+    let is_nostd = args.freestanding || eff_target.is_nostd;
+    let base_vaddr: u64 = if eff_target.arch == .AArch64 {
+        0x40080000_u64
+    } else if eff_target.arch == .RiscV64 {
+        0x80200000_u64
+    } else {
+        0x00100000_u64
+    };
+    let mode_base = if is_nostd {
+        elf64.ElfMode.freestanding(base_vaddr, eff_target.arch == .X86_64)
+    } else if args.shared {
+        elf64.ElfMode.linux_shared(0_u32, 0_u32)
+    } else {
+        elf64.ElfMode.linux_pie()
+    };
+    let mode = mode_base.with_arch(eff_target.arch);
+    var opt_cfg = args.opt;
+    opt_cfg.incremental_cgu = args.has_emi_cache && eff_target.arch == .X86_64;
     let copts = mach_x64.CompileOptions.{
         mode: mode,
         target_spec: eff_target,
         sanitize: args.sanitize,
         emit_debug_line: true,
-        has_emi_cache: args.has_emi_cache,
+        has_emi_cache: args.has_emi_cache && eff_target.arch == .X86_64,
         opt: opt_cfg,
         jobs: args.jobs,
     };
 
     var user_file_count: usize = 0_usize;
-    if args.has_emi_cache
+    if copts.has_emi_cache
         && args.emi_cache.len() > 0_usize
-        && !args.freestanding
+        && !is_nostd
         && !args.shared
         && args.needed_libs.len() == 0_usize
         && !args.audit_tcb
@@ -7217,11 +7240,11 @@ fn cmd_run(env: *mut Env) -> i32 ! OutOfMemory | Utf8Error {
         try tmp_bin.push_str_grow(&mut env.alloc, ".bin");
 
         let copts = mach_x64.CompileOptions.{
-            mode: elf64.ElfMode.linux_pie(),
+            mode: elf64.ElfMode.linux_pie().with_arch(args.target_spec.arch),
             target_spec: args.target_spec,
             sanitize: args.sanitize,
             emit_debug_line: true,
-            has_emi_cache: args.has_emi_cache,
+            has_emi_cache: args.has_emi_cache && args.target_spec.arch == .X86_64,
             opt: args.opt,
             jobs: args.jobs,
         };

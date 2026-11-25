@@ -4,16 +4,16 @@ module std.fs @hal;
 // Capability-first + linear-FD OS filesystem layer (`std.fs`)
 // ---------------------------------------------------------------------------
 
-const SYS_READ: u64 = 0_u64;
-const SYS_WRITE: u64 = 1_u64;
-const SYS_CLOSE: u64 = 3_u64;
-const SYS_FSTAT: u64 = 5_u64;
-const SYS_LSEEK: u64 = 8_u64;
-const SYS_FSYNC: u64 = 74_u64;
-const SYS_OPENAT: u64 = 257_u64;
-const SYS_NEWFSTATAT: u64 = 262_u64;
-const SYS_UNLINKAT: u64 = 263_u64;
-const SYS_RENAMEAT: u64 = 264_u64;
+@inline fn sys_nr_read() -> u64 { comptime if @target_arch() == .AArch64 { return 63_u64; } else { return 0_u64; } }
+@inline fn sys_nr_write() -> u64 { comptime if @target_arch() == .AArch64 { return 64_u64; } else { return 1_u64; } }
+@inline fn sys_nr_close() -> u64 { comptime if @target_arch() == .AArch64 { return 57_u64; } else { return 3_u64; } }
+@inline fn sys_nr_fstat() -> u64 { comptime if @target_arch() == .AArch64 { return 80_u64; } else { return 5_u64; } }
+@inline fn sys_nr_lseek() -> u64 { comptime if @target_arch() == .AArch64 { return 62_u64; } else { return 8_u64; } }
+@inline fn sys_nr_fsync() -> u64 { comptime if @target_arch() == .AArch64 { return 82_u64; } else { return 74_u64; } }
+@inline fn sys_nr_openat() -> u64 { comptime if @target_arch() == .AArch64 { return 56_u64; } else { return 257_u64; } }
+@inline fn sys_nr_newfstatat() -> u64 { comptime if @target_arch() == .AArch64 { return 79_u64; } else { return 262_u64; } }
+@inline fn sys_nr_unlinkat() -> u64 { comptime if @target_arch() == .AArch64 { return 35_u64; } else { return 263_u64; } }
+@inline fn sys_nr_renameat() -> u64 { comptime if @target_arch() == .AArch64 { return 38_u64; } else { return 264_u64; } }
 
 const AT_FDCWD: u64 = 0xFFFFFFFFFFFFFF9C_u64; // -100
 const AT_REMOVEDIR: u64 = 0x200_u64;
@@ -37,48 +37,60 @@ pub const SEEK_END: i32 = 2_i32;
 
 @naked
 fn syscall1(_nr: u64, _a1: u64) -> i64 {
-    raw {
-        asm("mov rax, rdi; mov rdi, rsi; syscall; ret", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x8, x0; mov x0, x1; svc #0; ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; syscall; ret", options(noreturn)); }
     }
     return 0_i64;
 }
 
 @naked
 fn syscall2(_nr: u64, _a1: u64, _a2: u64) -> i64 {
-    raw {
-        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; syscall; ret", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; svc #0; ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; syscall; ret", options(noreturn)); }
     }
     return 0_i64;
 }
 
 @naked
 fn syscall3(_nr: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
-    raw {
-        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; syscall; ret", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; svc #0; ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; syscall; ret", options(noreturn)); }
     }
     return 0_i64;
 }
 
 @naked
 fn syscall4(_nr: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64) -> i64 {
-    raw {
-        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r10, r8; syscall; ret", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; svc #0; ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r10, r8; syscall; ret", options(noreturn)); }
     }
     return 0_i64;
 }
 
 @naked
 fn slice_ptr(_s: *[u8]) -> u64 {
-    raw {
-        asm("mov rax, rdi; ret", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
     }
     return 0_u64;
 }
 
 @naked
 fn slice_mut_ptr(_s: *mut [u8]) -> u64 {
-    raw {
-        asm("mov rax, rdi; ret", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
     }
     return 0_u64;
 }
@@ -146,10 +158,12 @@ pub struct FileStat {
     pub mtime_sec: i64;
 }
 
-fn parse_linux_x64_stat(buf: *[u8]) -> FileStat {
-    // Linux x86_64 `struct stat` (144 bytes):
-    //   +24: st_mode (u32), +48: st_size (i64), +88: st_mtime (i64)
-    let mode = read_le_u32(buf, 24_usize);
+fn parse_linux_stat(buf: *[u8]) -> FileStat {
+    // Linux `struct stat`:
+    //   x86_64 (144B):      +24 st_mode (u32), +48 st_size (i64), +88 st_mtime (i64)
+    //   AArch64/RV64 (128B): +16 st_mode (u32), +48 st_size (i64), +88 st_mtime (i64)
+    let mode_off: usize = comptime if @target_arch() == .X86_64 { 24_usize } else { 16_usize };
+    let mode = read_le_u32(buf, mode_off);
     let sz_i = read_le_i64(buf, 48_usize);
     let mt = read_le_i64(buf, 88_usize);
     let ftype = mode & S_IFMT;
@@ -191,14 +205,14 @@ pub fn stat_path(_fs: *FsCap, path: *str) -> FileStat ! IoError {
     }
     var st_raw: [144]u8 = [0_u8; 144];
     let rc = syscall4(
-        SYS_NEWFSTATAT,
+        sys_nr_newfstatat(),
         AT_FDCWD,
         slice_ptr(&cpath),
         slice_mut_ptr(&mut st_raw),
         0_u64,
     );
     try check_errno(rc);
-    return parse_linux_x64_stat(&st_raw);
+    return parse_linux_stat(&st_raw);
 }
 
 pub fn exists(fs: *FsCap, path: *str) -> bool {
@@ -213,7 +227,7 @@ pub fn remove_file(_fs: *FsCap, path: *str) -> !IoError {
     if !copy_cstr(path.as_bytes(), &mut cpath) {
         return .InvalidInput;
     }
-    let rc = syscall3(SYS_UNLINKAT, AT_FDCWD, slice_ptr(&cpath), 0_u64);
+    let rc = syscall3(sys_nr_unlinkat(), AT_FDCWD, slice_ptr(&cpath), 0_u64);
     try check_errno(rc);
     return;
 }
@@ -223,7 +237,7 @@ pub fn remove_dir(_fs: *FsCap, path: *str) -> !IoError {
     if !copy_cstr(path.as_bytes(), &mut cpath) {
         return .InvalidInput;
     }
-    let rc = syscall3(SYS_UNLINKAT, AT_FDCWD, slice_ptr(&cpath), AT_REMOVEDIR);
+    let rc = syscall3(sys_nr_unlinkat(), AT_FDCWD, slice_ptr(&cpath), AT_REMOVEDIR);
     try check_errno(rc);
     return;
 }
@@ -234,7 +248,7 @@ pub fn rename_path(_fs: *FsCap, old_path: *str, new_path: *str) -> !IoError {
     if !copy_cstr(old_path.as_bytes(), &mut old_c) || !copy_cstr(new_path.as_bytes(), &mut new_c) {
         return .InvalidInput;
     }
-    let rc = syscall4(SYS_RENAMEAT, AT_FDCWD, slice_ptr(&old_c), AT_FDCWD, slice_ptr(&new_c));
+    let rc = syscall4(sys_nr_renameat(), AT_FDCWD, slice_ptr(&old_c), AT_FDCWD, slice_ptr(&new_c));
     try check_errno(rc);
     return;
 }
@@ -253,7 +267,7 @@ impl File {
         if !copy_cstr(path.as_bytes(), &mut cpath) {
             return .InvalidInput;
         }
-        let rc = syscall4(SYS_OPENAT, AT_FDCWD, slice_ptr(&cpath), flags, mode);
+        let rc = syscall4(sys_nr_openat(), AT_FDCWD, slice_ptr(&cpath), flags, mode);
         try check_errno(rc);
         return File.{ fd: rc.trunc.[i32]() };
     }
@@ -280,7 +294,7 @@ impl File {
         }
         loop {
             let rc = syscall3(
-                SYS_READ,
+                sys_nr_read(),
                 self.fd.widen.[i64]().bitcast.[u64](),
                 slice_mut_ptr(buf),
                 buf.len.widen.[u64](),
@@ -299,7 +313,7 @@ impl File {
         }
         loop {
             let rc = syscall3(
-                SYS_WRITE,
+                sys_nr_write(),
                 self.fd.widen.[i64]().bitcast.[u64](),
                 slice_ptr(data),
                 data.len.widen.[u64](),
@@ -328,14 +342,14 @@ impl File {
     }
 
     pub fn sync_all(self: *Self) -> !IoError {
-        let rc = syscall1(SYS_FSYNC, self.fd.widen.[i64]().bitcast.[u64]());
+        let rc = syscall1(sys_nr_fsync(), self.fd.widen.[i64]().bitcast.[u64]());
         try check_errno(rc);
         return;
     }
 
     pub fn seek(self: *mut Self, offset: i64, whence: i32) -> u64 ! IoError {
         let rc = syscall3(
-            SYS_LSEEK,
+            sys_nr_lseek(),
             self.fd.widen.[i64]().bitcast.[u64](),
             offset.bitcast.[u64](),
             whence.widen.[i64]().bitcast.[u64](),
@@ -347,18 +361,18 @@ impl File {
     pub fn stat(self: *Self) -> FileStat ! IoError {
         var st_raw: [144]u8 = [0_u8; 144];
         let rc = syscall2(
-            SYS_FSTAT,
+            sys_nr_fstat(),
             self.fd.widen.[i64]().bitcast.[u64](),
             slice_mut_ptr(&mut st_raw),
         );
         try check_errno(rc);
-        return parse_linux_x64_stat(&st_raw);
+        return parse_linux_stat(&st_raw);
     }
 
     pub fn close(self: File) {
         let File.{ fd } = self;
         if fd >= 0_i32 {
-            _ = syscall1(SYS_CLOSE, fd.widen.[i64]().bitcast.[u64]());
+            _ = syscall1(sys_nr_close(), fd.widen.[i64]().bitcast.[u64]());
         }
     }
 }

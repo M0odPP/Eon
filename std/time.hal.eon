@@ -4,8 +4,23 @@ module std.time @hal;
 // Monotonic & wall-clock time + OS sleep (`std.time`, Linux x86_64 syscalls)
 // ---------------------------------------------------------------------------
 
-const SYS_NANOSLEEP: u64 = 35_u64;
-const SYS_CLOCK_GETTIME: u64 = 228_u64;
+@inline
+fn sys_nr_nanosleep() -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        return 101_u64;
+    } else {
+        return 35_u64;
+    }
+}
+
+@inline
+fn sys_nr_clock_gettime() -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        return 113_u64;
+    } else {
+        return 228_u64;
+    }
+}
 
 const CLOCK_REALTIME: u64 = 0_u64;
 const CLOCK_MONOTONIC: u64 = 1_u64;
@@ -18,24 +33,42 @@ extern "C" struct Timespec {
 
 @naked
 fn syscall2(_nr: u64, _a1: u64, _a2: u64) -> i64 {
-    raw {
-        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; syscall; ret", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw {
+            asm("mov x8, x0; mov x0, x1; mov x1, x2; svc #0; ret", options(noreturn));
+        }
+    } else {
+        raw {
+            asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; syscall; ret", options(noreturn));
+        }
     }
     return 0_i64;
 }
 
 @naked
 fn timespec_mut_addr(_p: *mut Timespec) -> u64 {
-    raw {
-        asm("mov rax, rdi; ret", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw {
+            asm("ret", options(noreturn));
+        }
+    } else {
+        raw {
+            asm("mov rax, rdi; ret", options(noreturn));
+        }
     }
     return 0_u64;
 }
 
 @naked
 fn timespec_addr(_p: *Timespec) -> u64 {
-    raw {
-        asm("mov rax, rdi; ret", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw {
+            asm("ret", options(noreturn));
+        }
+    } else {
+        raw {
+            asm("mov rax, rdi; ret", options(noreturn));
+        }
     }
     return 0_u64;
 }
@@ -136,7 +169,7 @@ impl Instant {
     /// Read monotonic timestamp directly from the OS clock without a capability handle.
     pub fn now_monotonic() -> Instant {
         var ts = Timespec.{ tv_sec: 0_i64, tv_nsec: 0_i64 };
-        let rc = syscall2(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, timespec_mut_addr(&mut ts));
+        let rc = syscall2(sys_nr_clock_gettime(), CLOCK_MONOTONIC, timespec_mut_addr(&mut ts));
         if rc != 0_i64 || ts.tv_sec < 0_i64 || ts.tv_nsec < 0_i64 {
             return Instant.{ nanos: 0_u64 };
         }
@@ -171,7 +204,7 @@ pub struct WallTime {
 impl WallTime {
     pub fn now_utc() -> WallTime {
         var ts = Timespec.{ tv_sec: 0_i64, tv_nsec: 0_i64 };
-        let rc = syscall2(SYS_CLOCK_GETTIME, CLOCK_REALTIME, timespec_mut_addr(&mut ts));
+        let rc = syscall2(sys_nr_clock_gettime(), CLOCK_REALTIME, timespec_mut_addr(&mut ts));
         if rc != 0_i64 {
             return WallTime.{ secs: 0_i64, nanos: 0_u32 };
         }
@@ -202,7 +235,7 @@ pub fn sleep(d: Duration) {
     var rem = Timespec.{ tv_sec: 0_i64, tv_nsec: 0_i64 };
     var retries: u32 = 0_u32;
     while retries < 64_u32 {
-        let rc = syscall2(SYS_NANOSLEEP, timespec_addr(&req), timespec_mut_addr(&mut rem));
+        let rc = syscall2(sys_nr_nanosleep(), timespec_addr(&req), timespec_mut_addr(&mut rem));
         if rc == 0_i64 || rc != EINTR {
             return;
         }

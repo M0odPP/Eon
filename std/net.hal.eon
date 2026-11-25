@@ -4,20 +4,20 @@ module std.net @hal;
 // Capability-gated TCP/UDP IPv4 networking over direct Linux syscalls (`std.net`)
 // ---------------------------------------------------------------------------
 
-const SYS_READ: u64 = 0_u64;
-const SYS_WRITE: u64 = 1_u64;
-const SYS_CLOSE: u64 = 3_u64;
-const SYS_SOCKET: u64 = 41_u64;
-const SYS_CONNECT: u64 = 42_u64;
-const SYS_SENDTO: u64 = 44_u64;
-const SYS_RECVFROM: u64 = 45_u64;
-const SYS_SHUTDOWN: u64 = 48_u64;
-const SYS_BIND: u64 = 49_u64;
-const SYS_LISTEN: u64 = 50_u64;
-const SYS_GETSOCKNAME: u64 = 51_u64;
-const SYS_SETSOCKOPT: u64 = 54_u64;
-const SYS_FCNTL: u64 = 72_u64;
-const SYS_ACCEPT4: u64 = 288_u64;
+@inline fn sys_nr_read() -> u64 { comptime if @target_arch() == .AArch64 { return 63_u64; } else { return 0_u64; } }
+@inline fn sys_nr_write() -> u64 { comptime if @target_arch() == .AArch64 { return 64_u64; } else { return 1_u64; } }
+@inline fn sys_nr_close() -> u64 { comptime if @target_arch() == .AArch64 { return 57_u64; } else { return 3_u64; } }
+@inline fn sys_nr_socket() -> u64 { comptime if @target_arch() == .AArch64 { return 198_u64; } else { return 41_u64; } }
+@inline fn sys_nr_connect() -> u64 { comptime if @target_arch() == .AArch64 { return 203_u64; } else { return 42_u64; } }
+@inline fn sys_nr_sendto() -> u64 { comptime if @target_arch() == .AArch64 { return 206_u64; } else { return 44_u64; } }
+@inline fn sys_nr_recvfrom() -> u64 { comptime if @target_arch() == .AArch64 { return 207_u64; } else { return 45_u64; } }
+@inline fn sys_nr_shutdown() -> u64 { comptime if @target_arch() == .AArch64 { return 210_u64; } else { return 48_u64; } }
+@inline fn sys_nr_bind() -> u64 { comptime if @target_arch() == .AArch64 { return 200_u64; } else { return 49_u64; } }
+@inline fn sys_nr_listen() -> u64 { comptime if @target_arch() == .AArch64 { return 201_u64; } else { return 50_u64; } }
+@inline fn sys_nr_getsockname() -> u64 { comptime if @target_arch() == .AArch64 { return 204_u64; } else { return 51_u64; } }
+@inline fn sys_nr_setsockopt() -> u64 { comptime if @target_arch() == .AArch64 { return 208_u64; } else { return 54_u64; } }
+@inline fn sys_nr_fcntl() -> u64 { comptime if @target_arch() == .AArch64 { return 25_u64; } else { return 72_u64; } }
+@inline fn sys_nr_accept4() -> u64 { comptime if @target_arch() == .AArch64 { return 242_u64; } else { return 288_u64; } }
 
 const AF_INET: u64 = 2_u64;
 const SOCK_STREAM: u64 = 1_u64;
@@ -33,40 +33,50 @@ const EINTR: i64 = -4_i64;
 
 @naked
 fn syscall1(_nr: u64, _a1: u64) -> i64 {
-    raw {
-        asm("mov rax, rdi; mov rdi, rsi; syscall; ret", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x8, x0; mov x0, x1; svc #0; ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; syscall; ret", options(noreturn)); }
     }
     return 0_i64;
 }
 
 @naked
 fn syscall2(_nr: u64, _a1: u64, _a2: u64) -> i64 {
-    raw {
-        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; syscall; ret", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; svc #0; ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; syscall; ret", options(noreturn)); }
     }
     return 0_i64;
 }
 
 @naked
 fn syscall3(_nr: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
-    raw {
-        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; syscall; ret", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; svc #0; ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; syscall; ret", options(noreturn)); }
     }
     return 0_i64;
 }
 
 @naked
 fn syscall4(_nr: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64) -> i64 {
-    raw {
-        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r10, r8; syscall; ret", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; svc #0; ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r10, r8; syscall; ret", options(noreturn)); }
     }
     return 0_i64;
 }
 
 @naked
 fn syscall5(_nr: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> i64 {
-    raw {
-        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r10, r8; mov r8, r9; syscall; ret", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; mov x4, x5; svc #0; ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r10, r8; mov r8, r9; syscall; ret", options(noreturn)); }
     }
     return 0_i64;
 }
@@ -81,41 +91,39 @@ fn syscall6(
     _a5: u64,
     _a6: u64,
 ) -> i64 {
-    raw {
-        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r11, r10; mov r10, r8; mov r8, r9; mov r9, r11; syscall; ret", options(noreturn));
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; mov x4, x5; mov x5, x6; svc #0; ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r11, r10; mov r10, r8; mov r8, r9; mov r9, r11; syscall; ret", options(noreturn)); }
     }
     return 0_i64;
 }
 
 @naked
 fn slice_ptr(_s: *[u8]) -> u64 {
-    raw {
-        asm("mov rax, rdi; ret", options(noreturn));
-    }
+    comptime if @target_arch() == .AArch64 { raw { asm("ret", options(noreturn)); } }
+    else { raw { asm("mov rax, rdi; ret", options(noreturn)); } }
     return 0_u64;
 }
 
 @naked
 fn slice_mut_ptr(_s: *mut [u8]) -> u64 {
-    raw {
-        asm("mov rax, rdi; ret", options(noreturn));
-    }
+    comptime if @target_arch() == .AArch64 { raw { asm("ret", options(noreturn)); } }
+    else { raw { asm("mov rax, rdi; ret", options(noreturn)); } }
     return 0_u64;
 }
 
 @naked
 fn u32_mut_addr(_p: *mut u32) -> u64 {
-    raw {
-        asm("mov rax, rdi; ret", options(noreturn));
-    }
+    comptime if @target_arch() == .AArch64 { raw { asm("ret", options(noreturn)); } }
+    else { raw { asm("mov rax, rdi; ret", options(noreturn)); } }
     return 0_u64;
 }
 
 @naked
 fn u32_addr(_p: *u32) -> u64 {
-    raw {
-        asm("mov rax, rdi; ret", options(noreturn));
-    }
+    comptime if @target_arch() == .AArch64 { raw { asm("ret", options(noreturn)); } }
+    else { raw { asm("mov rax, rdi; ret", options(noreturn)); } }
     return 0_u64;
 }
 
@@ -201,11 +209,11 @@ fn decode_sockaddr_in(buf: *[u8]) -> SocketAddrV4 {
 
 fn set_fd_nonblocking(fd: i32, nonblock: bool) -> !IoError {
     let fdu = fd.widen.[i64]().bitcast.[u64]();
-    let cur = syscall3(SYS_FCNTL, fdu, F_GETFL, 0_u64);
+    let cur = syscall3(sys_nr_fcntl(), fdu, F_GETFL, 0_u64);
     try check_errno(cur);
     let cur_u = cur.bitcast.[u64]();
     let next_u = if nonblock { cur_u | O_NONBLOCK } else { cur_u & (~O_NONBLOCK) };
-    let rc = syscall3(SYS_FCNTL, fdu, F_SETFL, next_u);
+    let rc = syscall3(sys_nr_fcntl(), fdu, F_SETFL, next_u);
     try check_errno(rc);
     return;
 }
@@ -220,14 +228,14 @@ pub linear struct TcpStream {
 
 impl TcpStream {
     pub fn connect(_net: *NetCap, addr: SocketAddrV4) -> TcpStream ! IoError {
-        let fd_rc = syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0_u64);
+        let fd_rc = syscall3(sys_nr_socket(), AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0_u64);
         try check_errno(fd_rc);
         let fd = fd_rc.trunc.[i32]();
         var sa: [16]u8 = [0_u8; 16];
         encode_sockaddr_in(addr, &mut sa);
-        let rc = syscall3(SYS_CONNECT, fd_rc.bitcast.[u64](), slice_ptr(&sa), 16_u64);
+        let rc = syscall3(sys_nr_connect(), fd_rc.bitcast.[u64](), slice_ptr(&sa), 16_u64);
         if rc < 0_i64 {
-            _ = syscall1(SYS_CLOSE, fd_rc.bitcast.[u64]());
+            _ = syscall1(sys_nr_close(), fd_rc.bitcast.[u64]());
             try check_errno(rc);
         }
         return TcpStream.{ fd: fd };
@@ -239,7 +247,7 @@ impl TcpStream {
         }
         loop {
             let rc = syscall3(
-                SYS_READ,
+                sys_nr_read(),
                 self.fd.widen.[i64]().bitcast.[u64](),
                 slice_mut_ptr(buf),
                 buf.len.widen.[u64](),
@@ -258,7 +266,7 @@ impl TcpStream {
         }
         loop {
             let rc = syscall3(
-                SYS_WRITE,
+                sys_nr_write(),
                 self.fd.widen.[i64]().bitcast.[u64](),
                 slice_ptr(data),
                 data.len.widen.[u64](),
@@ -292,7 +300,7 @@ impl TcpStream {
     }
 
     pub fn shutdown_write(self: *mut Self) -> !IoError {
-        let rc = syscall2(SYS_SHUTDOWN, self.fd.widen.[i64]().bitcast.[u64](), SHUT_WR);
+        let rc = syscall2(sys_nr_shutdown(), self.fd.widen.[i64]().bitcast.[u64](), SHUT_WR);
         try check_errno(rc);
         return;
     }
@@ -300,7 +308,7 @@ impl TcpStream {
     pub fn close(self: TcpStream) {
         let TcpStream.{ fd } = self;
         if fd >= 0_i32 {
-            _ = syscall1(SYS_CLOSE, fd.widen.[i64]().bitcast.[u64]());
+            _ = syscall1(sys_nr_close(), fd.widen.[i64]().bitcast.[u64]());
         }
     }
 }
@@ -315,22 +323,22 @@ pub linear struct TcpListener {
 
 impl TcpListener {
     pub fn bind(_net: *NetCap, addr: SocketAddrV4) -> TcpListener ! IoError {
-        let fd_rc = syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0_u64);
+        let fd_rc = syscall3(sys_nr_socket(), AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0_u64);
         try check_errno(fd_rc);
         let fdu = fd_rc.bitcast.[u64]();
         let one: u32 = 1_u32;
-        _ = syscall5(SYS_SETSOCKOPT, fdu, SOL_SOCKET, SO_REUSEADDR, u32_addr(&one), 4_u64);
+        _ = syscall5(sys_nr_setsockopt(), fdu, SOL_SOCKET, SO_REUSEADDR, u32_addr(&one), 4_u64);
 
         var sa: [16]u8 = [0_u8; 16];
         encode_sockaddr_in(addr, &mut sa);
-        let brc = syscall3(SYS_BIND, fdu, slice_ptr(&sa), 16_u64);
+        let brc = syscall3(sys_nr_bind(), fdu, slice_ptr(&sa), 16_u64);
         if brc < 0_i64 {
-            _ = syscall1(SYS_CLOSE, fdu);
+            _ = syscall1(sys_nr_close(), fdu);
             try check_errno(brc);
         }
-        let lrc = syscall2(SYS_LISTEN, fdu, 128_u64);
+        let lrc = syscall2(sys_nr_listen(), fdu, 128_u64);
         if lrc < 0_i64 {
-            _ = syscall1(SYS_CLOSE, fdu);
+            _ = syscall1(sys_nr_close(), fdu);
             try check_errno(lrc);
         }
         return TcpListener.{ fd: fd_rc.trunc.[i32]() };
@@ -340,7 +348,7 @@ impl TcpListener {
         var sa: [16]u8 = [0_u8; 16];
         var salen: u32 = 16_u32;
         let rc = syscall3(
-            SYS_GETSOCKNAME,
+            sys_nr_getsockname(),
             self.fd.widen.[i64]().bitcast.[u64](),
             slice_mut_ptr(&mut sa),
             u32_mut_addr(&mut salen),
@@ -354,7 +362,7 @@ impl TcpListener {
         var salen: u32 = 16_u32;
         loop {
             let rc = syscall4(
-                SYS_ACCEPT4,
+                sys_nr_accept4(),
                 self.fd.widen.[i64]().bitcast.[u64](),
                 slice_mut_ptr(&mut sa),
                 u32_mut_addr(&mut salen),
@@ -371,7 +379,7 @@ impl TcpListener {
     pub fn close(self: TcpListener) {
         let TcpListener.{ fd } = self;
         if fd >= 0_i32 {
-            _ = syscall1(SYS_CLOSE, fd.widen.[i64]().bitcast.[u64]());
+            _ = syscall1(sys_nr_close(), fd.widen.[i64]().bitcast.[u64]());
         }
     }
 }
@@ -391,14 +399,14 @@ pub linear struct UdpSocket {
 
 impl UdpSocket {
     pub fn bind(_net: *NetCap, addr: SocketAddrV4) -> UdpSocket ! IoError {
-        let fd_rc = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0_u64);
+        let fd_rc = syscall3(sys_nr_socket(), AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0_u64);
         try check_errno(fd_rc);
         let fdu = fd_rc.bitcast.[u64]();
         var sa: [16]u8 = [0_u8; 16];
         encode_sockaddr_in(addr, &mut sa);
-        let brc = syscall3(SYS_BIND, fdu, slice_ptr(&sa), 16_u64);
+        let brc = syscall3(sys_nr_bind(), fdu, slice_ptr(&sa), 16_u64);
         if brc < 0_i64 {
-            _ = syscall1(SYS_CLOSE, fdu);
+            _ = syscall1(sys_nr_close(), fdu);
             try check_errno(brc);
         }
         return UdpSocket.{ fd: fd_rc.trunc.[i32]() };
@@ -408,7 +416,7 @@ impl UdpSocket {
         var sa: [16]u8 = [0_u8; 16];
         var salen: u32 = 16_u32;
         let rc = syscall3(
-            SYS_GETSOCKNAME,
+            sys_nr_getsockname(),
             self.fd.widen.[i64]().bitcast.[u64](),
             slice_mut_ptr(&mut sa),
             u32_mut_addr(&mut salen),
@@ -421,7 +429,7 @@ impl UdpSocket {
         var sa: [16]u8 = [0_u8; 16];
         encode_sockaddr_in(target, &mut sa);
         let rc = syscall6(
-            SYS_SENDTO,
+            sys_nr_sendto(),
             self.fd.widen.[i64]().bitcast.[u64](),
             slice_ptr(data),
             data.len.widen.[u64](),
@@ -437,7 +445,7 @@ impl UdpSocket {
         var sa: [16]u8 = [0_u8; 16];
         var salen: u32 = 16_u32;
         let rc = syscall6(
-            SYS_RECVFROM,
+            sys_nr_recvfrom(),
             self.fd.widen.[i64]().bitcast.[u64](),
             slice_mut_ptr(buf),
             buf.len.widen.[u64](),
@@ -460,7 +468,7 @@ impl UdpSocket {
     pub fn close(self: UdpSocket) {
         let UdpSocket.{ fd } = self;
         if fd >= 0_i32 {
-            _ = syscall1(SYS_CLOSE, fd.widen.[i64]().bitcast.[u64]());
+            _ = syscall1(sys_nr_close(), fd.widen.[i64]().bitcast.[u64]());
         }
     }
 }

@@ -513,6 +513,7 @@ def build_and_run(
     src_dir: Path,
     bin_path: Path,
     extra_build_flags: list[str],
+    runner: list[str] | None = None,
 ) -> tuple[bool, int, str]:
     b_code, b_out = run_cmd(
         [eonc, "build", *extra_build_flags, "-o", str(bin_path), "."],
@@ -520,12 +521,13 @@ def build_and_run(
     )
     if b_code != 0:
         return False, b_code, f"[build failed]\n{b_out}"
-    r_code, r_out = run_cmd([str(bin_path)], src_dir)
+    exec_cmd = [*(runner or []), str(bin_path)]
+    r_code, r_out = run_cmd(exec_cmd, src_dir)
     return True, r_code, r_out
 
 
-def run_one(args_tuple: tuple[int, int, str, Path, Path, bool, bool, bool]) -> tuple[str, int, str | None]:
-    idx, seed, eonc, work, out_dir, test_release, verify_opt, test_sanitize = args_tuple
+def run_one(args_tuple: tuple[int, int, str, Path, Path, bool, bool, bool, bool, bool]) -> tuple[str, int, str | None]:
+    idx, seed, eonc, work, out_dir, test_release, verify_opt, test_sanitize, test_aarch64, test_riscv64 = args_tuple
     src = Gen(random.Random(seed)).program()
     d = work / f"p{idx}"
     d.mkdir()
@@ -554,6 +556,42 @@ def run_one(args_tuple: tuple[int, int, str, Path, Path, bool, bool, bool]) -> t
             if (not s_ok) or ((n_code, n_out) != (s_code, s_out)):
                 bad = True
 
+        a64_dev_res = (True, 0, "")
+        a64_rel_res = (True, 0, "")
+        if test_aarch64:
+            a64_dev_res = build_and_run(
+                eonc, d, d / "prog_a64_dev", ["--dev", "--target=aarch64-linux"], ["/usr/bin/qemu-aarch64"]
+            )
+            if (not a64_dev_res[0]) or ((i_code, i_out) != (a64_dev_res[1], a64_dev_res[2])):
+                bad = True
+            if test_release:
+                a64_rel_flags = ["--release", "--target=aarch64-linux"]
+                if verify_opt:
+                    a64_rel_flags.append("--verify-opt")
+                a64_rel_res = build_and_run(
+                    eonc, d, d / "prog_a64_rel", a64_rel_flags, ["/usr/bin/qemu-aarch64"]
+                )
+                if (not a64_rel_res[0]) or ((i_code, i_out) != (a64_rel_res[1], a64_rel_res[2])):
+                    bad = True
+
+        rv64_dev_res = (True, 0, "")
+        rv64_rel_res = (True, 0, "")
+        if test_riscv64:
+            rv64_dev_res = build_and_run(
+                eonc, d, d / "prog_rv64_dev", ["--dev", "--target=riscv64-linux"], ["/usr/bin/qemu-riscv64"]
+            )
+            if (not rv64_dev_res[0]) or ((i_code, i_out) != (rv64_dev_res[1], rv64_dev_res[2])):
+                bad = True
+            if test_release:
+                rv64_rel_flags = ["--release", "--target=riscv64-linux"]
+                if verify_opt:
+                    rv64_rel_flags.append("--verify-opt")
+                rv64_rel_res = build_and_run(
+                    eonc, d, d / "prog_rv64_rel", rv64_rel_flags, ["/usr/bin/qemu-riscv64"]
+                )
+                if (not rv64_rel_res[0]) or ((i_code, i_out) != (rv64_rel_res[1], rv64_rel_res[2])):
+                    bad = True
+
         if bad:
             dst = out_dir / f"seed_{seed}"
             dst.mkdir(parents=True, exist_ok=True)
@@ -565,6 +603,14 @@ def run_one(args_tuple: tuple[int, int, str, Path, Path, bool, bool, bool]) -> t
                 (dst / "native_rel.out").write_text(f"exit={r_code}\n{r_out}")
             if test_sanitize:
                 (dst / "native_san.out").write_text(f"exit={s_code}\n{s_out}")
+            if test_aarch64:
+                (dst / "aarch64_dev.out").write_text(f"exit={a64_dev_res[1]}\n{a64_dev_res[2]}")
+                if test_release:
+                    (dst / "aarch64_rel.out").write_text(f"exit={a64_rel_res[1]}\n{a64_rel_res[2]}")
+            if test_riscv64:
+                (dst / "riscv64_dev.out").write_text(f"exit={rv64_dev_res[1]}\n{rv64_dev_res[2]}")
+                if test_release:
+                    (dst / "riscv64_rel.out").write_text(f"exit={rv64_rel_res[1]}\n{rv64_rel_res[2]}")
             return ("mismatch", seed, str(dst))
         return ("ok", seed, None)
     finally:
@@ -578,14 +624,15 @@ def main() -> int:
     ap.add_argument("--jobs", type=int, default=max(1, min(os.cpu_count() or 4, 16)))
     ap.add_argument("--eonc", default=str(DEFAULT_EONC))
     ap.add_argument("--out", default=str(REPO / "tests" / "fuzz" / "failures"))
-    ap.add_argument("--release", action="store_true", help="3-way diff: EIR-Interp == --dev == --release")
+    ap.add_argument("--release", action="store_true", help="Include --release optimization leg")
     ap.add_argument("--verify-opt", action="store_true", help="Pass --verify-opt when building --release")
-    ap.add_argument("--no-sanitize", action="store_true", help="Skip --sanitize leg (used with --release for pure 3-way)")
+    ap.add_argument("--no-sanitize", action="store_true", help="Skip --sanitize leg")
+    ap.add_argument("--aarch64", action="store_true", help="Include AArch64 cross-compile + qemu-aarch64 leg")
+    ap.add_argument("--riscv64", action="store_true", help="Include RISC-V 64 cross-compile + qemu-riscv64 leg")
     args = ap.parse_args()
 
     test_sanitize = not args.no_sanitize
-    if args.release and not args.no_sanitize:
-        # In --release mode default to 3-way (Interp == --dev == --release) for speed unless explicitly desired
+    if (args.release or args.aarch64 or args.riscv64) and not args.no_sanitize:
         test_sanitize = False
 
     t0 = time.monotonic()
@@ -596,7 +643,18 @@ def main() -> int:
     first_reject = None
     try:
         tasks = [
-            (i, args.seed * 1_000_003 + i, eonc_abs, work, out_dir, args.release, args.verify_opt, test_sanitize)
+            (
+                i,
+                args.seed * 1_000_003 + i,
+                eonc_abs,
+                work,
+                out_dir,
+                args.release,
+                args.verify_opt,
+                test_sanitize,
+                args.aarch64,
+                args.riscv64,
+            )
             for i in range(args.n)
         ]
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:
@@ -614,7 +672,16 @@ def main() -> int:
         shutil.rmtree(work, ignore_errors=True)
 
     dt = time.monotonic() - t0
-    mode_tag = "interp==dev==release" if args.release else "interp==dev==san"
+    legs = ["interp", "x64_dev"]
+    if args.release:
+        legs.append("x64_rel")
+    if test_sanitize:
+        legs.append("x64_san")
+    if args.aarch64:
+        legs.append("a64_dev+rel" if args.release else "a64_dev")
+    if args.riscv64:
+        legs.append("rv64_dev+rel" if args.release else "rv64_dev")
+    mode_tag = "==".join(legs)
     print(
         f"programs={args.n} mode={mode_tag} agree={ok} mismatch={mismatches} rejected={rejected} elapsed={dt:.1f}s (jobs={args.jobs})"
     )
