@@ -1,0 +1,12 @@
+# Eon deterministic lockfile v1
+lock_version = 1
+
+[[dep]]
+name = "eon_gpu"
+path = "../eon_gpu"
+sha256 = "3f1a216f11aa381866596489fab47220a6d31582647803e185fcc40883252698"
+
+[[dep]]
+name = "eon_win"
+path = "../eon_win"
+sha256 = "6049f204ac727c24db6685590f9a321b04dd9e64d596af20d6e11ca5db83bf89"

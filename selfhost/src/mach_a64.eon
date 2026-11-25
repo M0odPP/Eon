@@ -914,7 +914,11 @@ pub fn compile_and_link_a64(
                 if str.bytes_eq(interner.get(ef.name), "_start".as_bytes()) {
                     input.entry_sym = ef_sym;
                 } else {
-                    // Bare-metal AArch64 boot trampoline: initialize SP in QEMU virt RAM + enable EL1 FP/NEON.
+                    // Bare-metal AArch64 boot trampoline:
+                    // 1. Initialize SP in QEMU virt RAM (0x43E00000) & enable EL1 FP/NEON.
+                    // 2. Build a 4-entry Level-1 1 GiB identity page table at 0x43E01000
+                    //    (0x00000000 Device-nGnRnE for UART/fw_cfg; 0x40000000..0xFFFFFFFF
+                    //    Normal Non-Cacheable RAM so unaligned accesses & DMA/ramfb work cleanly).
                     var sbuf = try a64_asm.A64Buf.init(alloc);
                     errdefer sbuf.destroy(alloc);
                     try sbuf.mov_imm64(alloc, a64_asm.X0, 0x43E00000_u64);
@@ -922,6 +926,34 @@ pub fn compile_and_link_a64(
                     try sbuf.mov_imm64(alloc, a64_asm.X0, 0x00300000_u64); // CPACR_EL1.FPEN = 0b11
                     try sbuf.emit32(alloc, 0xD5181040_u32); // msr cpacr_el1, x0
                     try sbuf.isb(alloc);
+
+                    try sbuf.mov_imm64(alloc, a64_asm.X2, 0x43E01000_u64); // L1 table base
+                    try sbuf.mov_imm64(alloc, a64_asm.X1, 0x0000000000000401_u64); // 0..1G Device-nGnRnE
+                    try sbuf.emit32(alloc, 0xF9000041_u32); // str x1, [x2, #0]
+                    try sbuf.mov_imm64(alloc, a64_asm.X1, 0x0000000040000705_u64); // 1..2G Normal NC
+                    try sbuf.emit32(alloc, 0xF9000441_u32); // str x1, [x2, #8]
+                    try sbuf.mov_imm64(alloc, a64_asm.X1, 0x0000000080000705_u64); // 2..3G Normal NC
+                    try sbuf.emit32(alloc, 0xF9000841_u32); // str x1, [x2, #16]
+                    try sbuf.mov_imm64(alloc, a64_asm.X1, 0x00000000C0000705_u64); // 3..4G Normal NC
+                    try sbuf.emit32(alloc, 0xF9000C41_u32); // str x1, [x2, #24]
+
+                    try sbuf.mov_imm64(alloc, a64_asm.X0, 0x0000000000004400_u64); // MAIR: Attr0=Device, Attr1=Normal NC
+                    try sbuf.emit32(alloc, 0xD518A200_u32); // msr mair_el1, x0
+                    try sbuf.mov_imm64(alloc, a64_asm.X0, 0x0000000200803520_u64); // TCR: T0SZ=32, 4K, SH=IS, EPD1=1, IPS=40b
+                    try sbuf.emit32(alloc, 0xD5182040_u32); // msr tcr_el1, x0
+                    try sbuf.emit32(alloc, 0xD5182002_u32); // msr ttbr0_el1, x2
+                    try sbuf.emit32(alloc, 0xD5033F9F_u32); // dsb sy
+                    try sbuf.emit32(alloc, 0xD508871F_u32); // tlbi vmalle1
+                    try sbuf.emit32(alloc, 0xD5033F9F_u32); // dsb sy
+                    try sbuf.isb(alloc);
+                    try sbuf.emit32(alloc, 0xD5381000_u32); // mrs x0, sctlr_el1
+                    try sbuf.mov_imm64(alloc, a64_asm.X1, 1_u64);
+                    try sbuf.emit32(alloc, 0xAA010000_u32); // orr x0, x0, x1 (M=1)
+                    try sbuf.mov_imm64(alloc, a64_asm.X1, 2_u64);
+                    try sbuf.emit32(alloc, 0x8A210000_u32); // bic x0, x0, x1 (A=0)
+                    try sbuf.emit32(alloc, 0xD5181000_u32); // msr sctlr_el1, x0
+                    try sbuf.isb(alloc);
+
                     try sbuf.bl_sym(alloc, ef_sym);
                     try sbuf.emit32(alloc, 0xD503205F_u32); // wfe
                     try sbuf.emit32(alloc, 0x17FFFFFF_u32); // b -4

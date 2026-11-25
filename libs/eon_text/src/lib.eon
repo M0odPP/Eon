@@ -1,0 +1,351 @@
+module eon_text.lib;
+
+import core.col;
+import core.color;
+import eon_gpu.scene;
+import eon_text.embedded_font;
+import eon_text.ttf;
+import eon_text.atlas;
+import eon_text.shaper;
+import eon_text.sys_font;
+
+// ============================================================================
+// Safe Unified Pure-Eon Text Engine (`libs/eon_text/src/lib.eon`)
+// 100% safe, `core/`-only facade (zero `@hal`/`raw`), works identically on
+// Linux, Windows, macOS, Android, iOS, and bare-metal `nostd`!
+// ============================================================================
+
+pub const FONT_UI_SANS: u16 = 0_u16;
+pub const FONT_UI_MONO: u16 = 1_u16;
+
+pub enum TextAlign : u8 {
+    Left = 0,
+    Center = 1,
+    Right = 2,
+}
+
+/// Freestanding / zero-heap text engine core operating over caller-supplied
+/// decoded TTF byte slices and R8 atlas pixels (ideal for bare-metal `nostd`!).
+pub struct TextEngineCore {
+    pub sans: ttf.TtfFont;
+    pub mono: ttf.TtfFont;
+    pub atlas: atlas.GlyphAtlasCore;
+}
+
+impl TextEngineCore {
+    pub fn new(sans_ttf: *[u8], mono_ttf: *[u8], atlas_w: u32, atlas_h: u32) -> TextEngineCore {
+        return TextEngineCore.{
+            sans: ttf.TtfFont.parse(sans_ttf),
+            mono: ttf.TtfFont.parse(mono_ttf),
+            atlas: atlas.GlyphAtlasCore.new(atlas_w, atlas_h),
+        };
+    }
+
+    pub fn measure(self: *Self, font_id: u16, font_data: *[u8], text: *str, px_size: f32) -> shaper.TextMetrics {
+        let f = if font_id == FONT_UI_MONO { &self.mono } else { &self.sans };
+        return shaper.measure_line(f, font_data, text.as_bytes(), px_size);
+    }
+
+    pub fn hit_test_x(self: *Self, font_id: u16, font_data: *[u8], text: *str, px_size: f32, local_x: f32) -> usize {
+        let f = if font_id == FONT_UI_MONO { &self.mono } else { &self.sans };
+        return shaper.hit_test_x(f, font_data, text.as_bytes(), px_size, local_x);
+    }
+
+    pub fn push_text_slice(
+        self: *mut Self,
+        font_data: *[u8],
+        atlas_pixels: *mut [u8],
+        atlas_entries: *mut [atlas.GlyphEntry],
+        out_sprites: *mut [scene.MonoSprite],
+        sprite_count: *mut usize,
+        next_order: *mut u32,
+        clip_mask: f32x4,
+        font_id: u16,
+        text: *str,
+        x: f32,
+        y: f32,
+        px_size: f32,
+        col_rgba: color.Rgba,
+    ) -> f32 {
+        let f = if font_id == FONT_UI_MONO { self.mono } else { self.sans };
+        return shaper.push_line_to_slice(
+            out_sprites, sprite_count, next_order, clip_mask,
+            &f, font_data, font_id, &mut self.atlas, atlas_pixels, atlas_entries,
+            text.as_bytes(), x, y, px_size, col_rgba,
+        );
+    }
+}
+
+/// Hosted unified `TextEngine` owning decoded TrueType font buffers (embedded SIL OFL
+/// Liberation Sans & Mono by default, optionally upgraded from desktop system `.ttf`
+/// files) and a dynamic shelf-packed R8 `GlyphAtlas`.
+pub linear struct TextEngine {
+    pub sans: ttf.TtfFont;
+    pub mono: ttf.TtfFont;
+    pub sans_data: col.DynBuf[u8];
+    pub mono_data: col.DynBuf[u8];
+    pub atlas: atlas.GlyphAtlas;
+}
+
+impl TextEngine {
+    pub fn init(alloc: *mut AllocCap, atlas_w: u32, atlas_h: u32) -> TextEngine ! OutOfMemory {
+        var sans_buf = try col.DynBuf.[u8].init(alloc, embedded_font.FONT_UI_SANS_LEN);
+        errdefer sans_buf.destroy(alloc);
+        var i: usize = 0_usize;
+        while i < embedded_font.FONT_UI_SANS_LEN {
+            try sans_buf.push(alloc, 0_u8);
+            i = i +% 1_usize;
+        }
+        _ = embedded_font.decode_b64(embedded_font.FONT_UI_SANS_B64, sans_buf.as_mut_slice());
+
+        var mono_buf = try col.DynBuf.[u8].init(alloc, embedded_font.FONT_UI_MONO_LEN);
+        errdefer mono_buf.destroy(alloc);
+        i = 0_usize;
+        while i < embedded_font.FONT_UI_MONO_LEN {
+            try mono_buf.push(alloc, 0_u8);
+            i = i +% 1_usize;
+        }
+        _ = embedded_font.decode_b64(embedded_font.FONT_UI_MONO_B64, mono_buf.as_mut_slice());
+
+        let at = try atlas.GlyphAtlas.init(alloc, atlas_w, atlas_h);
+        let sans_parsed = ttf.TtfFont.parse(sans_buf.as_slice());
+        let mono_parsed = ttf.TtfFont.parse(mono_buf.as_slice());
+        return TextEngine.{
+            sans: sans_parsed,
+            mono: mono_parsed,
+            sans_data: sans_buf,
+            mono_data: mono_buf,
+            atlas: at,
+        };
+    }
+
+    pub fn destroy(self: TextEngine, alloc: *mut AllocCap) {
+        let TextEngine.{ sans: _, mono: _, sans_data, mono_data, atlas: at } = self;
+        sans_data.destroy(alloc);
+        mono_data.destroy(alloc);
+        at.destroy(alloc);
+    }
+
+    /// Optionally upgrade the primary UI sans font from a desktop system `.ttf` file
+    /// (falls back cleanly to the embedded SIL OFL font on failure or `nostd`/mobile).
+    pub fn try_load_system_ui_font(self: *mut Self, fscap: *FsCap, alloc: *mut AllocCap) -> bool {
+        var tmp = col.DynBuf.[u8].init(alloc, 64_usize) catch { return false; };
+        if !sys_font.load_default_system_ui_font(fscap, alloc, &mut tmp) {
+            tmp.destroy(alloc);
+            return false;
+        }
+        let parsed = ttf.TtfFont.parse(tmp.as_slice());
+        if !parsed.valid {
+            tmp.destroy(alloc);
+            return false;
+        }
+        self.sans_data.clear();
+        self.sans_data.push_slice(alloc, tmp.as_slice()) catch {
+            tmp.destroy(alloc);
+            return false;
+        };
+        tmp.destroy(alloc);
+        self.sans = ttf.TtfFont.parse(self.sans_data.as_slice());
+        self.atlas.core.reset(self.atlas.pixels.as_mut_slice(), self.atlas.entries.as_mut_slice());
+        return true;
+    }
+
+    pub fn begin_frame(self: *mut Self) {
+        self.atlas.core.begin_frame();
+    }
+
+    pub view fn atlas_pixels(self: *Self) -> *[u8] {
+        return self.atlas.as_pixels();
+    }
+
+    pub fn atlas_width(self: *Self) -> u32 {
+        return self.atlas.core.width;
+    }
+
+    pub fn atlas_height(self: *Self) -> u32 {
+        return self.atlas.core.height;
+    }
+
+    pub fn atlas_generation(self: *Self) -> u64 {
+        return self.atlas.core.generation;
+    }
+
+    pub fn line_metrics(self: *Self, font_id: u16, px_size: f32) -> ttf.LineMetrics {
+        if font_id == FONT_UI_MONO {
+            return self.mono.line_metrics(px_size);
+        }
+        return self.sans.line_metrics(px_size);
+    }
+
+    pub fn measure(self: *Self, font_id: u16, text: *str, px_size: f32) -> shaper.TextMetrics {
+        return self.measure_bytes(font_id, text.as_bytes(), px_size);
+    }
+
+    pub fn measure_bytes(self: *Self, font_id: u16, text: *[u8], px_size: f32) -> shaper.TextMetrics {
+        if font_id == FONT_UI_MONO {
+            return shaper.measure_line(&self.mono, self.mono_data.as_slice(), text, px_size);
+        }
+        return shaper.measure_line(&self.sans, self.sans_data.as_slice(), text, px_size);
+    }
+
+    pub fn hit_test_x(self: *Self, font_id: u16, text: *str, px_size: f32, local_x: f32) -> usize {
+        if font_id == FONT_UI_MONO {
+            return shaper.hit_test_x(&self.mono, self.mono_data.as_slice(), text.as_bytes(), px_size, local_x);
+        }
+        return shaper.hit_test_x(&self.sans, self.sans_data.as_slice(), text.as_bytes(), px_size, local_x);
+    }
+
+    pub fn hit_test_bytes_x(self: *Self, font_id: u16, text: *[u8], px_size: f32, local_x: f32) -> usize {
+        if font_id == FONT_UI_MONO {
+            return shaper.hit_test_x(&self.mono, self.mono_data.as_slice(), text, px_size, local_x);
+        }
+        return shaper.hit_test_x(&self.sans, self.sans_data.as_slice(), text, px_size, local_x);
+    }
+
+    pub fn cursor_x(self: *Self, font_id: u16, text: *str, px_size: f32, byte_offset: usize) -> f32 {
+        if font_id == FONT_UI_MONO {
+            return shaper.cursor_x_for_byte(&self.mono, self.mono_data.as_slice(), text.as_bytes(), px_size, byte_offset);
+        }
+        return shaper.cursor_x_for_byte(&self.sans, self.sans_data.as_slice(), text.as_bytes(), px_size, byte_offset);
+    }
+
+    pub fn cursor_bytes_x(self: *Self, font_id: u16, text: *[u8], px_size: f32, byte_offset: usize) -> f32 {
+        if font_id == FONT_UI_MONO {
+            return shaper.cursor_x_for_byte(&self.mono, self.mono_data.as_slice(), text, px_size, byte_offset);
+        }
+        return shaper.cursor_x_for_byte(&self.sans, self.sans_data.as_slice(), text, px_size, byte_offset);
+    }
+
+    pub fn wrap_bytes(
+        self: *Self,
+        font_id: u16,
+        text: *[u8],
+        px_size: f32,
+        max_width: f32,
+        out_lines: *mut [shaper.WrappedLine],
+    ) -> usize {
+        if font_id == FONT_UI_MONO {
+            return shaper.wrap_lines(&self.mono, self.mono_data.as_slice(), text, px_size, max_width, out_lines);
+        }
+        return shaper.wrap_lines(&self.sans, self.sans_data.as_slice(), text, px_size, max_width, out_lines);
+    }
+
+    pub fn push_text(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        sc: *mut scene.Scene,
+        font_id: u16,
+        text: *str,
+        x: f32,
+        y: f32,
+        px_size: f32,
+        col_rgba: color.Rgba,
+    ) -> f32 ! OutOfMemory {
+        return try self.push_text_bytes(alloc, sc, font_id, text.as_bytes(), x, y, px_size, col_rgba);
+    }
+
+    pub fn push_text_bytes(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        sc: *mut scene.Scene,
+        font_id: u16,
+        text: *[u8],
+        x: f32,
+        y: f32,
+        px_size: f32,
+        col_rgba: color.Rgba,
+    ) -> f32 ! OutOfMemory {
+        if font_id == FONT_UI_MONO {
+            return try shaper.push_line_to_scene(
+                alloc, sc, &self.mono, self.mono_data.as_slice(), font_id,
+                &mut self.atlas.core, self.atlas.pixels.as_mut_slice(), self.atlas.entries.as_mut_slice(),
+                text, x, y, px_size, col_rgba,
+            );
+        }
+        return try shaper.push_line_to_scene(
+            alloc, sc, &self.sans, self.sans_data.as_slice(), font_id,
+            &mut self.atlas.core, self.atlas.pixels.as_mut_slice(), self.atlas.entries.as_mut_slice(),
+            text, x, y, px_size, col_rgba,
+        );
+    }
+
+    pub fn push_text_aligned(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        sc: *mut scene.Scene,
+        font_id: u16,
+        text: *[u8],
+        x: f32,
+        y: f32,
+        box_w: f32,
+        box_h: f32,
+        px_size: f32,
+        align: TextAlign,
+        col_rgba: color.Rgba,
+    ) -> f32 ! OutOfMemory {
+        let m = self.measure_bytes(font_id, text, px_size);
+        let draw_x: f32 = match align {
+            .Left => x,
+            .Center => x + (box_w - m.width) * 0.5_f32,
+            .Right => x + (box_w - m.width),
+        };
+        let draw_y = y + (box_h - m.line_height) * 0.5_f32;
+        return try self.push_text_bytes(alloc, sc, font_id, text, draw_x, draw_y, px_size, col_rgba);
+    }
+
+    pub fn push_text_ellipsis(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        sc: *mut scene.Scene,
+        font_id: u16,
+        text: *[u8],
+        x: f32,
+        y: f32,
+        max_w: f32,
+        px_size: f32,
+        col_rgba: color.Rgba,
+    ) -> f32 ! OutOfMemory {
+        let full = self.measure_bytes(font_id, text, px_size);
+        if max_w <= 0.0_f32 || full.width <= max_w {
+            return try self.push_text_bytes(alloc, sc, font_id, text, x, y, px_size, col_rgba);
+        }
+        let ell = "…".as_bytes();
+        let ell_w = self.measure_bytes(font_id, ell, px_size).width;
+        let budget = if max_w > ell_w { max_w - ell_w } else { 0.0_f32 };
+        let cut = self.hit_test_bytes_x(font_id, text, px_size, budget);
+        let prefix = text.sub(0_usize, cut) catch { "".as_bytes() };
+        let pw = try self.push_text_bytes(alloc, sc, font_id, prefix, x, y, px_size, col_rgba);
+        let ew = try self.push_text_bytes(alloc, sc, font_id, ell, x + pw, y, px_size, col_rgba);
+        return pw + ew;
+    }
+
+    pub fn push_text_wrapped(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        sc: *mut scene.Scene,
+        font_id: u16,
+        text: *[u8],
+        x: f32,
+        y: f32,
+        max_w: f32,
+        px_size: f32,
+        col_rgba: color.Rgba,
+    ) -> f32 ! OutOfMemory {
+        var lines: [64]shaper.WrappedLine = [
+            shaper.WrappedLine.{ start_byte: 0_usize, end_byte: 0_usize, width: 0.0_f32 };
+            64
+        ];
+        let n = self.wrap_bytes(font_id, text, px_size, max_w, &mut lines);
+        let lm = self.line_metrics(font_id, px_size);
+        var cur_y = y;
+        var li: usize = 0_usize;
+        while li < n && li < 64_usize {
+            let wl = lines[li];
+            let sl = text.sub(wl.start_byte, wl.end_byte) catch { "".as_bytes() };
+            _ = try self.push_text_bytes(alloc, sc, font_id, sl, x, cur_y, px_size, col_rgba);
+            cur_y = cur_y + lm.line_height;
+            li = li +% 1_usize;
+        }
+        return cur_y - y;
+    }
+}

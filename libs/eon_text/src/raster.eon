@@ -1,0 +1,293 @@
+module eon_text.raster;
+
+import core.math_vec;
+import eon_text.ttf;
+
+// ============================================================================
+// Pure-Eon Analytical Anti-Aliased Quadratic Bezier Scanline Rasterizer
+// (`libs/eon_text/src/raster.eon`) — 100% safe `core/`-only, zero heap allocs.
+// Uses exact trapezoidal signed-area coverage (`deltas[col] += h*(1-m)`,
+// `deltas[col+1] += h*m`) with non-zero winding rule for crisp R8 subpixel AA.
+// ============================================================================
+
+pub const MAX_RASTER_W: usize = 128_usize;
+pub const MAX_RASTER_H: usize = 128_usize;
+pub const MAX_RASTER_PIXELS: usize = 16384_usize; // 128 * 128
+const MAX_SEGMENTS: usize = 1024_usize;
+
+struct LineSeg {
+    x0: f32;
+    y0: f32;
+    x1: f32;
+    y1: f32;
+}
+
+pub struct RasterResult {
+    pub width: u32;
+    pub height: u32;
+    pub bearing_x: i32;
+    pub bearing_y: i32; // distance from baseline UP to top of bitmap (positive = above baseline)
+    pub ok: bool;
+}
+
+@inline
+fn abs_f32(x: f32) -> f32 {
+    return if x < 0.0_f32 { -x } else { x };
+}
+
+@inline
+fn floor_i32(x: f32) -> i32 {
+    let i = x.trunc_to_int.[i32]();
+    if i.to_float.[f32]() > x {
+        return i -| 1_i32;
+    }
+    return i;
+}
+
+@inline
+fn ceil_i32(x: f32) -> i32 {
+    let i = x.trunc_to_int.[i32]();
+    if i.to_float.[f32]() < x {
+        return i +| 1_i32;
+    }
+    return i;
+}
+
+fn push_seg(segs: *mut [LineSeg], count: *mut usize, x0: f32, y0: f32, x1: f32, y1: f32) {
+    if abs_f32(y1 - y0) < 1.0e-5_f32 {
+        return;
+    }
+    let idx = count.*;
+    if idx < segs.len {
+        segs[idx] = LineSeg.{ x0: x0, y0: y0, x1: x1, y1: y1 };
+        count.* = idx +% 1_usize;
+    }
+}
+
+/// Flatten a quadratic Bezier `(x0,y0) -> (cx,cy) -> (x1,y1)` into directed segments
+/// using adaptive flatness subdivision (max deviation <= 0.15 px).
+fn flatten_quad(
+    segs: *mut [LineSeg],
+    count: *mut usize,
+    x0: f32, y0: f32,
+    cx: f32, cy: f32,
+    x1: f32, y1: f32,
+) {
+    // Upper bound on distance from control point to chord midpoint:
+    // d = 0.25 * |(x0 - 2*cx + x1, y0 - 2*cy + y1)|
+    let ddx = x0 - 2.0_f32 * cx + x1;
+    let ddy = y0 - 2.0_f32 * cy + y1;
+    let err_sq = (ddx * ddx + ddy * ddy) * 0.0625_f32;
+    var steps: usize = 1_usize;
+    if err_sq > 0.0225_f32 {
+        // n = ceil(sqrt(err / 0.15)), capped at 16 for crisp curves without blowup
+        let ratio = @sqrt(err_sq) / 0.15_f32;
+        let n_est = ceil_i32(@sqrt(ratio));
+        if n_est > 1_i32 {
+            steps = if n_est > 16_i32 { 16_usize } else { n_est.bitcast.[u32]().widen.[usize]() };
+        }
+    }
+    if steps <= 1_usize {
+        push_seg(segs, count, x0, y0, x1, y1);
+        return;
+    }
+    let inv_n = 1.0_f32 / steps.widen.[u64]().to_float.[f32]();
+    var px = x0;
+    var py = y0;
+    var si: usize = 1_usize;
+    while si <= steps {
+        let t = if si == steps { 1.0_f32 } else { si.widen.[u64]().to_float.[f32]() * inv_n };
+        let mt = 1.0_f32 - t;
+        let nx = mt * mt * x0 + 2.0_f32 * mt * t * cx + t * t * x1;
+        let ny = mt * mt * y0 + 2.0_f32 * mt * t * cy + t * t * y1;
+        push_seg(segs, count, px, py, nx, ny);
+        px = nx;
+        py = ny;
+        si = si +% 1_usize;
+    }
+}
+
+/// Rasterize `gid` from `font` at `px_size` into caller-supplied R8 `out_alpha` buffer
+/// (`out_alpha.len >= width * height`). Returns bitmap dimensions & baseline bearings.
+pub fn rasterize_glyph(
+    font: *ttf.TtfFont,
+    data: *[u8],
+    gid: u16,
+    px_size: f32,
+    out_alpha: *mut [u8],
+) -> RasterResult {
+    let empty_res = RasterResult.{ width: 0_u32, height: 0_u32, bearing_x: 0_i32, bearing_y: 0_i32, ok: false };
+    if !font.valid || px_size <= 0.5_f32 {
+        return empty_res;
+    }
+    let scale = font.scale_for_px(px_size);
+
+    var curves: [512]ttf.OutlineCurve = [
+        ttf.OutlineCurve.{ x0: 0.0_f32, y0: 0.0_f32, cx: 0.0_f32, cy: 0.0_f32, x1: 0.0_f32, y1: 0.0_f32, is_quad: false };
+        512
+    ];
+    let obox = font.extract_outline(data, gid, scale, &mut curves);
+    if obox.empty || obox.curve_count == 0_usize {
+        return RasterResult.{ width: 0_u32, height: 0_u32, bearing_x: 0_i32, bearing_y: 0_i32, ok: true };
+    }
+
+    let raw_w = obox.max_x -% obox.min_x;
+    let raw_h = obox.max_y -% obox.min_y;
+    if raw_w <= 0_i32 || raw_h <= 0_i32 {
+        return RasterResult.{ width: 0_u32, height: 0_u32, bearing_x: 0_i32, bearing_y: 0_i32, ok: true };
+    }
+    let w_u = raw_w.bitcast.[u32]().widen.[usize]();
+    let h_u = raw_h.bitcast.[u32]().widen.[usize]();
+    let w = if w_u > MAX_RASTER_W { MAX_RASTER_W } else { w_u };
+    let h = if h_u > MAX_RASTER_H { MAX_RASTER_H } else { h_u };
+    let total_px = w *% h;
+    if total_px == 0_usize || total_px > out_alpha.len {
+        return empty_res;
+    }
+
+    let ox = obox.min_x.to_float.[f32]();
+    let oy = obox.min_y.to_float.[f32]();
+
+    // Flatten all outline curves into glyph-local pixel coordinates [0..w] x [0..h]
+    var segs: [1024]LineSeg = [LineSeg.{ x0: 0.0_f32, y0: 0.0_f32, x1: 0.0_f32, y1: 0.0_f32 }; 1024];
+    var seg_count: usize = 0_usize;
+    var ci: usize = 0_usize;
+    while ci < obox.curve_count && ci < 512_usize {
+        let c = curves[ci];
+        let x0 = c.x0 - ox;
+        let y0 = c.y0 - oy;
+        let x1 = c.x1 - ox;
+        let y1 = c.y1 - oy;
+        if c.is_quad {
+            flatten_quad(&mut segs, &mut seg_count, x0, y0, c.cx - ox, c.cy - oy, x1, y1);
+        } else {
+            push_seg(&mut segs, &mut seg_count, x0, y0, x1, y1);
+        }
+        ci = ci +% 1_usize;
+    }
+
+    // Zero output coverage buffer
+    var zi: usize = 0_usize;
+    while zi < total_px {
+        out_alpha[zi] = 0_u8;
+        zi = zi +% 1_usize;
+    }
+
+    // Exact analytical scanline coverage using single-array signed area deltas per row
+    let wf = w.widen.[u64]().to_float.[f32]();
+    var deltas: [129]f32 = [0.0_f32; 129];
+    var row: usize = 0_usize;
+    while row < h {
+        let ry_top = row.widen.[u64]().to_float.[f32]();
+        let ry_bot = ry_top + 1.0_f32;
+
+        // Clear row deltas
+        var di: usize = 0_usize;
+        while di <= w && di < 129_usize {
+            deltas[di] = 0.0_f32;
+            di = di +% 1_usize;
+        }
+
+        // Accumulate every segment intersecting [ry_top, ry_bot]
+        var si: usize = 0_usize;
+        while si < seg_count && si < MAX_SEGMENTS {
+            let s = segs[si];
+            let going_down = s.y1 > s.y0;
+            let ay = if going_down { s.y0 } else { s.y1 };
+            let by = if going_down { s.y1 } else { s.y0 };
+            if by > ry_top && ay < ry_bot {
+                let ax = if going_down { s.x0 } else { s.x1 };
+                let bx = if going_down { s.x1 } else { s.x0 };
+                let dir: f32 = if going_down { 1.0_f32 } else { -1.0_f32 };
+
+                let y_lo = math_vec.max_f32(ay, ry_top);
+                let y_hi = math_vec.min_f32(by, ry_bot);
+                let dy = y_hi - y_lo;
+                if dy > 1.0e-6_f32 {
+                    let inv_full_dy = 1.0_f32 / (by - ay);
+                    let rx0 = ax + (bx - ax) * ((y_lo - ay) * inv_full_dy);
+                    let rx1 = ax + (bx - ax) * ((y_hi - ay) * inv_full_dy);
+                    let x_left = math_vec.min_f32(rx0, rx1);
+                    let x_right = math_vec.max_f32(rx0, rx1);
+                    let sdy = dy * dir;
+
+                    if x_right <= 0.0_f32 {
+                        deltas[0_usize] = deltas[0_usize] + sdy;
+                    } else if x_left < wf {
+                        let span_x = x_right - x_left;
+                        if span_x < 1.0e-5_f32 {
+                            // Vertical / sub-epsilon horizontal extent inside one column
+                            let col_i = floor_i32(x_left);
+                            if col_i < 0_i32 {
+                                deltas[0_usize] = deltas[0_usize] + sdy;
+                            } else {
+                                let col = col_i.bitcast.[u32]().widen.[usize]();
+                                if col < w && col + 1_usize < 129_usize {
+                                    let m = math_vec.clamp_f32(x_left - col_i.to_float.[f32](), 0.0_f32, 1.0_f32);
+                                    deltas[col] = deltas[col] + sdy * (1.0_f32 - m);
+                                    deltas[col + 1_usize] = deltas[col + 1_usize] + sdy * m;
+                                }
+                            }
+                        } else {
+                            let inv_span = 1.0_f32 / span_x;
+                            // Portion strictly to the left of x = 0 contributes full winding to col 0
+                            if x_left < 0.0_f32 {
+                                let frac_l = (0.0_f32 - x_left) * inv_span;
+                                deltas[0_usize] = deltas[0_usize] + sdy * frac_l;
+                            }
+                            let cx_start = math_vec.max_f32(x_left, 0.0_f32);
+                            let cx_end = math_vec.min_f32(x_right, wf);
+                            let c0_i = floor_i32(cx_start);
+                            let c1_i = floor_i32(cx_end);
+                            var col_i = c0_i;
+                            while col_i <= c1_i {
+                                if col_i >= 0_i32 {
+                                    let col = col_i.bitcast.[u32]().widen.[usize]();
+                                    if col < w && col + 1_usize < 129_usize {
+                                        let cf = col_i.to_float.[f32]();
+                                        let sx0 = math_vec.max_f32(cx_start, cf);
+                                        let sx1 = math_vec.min_f32(cx_end, cf + 1.0_f32);
+                                        let seg_w = sx1 - sx0;
+                                        if seg_w > 0.0_f32 {
+                                            let cdy = sdy * (seg_w * inv_span);
+                                            let m = math_vec.clamp_f32(0.5_f32 * (sx0 + sx1) - cf, 0.0_f32, 1.0_f32);
+                                            deltas[col] = deltas[col] + cdy * (1.0_f32 - m);
+                                            deltas[col + 1_usize] = deltas[col + 1_usize] + cdy * m;
+                                        }
+                                    }
+                                }
+                                col_i = col_i +% 1_i32;
+                            }
+                        }
+                    }
+                }
+            }
+            si = si +% 1_usize;
+        }
+
+        // Prefix-sum signed coverage across row -> R8 alpha [0..255]
+        var acc: f32 = 0.0_f32;
+        let row_off = row *% w;
+        var col: usize = 0_usize;
+        while col < w && col < 128_usize {
+            acc = acc + deltas[col];
+            let cov = math_vec.clamp_f32(abs_f32(acc), 0.0_f32, 1.0_f32);
+            let q = (cov * 255.0_f32 + 0.5_f32).trunc_to_int.[i32]();
+            let a_u8: u8 = if q <= 0_i32 { 0_u8 } else if q >= 255_i32 { 255_u8 } else { q.trunc.[u8]() };
+            let out_idx = row_off +% col;
+            if out_idx < out_alpha.len {
+                out_alpha[out_idx] = a_u8;
+            }
+            col = col +% 1_usize;
+        }
+        row = row +% 1_usize;
+    }
+
+    return RasterResult.{
+        width: w.trunc.[u32](),
+        height: h.trunc.[u32](),
+        bearing_x: obox.min_x,
+        bearing_y: 0_i32 -% obox.min_y, // min_y is negative above baseline, so bearing_y is positive upward!
+        ok: true,
+    };
+}

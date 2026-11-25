@@ -1,0 +1,791 @@
+module eon_text.ttf;
+
+// ============================================================================
+// Pure-Eon TrueType (.ttf) Parser (`libs/eon_text/src/ttf.eon`)
+// 100% safe, `core/`-only, zero heap allocations, zero C dependencies.
+// Supports `sfnt` directory, `head`, `hhea`, `maxp`, `hmtx`, `cmap` (Format 4
+// and Format 12), `loca` (short & long), `glyf` (simple + compound glyphs
+// with 2x2 affine transform), and `kern` (Format 0 binary search).
+// ============================================================================
+
+pub const MAX_GLYPH_POINTS: usize = 512_usize;
+pub const MAX_GLYPH_CONTOURS: usize = 64_usize;
+pub const MAX_GLYPH_EDGES: usize = 1024_usize;
+
+@inline
+pub fn be_u8(data: *[u8], off: usize) -> u8 {
+    if off < data.len {
+        return data[off];
+    }
+    return 0_u8;
+}
+
+@inline
+pub fn be_u16(data: *[u8], off: usize) -> u16 {
+    if data.len < 2_usize || off > data.len - 2_usize {
+        return 0_u16;
+    }
+    return (data[off].widen.[u16]() << 8_u16) | data[off + 1_usize].widen.[u16]();
+}
+
+@inline
+pub fn sign_i16_i32(v: i16) -> i32 {
+    let u = v.bitcast.[u16]().widen.[i32]();
+    return if u >= 32768_i32 { u -% 65536_i32 } else { u };
+}
+
+@inline
+pub fn be_i16(data: *[u8], off: usize) -> i16 {
+    return be_u16(data, off).bitcast.[i16]();
+}
+
+@inline
+pub fn be_i16_i32(data: *[u8], off: usize) -> i32 {
+    let u = be_u16(data, off).widen.[i32]();
+    return if u >= 32768_i32 { u -% 65536_i32 } else { u };
+}
+
+@inline
+pub fn be_i8_i32(data: *[u8], off: usize) -> i32 {
+    let u = be_u8(data, off).widen.[i32]();
+    return if u >= 128_i32 { u -% 256_i32 } else { u };
+}
+
+@inline
+pub fn be_u32(data: *[u8], off: usize) -> u32 {
+    if data.len < 4_usize || off > data.len - 4_usize {
+        return 0_u32;
+    }
+    return (data[off].widen.[u32]() << 24_u32)
+        | (data[off + 1_usize].widen.[u32]() << 16_u32)
+        | (data[off + 2_usize].widen.[u32]() << 8_u32)
+        | data[off + 3_usize].widen.[u32]();
+}
+
+@inline
+pub fn tag4(a: u8, b: u8, c: u8, d: u8) -> u32 {
+    return (a.widen.[u32]() << 24_u32)
+        | (b.widen.[u32]() << 16_u32)
+        | (c.widen.[u32]() << 8_u32)
+        | d.widen.[u32]();
+}
+
+pub struct GlyphHMetrics {
+    pub advance_width: u16;
+    pub lsb: i16;
+}
+
+pub struct LineMetrics {
+    pub ascent: f32;
+    pub descent: f32;
+    pub line_gap: f32;
+    pub line_height: f32;
+}
+
+/// Directed quadratic Bezier curve or straight segment in scaled pixel coordinates
+/// (Y increases downward, baseline at y = 0).
+pub struct OutlineCurve {
+    pub x0: f32;
+    pub y0: f32;
+    pub cx: f32;
+    pub cy: f32;
+    pub x1: f32;
+    pub y1: f32;
+    pub is_quad: bool;
+}
+
+pub struct OutlineBox {
+    pub min_x: i32;
+    pub min_y: i32;
+    pub max_x: i32;
+    pub max_y: i32;
+    pub curve_count: usize;
+    pub empty: bool;
+}
+
+pub struct TtfFont {
+    pub valid: bool;
+    pub units_per_em: u16;
+    pub index_to_loc_fmt: i16;
+    pub ascent: i16;
+    pub descent: i16;
+    pub line_gap: i16;
+    pub num_hmetrics: u16;
+    pub num_glyphs: u16;
+
+    // Table byte offsets inside the font slice
+    pub off_cmap: usize;
+    pub len_cmap: usize;
+    pub off_cmap_fmt4: usize;
+    pub off_cmap_fmt12: usize;
+    pub off_hmtx: usize;
+    pub len_hmtx: usize;
+    pub off_loca: usize;
+    pub len_loca: usize;
+    pub off_glyf: usize;
+    pub len_glyf: usize;
+    pub off_kern: usize;
+    pub len_kern: usize;
+    pub off_kern_fmt0: usize;
+    pub kern_num_pairs: u16;
+}
+
+impl TtfFont {
+    pub fn empty() -> TtfFont {
+        return TtfFont.{
+            valid: false,
+            units_per_em: 1000_u16,
+            index_to_loc_fmt: 0_i16,
+            ascent: 800_i16,
+            descent: -200_i16,
+            line_gap: 0_i16,
+            num_hmetrics: 0_u16,
+            num_glyphs: 0_u16,
+            off_cmap: 0_usize,
+            len_cmap: 0_usize,
+            off_cmap_fmt4: 0_usize,
+            off_cmap_fmt12: 0_usize,
+            off_hmtx: 0_usize,
+            len_hmtx: 0_usize,
+            off_loca: 0_usize,
+            len_loca: 0_usize,
+            off_glyf: 0_usize,
+            len_glyf: 0_usize,
+            off_kern: 0_usize,
+            len_kern: 0_usize,
+            off_kern_fmt0: 0_usize,
+            kern_num_pairs: 0_u16,
+        };
+    }
+
+    pub fn parse(data: *[u8]) -> TtfFont {
+        var f = TtfFont.empty();
+        if data.len < 12_usize {
+            return f;
+        }
+        let sfnt = be_u32(data, 0_usize);
+        // Accept TrueType 1.0 (0x00010000) or Apple 'true' (0x74727565)
+        if sfnt != 0x00010000_u32 && sfnt != 0x74727565_u32 {
+            return f;
+        }
+        let num_tables = be_u16(data, 4_usize).widen.[usize]();
+        if 12_usize +% num_tables *% 16_usize > data.len {
+            return f;
+        }
+
+        let t_head = tag4(b'h', b'e', b'a', b'd');
+        let t_hhea = tag4(b'h', b'h', b'e', b'a');
+        let t_maxp = tag4(b'm', b'a', b'x', b'p');
+        let t_cmap = tag4(b'c', b'm', b'a', b'p');
+        let t_hmtx = tag4(b'h', b'm', b't', b'x');
+        let t_loca = tag4(b'l', b'o', b'c', b'a');
+        let t_glyf = tag4(b'g', b'l', b'y', b'f');
+        let t_kern = tag4(b'k', b'e', b'r', b'n');
+
+        var off_head: usize = 0_usize;
+        var off_hhea: usize = 0_usize;
+        var off_maxp: usize = 0_usize;
+
+        var ti: usize = 0_usize;
+        while ti < num_tables {
+            let rec = 12_usize +% ti *% 16_usize;
+            let tag = be_u32(data, rec);
+            let toff = be_u32(data, rec +% 8_usize).widen.[usize]();
+            let tlen = be_u32(data, rec +% 12_usize).widen.[usize]();
+            if toff <= data.len && tlen <= data.len - toff {
+                if tag == t_head && tlen >= 54_usize {
+                    off_head = toff;
+                } else if tag == t_hhea && tlen >= 36_usize {
+                    off_hhea = toff;
+                } else if tag == t_maxp && tlen >= 6_usize {
+                    off_maxp = toff;
+                } else if tag == t_cmap && tlen >= 4_usize {
+                    f.off_cmap = toff;
+                    f.len_cmap = tlen;
+                } else if tag == t_hmtx {
+                    f.off_hmtx = toff;
+                    f.len_hmtx = tlen;
+                } else if tag == t_loca {
+                    f.off_loca = toff;
+                    f.len_loca = tlen;
+                } else if tag == t_glyf {
+                    f.off_glyf = toff;
+                    f.len_glyf = tlen;
+                } else if tag == t_kern && tlen >= 4_usize {
+                    f.off_kern = toff;
+                    f.len_kern = tlen;
+                }
+            }
+            ti = ti +% 1_usize;
+        }
+
+        if off_head == 0_usize || off_hhea == 0_usize || off_maxp == 0_usize || f.off_cmap == 0_usize || f.off_loca == 0_usize || f.off_glyf == 0_usize {
+            return f;
+        }
+
+        f.units_per_em = be_u16(data, off_head +% 18_usize);
+        if f.units_per_em == 0_u16 {
+            return f;
+        }
+        f.index_to_loc_fmt = be_i16(data, off_head +% 50_usize);
+        f.ascent = be_i16(data, off_hhea +% 4_usize);
+        f.descent = be_i16(data, off_hhea +% 6_usize);
+        f.line_gap = be_i16(data, off_hhea +% 8_usize);
+        f.num_hmetrics = be_u16(data, off_hhea +% 34_usize);
+        f.num_glyphs = be_u16(data, off_maxp +% 4_usize);
+
+        // Locate preferred cmap subtables (Format 12 for full Unicode, Format 4 for BMP)
+        let n_sub = be_u16(data, f.off_cmap +% 2_usize).widen.[usize]();
+        var si: usize = 0_usize;
+        while si < n_sub {
+            let rec = f.off_cmap +% 4_usize +% si *% 8_usize;
+            if rec +% 8_usize > data.len { break; }
+            let pid = be_u16(data, rec);
+            let eid = be_u16(data, rec +% 2_usize);
+            let sub_rel = be_u32(data, rec +% 4_usize).widen.[usize]();
+            let sub_abs = f.off_cmap +% sub_rel;
+            if sub_abs +% 2_usize <= data.len {
+                let fmt = be_u16(data, sub_abs);
+                if fmt == 12_u16 && ((pid == 3_u16 && eid == 10_u16) || pid == 0_u16) {
+                    f.off_cmap_fmt12 = sub_abs;
+                } else if fmt == 4_u16 && ((pid == 3_u16 && eid == 1_u16) || pid == 0_u16) {
+                    if f.off_cmap_fmt4 == 0_usize || (pid == 3_u16 && eid == 1_u16) {
+                        f.off_cmap_fmt4 = sub_abs;
+                    }
+                }
+            }
+            si = si +% 1_usize;
+        }
+        if f.off_cmap_fmt4 == 0_usize && f.off_cmap_fmt12 == 0_usize {
+            return f;
+        }
+
+        // Locate kern Format 0 horizontal table (optional)
+        if f.off_kern != 0_usize && f.len_kern >= 4_usize {
+            let n_kt = be_u16(data, f.off_kern +% 2_usize).widen.[usize]();
+            var kpos = f.off_kern +% 4_usize;
+            var ki: usize = 0_usize;
+            while ki < n_kt && kpos +% 6_usize <= f.off_kern +% f.len_kern {
+                let slen = be_u16(data, kpos +% 2_usize).widen.[usize]();
+                let cov = be_u16(data, kpos +% 4_usize);
+                if (cov >> 8_u16) == 0_u16 && (cov & 1_u16) == 1_u16 && kpos +% 14_usize <= data.len {
+                    f.off_kern_fmt0 = kpos +% 14_usize;
+                    f.kern_num_pairs = be_u16(data, kpos +% 6_usize);
+                    break;
+                }
+                if slen == 0_usize { break; }
+                kpos = kpos +% slen;
+                ki = ki +% 1_usize;
+            }
+        }
+
+        f.valid = true;
+        return f;
+    }
+
+    @inline
+    pub fn scale_for_px(self: *Self, px_size: f32) -> f32 {
+        let upm = self.units_per_em.widen.[u32]().to_float.[f32]();
+        if upm <= 0.0_f32 { return 1.0_f32; }
+        return px_size / upm;
+    }
+
+    pub fn line_metrics(self: *Self, px_size: f32) -> LineMetrics {
+        let sc = self.scale_for_px(px_size);
+        let asc = sign_i16_i32(self.ascent).to_float.[f32]() * sc;
+        let desc = sign_i16_i32(self.descent).to_float.[f32]() * sc;
+        let gap = sign_i16_i32(self.line_gap).to_float.[f32]() * sc;
+        return LineMetrics.{
+            ascent: asc,
+            descent: desc,
+            line_gap: gap,
+            line_height: asc - desc + gap,
+        };
+    }
+
+    pub fn glyph_index(self: *Self, data: *[u8], cp: u32) -> u16 {
+        if !self.valid { return 0_u16; }
+
+        // Try Format 12 (full Unicode 32-bit binary search) first
+        if self.off_cmap_fmt12 != 0_usize && self.off_cmap_fmt12 +% 16_usize <= data.len {
+            let ngroups = be_u32(data, self.off_cmap_fmt12 +% 12_usize);
+            var lo: u32 = 0_u32;
+            var hi: u32 = ngroups;
+            while lo < hi {
+                let mid = lo +% ((hi - lo) >> 1_u32);
+                let goff = self.off_cmap_fmt12 +% 16_usize +% mid.widen.[usize]() *% 12_usize;
+                let sc = be_u32(data, goff);
+                let ec = be_u32(data, goff +% 4_usize);
+                if cp < sc {
+                    hi = mid;
+                } else if cp > ec {
+                    lo = mid +% 1_u32;
+                } else {
+                    let sg = be_u32(data, goff +% 8_usize);
+                    return (sg +% (cp - sc)).trunc.[u16]();
+                }
+            }
+        }
+
+        // Format 4 (BMP binary search)
+        if self.off_cmap_fmt4 != 0_usize && cp <= 0xFFFF_u32 && self.off_cmap_fmt4 +% 14_usize <= data.len {
+            let base = self.off_cmap_fmt4;
+            let seg_cnt_x2 = be_u16(data, base +% 6_usize).widen.[usize]();
+            let seg_cnt = seg_cnt_x2 >> 1_usize;
+            let end_base = base +% 14_usize;
+            let start_base = end_base +% seg_cnt_x2 +% 2_usize;
+            let delta_base = start_base +% seg_cnt_x2;
+            let ro_base = delta_base +% seg_cnt_x2;
+            let cp16 = cp.trunc.[u16]();
+
+            var lo: usize = 0_usize;
+            var hi: usize = seg_cnt;
+            while lo < hi {
+                let mid = lo +% ((hi - lo) >> 1_usize);
+                let ec = be_u16(data, end_base +% mid *% 2_usize);
+                if ec < cp16 {
+                    lo = mid +% 1_usize;
+                } else {
+                    hi = mid;
+                }
+            }
+            if lo < seg_cnt {
+                let sc = be_u16(data, start_base +% lo *% 2_usize);
+                let ec = be_u16(data, end_base +% lo *% 2_usize);
+                if cp16 >= sc && cp16 <= ec {
+                    let delta = be_u16(data, delta_base +% lo *% 2_usize);
+                    let ro = be_u16(data, ro_base +% lo *% 2_usize).widen.[usize]();
+                    if ro == 0_usize {
+                        return cp16 +% delta;
+                    }
+                    let gpos = ro_base +% lo *% 2_usize +% ro +% (cp16 - sc).widen.[usize]() *% 2_usize;
+                    let raw_g = be_u16(data, gpos);
+                    if raw_g != 0_u16 {
+                        return raw_g +% delta;
+                    }
+                }
+            }
+        }
+        return 0_u16;
+    }
+
+    pub fn hmetrics(self: *Self, data: *[u8], gid: u16) -> GlyphHMetrics {
+        if !self.valid || self.num_hmetrics == 0_u16 {
+            return GlyphHMetrics.{ advance_width: 0_u16, lsb: 0_i16 };
+        }
+        let g = gid.widen.[usize]();
+        let nh = self.num_hmetrics.widen.[usize]();
+        if g < nh {
+            let off = self.off_hmtx +% g *% 4_usize;
+            return GlyphHMetrics.{
+                advance_width: be_u16(data, off),
+                lsb: be_i16(data, off +% 2_usize),
+            };
+        }
+        let last_adv = be_u16(data, self.off_hmtx +% (nh - 1_usize) *% 4_usize);
+        let lsb_off = self.off_hmtx +% nh *% 4_usize +% (g - nh) *% 2_usize;
+        return GlyphHMetrics.{
+            advance_width: last_adv,
+            lsb: be_i16(data, lsb_off),
+        };
+    }
+
+    pub fn kern_advance(self: *Self, data: *[u8], left_gid: u16, right_gid: u16) -> i16 {
+        if self.off_kern_fmt0 == 0_usize || self.kern_num_pairs == 0_u16 {
+            return 0_i16;
+        }
+        let target: u32 = (left_gid.widen.[u32]() << 16_u32) | right_gid.widen.[u32]();
+        var lo: usize = 0_usize;
+        var hi: usize = self.kern_num_pairs.widen.[usize]();
+        while lo < hi {
+            let mid = lo +% ((hi - lo) >> 1_usize);
+            let off = self.off_kern_fmt0 +% mid *% 6_usize;
+            let k = be_u32(data, off);
+            if k < target {
+                lo = mid +% 1_usize;
+            } else if k > target {
+                hi = mid;
+            } else {
+                return be_i16(data, off +% 4_usize);
+            }
+        }
+        return 0_i16;
+    }
+
+    fn glyph_data_range(self: *Self, data: *[u8], gid: u16, out_start: *mut usize, out_end: *mut usize) -> bool {
+        if gid >= self.num_glyphs {
+            return false;
+        }
+        let g = gid.widen.[usize]();
+        var s0: usize = 0_usize;
+        var s1: usize = 0_usize;
+        if self.index_to_loc_fmt == 0_i16 {
+            s0 = be_u16(data, self.off_loca +% g *% 2_usize).widen.[usize]() *% 2_usize;
+            s1 = be_u16(data, self.off_loca +% (g +% 1_usize) *% 2_usize).widen.[usize]() *% 2_usize;
+        } else {
+            s0 = be_u32(data, self.off_loca +% g *% 4_usize).widen.[usize]();
+            s1 = be_u32(data, self.off_loca +% (g +% 1_usize) *% 4_usize).widen.[usize]();
+        }
+        if s1 <= s0 || s1 > self.len_glyf {
+            return false;
+        }
+        out_start.* = self.off_glyf +% s0;
+        out_end.* = self.off_glyf +% s1;
+        return true;
+    }
+
+    /// Extract all outline curves of `gid` (simple or compound) in scaled pixel space
+    /// (Y-down: `py = -font_y * scale`), appending to `curves` and returning pixel bbox.
+    pub fn extract_outline(
+        self: *Self,
+        data: *[u8],
+        gid: u16,
+        scale: f32,
+        curves: *mut [OutlineCurve],
+    ) -> OutlineBox {
+        var count: usize = 0_usize;
+        var min_xf: f32 = 1.0e9_f32;
+        var min_yf: f32 = 1.0e9_f32;
+        var max_xf: f32 = -1.0e9_f32;
+        var max_yf: f32 = -1.0e9_f32;
+        self.extract_glyph_transformed(
+            data, gid, scale, 1.0_f32, 0.0_f32, 0.0_f32, 1.0_f32, 0.0_f32, 0.0_f32, 0_u8,
+            curves, &mut count, &mut min_xf, &mut min_yf, &mut max_xf, &mut max_yf,
+        );
+        if count == 0_usize || max_xf <= min_xf || max_yf <= min_yf {
+            return OutlineBox.{
+                min_x: 0_i32, min_y: 0_i32, max_x: 0_i32, max_y: 0_i32,
+                curve_count: 0_usize, empty: true,
+            };
+        }
+        return OutlineBox.{
+            min_x: floor_i32(min_xf) -| 1_i32,
+            min_y: floor_i32(min_yf) -| 1_i32,
+            max_x: ceil_i32(max_xf) +| 1_i32,
+            max_y: ceil_i32(max_yf) +| 1_i32,
+            curve_count: count,
+            empty: false,
+        };
+    }
+
+    @recursive
+    fn extract_glyph_transformed(
+        self: *Self,
+        data: *[u8],
+        gid: u16,
+        scale: f32,
+        m00: f32, m01: f32, m10: f32, m11: f32,
+        tx: f32, ty: f32,
+        depth: u8,
+        curves: *mut [OutlineCurve],
+        count: *mut usize,
+        min_xf: *mut f32,
+        min_yf: *mut f32,
+        max_xf: *mut f32,
+        max_yf: *mut f32,
+    ) {
+        if depth >= 6_u8 { return; }
+        var gstart: usize = 0_usize;
+        var gend: usize = 0_usize;
+        if !self.glyph_data_range(data, gid, &mut gstart, &mut gend) {
+            return;
+        }
+        if gend < gstart || gend - gstart < 10_usize { return; }
+
+        let num_contours = be_i16_i32(data, gstart);
+        if num_contours > 0_i32 {
+            self.extract_simple_glyph(
+                data, gstart, gend, num_contours.bitcast.[u32]().widen.[usize](),
+                scale, m00, m01, m10, m11, tx, ty,
+                curves, count, min_xf, min_yf, max_xf, max_yf,
+            );
+            return;
+        }
+        if num_contours < 0_i32 {
+            // Compound glyph: iterate component descriptors
+            var pos = gstart +% 10_usize;
+            while pos +% 4_usize <= gend {
+                let flags = be_u16(data, pos);
+                let comp_gid = be_u16(data, pos +% 2_usize);
+                pos = pos +% 4_usize;
+
+                var dx: f32 = 0.0_f32;
+                var dy: f32 = 0.0_f32;
+                let args_are_words = (flags & 0x0001_u16) != 0_u16;
+                let args_are_xy = (flags & 0x0002_u16) != 0_u16;
+                if args_are_words {
+                    if pos +% 4_usize > gend { break; }
+                    if args_are_xy {
+                        dx = be_i16_i32(data, pos).to_float.[f32]();
+                        dy = be_i16_i32(data, pos +% 2_usize).to_float.[f32]();
+                    }
+                    pos = pos +% 4_usize;
+                } else {
+                    if pos +% 2_usize > gend { break; }
+                    if args_are_xy {
+                        dx = be_i8_i32(data, pos).to_float.[f32]();
+                        dy = be_i8_i32(data, pos +% 1_usize).to_float.[f32]();
+                    }
+                    pos = pos +% 2_usize;
+                }
+
+                var c00: f32 = 1.0_f32;
+                var c01: f32 = 0.0_f32;
+                var c10: f32 = 0.0_f32;
+                var c11: f32 = 1.0_f32;
+                let inv_214 = 1.0_f32 / 16384.0_f32;
+                if (flags & 0x0008_u16) != 0_u16 {
+                    if pos +% 2_usize > gend { break; }
+                    let s = be_i16_i32(data, pos).to_float.[f32]() * inv_214;
+                    c00 = s; c11 = s;
+                    pos = pos +% 2_usize;
+                } else if (flags & 0x0040_u16) != 0_u16 {
+                    if pos +% 4_usize > gend { break; }
+                    c00 = be_i16_i32(data, pos).to_float.[f32]() * inv_214;
+                    c11 = be_i16_i32(data, pos +% 2_usize).to_float.[f32]() * inv_214;
+                    pos = pos +% 4_usize;
+                } else if (flags & 0x0080_u16) != 0_u16 {
+                    if pos +% 8_usize > gend { break; }
+                    c00 = be_i16_i32(data, pos).to_float.[f32]() * inv_214;
+                    c01 = be_i16_i32(data, pos +% 2_usize).to_float.[f32]() * inv_214;
+                    c10 = be_i16_i32(data, pos +% 4_usize).to_float.[f32]() * inv_214;
+                    c11 = be_i16_i32(data, pos +% 6_usize).to_float.[f32]() * inv_214;
+                    pos = pos +% 8_usize;
+                }
+
+                // Compose affine transform: M_new = M * C, T_new = M * (dx, dy) + T
+                let nm00 = m00 * c00 + m01 * c10;
+                let nm01 = m00 * c01 + m01 * c11;
+                let nm10 = m10 * c00 + m11 * c10;
+                let nm11 = m10 * c01 + m11 * c11;
+                let ntx = m00 * dx + m01 * dy + tx;
+                let nty = m10 * dx + m11 * dy + ty;
+
+                self.extract_glyph_transformed(
+                    data, comp_gid, scale, nm00, nm01, nm10, nm11, ntx, nty, depth +% 1_u8,
+                    curves, count, min_xf, min_yf, max_xf, max_yf,
+                );
+                if (flags & 0x0020_u16) == 0_u16 {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn extract_simple_glyph(
+        self: *Self,
+        data: *[u8],
+        gstart: usize,
+        gend: usize,
+        num_contours: usize,
+        scale: f32,
+        m00: f32, m01: f32, m10: f32, m11: f32,
+        tx: f32, ty: f32,
+        curves: *mut [OutlineCurve],
+        count: *mut usize,
+        min_xf: *mut f32,
+        min_yf: *mut f32,
+        max_xf: *mut f32,
+        max_yf: *mut f32,
+    ) {
+        _ = self;
+        if num_contours == 0_usize || num_contours > MAX_GLYPH_CONTOURS { return; }
+        let end_pts_off = gstart +% 10_usize;
+        if end_pts_off +% num_contours *% 2_usize +% 2_usize > gend { return; }
+
+        var end_pts: [64]usize = [0_usize; 64];
+        var ci: usize = 0_usize;
+        while ci < num_contours {
+            end_pts[ci] = be_u16(data, end_pts_off +% ci *% 2_usize).widen.[usize]();
+            ci = ci +% 1_usize;
+        }
+        let num_pts = end_pts[num_contours - 1_usize] +% 1_usize;
+        if num_pts == 0_usize || num_pts > MAX_GLYPH_POINTS { return; }
+
+        let instr_len_off = end_pts_off +% num_contours *% 2_usize;
+        let instr_len = be_u16(data, instr_len_off).widen.[usize]();
+        var pos = instr_len_off +% 2_usize +% instr_len;
+        if pos > gend { return; }
+
+        // Decode point flags
+        var pflags: [512]u8 = [0_u8; 512];
+        var pi: usize = 0_usize;
+        while pi < num_pts && pos < gend {
+            let fl = be_u8(data, pos);
+            pos = pos +% 1_usize;
+            pflags[pi] = fl;
+            pi = pi +% 1_usize;
+            if (fl & 0x08_u8) != 0_u8 && pos < gend {
+                let rep = be_u8(data, pos).widen.[usize]();
+                pos = pos +% 1_usize;
+                var ri: usize = 0_usize;
+                while ri < rep && pi < num_pts {
+                    pflags[pi] = fl;
+                    pi = pi +% 1_usize;
+                    ri = ri +% 1_usize;
+                }
+            }
+        }
+        if pi < num_pts { return; }
+
+        // Decode X coordinates (delta-encoded)
+        var px_raw: [512]i32 = [0_i32; 512];
+        var cur_x: i32 = 0_i32;
+        pi = 0_usize;
+        while pi < num_pts {
+            let fl = pflags[pi];
+            if (fl & 0x02_u8) != 0_u8 {
+                if pos >= gend { return; }
+                let d = be_u8(data, pos).widen.[i32]();
+                pos = pos +% 1_usize;
+                if (fl & 0x10_u8) != 0_u8 { cur_x = cur_x +% d; } else { cur_x = cur_x -% d; }
+            } else if (fl & 0x10_u8) == 0_u8 {
+                if pos +% 2_usize > gend { return; }
+                cur_x = cur_x +% be_i16_i32(data, pos);
+                pos = pos +% 2_usize;
+            }
+            px_raw[pi] = cur_x;
+            pi = pi +% 1_usize;
+        }
+
+        // Decode Y coordinates (delta-encoded)
+        var py_raw: [512]i32 = [0_i32; 512];
+        var cur_y: i32 = 0_i32;
+        pi = 0_usize;
+        while pi < num_pts {
+            let fl = pflags[pi];
+            if (fl & 0x04_u8) != 0_u8 {
+                if pos >= gend { return; }
+                let d = be_u8(data, pos).widen.[i32]();
+                pos = pos +% 1_usize;
+                if (fl & 0x20_u8) != 0_u8 { cur_y = cur_y +% d; } else { cur_y = cur_y -% d; }
+            } else if (fl & 0x20_u8) == 0_u8 {
+                if pos +% 2_usize > gend { return; }
+                cur_y = cur_y +% be_i16_i32(data, pos);
+                pos = pos +% 2_usize;
+            }
+            py_raw[pi] = cur_y;
+            pi = pi +% 1_usize;
+        }
+
+        // Transform all points to scaled pixel coordinates (Y-down) & update bbox
+        var xs: [512]f32 = [0.0_f32; 512];
+        var ys: [512]f32 = [0.0_f32; 512];
+        pi = 0_usize;
+        while pi < num_pts {
+            let fx = px_raw[pi].to_float.[f32]();
+            let fy = py_raw[pi].to_float.[f32]();
+            let gx = (m00 * fx + m01 * fy + tx) * scale;
+            let gy = -(m10 * fx + m11 * fy + ty) * scale;
+            xs[pi] = gx;
+            ys[pi] = gy;
+            if gx < min_xf.* { min_xf.* = gx; }
+            if gx > max_xf.* { max_xf.* = gx; }
+            if gy < min_yf.* { min_yf.* = gy; }
+            if gy > max_yf.* { max_yf.* = gy; }
+            pi = pi +% 1_usize;
+        }
+
+        // Walk each closed contour, resolving implied on-curve midpoints between adjacent off-curve points
+        var c_start: usize = 0_usize;
+        ci = 0_usize;
+        while ci < num_contours {
+            let c_end = end_pts[ci];
+            if c_end >= num_pts || c_end < c_start { break; }
+            let clen = (c_end - c_start) +% 1_usize;
+            if clen >= 2_usize {
+                let first_on = (pflags[c_start] & 1_u8) != 0_u8;
+                let last_on = (pflags[c_end] & 1_u8) != 0_u8;
+
+                var sx: f32 = 0.0_f32;
+                var sy: f32 = 0.0_f32;
+                var start_idx: usize = c_start;
+                if first_on {
+                    sx = xs[c_start];
+                    sy = ys[c_start];
+                    start_idx = c_start +% 1_usize;
+                } else if last_on {
+                    sx = xs[c_end];
+                    sy = ys[c_end];
+                    start_idx = c_start;
+                } else {
+                    sx = (xs[c_start] + xs[c_end]) * 0.5_f32;
+                    sy = (ys[c_start] + ys[c_end]) * 0.5_f32;
+                    start_idx = c_start;
+                }
+
+                var cur_px = sx;
+                var cur_py = sy;
+                var has_ctrl = false;
+                var ctrl_x: f32 = 0.0_f32;
+                var ctrl_y: f32 = 0.0_f32;
+
+                var step: usize = 0_usize;
+                let n_steps = if first_on { clen - 1_usize } else { clen };
+                while step < n_steps {
+                    let idx = c_start +% ((start_idx - c_start +% step) % clen);
+                    let on = (pflags[idx] & 1_u8) != 0_u8;
+                    let x = xs[idx];
+                    let y = ys[idx];
+                    if on {
+                        if has_ctrl {
+                            push_curve(curves, count, OutlineCurve.{ x0: cur_px, y0: cur_py, cx: ctrl_x, cy: ctrl_y, x1: x, y1: y, is_quad: true });
+                            has_ctrl = false;
+                        } else {
+                            push_curve(curves, count, OutlineCurve.{ x0: cur_px, y0: cur_py, cx: x, cy: y, x1: x, y1: y, is_quad: false });
+                        }
+                        cur_px = x;
+                        cur_py = y;
+                    } else {
+                        if has_ctrl {
+                            let mx = (ctrl_x + x) * 0.5_f32;
+                            let my = (ctrl_y + y) * 0.5_f32;
+                            push_curve(curves, count, OutlineCurve.{ x0: cur_px, y0: cur_py, cx: ctrl_x, cy: ctrl_y, x1: mx, y1: my, is_quad: true });
+                            cur_px = mx;
+                            cur_py = my;
+                        }
+                        ctrl_x = x;
+                        ctrl_y = y;
+                        has_ctrl = true;
+                    }
+                    step = step +% 1_usize;
+                }
+                // Close contour back to (sx, sy)
+                if has_ctrl {
+                    push_curve(curves, count, OutlineCurve.{ x0: cur_px, y0: cur_py, cx: ctrl_x, cy: ctrl_y, x1: sx, y1: sy, is_quad: true });
+                } else {
+                    push_curve(curves, count, OutlineCurve.{ x0: cur_px, y0: cur_py, cx: sx, cy: sy, x1: sx, y1: sy, is_quad: false });
+                }
+            }
+            c_start = c_end +% 1_usize;
+            ci = ci +% 1_usize;
+        }
+    }
+}
+
+@inline
+fn push_curve(curves: *mut [OutlineCurve], count: *mut usize, c: OutlineCurve) {
+    let idx = count.*;
+    if idx < curves.len {
+        curves[idx] = c;
+        count.* = idx +% 1_usize;
+    }
+}
+
+@inline
+fn floor_i32(x: f32) -> i32 {
+    let i = x.trunc_to_int.[i32]();
+    if i.to_float.[f32]() > x {
+        return i -| 1_i32;
+    }
+    return i;
+}
+
+@inline
+fn ceil_i32(x: f32) -> i32 {
+    let i = x.trunc_to_int.[i32]();
+    if i.to_float.[f32]() < x {
+        return i +| 1_i32;
+    }
+    return i;
+}

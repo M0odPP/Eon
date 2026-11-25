@@ -1,0 +1,340 @@
+module eon_text.atlas;
+
+import core.col;
+
+// ============================================================================
+// Shelf-Packed Dynamic R8 Glyph Atlas (`libs/eon_text/src/atlas.eon`)
+// 100% safe `core/`-only — caches rasterized `(font_id, gid, px_tenths)`
+// glyphs in a linear R8 pixel buffer with open-addressed hashing, dirty-rect
+// tracking, and `generation: u64` bumps for zero-redundant GPU texture uploads.
+// Compact 24-byte `GlyphEntry` & 48-byte `GlyphAtlasCore` (zero stack bloat!).
+// ============================================================================
+
+const ATLAS_PADDING: u32 = 1_u32;
+const KEY_OCCUPIED_BIT: u64 = 0x8000000000000000_u64;
+
+/// Compact 24-byte cached glyph descriptor (stores exact integer atlas pixel origin).
+pub struct GlyphEntry {
+    pub key: u64;        // bit 63 = occupied; bits 0..47 = (font_id:16 << 32) | (gid:16 << 16) | px_tenths:16
+    pub advance: f32;
+    pub atlas_x: u16;
+    pub atlas_y: u16;
+    pub width: u16;
+    pub height: u16;
+    pub bearing_x: i16;
+    pub bearing_y: i16;
+}
+
+impl GlyphEntry {
+    pub fn empty() -> GlyphEntry {
+        return GlyphEntry.{
+            key: 0_u64,
+            advance: 0.0_f32,
+            atlas_x: 0_u16,
+            atlas_y: 0_u16,
+            width: 0_u16,
+            height: 0_u16,
+            bearing_x: 0_i16,
+            bearing_y: 0_i16,
+        };
+    }
+
+    @inline
+    pub fn is_occupied(self: *Self) -> bool {
+        return (self.key & KEY_OCCUPIED_BIT) != 0_u64;
+    }
+
+    @inline
+    pub fn uv_bounds(self: *Self, atlas_w: u32, atlas_h: u32) -> f32x4 {
+        if atlas_w == 0_u32 || atlas_h == 0_u32 || self.width == 0_u16 || self.height == 0_u16 {
+            return .{ 0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32 };
+        }
+        let inv_w = 1.0_f32 / atlas_w.to_float.[f32]();
+        let inv_h = 1.0_f32 / atlas_h.to_float.[f32]();
+        let x0 = self.atlas_x.widen.[u32]().to_float.[f32]();
+        let y0 = self.atlas_y.widen.[u32]().to_float.[f32]();
+        let x1 = (self.atlas_x.widen.[u32]() +% self.width.widen.[u32]()).to_float.[f32]();
+        let y1 = (self.atlas_y.widen.[u32]() +% self.height.widen.[u32]()).to_float.[f32]();
+        return .{ x0 * inv_w, y0 * inv_h, x1 * inv_w, y1 * inv_h };
+    }
+}
+
+@inline
+pub fn pack_glyph_key(font_id: u16, gid: u16, px_tenths: u16) -> u64 {
+    return KEY_OCCUPIED_BIT
+        | (font_id.widen.[u64]() << 32_u64)
+        | (gid.widen.[u64]() << 16_u64)
+        | px_tenths.widen.[u64]();
+}
+
+@inline
+fn hash_key(k: u64, cap: usize) -> usize {
+    if cap == 0_usize { return 0_usize; }
+    var x = k ^ (k >> 30_u64);
+    x = x *% 0xBF58476D1CE4E5B9_u64;
+    x = x ^ (x >> 27_u64);
+    x = x *% 0x94D049BB133111EB_u64;
+    x = x ^ (x >> 31_u64);
+    return x.trunc.[usize]() % cap;
+}
+
+/// Tiny 56-byte shelf-packing state operating over caller-provided `pixels` & `entries` slices
+/// (works identically on hosted OS with `DynBuf` AND bare-metal `nostd` with stack arrays!).
+pub struct GlyphAtlasCore {
+    pub width: u32;
+    pub height: u32;
+    pub cursor_x: u32;
+    pub cursor_y: u32;
+    pub shelf_h: u32;
+    pub generation: u64;
+    pub frame_num: u32;
+    pub count: usize;
+    pub dirty: bool;
+    pub dirty_x0: u32;
+    pub dirty_y0: u32;
+    pub dirty_x1: u32;
+    pub dirty_y1: u32;
+}
+
+impl GlyphAtlasCore {
+    pub fn new(width: u32, height: u32) -> GlyphAtlasCore {
+        return GlyphAtlasCore.{
+            width: width,
+            height: height,
+            cursor_x: ATLAS_PADDING,
+            cursor_y: ATLAS_PADDING,
+            shelf_h: 0_u32,
+            generation: 1_u64,
+            frame_num: 0_u32,
+            count: 0_usize,
+            dirty: false,
+            dirty_x0: width,
+            dirty_y0: height,
+            dirty_x1: 0_u32,
+            dirty_y1: 0_u32,
+        };
+    }
+
+    pub fn begin_frame(self: *mut Self) {
+        self.frame_num = self.frame_num +% 1_u32;
+    }
+
+    pub fn clear_dirty(self: *mut Self) {
+        self.dirty = false;
+        self.dirty_x0 = self.width;
+        self.dirty_y0 = self.height;
+        self.dirty_x1 = 0_u32;
+        self.dirty_y1 = 0_u32;
+    }
+
+    /// Reset shelf packer and clear all cached glyphs (triggered automatically on full eviction).
+    pub fn reset(self: *mut Self, pixels: *mut [u8], entries: *mut [GlyphEntry]) {
+        var i: usize = 0_usize;
+        while i < pixels.len {
+            pixels[i] = 0_u8;
+            i = i +% 1_usize;
+        }
+        var ei: usize = 0_usize;
+        while ei < entries.len {
+            entries[ei].key = 0_u64;
+            ei = ei +% 1_usize;
+        }
+        self.cursor_x = ATLAS_PADDING;
+        self.cursor_y = ATLAS_PADDING;
+        self.shelf_h = 0_u32;
+        self.count = 0_usize;
+        self.generation = self.generation +% 1_u64;
+        self.dirty = true;
+        self.dirty_x0 = 0_u32;
+        self.dirty_y0 = 0_u32;
+        self.dirty_x1 = self.width;
+        self.dirty_y1 = self.height;
+    }
+
+    /// Look up a cached glyph by packed key.
+    pub fn get(self: *Self, entries: *[GlyphEntry], key: u64) -> ?GlyphEntry {
+        _ = self;
+        if entries.len == 0_usize { return null; }
+        var slot = hash_key(key, entries.len);
+        var probes: usize = 0_usize;
+        while probes < entries.len {
+            if slot < entries.len {
+                let e = entries[slot];
+                if e.key == 0_u64 {
+                    return null;
+                }
+                if e.key == key {
+                    return e;
+                }
+            }
+            slot = slot +% 1_usize;
+            if slot >= entries.len { slot = 0_usize; }
+            probes = probes +% 1_usize;
+        }
+        return null;
+    }
+
+    /// Pack a newly rasterized R8 bitmap (`gw x gh`) into `pixels`, register in `entries`,
+    /// bump `generation` & dirty rect, and return the cached `GlyphEntry`.
+    pub fn insert(
+        self: *mut Self,
+        pixels: *mut [u8],
+        entries: *mut [GlyphEntry],
+        key: u64,
+        gw: u32,
+        gh: u32,
+        bearing_x: i32,
+        bearing_y: i32,
+        advance: f32,
+        glyph_alpha: *[u8],
+    ) -> GlyphEntry {
+        if gw == 0_u32 || gh == 0_u32 {
+            let ent = GlyphEntry.{
+                key: key,
+                advance: advance,
+                atlas_x: 0_u16,
+                atlas_y: 0_u16,
+                width: 0_u16,
+                height: 0_u16,
+                bearing_x: bearing_x.trunc.[i16](),
+                bearing_y: bearing_y.trunc.[i16](),
+            };
+            self.store_entry(pixels, entries, &ent);
+            return ent;
+        }
+
+        let max_load = (entries.len *% 3_usize) >> 2_usize;
+        if max_load > 0_usize && self.count >= max_load {
+            self.reset(pixels, entries);
+        }
+        if self.cursor_x +% gw +% ATLAS_PADDING > self.width {
+            self.cursor_x = ATLAS_PADDING;
+            self.cursor_y = self.cursor_y +% self.shelf_h +% ATLAS_PADDING;
+            self.shelf_h = 0_u32;
+        }
+        if self.cursor_y +% gh +% ATLAS_PADDING > self.height {
+            self.reset(pixels, entries);
+        }
+        if self.cursor_x +% gw +% ATLAS_PADDING > self.width || self.cursor_y +% gh +% ATLAS_PADDING > self.height {
+            return GlyphEntry.empty();
+        }
+
+        let dst_x = self.cursor_x;
+        let dst_y = self.cursor_y;
+        self.cursor_x = self.cursor_x +% gw +% ATLAS_PADDING;
+        if gh > self.shelf_h {
+            self.shelf_h = gh;
+        }
+
+        // Blit R8 glyph bitmap into atlas pixel buffer
+        let aw = self.width.widen.[usize]();
+        let gw_u = gw.widen.[usize]();
+        let gh_u = gh.widen.[usize]();
+        var ry: usize = 0_usize;
+        while ry < gh_u {
+            let dst_row = (dst_y.widen.[usize]() +% ry) *% aw +% dst_x.widen.[usize]();
+            let src_row = ry *% gw_u;
+            var rx: usize = 0_usize;
+            while rx < gw_u {
+                let d_idx = dst_row +% rx;
+                let s_idx = src_row +% rx;
+                if d_idx < pixels.len && s_idx < glyph_alpha.len {
+                    pixels[d_idx] = glyph_alpha[s_idx];
+                }
+                rx = rx +% 1_usize;
+            }
+            ry = ry +% 1_usize;
+        }
+
+        if dst_x < self.dirty_x0 { self.dirty_x0 = dst_x; }
+        if dst_y < self.dirty_y0 { self.dirty_y0 = dst_y; }
+        if dst_x +% gw > self.dirty_x1 { self.dirty_x1 = dst_x +% gw; }
+        if dst_y +% gh > self.dirty_y1 { self.dirty_y1 = dst_y +% gh; }
+        self.dirty = true;
+        self.generation = self.generation +% 1_u64;
+
+        let ent = GlyphEntry.{
+            key: key,
+            advance: advance,
+            atlas_x: dst_x.trunc.[u16](),
+            atlas_y: dst_y.trunc.[u16](),
+            width: gw.trunc.[u16](),
+            height: gh.trunc.[u16](),
+            bearing_x: bearing_x.trunc.[i16](),
+            bearing_y: bearing_y.trunc.[i16](),
+        };
+        self.store_entry(pixels, entries, &ent);
+        return ent;
+    }
+
+    fn store_entry(self: *mut Self, pixels: *mut [u8], entries: *mut [GlyphEntry], ent: *GlyphEntry) {
+        if entries.len == 0_usize { return; }
+        let max_load = (entries.len *% 3_usize) >> 2_usize;
+        if max_load > 0_usize && self.count >= max_load {
+            self.reset(pixels, entries);
+        }
+        var slot = hash_key(ent.key, entries.len);
+        var probes: usize = 0_usize;
+        while probes < entries.len {
+            if slot < entries.len {
+                if entries[slot].key == 0_u64 || entries[slot].key == ent.key {
+                    if entries[slot].key == 0_u64 {
+                        self.count = self.count +% 1_usize;
+                    }
+                    entries[slot] = ent.*;
+                    return;
+                }
+            }
+            slot = slot +% 1_usize;
+            if slot >= entries.len { slot = 0_usize; }
+            probes = probes +% 1_usize;
+        }
+    }
+}
+
+/// Heap-backed owned `GlyphAtlas` for hosted apps (`AllocCap`-managed pixels + 2048-slot table).
+/// Stack size: ~104 bytes!
+pub linear struct GlyphAtlas {
+    pub core: GlyphAtlasCore;
+    pub pixels: col.DynBuf[u8];
+    pub entries: col.DynBuf[GlyphEntry];
+}
+
+impl GlyphAtlas {
+    pub fn init(alloc: *mut AllocCap, width: u32, height: u32) -> GlyphAtlas ! OutOfMemory {
+        let total = width.widen.[usize]() *% height.widen.[usize]();
+        var pixels = try col.DynBuf.[u8].init(alloc, total);
+        errdefer pixels.destroy(alloc);
+        var i: usize = 0_usize;
+        while i < total {
+            try pixels.push(alloc, 0_u8);
+            i = i +% 1_usize;
+        }
+        var entries = try col.DynBuf.[GlyphEntry].init(alloc, 2048_usize);
+        errdefer entries.destroy(alloc);
+        var ei: usize = 0_usize;
+        while ei < 2048_usize {
+            try entries.push(alloc, GlyphEntry.empty());
+            ei = ei +% 1_usize;
+        }
+        return GlyphAtlas.{
+            core: GlyphAtlasCore.new(width, height),
+            pixels: pixels,
+            entries: entries,
+        };
+    }
+
+    pub fn destroy(self: GlyphAtlas, alloc: *mut AllocCap) {
+        let GlyphAtlas.{ core: _, pixels, entries } = self;
+        pixels.destroy(alloc);
+        entries.destroy(alloc);
+    }
+
+    pub view fn as_pixels(self: *Self) -> *[u8] {
+        return self.pixels.as_slice();
+    }
+
+    pub view fn as_pixels_mut(self: *mut Self) -> *mut [u8] {
+        return self.pixels.as_mut_slice();
+    }
+}

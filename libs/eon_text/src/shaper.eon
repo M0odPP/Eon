@@ -1,0 +1,405 @@
+module eon_text.shaper;
+
+import core.color;
+import core.math_vec;
+import eon_gpu.scene;
+import eon_text.ttf;
+import eon_text.raster;
+import eon_text.atlas;
+
+// ============================================================================
+// UTF-8 Text Shaper, Measurement, Word-Wrap, Ellipsis & Cursor Hit-Testing
+// (`libs/eon_text/src/shaper.eon`) — 100% safe `core/`-only (`nostd`-ready!).
+// ============================================================================
+
+pub struct Utf8Decode {
+    pub cp: u32;
+    pub next_idx: usize;
+}
+
+/// Decode one UTF-8 codepoint starting at `bytes[idx]`.
+pub fn next_codepoint(bytes: *[u8], idx: usize) -> Utf8Decode {
+    if idx >= bytes.len {
+        return Utf8Decode.{ cp: 0_u32, next_idx: idx };
+    }
+    let b0 = bytes[idx];
+    if b0 < 0x80_u8 {
+        return Utf8Decode.{ cp: b0.widen.[u32](), next_idx: idx +% 1_usize };
+    }
+    if (b0 & 0xE0_u8) == 0xC0_u8 && idx +% 1_usize < bytes.len {
+        let cp = ((b0 & 0x1F_u8).widen.[u32]() << 6_u32)
+            | (bytes[idx +% 1_usize] & 0x3F_u8).widen.[u32]();
+        return Utf8Decode.{ cp: cp, next_idx: idx +% 2_usize };
+    }
+    if (b0 & 0xF0_u8) == 0xE0_u8 && idx +% 2_usize < bytes.len {
+        let cp = ((b0 & 0x0F_u8).widen.[u32]() << 12_u32)
+            | ((bytes[idx +% 1_usize] & 0x3F_u8).widen.[u32]() << 6_u32)
+            | (bytes[idx +% 2_usize] & 0x3F_u8).widen.[u32]();
+        return Utf8Decode.{ cp: cp, next_idx: idx +% 3_usize };
+    }
+    if (b0 & 0xF8_u8) == 0xF0_u8 && idx +% 3_usize < bytes.len {
+        let cp = ((b0 & 0x07_u8).widen.[u32]() << 18_u32)
+            | ((bytes[idx +% 1_usize] & 0x3F_u8).widen.[u32]() << 12_u32)
+            | ((bytes[idx +% 2_usize] & 0x3F_u8).widen.[u32]() << 6_u32)
+            | (bytes[idx +% 3_usize] & 0x3F_u8).widen.[u32]();
+        return Utf8Decode.{ cp: cp, next_idx: idx +% 4_usize };
+    }
+    return Utf8Decode.{ cp: 0xFFFD_u32, next_idx: idx +% 1_usize };
+}
+
+pub struct TextMetrics {
+    pub width: f32;
+    pub height: f32;
+    pub ascent: f32;
+    pub descent: f32;
+    pub line_height: f32;
+    pub line_count: u32;
+}
+
+pub struct WrappedLine {
+    pub start_byte: usize;
+    pub end_byte: usize;
+    pub width: f32;
+}
+
+@inline
+pub fn quantize_px_tenths(px_size: f32) -> u16 {
+    let clamped = math_vec.clamp_f32(px_size, 4.0_f32, 160.0_f32);
+    let q = (clamped * 10.0_f32 + 0.5_f32).trunc_to_int.[i32]();
+    if q < 40_i32 { return 40_u16; }
+    if q > 1600_i32 { return 1600_u16; }
+    return q.trunc.[u16]();
+}
+
+/// Measure single-line UTF-8 text width & vertical line metrics with kerning.
+pub fn measure_line(font: *ttf.TtfFont, font_data: *[u8], text: *[u8], px_size: f32) -> TextMetrics {
+    let lm = font.line_metrics(px_size);
+    let sc = font.scale_for_px(px_size);
+    var pen_x: f32 = 0.0_f32;
+    var prev_gid: u16 = 0_u16;
+    var has_prev = false;
+    var idx: usize = 0_usize;
+    while idx < text.len {
+        let dec = next_codepoint(text, idx);
+        idx = dec.next_idx;
+        if dec.cp == 10_u32 || dec.cp == 13_u32 {
+            break;
+        }
+        let gid = font.glyph_index(font_data, dec.cp);
+        if has_prev {
+            let kern = font.kern_advance(font_data, prev_gid, gid);
+            pen_x = pen_x + ttf.sign_i16_i32(kern).to_float.[f32]() * sc;
+        }
+        let hm = font.hmetrics(font_data, gid);
+        pen_x = pen_x + hm.advance_width.widen.[u32]().to_float.[f32]() * sc;
+        prev_gid = gid;
+        has_prev = true;
+    }
+    return TextMetrics.{
+        width: pen_x,
+        height: lm.line_height,
+        ascent: lm.ascent,
+        descent: lm.descent,
+        line_height: lm.line_height,
+        line_count: 1_u32,
+    };
+}
+
+/// Return the nearest UTF-8 byte index in `text` for a horizontal click/cursor offset `target_x`.
+pub fn hit_test_x(font: *ttf.TtfFont, font_data: *[u8], text: *[u8], px_size: f32, target_x: f32) -> usize {
+    if target_x <= 0.0_f32 || text.len == 0_usize {
+        return 0_usize;
+    }
+    let sc = font.scale_for_px(px_size);
+    var pen_x: f32 = 0.0_f32;
+    var prev_gid: u16 = 0_u16;
+    var has_prev = false;
+    var idx: usize = 0_usize;
+    while idx < text.len {
+        let start_b = idx;
+        let dec = next_codepoint(text, idx);
+        idx = dec.next_idx;
+        if dec.cp == 10_u32 {
+            return start_b;
+        }
+        let gid = font.glyph_index(font_data, dec.cp);
+        if has_prev {
+            let kern = font.kern_advance(font_data, prev_gid, gid);
+            pen_x = pen_x + ttf.sign_i16_i32(kern).to_float.[f32]() * sc;
+        }
+        let hm = font.hmetrics(font_data, gid);
+        let adv = hm.advance_width.widen.[u32]().to_float.[f32]() * sc;
+        let mid = pen_x + adv * 0.5_f32;
+        if target_x < mid {
+            return start_b;
+        }
+        pen_x = pen_x + adv;
+        prev_gid = gid;
+        has_prev = true;
+    }
+    return text.len;
+}
+
+/// Compute horizontal cursor X position at `byte_offset` inside single-line `text`.
+pub fn cursor_x_for_byte(font: *ttf.TtfFont, font_data: *[u8], text: *[u8], px_size: f32, byte_offset: usize) -> f32 {
+    let lim = if byte_offset > text.len { text.len } else { byte_offset };
+    let sc = font.scale_for_px(px_size);
+    var pen_x: f32 = 0.0_f32;
+    var prev_gid: u16 = 0_u16;
+    var has_prev = false;
+    var idx: usize = 0_usize;
+    while idx < lim {
+        let dec = next_codepoint(text, idx);
+        idx = dec.next_idx;
+        if dec.cp == 10_u32 { break; }
+        let gid = font.glyph_index(font_data, dec.cp);
+        if has_prev {
+            let kern = font.kern_advance(font_data, prev_gid, gid);
+            pen_x = pen_x + ttf.sign_i16_i32(kern).to_float.[f32]() * sc;
+        }
+        let hm = font.hmetrics(font_data, gid);
+        pen_x = pen_x + hm.advance_width.widen.[u32]().to_float.[f32]() * sc;
+        prev_gid = gid;
+        has_prev = true;
+    }
+    return pen_x;
+}
+
+/// Word-wrap `text` into `out_lines` given `max_width` (respects explicit `\n` breaks).
+/// Returns the number of wrapped lines written into `out_lines`.
+pub fn wrap_lines(
+    font: *ttf.TtfFont,
+    font_data: *[u8],
+    text: *[u8],
+    px_size: f32,
+    max_width: f32,
+    out_lines: *mut [WrappedLine],
+) -> usize {
+    if out_lines.len == 0_usize { return 0_usize; }
+    if text.len == 0_usize {
+        out_lines[0_usize] = WrappedLine.{ start_byte: 0_usize, end_byte: 0_usize, width: 0.0_f32 };
+        return 1_usize;
+    }
+    let sc = font.scale_for_px(px_size);
+    var n_lines: usize = 0_usize;
+    var line_start: usize = 0_usize;
+    var pen_x: f32 = 0.0_f32;
+    var prev_gid: u16 = 0_u16;
+    var has_prev = false;
+    var last_space_end: usize = 0_usize;
+    var last_space_next: usize = 0_usize;
+    var width_at_space: f32 = 0.0_f32;
+    var has_space = false;
+
+    var idx: usize = 0_usize;
+    while idx < text.len && n_lines < out_lines.len {
+        let cur_b = idx;
+        let dec = next_codepoint(text, idx);
+        if dec.cp == 10_u32 {
+            out_lines[n_lines] = WrappedLine.{ start_byte: line_start, end_byte: cur_b, width: pen_x };
+            n_lines = n_lines +% 1_usize;
+            idx = dec.next_idx;
+            line_start = idx;
+            pen_x = 0.0_f32;
+            has_prev = false;
+            has_space = false;
+            continue;
+        }
+        let gid = font.glyph_index(font_data, dec.cp);
+        let k_adv: f32 = if has_prev { ttf.sign_i16_i32(font.kern_advance(font_data, prev_gid, gid)).to_float.[f32]() * sc } else { 0.0_f32 };
+        let g_adv = font.hmetrics(font_data, gid).advance_width.widen.[u32]().to_float.[f32]() * sc;
+        let next_x = pen_x + k_adv + g_adv;
+
+        if max_width > 0.0_f32 && next_x > max_width && cur_b > line_start {
+            if has_space && last_space_end > line_start {
+                out_lines[n_lines] = WrappedLine.{ start_byte: line_start, end_byte: last_space_end, width: width_at_space };
+                n_lines = n_lines +% 1_usize;
+                idx = last_space_next;
+                line_start = idx;
+            } else {
+                out_lines[n_lines] = WrappedLine.{ start_byte: line_start, end_byte: cur_b, width: pen_x };
+                n_lines = n_lines +% 1_usize;
+                line_start = cur_b;
+            }
+            pen_x = 0.0_f32;
+            has_prev = false;
+            has_space = false;
+            continue;
+        }
+
+        if dec.cp == 32_u32 {
+            last_space_end = cur_b;
+            last_space_next = dec.next_idx;
+            width_at_space = pen_x;
+            has_space = true;
+        }
+        pen_x = next_x;
+        prev_gid = gid;
+        has_prev = true;
+        idx = dec.next_idx;
+    }
+
+    if n_lines < out_lines.len && (line_start <= text.len) {
+        out_lines[n_lines] = WrappedLine.{ start_byte: line_start, end_byte: text.len, width: pen_x };
+        n_lines = n_lines +% 1_usize;
+    }
+    return n_lines;
+}
+
+/// Ensure `(font_id, gid, px_tenths)` is cached in `atlas_core` + `atlas_pixels` + `atlas_entries`,
+/// rasterizing on demand if missing.
+pub fn fetch_or_rasterize_glyph(
+    font: *ttf.TtfFont,
+    font_data: *[u8],
+    font_id: u16,
+    gid: u16,
+    px_size: f32,
+    atlas_core: *mut atlas.GlyphAtlasCore,
+    atlas_pixels: *mut [u8],
+    atlas_entries: *mut [atlas.GlyphEntry],
+) -> atlas.GlyphEntry {
+    let px_t = quantize_px_tenths(px_size);
+    let key = atlas.pack_glyph_key(font_id, gid, px_t);
+    if let hit = atlas_core.get(atlas_entries, key) {
+        return hit;
+    }
+    let qpx = px_t.widen.[u32]().to_float.[f32]() * 0.1_f32;
+    let sc = font.scale_for_px(qpx);
+    let hm = font.hmetrics(font_data, gid);
+    let adv = hm.advance_width.widen.[u32]().to_float.[f32]() * sc;
+
+    var scratch: [16384]u8 = [0_u8; 16384];
+    let rr = raster.rasterize_glyph(font, font_data, gid, qpx, &mut scratch);
+    if !rr.ok {
+        return atlas.GlyphEntry.empty();
+    }
+    return atlas_core.insert(
+        atlas_pixels,
+        atlas_entries,
+        key,
+        rr.width,
+        rr.height,
+        rr.bearing_x,
+        rr.bearing_y,
+        adv,
+        &scratch,
+    );
+}
+
+/// Shape single-line UTF-8 text and append `MonoSprite` instances into a caller-owned
+/// `Scene` (hosted) at top-left origin `(x, y)` (baseline = `y + ascent`).
+/// Returns the final horizontal pen advance.
+pub fn push_line_to_scene(
+    alloc: *mut AllocCap,
+    sc: *mut scene.Scene,
+    font: *ttf.TtfFont,
+    font_data: *[u8],
+    font_id: u16,
+    atlas_core: *mut atlas.GlyphAtlasCore,
+    atlas_pixels: *mut [u8],
+    atlas_entries: *mut [atlas.GlyphEntry],
+    text: *[u8],
+    x: f32,
+    y: f32,
+    px_size: f32,
+    col_rgba: color.Rgba,
+) -> f32 ! OutOfMemory {
+    let lm = font.line_metrics(px_size);
+    let scale = font.scale_for_px(px_size);
+    let baseline_y = y + lm.ascent;
+    var pen_x = x;
+    var prev_gid: u16 = 0_u16;
+    var has_prev = false;
+    var idx: usize = 0_usize;
+
+    while idx < text.len {
+        let dec = next_codepoint(text, idx);
+        idx = dec.next_idx;
+        if dec.cp == 10_u32 || dec.cp == 13_u32 { break; }
+        let gid = font.glyph_index(font_data, dec.cp);
+        if has_prev {
+            let kern = font.kern_advance(font_data, prev_gid, gid);
+            pen_x = pen_x + ttf.sign_i16_i32(kern).to_float.[f32]() * scale;
+        }
+        let ent = fetch_or_rasterize_glyph(font, font_data, font_id, gid, px_size, atlas_core, atlas_pixels, atlas_entries);
+        if ent.width > 0_u16 && ent.height > 0_u16 {
+            let gx = pen_x + ttf.sign_i16_i32(ent.bearing_x).to_float.[f32]();
+            let gy = baseline_y - ttf.sign_i16_i32(ent.bearing_y).to_float.[f32]();
+            let gw = ent.width.widen.[u32]().to_float.[f32]();
+            let gh = ent.height.widen.[u32]().to_float.[f32]();
+            let uv = ent.uv_bounds(atlas_core.width, atlas_core.height);
+            try sc.push_mono_sprite(alloc, math_vec.Bounds.from_xywh(gx, gy, gw, gh), uv, col_rgba);
+        }
+        pen_x = pen_x + ent.advance;
+        prev_gid = gid;
+        has_prev = true;
+    }
+    return pen_x - x;
+}
+
+/// Zero-heap `nostd`-compatible shaper: writes `MonoSprite` instances directly into
+/// caller-provided `out_sprites` slice starting at `sprite_count.*`.
+pub fn push_line_to_slice(
+    out_sprites: *mut [scene.MonoSprite],
+    sprite_count: *mut usize,
+    next_order: *mut u32,
+    clip_mask: f32x4,
+    font: *ttf.TtfFont,
+    font_data: *[u8],
+    font_id: u16,
+    atlas_core: *mut atlas.GlyphAtlasCore,
+    atlas_pixels: *mut [u8],
+    atlas_entries: *mut [atlas.GlyphEntry],
+    text: *[u8],
+    x: f32,
+    y: f32,
+    px_size: f32,
+    col_rgba: color.Rgba,
+) -> f32 {
+    let lm = font.line_metrics(px_size);
+    let scale = font.scale_for_px(px_size);
+    let baseline_y = y + lm.ascent;
+    let col4 = col_rgba.to_f32x4();
+    var pen_x = x;
+    var prev_gid: u16 = 0_u16;
+    var has_prev = false;
+    var idx: usize = 0_usize;
+
+    while idx < text.len {
+        let dec = next_codepoint(text, idx);
+        idx = dec.next_idx;
+        if dec.cp == 10_u32 || dec.cp == 13_u32 { break; }
+        let gid = font.glyph_index(font_data, dec.cp);
+        if has_prev {
+            let kern = font.kern_advance(font_data, prev_gid, gid);
+            pen_x = pen_x + kern.widen.[i32]().to_float.[f32]() * scale;
+        }
+        let ent = fetch_or_rasterize_glyph(font, font_data, font_id, gid, px_size, atlas_core, atlas_pixels, atlas_entries);
+        if ent.width > 0_u16 && ent.height > 0_u16 {
+            let sidx = sprite_count.*;
+            if sidx < out_sprites.len {
+                let gx = pen_x + ent.bearing_x.widen.[i32]().to_float.[f32]();
+                let gy = baseline_y - ent.bearing_y.widen.[i32]().to_float.[f32]();
+                let gw = ent.width.widen.[u32]().to_float.[f32]();
+                let gh = ent.height.widen.[u32]().to_float.[f32]();
+                let ord = next_order.*;
+                next_order.* = ord +% 1_u32;
+                out_sprites[sidx] = scene.MonoSprite.{
+                    bounds: .{ gx, gy, gw, gh },
+                    clip_mask: clip_mask,
+                    uv_bounds: ent.uv_bounds(atlas_core.width, atlas_core.height),
+                    color: col4,
+                    order: ord,
+                    atlas_id: 0_u32,
+                    _pad0: 0_u32,
+                    _pad1: 0_u32,
+                };
+                sprite_count.* = sidx +% 1_usize;
+            }
+        }
+        pen_x = pen_x + ent.advance;
+        prev_gid = gid;
+        has_prev = true;
+    }
+    return pen_x - x;
+}

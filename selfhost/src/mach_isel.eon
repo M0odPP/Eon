@@ -6769,7 +6769,13 @@ fn emit_cast_inst(
             try store_gpr_to_val(alloc, ctx, mf, eir_prog, env, dst, nv, sp);
         }
         .Bitcast => {
-            try emit_copy_val_to_val(alloc, ctx, mf, eir_prog, env, dst, operand, sp);
+            if from_n.kind == .Int && to_n.kind == .Int && env.int_bits(to_ty) < 64_u8 {
+                let v = try load_val_gpr(alloc, ctx, mf, eir_prog, env, operand, false, sp);
+                let nv = try emit_norm_subword(alloc, mf, env, to_ty, v, sp);
+                try store_gpr_to_val(alloc, ctx, mf, eir_prog, env, dst, nv, sp);
+            } else {
+                try emit_copy_val_to_val(alloc, ctx, mf, eir_prog, env, dst, operand, sp);
+            }
         }
         .AsU64 => {
             let v = try load_val_gpr(alloc, ctx, mf, eir_prog, env, operand, false, sp);

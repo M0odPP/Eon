@@ -1,0 +1,51 @@
+module eon_text.sys_font @hal;
+
+import core.col;
+import std.fs;
+
+// ============================================================================
+// Optional Desktop System TrueType (.ttf) Loader (`libs/eon_text/src/sys_font.hal.eon`)
+// Loads a system UI `.ttf` file via capability-checked `std.fs` on desktop OSes;
+// cleanly returns false on `nostd`/mobile so `TextEngine` uses its embedded OFL TTF.
+// ============================================================================
+
+pub fn load_ttf_file(fscap: *FsCap, alloc: *mut AllocCap, path: *str, out_bytes: *mut col.DynBuf[u8]) -> bool {
+    let res = fs.read_to_buf(fscap, alloc, path) catch {
+        return false;
+    };
+    out_bytes.clear();
+    out_bytes.push_slice(alloc, res.as_slice()) catch {
+        res.destroy(alloc);
+        return false;
+    };
+    res.destroy(alloc);
+    return out_bytes.len() >= 64_usize;
+}
+
+pub fn load_default_system_ui_font(fscap: *FsCap, alloc: *mut AllocCap, out_bytes: *mut col.DynBuf[u8]) -> bool {
+    comptime if @target_os() == .Linux {
+        if load_ttf_file(fscap, alloc, "/usr/share/fonts/liberation/LiberationSans-Regular.ttf", out_bytes) {
+            return true;
+        }
+        if load_ttf_file(fscap, alloc, "/usr/share/fonts/TTF/DejaVuSans.ttf", out_bytes) {
+            return true;
+        }
+        if load_ttf_file(fscap, alloc, "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", out_bytes) {
+            return true;
+        }
+        return false;
+    } else comptime if @target_os() == .Windows {
+        if load_ttf_file(fscap, alloc, "C:\\Windows\\Fonts\\segoeui.ttf", out_bytes) {
+            return true;
+        }
+        return load_ttf_file(fscap, alloc, "C:\\Windows\\Fonts\\arial.ttf", out_bytes);
+    } else comptime if @target_os() == .MacOS {
+        if load_ttf_file(fscap, alloc, "/System/Library/Fonts/Supplemental/Arial.ttf", out_bytes) {
+            return true;
+        }
+        return false;
+    } else {
+        _ = fscap; _ = alloc; _ = out_bytes;
+        return false;
+    }
+}
