@@ -320,6 +320,14 @@ pub fn const_bytes(bytes_range: ast.IdRange) -> CfgConst {
     return c;
 }
 
+pub fn const_bytes_typed(bytes_range: ast.IdRange, ty: types.TyId) -> CfgConst {
+    var c = const_void();
+    c.kind = .Bytes;
+    c.bytes = bytes_range;
+    c.ty = ty;
+    return c;
+}
+
 pub fn const_null(ty: types.TyId) -> CfgConst {
     var c = const_void();
     c.kind = .Null;
@@ -370,7 +378,12 @@ pub fn const_ty(c: *CfgConst, env: *types.TypeEnv) -> types.TyId {
         .Int => { return c.ty; }
         .Float => { return c.ty; }
         .Str => { return types.TY_STR; }
-        .Bytes => { return types.TY_STR; }
+        .Bytes => {
+            if c.ty != types.TY_VOID && c.ty != types.TY_NONE {
+                return c.ty;
+            }
+            return types.TY_STR;
+        }
         .Null => { return c.ty; }
         .EnumTag => { return c.ty; }
         .ErrorTag => {
@@ -660,6 +673,18 @@ pub enum CfgBuiltinOpKind : u8 {
     VecShuffle = 115,
     BuildAddDep = 116,
     BuildAddLib = 117,
+    GpuVertexIndex = 118,
+    GpuInstanceIndex = 119,
+    GpuFragCoord = 120,
+    GpuDiscard = 121,
+    GpuImageLoad = 122,
+    GpuImageStore = 123,
+    GpuImageSample = 124,
+    GpuMath1 = 125,
+    GpuMath2 = 126,
+    GpuMath3 = 127,
+    EmbedGpuSpirv = 128,
+    EmbedGpuMsl = 129,
 }
 
 pub struct CfgBuiltinOp {
@@ -1265,6 +1290,7 @@ pub struct CfgLocal {
     pub scope_depth: u32;
     pub has_param_index: bool;
     pub param_index: u32;
+    pub is_gpu_shared: bool;
 }
 
 pub fn local_new(id: LocalId, ty: types.TyId, sp: span.Span) -> CfgLocal {
@@ -1283,6 +1309,7 @@ pub fn local_new(id: LocalId, ty: types.TyId, sp: span.Span) -> CfgLocal {
         scope_depth: 0_u32,
         has_param_index: false,
         param_index: 0_u32,
+        is_gpu_shared: false,
     };
 }
 

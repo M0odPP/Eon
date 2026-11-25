@@ -3720,7 +3720,7 @@ fn cg_emit_const(
         }
         .Bytes => {
             let bytes = eir_prog.bytes_slice(c.bytes);
-            let ro_sym = try cg_intern_rodata(alloc, cg, interner, bytes, 1_u32);
+            let ro_sym = try cg_intern_rodata(alloc, cg, interner, bytes, 4_u32);
             let off = cg_val_stack_off(cg, dst);
             try cg.buf.lea_rip_sym(alloc, .Rax, ro_sym, 0_i64);
             try cg.buf.store_mem(alloc, .Rbp, off, .Rax, 8_usize);

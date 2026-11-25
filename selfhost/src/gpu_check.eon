@@ -1,0 +1,909 @@
+module eonc.gpu_check;
+
+import core.col;
+import core.str;
+import eonc.span;
+import eonc.diag;
+import eonc.types;
+import eonc.cfg_ir;
+import eonc.eir;
+
+// ===========================================================================
+// Shared Float Literal Parsing Helpers (used by SPIR-V and MSL emitters)
+// ===========================================================================
+
+pub fn parse_f64_lit(src: *[u8]) -> f64 {
+    var end = src.len;
+    if end >= 4_usize && src[end - 4_usize] == b'_' && src[end - 3_usize] == b'f' {
+        end = end - 4_usize;
+    } else if end >= 3_usize && src[end - 3_usize] == b'f' {
+        end = end - 3_usize;
+    }
+    var i: usize = 0_usize;
+    var neg = false;
+    if i < end && src[i] == b'-' {
+        neg = true;
+        i = i +% 1_usize;
+    } else if i < end && src[i] == b'+' {
+        i = i +% 1_usize;
+    }
+    var int_p: f64 = 0.0_f64;
+    while i < end {
+        let ch = src[i];
+        if ch == b'_' {
+            i = i +% 1_usize;
+            continue;
+        }
+        if ch >= b'0' && ch <= b'9' {
+            int_p = int_p * 10.0_f64 + (ch - b'0').widen.[u64]().to_float.[f64]();
+            i = i +% 1_usize;
+        } else {
+            break;
+        }
+    }
+    var frac_p: f64 = 0.0_f64;
+    var frac_d: f64 = 1.0_f64;
+    if i < end && src[i] == b'.' {
+        i = i +% 1_usize;
+        while i < end {
+            let ch = src[i];
+            if ch == b'_' {
+                i = i +% 1_usize;
+                continue;
+            }
+            if ch >= b'0' && ch <= b'9' {
+                frac_p = frac_p * 10.0_f64 + (ch - b'0').widen.[u64]().to_float.[f64]();
+                frac_d = frac_d * 10.0_f64;
+                i = i +% 1_usize;
+            } else {
+                break;
+            }
+        }
+    }
+    var val: f64 = int_p + (frac_p / frac_d);
+    if i < end && (src[i] == b'e' || src[i] == b'E') {
+        i = i +% 1_usize;
+        var exp_neg = false;
+        if i < end && src[i] == b'-' {
+            exp_neg = true;
+            i = i +% 1_usize;
+        } else if i < end && src[i] == b'+' {
+            i = i +% 1_usize;
+        }
+        var ea: i32 = 0_i32;
+        while i < end {
+            let ch = src[i];
+            if ch == b'_' {
+                i = i +% 1_usize;
+                continue;
+            }
+            if ch >= b'0' && ch <= b'9' {
+                if ea < 1000_i32 {
+                    ea = ea *% 10_i32 +% (ch - b'0').widen.[i32]();
+                }
+                i = i +% 1_usize;
+            } else {
+                break;
+            }
+        }
+        var p10: f64 = 1.0_f64;
+        var base: f64 = 10.0_f64;
+        while ea > 0_i32 {
+            if (ea & 1_i32) != 0_i32 {
+                p10 = p10 * base;
+            }
+            base = base * base;
+            ea = ea >> 1_i32;
+        }
+        if exp_neg {
+            val = val / p10;
+        } else {
+            val = val * p10;
+        }
+    }
+    if neg {
+        val = -val;
+    }
+    return val;
+}
+
+pub fn f64_bits_to_f32_bits(bits: u64) -> u32 {
+    let sign = ((bits >> 32_u64) & 0x80000000_u64).trunc.[u32]();
+    let exp = ((bits >> 52_u64) & 0x7FF_u64).trunc.[i32]();
+    let frac = bits & 0x000FFFFFFFFFFFFF_u64;
+    if exp == 0x7FF_i32 {
+        if frac != 0_u64 {
+            let p = (frac >> 29_u64).trunc.[u32]();
+            return sign | 0x7F800000_u32 | (if p == 0_u32 { 1_u32 } else { p });
+        }
+        return sign | 0x7F800000_u32;
+    }
+    if exp == 0_i32 {
+        return sign;
+    }
+    let ub = exp -% 1023_i32;
+    if ub > 127_i32 {
+        return sign | 0x7F800000_u32;
+    }
+    if ub < -149_i32 {
+        return sign;
+    }
+    if ub < -126_i32 {
+        let full = frac | 0x0010000000000000_u64;
+        let sh = (((-126_i32 -% ub).bitcast.[u32]() +% 29_u32).widen.[u64]()) & 63_u64;
+        let m = (full >> sh).trunc.[u32]();
+        let rem = full & ((1_u64 <<% sh) -% 1_u64);
+        let half = 1_u64 <<% (sh -% 1_u64);
+        let rnd: u32 = if rem > half || (rem == half && (m & 1_u32) != 0_u32) { 1_u32 } else { 0_u32 };
+        return sign | (m +% rnd);
+    }
+    let fe = ((ub +% 127_i32).bitcast.[u32]()) <<% 23_u32;
+    let m = (frac >> 29_u64).trunc.[u32]();
+    let rem = frac & 0x1FFFFFFF_u64;
+    let rnd: u32 = if rem > 0x10000000_u64 || (rem == 0x10000000_u64 && (m & 1_u32) != 0_u32) { 1_u32 } else { 0_u32 };
+    return sign | (fe +% m +% rnd);
+}
+
+// ===========================================================================
+// Post-Dominator & Transitive GPU Callee Analysis
+// ===========================================================================
+
+pub fn collect_term_succs(
+    alloc: *mut AllocCap,
+    eir_prog: *eir.EirProgram,
+    term: *eir.EirTerm,
+    out: *mut col.DynBuf[u32],
+) -> !OutOfMemory {
+    out.clear();
+    match term.kind {
+        .Goto => {
+            try out.push(alloc, term.bb0);
+        }
+        .Branch => {
+            try out.push(alloc, term.bb0);
+            try out.push(alloc, term.bb1);
+        }
+        .SwitchInt => {
+            let ts = eir_prog.switch_targets_slice(term.targets);
+            var i: usize = 0_usize;
+            while i < ts.len {
+                try out.push(alloc, ts[i].target);
+                i = i +% 1_usize;
+            }
+            try out.push(alloc, term.bb0);
+        }
+        _ => {}
+    }
+    return;
+}
+
+pub linear struct PdomInfo {
+    pub n: usize;
+    pub words_per_blk: usize;
+    pub pdom_bits: col.DynBuf[u64];
+    pub ipdom: col.DynBuf[u32];
+}
+
+impl PdomInfo {
+    pub fn contains(self: *Self, b: u32, x: u32) -> bool {
+        let bu = b.widen.[usize]();
+        let xu = x.widen.[usize]();
+        if bu >= self.n || xu >= self.n {
+            return false;
+        }
+        let widx = bu *% self.words_per_blk +% (xu >> 6_usize);
+        let bit = 1_u64 <<% ((xu & 63_usize).trunc.[u64]());
+        if let wp = self.pdom_bits.get(widx) {
+            return (wp.* & bit) != 0_u64;
+        }
+        return false;
+    }
+
+    pub fn ipdom_of(self: *Self, b: u32) -> u32 {
+        if let ip = self.ipdom.get(b.widen.[usize]()) {
+            return ip.*;
+        }
+        return eir.EIR_NONE;
+    }
+
+    pub fn destroy(self: PdomInfo, alloc: *mut AllocCap) {
+        let PdomInfo.{ n: _, words_per_blk: _, pdom_bits, ipdom } = self;
+        pdom_bits.destroy(alloc);
+        ipdom.destroy(alloc);
+    }
+}
+
+fn pdom_popcnt_row(bits: *[u64], row_off: usize, wpb: usize) -> u32 {
+    var cnt: u32 = 0_u32;
+    var w: usize = 0_usize;
+    while w < wpb {
+        let idx = row_off +% w;
+        if idx < bits.len {
+            cnt = cnt +% @popcnt(bits[idx]).trunc.[u32]();
+        }
+        w = w +% 1_usize;
+    }
+    return cnt;
+}
+
+pub fn compute_pdom(
+    alloc: *mut AllocCap,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+) -> PdomInfo ! OutOfMemory {
+    let blks = eir_prog.fn_blocks(fn_id);
+    let n = blks.len;
+    let wpb = (n +% 63_usize) >> 6_usize;
+    let total_words = if wpb == 0_usize { 1_usize } else { n *% wpb };
+    var pdom_bits = try col.DynBuf.[u64].init(alloc, total_words);
+    errdefer pdom_bits.destroy(alloc);
+    var ipdom = try col.DynBuf.[u32].init(alloc, n +% 1_usize);
+    errdefer ipdom.destroy(alloc);
+    var succs = try col.DynBuf.[u32].init(alloc, 4_usize);
+    errdefer succs.destroy(alloc);
+    var inter = try col.DynBuf.[u64].init(alloc, wpb +% 1_usize);
+    errdefer inter.destroy(alloc);
+
+    // Initialize: exit blocks post-dominate only themselves; others start with all blocks set.
+    var wi: usize = 0_usize;
+    while wi < wpb {
+        try inter.push(alloc, 0_u64);
+        wi = wi +% 1_usize;
+    }
+    var bi: usize = 0_usize;
+    while bi < n {
+        try ipdom.push(alloc, eir.EIR_NONE);
+        try collect_term_succs(alloc, eir_prog, &blks[bi].term, &mut succs);
+        let is_exit = succs.len() == 0_usize;
+        var w: usize = 0_usize;
+        while w < wpb {
+            var v: u64 = 0_u64;
+            if is_exit {
+                if w == (bi >> 6_usize) {
+                    v = 1_u64 <<% ((bi & 63_usize).trunc.[u64]());
+                }
+            } else {
+                let base_bit = w *% 64_usize;
+                if base_bit +% 64_usize <= n {
+                    v = 0xFFFFFFFFFFFFFFFF_u64;
+                } else if base_bit < n {
+                    let rem = n - base_bit;
+                    v = (1_u64 <<% rem.trunc.[u64]()) -% 1_u64;
+                }
+            }
+            try pdom_bits.push(alloc, v);
+            w = w +% 1_usize;
+        }
+        bi = bi +% 1_usize;
+    }
+
+    var changed = true;
+    var iter: usize = 0_usize;
+    while changed && iter < (n *% 4_usize +% 16_usize) {
+        changed = false;
+        iter = iter +% 1_usize;
+        var b: usize = 0_usize;
+        while b < blks.len {
+            try collect_term_succs(alloc, eir_prog, &blks[b].term, &mut succs);
+            let ss = succs.as_slice();
+            if ss.len == 0_usize {
+                b = b +% 1_usize;
+                continue;
+            }
+            let pb = pdom_bits.as_mut_slice();
+            let s0 = ss[0_usize].widen.[usize]();
+            var w: usize = 0_usize;
+            while w < wpb {
+                let s0_idx = s0 *% wpb +% w;
+                let v0 = if s0 < n && s0_idx < pb.len { pb[s0_idx] } else { 0_u64 };
+                if let ip = inter.get_mut(w) {
+                    ip.* = v0;
+                }
+                w = w +% 1_usize;
+            }
+            var si: usize = 1_usize;
+            while si < ss.len {
+                let sx = ss[si].widen.[usize]();
+                var w2: usize = 0_usize;
+                while w2 < wpb {
+                    let sx_idx = sx *% wpb +% w2;
+                    let sv = if sx < n && sx_idx < pb.len { pb[sx_idx] } else { 0_u64 };
+                    if let ip = inter.get_mut(w2) {
+                        ip.* = ip.* & sv;
+                    }
+                    w2 = w2 +% 1_usize;
+                }
+                si = si +% 1_usize;
+            }
+            let self_w = b >> 6_usize;
+            if let ip = inter.get_mut(self_w) {
+                ip.* = ip.* | (1_u64 <<% ((b & 63_usize).trunc.[u64]()));
+            }
+            let im = inter.as_slice();
+            var w3: usize = 0_usize;
+            while w3 < wpb && w3 < im.len {
+                let dst_idx = b *% wpb +% w3;
+                if dst_idx < pb.len && pb[dst_idx] != im[w3] {
+                    pb[dst_idx] = im[w3];
+                    changed = true;
+                }
+                w3 = w3 +% 1_usize;
+            }
+            b = b +% 1_usize;
+        }
+    }
+
+    // Immediate post-dominator: strict post-dominator of `b` with largest pdom set size.
+    let pb_ro = pdom_bits.as_slice();
+    var b2: usize = 0_usize;
+    while b2 < n {
+        var best = eir.EIR_NONE;
+        var best_sz: u32 = 0_u32;
+        var cand: usize = 0_usize;
+        while cand < n {
+            if cand != b2 {
+                let c_idx = b2 *% wpb +% (cand >> 6_usize);
+                let c_bit = 1_u64 <<% ((cand & 63_usize).trunc.[u64]());
+                if c_idx < pb_ro.len && (pb_ro[c_idx] & c_bit) != 0_u64 {
+                    let sz = pdom_popcnt_row(pb_ro, cand *% wpb, wpb);
+                    if sz > best_sz {
+                        best_sz = sz;
+                        best = cand.trunc.[u32]();
+                    }
+                }
+            }
+            cand = cand +% 1_usize;
+        }
+        if let ip = ipdom.get_mut(b2) {
+            ip.* = best;
+        }
+        b2 = b2 +% 1_usize;
+    }
+
+    inter.destroy(alloc);
+    succs.destroy(alloc);
+    return PdomInfo.{
+        n: n,
+        words_per_blk: wpb,
+        pdom_bits: pdom_bits,
+        ipdom: ipdom,
+    };
+}
+
+fn resolve_direct_callee_fn(eir_prog: *eir.EirProgram, callee: *eir.EirCallee) -> ?u32 {
+    if callee.kind == .DirectFn {
+        return eir_prog.find_fn_by_key(cfg_ir.fn_key_top_def(callee.a));
+    }
+    if callee.kind == .Method {
+        return eir_prog.find_fn_by_key(cfg_ir.fn_key_impl_method(callee.a, callee.b));
+    }
+    if callee.kind == .GenericInst {
+        return eir_prog.find_fn_by_key(cfg_ir.fn_key_generic_inst(callee.a));
+    }
+    return null;
+}
+
+@recursive
+fn dfs_gpu_callees(
+    alloc: *mut AllocCap,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    entry_fn_id: u32,
+    visited: *mut col.BitSet,
+    out_fn_ids: *mut col.DynBuf[u32],
+) -> !OutOfMemory {
+    let fiu = fn_id.widen.[usize]();
+    if visited.test(fiu) {
+        return;
+    }
+    visited.set(fiu);
+    let blks = eir_prog.fn_blocks(fn_id);
+    var bi: usize = 0_usize;
+    while bi < blks.len {
+        let insts = eir_prog.insts_slice(blks[bi].insts);
+        var ii: usize = 0_usize;
+        while ii < insts.len {
+            if insts[ii].kind == .Call {
+                if let cd = eir_prog.get_call(insts[ii].aux0) {
+                    if let target = resolve_direct_callee_fn(eir_prog, &cd.callee) {
+                        try dfs_gpu_callees(alloc, eir_prog, target, entry_fn_id, visited, out_fn_ids);
+                    }
+                }
+            }
+            ii = ii +% 1_usize;
+        }
+        bi = bi +% 1_usize;
+    }
+    if fn_id != entry_fn_id {
+        try out_fn_ids.push(alloc, fn_id);
+    }
+    return;
+}
+
+pub fn collect_gpu_callees(
+    alloc: *mut AllocCap,
+    eir_prog: *eir.EirProgram,
+    entry_fn_id: u32,
+    out_fn_ids: *mut col.DynBuf[u32],
+) -> !OutOfMemory {
+    out_fn_ids.clear();
+    let nfns = eir_prog.fn_count().widen.[usize]();
+    var visited = try col.BitSet.init(alloc, nfns +% 1_usize);
+    errdefer visited.destroy(alloc);
+    try dfs_gpu_callees(alloc, eir_prog, entry_fn_id, entry_fn_id, &mut visited, out_fn_ids);
+    visited.destroy(alloc);
+    return;
+}
+
+// ===========================================================================
+// GPU Validation (`E0820` std430, `E0821` capabilities/types, `E0822` barrier)
+// ===========================================================================
+
+fn emit_err_fmt(
+    alloc: *mut AllocCap,
+    diags: *mut diag.DiagBag,
+    code: u32,
+    sp: span.Span,
+    p0: *str,
+    mid: *[u8],
+    p1: *str,
+) -> !OutOfMemory {
+    var sb = try str.StrBuf.init(alloc, p0.len() +% mid.len +% p1.len +% 4_usize);
+    errdefer sb.destroy(alloc);
+    try sb.push_str_grow(alloc, p0);
+    try sb.push_bytes_grow(alloc, mid);
+    try sb.push_str_grow(alloc, p1);
+    _ = try diags.emit_error_bytes(alloc, code, sp, sb.as_bytes());
+    sb.destroy(alloc);
+    return;
+}
+
+@recursive
+fn validate_gpu_type(
+    alloc: *mut AllocCap,
+    ty: types.TyId,
+    sp: span.Span,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+    checked_structs: *mut col.HashMap[u32],
+) -> !OutOfMemory {
+    let n = env.get(ty);
+    match n.kind {
+        .Struct => {
+            let def_id = n.primary;
+            if checked_structs.get(def_id.widen.[u64]()) == null {
+                try checked_structs.insert(alloc, def_id.widen.[u64](), 1_u32);
+                if let sm = env.get_struct(def_id) {
+                    if sm.layout_mode != .Std430 {
+                        var tbuf = try str.StrBuf.init(alloc, 32_usize);
+                        errdefer tbuf.destroy(alloc);
+                        try env.format_ty_short(alloc, ty, interner, &mut tbuf);
+                        try emit_err_fmt(
+                            alloc, diags, diag.E0820, sp,
+                            "struct `", tbuf.as_bytes(),
+                            "` used in `@gpu` function must be annotated with `@layout(std430)`",
+                        );
+                        tbuf.destroy(alloc);
+                    }
+                    let fs = env.struct_fields_range(sm.fields);
+                    var fi: usize = 0_usize;
+                    while fi < fs.len {
+                        try validate_gpu_type(alloc, fs[fi].ty, fs[fi].span, env, interner, diags, checked_structs);
+                        fi = fi +% 1_usize;
+                    }
+                }
+            }
+        }
+        .Builtin => {
+            if n.builtin_kind == .GpuBuf || n.builtin_kind == .GpuImage2D {
+                let gs = env.node_gval_list(&n);
+                if gs.len > 0_usize && gs[0_usize].kind == .Ty {
+                    try validate_gpu_type(alloc, gs[0_usize].id, sp, env, interner, diags, checked_structs);
+                }
+            } else if n.builtin_kind == .AllocCap
+                || n.builtin_kind == .Arena
+                || n.builtin_kind == .ArenaPool
+                || n.builtin_kind == .SlotPool
+                || n.builtin_kind == .Buf
+                || n.builtin_kind == .LinearBuf
+                || n.builtin_kind == .FsCap
+                || n.builtin_kind == .NetCap
+                || n.builtin_kind == .BuildCap
+            {
+                var tbuf = try str.StrBuf.init(alloc, 32_usize);
+                errdefer tbuf.destroy(alloc);
+                try env.format_ty_short(alloc, ty, interner, &mut tbuf);
+                try emit_err_fmt(
+                    alloc, diags, diag.E0821, sp,
+                    "CPU memory/capability type `", tbuf.as_bytes(),
+                    "` is forbidden inside `@gpu` function",
+                );
+                tbuf.destroy(alloc);
+            }
+        }
+        .RawPtr => {
+            _ = try diags.emit_error(alloc, diag.E0821, sp, "CPU `rawptr` type is forbidden inside `@gpu` function");
+        }
+        .Dyn => {
+            _ = try diags.emit_error(alloc, diag.E0821, sp, "CPU `dyn` trait object is forbidden inside `@gpu` function");
+        }
+        .Borrow => {
+            _ = try diags.emit_error(alloc, diag.E0821, sp, "CPU borrow/slice type is forbidden inside `@gpu` function");
+        }
+        .Int => {
+            if n.u8_val == 128_u8 {
+                _ = try diags.emit_error(alloc, diag.E0821, sp, "128-bit integer type is forbidden inside `@gpu` function");
+            }
+        }
+        .Array => {
+            try validate_gpu_type(alloc, n.primary, sp, env, interner, diags, checked_structs);
+        }
+        .Vec => {
+            try validate_gpu_type(alloc, n.primary, sp, env, interner, diags, checked_structs);
+        }
+        _ => {}
+    }
+    return;
+}
+
+fn is_tainted_gpu_builtin(k: cfg_ir.CfgBuiltinOpKind) -> bool {
+    return k == .GpuGlobalId
+        || k == .GpuLocalId
+        || k == .GpuVertexIndex
+        || k == .GpuInstanceIndex
+        || k == .GpuFragCoord;
+}
+
+fn check_uniform_barriers(
+    alloc: *mut AllocCap,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    let blks = eir_prog.fn_blocks(fn_id);
+    if blks.len == 0_usize {
+        return;
+    }
+    // Quick check: if there is no GpuWorkgroupBarrier in this function, skip post-dom work.
+    var has_barrier = false;
+    var bi0: usize = 0_usize;
+    while bi0 < blks.len && !has_barrier {
+        let insts = eir_prog.insts_slice(blks[bi0].insts);
+        var ii0: usize = 0_usize;
+        while ii0 < insts.len {
+            if insts[ii0].kind == .BuiltinCall {
+                if let bc = eir_prog.get_builtin_call(insts[ii0].aux0) {
+                    if bc.op.kind == .GpuWorkgroupBarrier {
+                        has_barrier = true;
+                        break;
+                    }
+                }
+            }
+            ii0 = ii0 +% 1_usize;
+        }
+        bi0 = bi0 +% 1_usize;
+    }
+    if !has_barrier {
+        return;
+    }
+
+    let nvals = eir_prog.fn_value_tys(fn_id).len;
+    let nslots = eir_prog.fn_slots(fn_id).len;
+    var t_vals = try col.BitSet.init(alloc, nvals +% 1_usize);
+    errdefer t_vals.destroy(alloc);
+    var t_slots = try col.BitSet.init(alloc, nslots +% 1_usize);
+    errdefer t_slots.destroy(alloc);
+
+    var changed = true;
+    while changed {
+        changed = false;
+        var bi: usize = 0_usize;
+        while bi < blks.len {
+            let blk_phis_r = blks[bi].phis;
+            let blk_insts_r = blks[bi].insts;
+            let phis = eir_prog.phis_slice(blk_phis_r);
+            var pi: usize = 0_usize;
+            while pi < phis.len {
+                let phi_dst = phis[pi].dst.widen.[usize]();
+                let incs = eir_prog.phi_incoming(phis[pi].incoming);
+                var k: usize = 0_usize;
+                while k < incs.len {
+                    if t_vals.test(incs[k].val.widen.[usize]()) && !t_vals.test(phi_dst) {
+                        t_vals.set(phi_dst);
+                        changed = true;
+                    }
+                    k = k +% 1_usize;
+                }
+                pi = pi +% 1_usize;
+            }
+            let insts = eir_prog.insts_slice(blk_insts_r);
+            var ii: usize = 0_usize;
+            while ii < insts.len {
+                let inst = insts[ii];
+                let du = inst.dst.widen.[usize]();
+                if inst.kind == .BuiltinCall {
+                    if let bc = eir_prog.get_builtin_call(inst.aux0) {
+                        var t = is_tainted_gpu_builtin(bc.op.kind);
+                        if !t {
+                            let args = eir_prog.vals_slice(bc.args);
+                            var ai: usize = 0_usize;
+                            while ai < args.len {
+                                if t_vals.test(args[ai].widen.[usize]()) {
+                                    t = true;
+                                    break;
+                                }
+                                ai = ai +% 1_usize;
+                            }
+                        }
+                        if t && inst.dst != eir.EIR_NONE && !t_vals.test(du) {
+                            t_vals.set(du);
+                            changed = true;
+                        }
+                    }
+                } else if inst.kind == .Copy || inst.kind == .Unary || inst.kind == .Cast || inst.kind == .FieldExtract {
+                    if t_vals.test(inst.v0.widen.[usize]()) && !t_vals.test(du) {
+                        t_vals.set(du);
+                        changed = true;
+                    }
+                } else if inst.kind == .Binary {
+                    if (t_vals.test(inst.v0.widen.[usize]()) || t_vals.test(inst.v1.widen.[usize]())) && !t_vals.test(du) {
+                        t_vals.set(du);
+                        changed = true;
+                    }
+                } else if inst.kind == .Aggregate {
+                    let avs = eir_prog.vals_slice(inst.range);
+                    var ai: usize = 0_usize;
+                    while ai < avs.len {
+                        if t_vals.test(avs[ai].widen.[usize]()) && !t_vals.test(du) {
+                            t_vals.set(du);
+                            changed = true;
+                            break;
+                        }
+                        ai = ai +% 1_usize;
+                    }
+                } else if inst.kind == .StoreSlot {
+                    let su = inst.aux0.widen.[usize]();
+                    if t_vals.test(inst.v0.widen.[usize]()) && !t_slots.test(su) {
+                        t_slots.set(su);
+                        changed = true;
+                    }
+                } else if inst.kind == .LoadSlot {
+                    let su = inst.aux0.widen.[usize]();
+                    if t_slots.test(su) && !t_vals.test(du) {
+                        t_vals.set(du);
+                        changed = true;
+                    }
+                } else if inst.kind == .LoadPlace {
+                    if let pl = eir_prog.get_place(inst.aux0) {
+                        var t = if pl.base.kind == .Slot {
+                            t_slots.test(pl.base.id.widen.[usize]())
+                        } else {
+                            t_vals.test(pl.base.id.widen.[usize]())
+                        };
+                        let ps = eir_prog.projs_slice(pl.projs);
+                        var pri: usize = 0_usize;
+                        while pri < ps.len && !t {
+                            if ps[pri].kind == .Index && t_vals.test(ps[pri].index.widen.[usize]()) {
+                                t = true;
+                            }
+                            pri = pri +% 1_usize;
+                        }
+                        if t && !t_vals.test(du) {
+                            t_vals.set(du);
+                            changed = true;
+                        }
+                    }
+                } else if inst.kind == .StorePlace {
+                    if let pl = eir_prog.get_place(inst.aux0) {
+                        if pl.base.kind == .Slot && t_vals.test(inst.v0.widen.[usize]()) {
+                            let su = pl.base.id.widen.[usize]();
+                            if !t_slots.test(su) {
+                                t_slots.set(su);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                ii = ii +% 1_usize;
+            }
+            bi = bi +% 1_usize;
+        }
+    }
+
+    let pdom = try compute_pdom(alloc, eir_prog, fn_id);
+    errdefer pdom.destroy(alloc);
+    var non_uniform = try col.BitSet.init(alloc, blks.len +% 1_usize);
+    errdefer non_uniform.destroy(alloc);
+    var queue = try col.DynBuf.[u32].init(alloc, blks.len +% 1_usize);
+    errdefer queue.destroy(alloc);
+    var visited = try col.BitSet.init(alloc, blks.len +% 1_usize);
+    errdefer visited.destroy(alloc);
+    var succs = try col.DynBuf.[u32].init(alloc, 4_usize);
+    errdefer succs.destroy(alloc);
+
+    var bi2: usize = 0_usize;
+    while bi2 < blks.len {
+        let term = blks[bi2].term;
+        let is_tainted_br = (term.kind == .Branch || term.kind == .SwitchInt)
+            && t_vals.test(term.val.widen.[usize]());
+        if is_tainted_br {
+            let bid = blks[bi2].id;
+            queue.clear();
+            visited.clear();
+            try collect_term_succs(alloc, eir_prog, &term, &mut succs);
+            let ss0 = succs.as_slice();
+            var s0i: usize = 0_usize;
+            while s0i < ss0.len {
+                let sv = ss0[s0i];
+                if !visited.test(sv.widen.[usize]()) {
+                    visited.set(sv.widen.[usize]());
+                    try queue.push(alloc, sv);
+                }
+                s0i = s0i +% 1_usize;
+            }
+            var qhead: usize = 0_usize;
+            while qhead < queue.len() {
+                let cur = if let cp = queue.get(qhead) { cp.* } else { 0_u32 };
+                qhead = qhead +% 1_usize;
+                if cur != bid && pdom.contains(bid, cur) {
+                    continue;
+                }
+                non_uniform.set(cur.widen.[usize]());
+                if cur.widen.[usize]() < blks.len {
+                    try collect_term_succs(alloc, eir_prog, &blks[cur.widen.[usize]()].term, &mut succs);
+                    let nss = succs.as_slice();
+                    var nsi: usize = 0_usize;
+                    while nsi < nss.len {
+                        let ns = nss[nsi];
+                        if !visited.test(ns.widen.[usize]()) {
+                            visited.set(ns.widen.[usize]());
+                            try queue.push(alloc, ns);
+                        }
+                        nsi = nsi +% 1_usize;
+                    }
+                }
+            }
+        }
+        bi2 = bi2 +% 1_usize;
+    }
+
+    var bi3: usize = 0_usize;
+    while bi3 < blks.len {
+        if non_uniform.test(blks[bi3].id.widen.[usize]()) {
+            let insts = eir_prog.insts_slice(blks[bi3].insts);
+            var ii3: usize = 0_usize;
+            while ii3 < insts.len {
+                if insts[ii3].kind == .BuiltinCall {
+                    if let bc = eir_prog.get_builtin_call(insts[ii3].aux0) {
+                        if bc.op.kind == .GpuWorkgroupBarrier {
+                            _ = try diags.emit_error(
+                                alloc,
+                                diag.E0822,
+                                insts[ii3].span,
+                                "`@gpu_workgroup_barrier()` called in non-uniform control flow (branch depends on invocation ID)",
+                            );
+                        }
+                    }
+                }
+                ii3 = ii3 +% 1_usize;
+            }
+        }
+        bi3 = bi3 +% 1_usize;
+    }
+
+    succs.destroy(alloc);
+    visited.destroy(alloc);
+    queue.destroy(alloc);
+    non_uniform.destroy(alloc);
+    pdom.destroy(alloc);
+    t_slots.destroy(alloc);
+    t_vals.destroy(alloc);
+    return;
+}
+
+pub fn validate_gpu_fn(
+    alloc: *mut AllocCap,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    let f = eir_prog.get_fn(fn_id) orelse { return; };
+    if f.sig.effects.is_recursive {
+        try emit_err_fmt(
+            alloc, diags, diag.E0821, f.body_span,
+            "`@gpu` function `", interner.get(f.name), "` cannot be `@recursive`",
+        );
+    }
+
+    var checked_structs = try col.HashMap.[u32].init(alloc, 16_usize);
+    errdefer checked_structs.destroy(alloc);
+
+    let ps = env.params_range(f.sig.params);
+    var pi: usize = 0_usize;
+    while pi < ps.len {
+        try validate_gpu_type(alloc, ps[pi].ty, ps[pi].span, env, interner, diags, &mut checked_structs);
+        pi = pi +% 1_usize;
+    }
+    try validate_gpu_type(alloc, f.sig.ret, f.body_span, env, interner, diags, &mut checked_structs);
+
+    let slots = eir_prog.fn_slots(fn_id);
+    var si: usize = 0_usize;
+    while si < slots.len {
+        try validate_gpu_type(alloc, slots[si].ty, f.body_span, env, interner, diags, &mut checked_structs);
+        si = si +% 1_usize;
+    }
+
+    let blks = eir_prog.fn_blocks(fn_id);
+    var bi: usize = 0_usize;
+    while bi < blks.len {
+        let insts = eir_prog.insts_slice(blks[bi].insts);
+        var ii: usize = 0_usize;
+        while ii < insts.len {
+            if insts[ii].kind == .Call {
+                if let cd = eir_prog.get_call(insts[ii].aux0) {
+                    if cd.callee.kind == .DynCall || cd.callee.kind == .ExternFn || cd.callee.kind == .FnPtr {
+                        _ = try diags.emit_error(
+                            alloc,
+                            diag.E0821,
+                            insts[ii].span,
+                            "disallowed `dyn`, `extern`, or function-pointer call inside `@gpu` function",
+                        );
+                    }
+                }
+            }
+            ii = ii +% 1_usize;
+        }
+        bi = bi +% 1_usize;
+    }
+
+    try check_uniform_barriers(alloc, eir_prog, fn_id, diags);
+    checked_structs.destroy(alloc);
+    return;
+}
+
+pub fn validate_all_gpu_fns(
+    alloc: *mut AllocCap,
+    eir_prog: *eir.EirProgram,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    let nfns = eir_prog.fn_count();
+    var validated = try col.BitSet.init(alloc, nfns.widen.[usize]() +% 1_usize);
+    errdefer validated.destroy(alloc);
+    var callees = try col.DynBuf.[u32].init(alloc, 8_usize);
+    errdefer callees.destroy(alloc);
+
+    var fi: u32 = 0_u32;
+    while fi < nfns {
+        var is_gpu = false;
+        if let f = eir_prog.get_fn(fi) {
+            is_gpu = f.sig.effects.is_gpu && !f.is_emi_stub && f.blocks.len > 0_u32;
+        }
+        if is_gpu {
+            if !validated.test(fi.widen.[usize]()) {
+                validated.set(fi.widen.[usize]());
+                try validate_gpu_fn(alloc, eir_prog, fi, env, interner, diags);
+            }
+            try collect_gpu_callees(alloc, eir_prog, fi, &mut callees);
+            let cs = callees.as_slice();
+            var ci: usize = 0_usize;
+            while ci < cs.len {
+                let cf = cs[ci];
+                if !validated.test(cf.widen.[usize]()) {
+                    validated.set(cf.widen.[usize]());
+                    try validate_gpu_fn(alloc, eir_prog, cf, env, interner, diags);
+                }
+                ci = ci +% 1_usize;
+            }
+        }
+        fi = fi +% 1_u32;
+    }
+
+    callees.destroy(alloc);
+    validated.destroy(alloc);
+    return;
+}

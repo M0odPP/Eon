@@ -5550,7 +5550,7 @@ fn emit_const_inst(
         }
         .Bytes => {
             let bytes = eir_prog.bytes_slice(c.bytes);
-            let ro_sym = try intern_fn_rodata(alloc, ctx, mf, interner, bytes, 1_u32);
+            let ro_sym = try intern_fn_rodata(alloc, ctx, mf, interner, bytes, 4_u32);
             let ptr_v = try mf.new_vreg(alloc, .Gpr);
             try mf.emit_inst(alloc, mach_ir.inst_lea(ptr_v, mach_ir.mem_rip_sym(ro_sym, 0_i32), sp));
             let len_v = try emit_imm_vreg(alloc, mf, bytes.len.widen.[u64](), sp);

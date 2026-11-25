@@ -390,12 +390,17 @@ fn is_decl_sync_stop(kind: tok.TokenKind) -> bool {
 }
 
 fn is_value_builtin_name(bytes: *[u8]) -> bool {
+    if bytes.len >= 4_usize && bytes[0_usize] == b'g' && bytes[1_usize] == b'p' && bytes[2_usize] == b'u' && bytes[3_usize] == b'_' {
+        return true;
+    }
     return str.bytes_eq(bytes, "sqrt".as_bytes())
         || str.bytes_eq(bytes, "fma".as_bytes())
         || str.bytes_eq(bytes, "lzcnt".as_bytes())
         || str.bytes_eq(bytes, "tzcnt".as_bytes())
         || str.bytes_eq(bytes, "popcnt".as_bytes())
-        || str.bytes_eq(bytes, "bswap".as_bytes());
+        || str.bytes_eq(bytes, "bswap".as_bytes())
+        || str.bytes_eq(bytes, "embed_gpu_spirv".as_bytes())
+        || str.bytes_eq(bytes, "embed_gpu_msl".as_bytes());
 }
 
 fn is_tuple_type_disqualifying_op(kind: tok.TokenKind) -> bool {

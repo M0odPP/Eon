@@ -3001,7 +3001,7 @@ fn mem2reg_peek_or_zero(
 
 fn is_stub_fn(eir_prog: *eir.EirProgram, fi: u32) -> bool {
     if let f = eir_prog.get_fn(fi) {
-        return f.is_emi_stub || f.blocks.len == 0_u32;
+        return f.is_emi_stub || f.sig.effects.is_gpu || f.blocks.len == 0_u32;
     }
     return true;
 }
@@ -4422,6 +4422,7 @@ fn inline_call_site(
             has_name: false,
             name: span.SYM_EMPTY,
             is_mut: true,
+            is_gpu_shared: false,
         };
         if let sp = eir_prog.funcs.slots.get((callee_slots_r.start +% si).widen.[usize]()) {
             sinfo = sp.*;
@@ -5822,6 +5823,7 @@ fn sroa_fn_once(
                         has_name: false,
                         name: span.SYM_EMPTY,
                         is_mut: is_m,
+                        is_gpu_shared: false,
                     },
                 );
                 try fslots_flat.push(alloc, ns);
@@ -15693,6 +15695,7 @@ fn inline_call_site_split(
             has_name: false,
             name: span.SYM_EMPTY,
             is_mut: true,
+            is_gpu_shared: false,
         };
         if let sp = callee_eir.funcs.slots.get((callee_slots_r.start +% si).widen.[usize]()) {
             sinfo = sp.*;

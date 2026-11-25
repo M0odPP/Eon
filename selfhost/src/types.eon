@@ -656,6 +656,9 @@ pub struct FieldMeta {
     pub has_explicit_offset: bool;
     pub offset: u64;
     pub misaligned_in_packed: bool;
+    pub has_gpu_location: bool;
+    pub gpu_location: u32;
+    pub is_gpu_position: bool;
 }
 
 pub struct StructMeta {
@@ -745,6 +748,12 @@ pub struct GenericParamMeta {
     pub builtin_eq: bool;
 }
 
+pub enum GpuStage : u8 {
+    Compute = 0,
+    Vertex = 1,
+    Fragment = 2,
+}
+
 pub struct ParamSig {
     pub name: u32;
     pub span: span.Span;
@@ -757,6 +766,8 @@ pub struct ParamSig {
     pub gpu_set: u32;
     pub gpu_binding: u32;
     pub is_push_const: bool;
+    pub has_gpu_location: bool;
+    pub gpu_location: u32;
 }
 
 pub struct EffectSet {
@@ -768,6 +779,7 @@ pub struct EffectSet {
     pub is_naked: bool;
     pub is_export_c: bool;
     pub is_gpu: bool;
+    pub gpu_stage: GpuStage;
     pub has_gpu_local_size: bool;
     pub gpu_local_x: u32;
     pub gpu_local_y: u32;
@@ -795,6 +807,7 @@ pub fn effect_set_empty() -> EffectSet {
         is_naked: false,
         is_export_c: false,
         is_gpu: false,
+        gpu_stage: .Compute,
         has_gpu_local_size: false,
         gpu_local_x: 1_u32,
         gpu_local_y: 1_u32,
@@ -6593,11 +6606,15 @@ fn resolve_struct_def(
         }
         var f_has_off = false;
         var f_off_val: u64 = 0_u64;
+        var f_has_loc = false;
+        var f_loc_val: u32 = 0_u32;
+        var f_is_pos = false;
         let fattrs = arena.attrs_range(f.attrs);
         var fai: usize = 0_usize;
         while fai < fattrs.len {
             let fattr = fattrs[fai];
-            if str.bytes_eq(interner.get(fattr.name.sym), "offset".as_bytes()) {
+            let fan = interner.get(fattr.name.sym);
+            if str.bytes_eq(fan, "offset".as_bytes()) {
                 let fargs = arena.attr_args_range(fattr.args);
                 if fargs.len > 0_usize {
                     if let iv = try eval_const_int(
@@ -6609,6 +6626,20 @@ fn resolve_struct_def(
                         }
                     }
                 }
+            } else if str.bytes_eq(fan, "location".as_bytes()) {
+                let fargs = arena.attr_args_range(fattr.args);
+                if fargs.len > 0_usize {
+                    if let iv = try eval_const_int(
+                        alloc, fargs[0_usize].value, mod_id, &ctx, arena, prog, env, interner, diags,
+                    ) {
+                        if let vu = int_val_to_u64(iv) {
+                            f_has_loc = true;
+                            f_loc_val = vu.trunc.[u32]();
+                        }
+                    }
+                }
+            } else if str.bytes_eq(fan, "position".as_bytes()) {
+                f_is_pos = true;
             }
             fai = fai +% 1_usize;
         }
@@ -6623,6 +6654,9 @@ fn resolve_struct_def(
                 has_explicit_offset: f_has_off,
                 offset: f_off_val,
                 misaligned_in_packed: false,
+                has_gpu_location: f_has_loc,
+                gpu_location: f_loc_val,
+                is_gpu_position: f_is_pos,
             },
         );
         fi = fi +% 1_usize;
@@ -6711,6 +6745,9 @@ fn resolve_extern_agg_def(
                 has_explicit_offset: false,
                 offset: 0_u64,
                 misaligned_in_packed: false,
+                has_gpu_location: false,
+                gpu_location: 0_u32,
+                is_gpu_position: false,
             },
         );
         fi = fi +% 1_usize;
@@ -7380,6 +7417,8 @@ fn resolve_iface_method(
                 gpu_set: 0_u32,
                 gpu_binding: 0_u32,
                 is_push_const: false,
+                has_gpu_location: false,
+                gpu_location: 0_u32,
             },
         );
         pi = pi +% 1_usize;
@@ -7663,6 +7702,7 @@ fn apply_effect_attr(
         es.is_noalloc = true;
         es.is_noblock = true;
         if !es.has_effect_span { es.has_effect_span = true; es.effect_span = a.span; }
+        es.gpu_stage = .Compute;
         es.has_gpu_local_size = true;
         es.gpu_local_x = 1_u32;
         es.gpu_local_y = 1_u32;
@@ -7671,7 +7711,28 @@ fn apply_effect_attr(
         var ai: usize = 0_usize;
         while ai < args.len {
             let arg = args[ai];
-            if ast.ident_is_some(arg.name) && str.bytes_eq(interner.get(arg.name.sym), "local_size".as_bytes()) {
+            if !ast.ident_is_some(arg.name) {
+                if let e = arena.get_expr(arg.value) {
+                    var ssym = span.SYM_EMPTY;
+                    if e.kind == .EnumLit {
+                        ssym = e.ident.sym;
+                    } else if e.kind == .Ident {
+                        ssym = e.a;
+                    }
+                    if ssym != span.SYM_EMPTY {
+                        let sn = interner.get(ssym);
+                        if str.bytes_eq(sn, "Vertex".as_bytes()) {
+                            es.gpu_stage = .Vertex;
+                            es.has_gpu_local_size = false;
+                        } else if str.bytes_eq(sn, "Fragment".as_bytes()) {
+                            es.gpu_stage = .Fragment;
+                            es.has_gpu_local_size = false;
+                        } else if str.bytes_eq(sn, "Compute".as_bytes()) {
+                            es.gpu_stage = .Compute;
+                        }
+                    }
+                }
+            } else if str.bytes_eq(interner.get(arg.name.sym), "local_size".as_bytes()) {
                 if let e = arena.get_expr(arg.value) {
                     if e.kind == .Tuple {
                         let ts = arena.expr_list_range(e.list);
@@ -7763,6 +7824,8 @@ fn resolve_params(
         var gpu_s: u32 = 0_u32;
         var gpu_b: u32 = 0_u32;
         var is_pc = false;
+        var has_loc = false;
+        var gpu_loc: u32 = 0_u32;
         let attrs = arena.attrs_range(p.attrs);
         var ai: usize = 0_usize;
         while ai < attrs.len {
@@ -7782,6 +7845,14 @@ fn resolve_params(
                 }
             } else if str.bytes_eq(an, "push_const".as_bytes()) {
                 is_pc = true;
+            } else if str.bytes_eq(an, "location".as_bytes()) {
+                has_loc = true;
+                let aargs = arena.attr_args_range(attrs[ai].args);
+                if aargs.len > 0_usize {
+                    if let iv = try eval_const_int(alloc, aargs[0_usize].value, mod_id, ctx, arena, prog, env, interner, diags) {
+                        gpu_loc = iv.lo.trunc.[u32]();
+                    }
+                }
             }
             ai = ai +% 1_usize;
         }
@@ -7799,6 +7870,8 @@ fn resolve_params(
                 gpu_set: gpu_s,
                 gpu_binding: gpu_b,
                 is_push_const: is_pc,
+                has_gpu_location: has_loc,
+                gpu_location: gpu_loc,
             },
         );
         pi = pi +% 1_usize;
@@ -8010,6 +8083,8 @@ fn resolve_sys_sig(
                 gpu_set: 0_u32,
                 gpu_binding: 0_u32,
                 is_push_const: false,
+                has_gpu_location: false,
+                gpu_location: 0_u32,
             },
         );
         pidx = pidx +% 1_usize;
@@ -8091,6 +8166,8 @@ fn resolve_extern_fn_sig(
                 gpu_set: 0_u32,
                 gpu_binding: 0_u32,
                 is_push_const: false,
+                has_gpu_location: false,
+                gpu_location: 0_u32,
             },
         );
         pi = pi +% 1_usize;

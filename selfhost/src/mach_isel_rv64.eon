@@ -1691,7 +1691,7 @@ fn cg_emit_const(alloc: *mut AllocCap, cg: *mut RvCg, eir_prog: *eir.EirProgram,
         }
         .Bytes => {
             let bytes = eir_prog.bytes_slice(c.bytes);
-            let sym = cg_intern_rodata(alloc, cg, interner, bytes, 1_u32);
+            let sym = cg_intern_rodata(alloc, cg, interner, bytes, 4_u32);
             let off = cg_val_off(cg, dst);
             cg.buf.lea_sym(alloc, rv64_asm.A0, sym, 0_i64);
             st(alloc, cg, rv64_asm.FP, off, rv64_asm.A0, 8_u8);

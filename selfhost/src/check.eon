@@ -3959,6 +3959,35 @@ impl Checker {
         expected: types.TyId,
         sp: span.Span,
     ) -> types.TyId ! OutOfMemory {
+        // Support SIMD vector literals such as `f32x4.{ a, b, c, d }` / `u8x4.{ ... }`.
+        if let te = arena.get_expr(target_id) {
+            if te.kind == .Ident {
+                let seg_arr: [1]ast.IdentSpan = [ast.ident_new(te.a, te.span)];
+                if let btarget = try types.resolve_path_segments(
+                    self.alloc, seg_arr[0_usize..1_usize], self.mod_id, self.prog, self.interner, self.diags,
+                ) {
+                    if btarget.kind == .Builtin {
+                        let bi = resolve.decode_builtin(btarget.target_id);
+                        if bi.kind == .SimdAlias {
+                            let et = try types.prim_to_ty_id_in_env(self.alloc, bi.prim, bi.prim_bits, self.env);
+                            let fields = arena.field_inits_range(fields_range);
+                            if fields.len != bi.lanes.widen.[usize]() {
+                                try self.emit_err(
+                                    diag.E0230, sp, "SIMD vector literal element count does not match vector lane width",
+                                );
+                            }
+                            var vi: usize = 0_usize;
+                            while vi < fields.len {
+                                let gt = try self.check_expr_rvalue(arena, fields[vi].value, et);
+                                try self.expect_assignable(gt, et, expr_span(arena, fields[vi].value));
+                                vi = vi +% 1_usize;
+                            }
+                            return try self.env.intern_vec(self.alloc, et, bi.lanes);
+                        }
+                    }
+                }
+            }
+        }
         var gargs = try col.DynBuf.[types.GenericVal].init(self.alloc, 4_usize);
         errdefer gargs.destroy(self.alloc);
         let def_opt = try self.resolve_type_target_expr(arena, target_id, &mut gargs);
@@ -5286,6 +5315,79 @@ impl Checker {
     }
 
     @recursive
+    fn check_builtin_gpu_math(
+        self: *mut Self,
+        arena: *ast.AstArena,
+        name: ast.IdentSpan,
+        args: *[ast.GenericArgNode],
+        expected: types.TyId,
+        sp: span.Span,
+    ) -> ?types.TyId ! OutOfMemory {
+        let is_m1 = self.sym_eq(name.sym, "gpu_abs")
+            || self.sym_eq(name.sym, "gpu_floor")
+            || self.sym_eq(name.sym, "gpu_ceil")
+            || self.sym_eq(name.sym, "gpu_fract")
+            || self.sym_eq(name.sym, "gpu_exp")
+            || self.sym_eq(name.sym, "gpu_sin")
+            || self.sym_eq(name.sym, "gpu_cos")
+            || self.sym_eq(name.sym, "gpu_sqrt")
+            || self.sym_eq(name.sym, "gpu_normalize");
+        let is_len = self.sym_eq(name.sym, "gpu_length");
+        if is_m1 || is_len {
+            if args.len != 1_usize || args[0_usize].kind != .Expr {
+                try self.emit_err_sym2(diag.E0230, sp, "`@", name.sym, "` expects 1 expression argument");
+                return types.TY_ERROR;
+            }
+            let hint = if !is_len && expected != types.TY_NONE { expected } else { types.TY_F32 };
+            let xt = try self.check_expr_rvalue(arena, args[0_usize].node_id, hint);
+            if xt == types.TY_ERROR { return types.TY_ERROR; }
+            if is_len { return types.TY_F32; }
+            if xt == types.TY_COMPTIME_FLOAT { return types.TY_F32; }
+            return xt;
+        }
+        let is_m2 = self.sym_eq(name.sym, "gpu_min")
+            || self.sym_eq(name.sym, "gpu_max")
+            || self.sym_eq(name.sym, "gpu_pow")
+            || self.sym_eq(name.sym, "gpu_step");
+        let is_dot = self.sym_eq(name.sym, "gpu_dot");
+        if is_m2 || is_dot {
+            if args.len != 2_usize || args[0_usize].kind != .Expr || args[1_usize].kind != .Expr {
+                try self.emit_err_sym2(diag.E0230, sp, "`@", name.sym, "` expects 2 expression arguments");
+                return types.TY_ERROR;
+            }
+            let h0 = if !is_dot && expected != types.TY_NONE { expected } else { types.TY_F32 };
+            let t0 = try self.check_expr_rvalue(arena, args[0_usize].node_id, h0);
+            let h1 = if t0 != types.TY_ERROR && t0 != types.TY_COMPTIME_FLOAT && t0 != types.TY_COMPTIME_INT { t0 } else { h0 };
+            let t1 = try self.check_expr_rvalue(arena, args[1_usize].node_id, h1);
+            if t0 == types.TY_ERROR || t1 == types.TY_ERROR { return types.TY_ERROR; }
+            if is_dot { return types.TY_F32; }
+            if t0 == types.TY_COMPTIME_FLOAT { return if t1 != types.TY_COMPTIME_FLOAT { t1 } else { types.TY_F32 }; }
+            return t0;
+        }
+        if self.sym_eq(name.sym, "gpu_clamp")
+            || self.sym_eq(name.sym, "gpu_mix")
+            || self.sym_eq(name.sym, "gpu_smoothstep")
+        {
+            if args.len != 3_usize || args[0_usize].kind != .Expr || args[1_usize].kind != .Expr || args[2_usize].kind != .Expr {
+                try self.emit_err_sym2(diag.E0230, sp, "`@", name.sym, "` expects 3 expression arguments");
+                return types.TY_ERROR;
+            }
+            let h0 = if expected != types.TY_NONE { expected } else { types.TY_F32 };
+            let t0 = try self.check_expr_rvalue(arena, args[0_usize].node_id, h0);
+            let h1 = if t0 != types.TY_ERROR && t0 != types.TY_COMPTIME_FLOAT && t0 != types.TY_COMPTIME_INT { t0 } else { h0 };
+            let t1 = try self.check_expr_rvalue(arena, args[1_usize].node_id, h1);
+            let t2 = try self.check_expr_rvalue(arena, args[2_usize].node_id, h1);
+            if t0 == types.TY_ERROR || t1 == types.TY_ERROR || t2 == types.TY_ERROR { return types.TY_ERROR; }
+            if self.sym_eq(name.sym, "gpu_smoothstep") {
+                return if t2 == types.TY_COMPTIME_FLOAT { types.TY_F32 } else { t2 };
+            }
+            if t0 == types.TY_COMPTIME_FLOAT { return if t1 != types.TY_COMPTIME_FLOAT { t1 } else { types.TY_F32 }; }
+            return t0;
+        }
+        return null;
+    }
+
+    @recursive
     fn check_builtin(
         self: *mut Self,
         arena: *ast.AstArena,
@@ -5382,8 +5484,37 @@ impl Checker {
         {
             return try self.env.intern_vec(self.alloc, types.TY_U32, 3_u8);
         }
-        if self.sym_eq(name.sym, "gpu_workgroup_barrier") {
+        if self.sym_eq(name.sym, "gpu_vertex_index") || self.sym_eq(name.sym, "gpu_instance_index") {
+            return types.TY_U32;
+        }
+        if self.sym_eq(name.sym, "gpu_frag_coord") {
+            return try self.env.intern_vec(self.alloc, types.TY_F32, 4_u8);
+        }
+        if self.sym_eq(name.sym, "gpu_workgroup_barrier") || self.sym_eq(name.sym, "gpu_discard") {
             return types.TY_VOID;
+        }
+        if self.sym_eq(name.sym, "embed_gpu_spirv") || self.sym_eq(name.sym, "embed_gpu_msl") {
+            if args.len != 1_usize {
+                try self.emit_err_sym2(diag.E0230, sp, "`@", name.sym, "` expects 1 GPU function name argument");
+                return types.TY_ERROR;
+            }
+            var target_sym = span.SYM_EMPTY;
+            if args[0_usize].kind == .Expr {
+                if let ae = arena.get_expr(args[0_usize].node_id) {
+                    if ae.kind == .StringLit || ae.kind == .RawStringLit {
+                        target_sym = try self.interner.intern(self.alloc, arena.str_bytes_range(ae.list));
+                    } else if ae.kind == .Ident {
+                        target_sym = ae.a;
+                    } else if ae.kind == .Field {
+                        target_sym = ae.ident.sym;
+                    }
+                }
+            }
+            try self.table.set_const_int(self.alloc, expr_id, types.int_val_from_u64(target_sym.widen.[u64]()));
+            return try self.env.intern_borrow(self.alloc, false, .Slice, types.TY_U8);
+        }
+        if let gm_ty = try self.check_builtin_gpu_math(arena, name, args, expected, sp) {
+            return gm_ty;
         }
         var k: usize = 0_usize;
         while k < args.len {
@@ -7744,6 +7875,40 @@ impl Checker {
                 return types.TY_VOID;
             }
         }
+        if bk == .GpuImage2D {
+            if self.sym_eq(mname_sym, "load") {
+                if args.len != 1_usize {
+                    try self.emit_err(diag.E0230, sp, "GpuImage2D.load expects 1 coord (u32x2) argument");
+                } else {
+                    let cty = try self.env.intern_vec(self.alloc, types.TY_U32, 2_u8);
+                    let at = try self.check_expr_rvalue(arena, args[0_usize], cty);
+                    try self.expect_assignable(at, cty, expr_span(arena, args[0_usize]));
+                }
+                return elem_ty;
+            }
+            if self.sym_eq(mname_sym, "store") {
+                if args.len != 2_usize {
+                    try self.emit_err(diag.E0230, sp, "GpuImage2D.store expects (coord: u32x2, val)");
+                } else {
+                    let cty = try self.env.intern_vec(self.alloc, types.TY_U32, 2_u8);
+                    let at = try self.check_expr_rvalue(arena, args[0_usize], cty);
+                    try self.expect_assignable(at, cty, expr_span(arena, args[0_usize]));
+                    let vt = try self.check_expr_rvalue(arena, args[1_usize], elem_ty);
+                    try self.expect_assignable(vt, elem_ty, expr_span(arena, args[1_usize]));
+                }
+                return types.TY_VOID;
+            }
+            if self.sym_eq(mname_sym, "sample") {
+                if args.len != 1_usize {
+                    try self.emit_err(diag.E0230, sp, "GpuImage2D.sample expects 1 uv (f32x2) argument");
+                } else {
+                    let uv_ty = try self.env.intern_vec(self.alloc, types.TY_F32, 2_u8);
+                    let at = try self.check_expr_rvalue(arena, args[0_usize], uv_ty);
+                    try self.expect_assignable(at, uv_ty, expr_span(arena, args[0_usize]));
+                }
+                return try self.env.intern_vec(self.alloc, types.TY_F32, 4_u8);
+            }
+        }
         return null;
     }
 
@@ -7780,6 +7945,7 @@ impl Checker {
             || dn.builtin_kind == .Buf
             || dn.builtin_kind == .Atomic
             || dn.builtin_kind == .MmioReg
+            || dn.builtin_kind == .GpuImage2D
         {
             var gbuf = try col.DynBuf.[types.GenericVal].init(
                 self.alloc, dn.list_len.widen.[usize]() +% 1_usize,

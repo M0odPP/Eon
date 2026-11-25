@@ -497,6 +497,8 @@ fn make_param_sig_simple(name: u32, sp: span.Span, modifier: ast.ParamModifier, 
         gpu_set: 0_u32,
         gpu_binding: 0_u32,
         is_push_const: false,
+        has_gpu_location: false,
+        gpu_location: 0_u32,
     };
 }
 
@@ -1634,6 +1636,7 @@ impl CfgBuilder {
     @recursive
     fn lower_stmt_var(
         self: *mut Self,
+        attrs_range: ast.IdRange,
         ty_id: u32,
         init_id: u32,
         ident: ast.IdentSpan,
@@ -1656,6 +1659,18 @@ impl CfgBuilder {
         }
         let val_ty = if decl_ty != types.TY_NONE { decl_ty } else { self.operand_ty(val_op) };
         let vloc = try self.bind_user_local(ident.sym, ident.span, val_ty, true);
+        let vattrs = self.arena.attrs_range(attrs_range);
+        var vai: usize = 0_usize;
+        while vai < vattrs.len {
+            if str.bytes_eq(self.interner.get(vattrs[vai].name.sym), "gpu_shared".as_bytes()) {
+                var ls = self.st.bufs.locals.as_mut_slice();
+                if vloc.widen.[usize]() < ls.len {
+                    ls[vloc.widen.[usize]()].is_gpu_shared = true;
+                }
+                break;
+            }
+            vai = vai +% 1_usize;
+        }
         let dst = try self.cfg.add_local_place(self.alloc, vloc, self.local_ty(vloc), ident.span);
         try self.emit_assign(sp, dst, cfg_ir.rvalue_use(val_op));
         return;
@@ -1728,7 +1743,7 @@ impl CfgBuilder {
         }
         match s_kind {
             .Let => { try self.lower_stmt_let(s_a, s_b, s_c, s_span); }
-            .Var => { try self.lower_stmt_var(s_b, s_c, s_ident, s_span); }
+            .Var => { try self.lower_stmt_var(s_list, s_b, s_c, s_ident, s_span); }
             .Const => { try self.lower_stmt_const(s_a, s_span); }
             .Defer => {
                 if !self.st.sc.scopes.is_empty() {
@@ -5328,12 +5343,46 @@ impl CfgBuilder {
             try self.push_stmt(cfg_ir.stmt_call(sp, dst, cid));
             return cfg_ir.op_copy(dst);
         }
-        if str.bytes_eq(bs, "gpu_workgroup_barrier".as_bytes()) {
+        if str.bytes_eq(bs, "gpu_vertex_index".as_bytes())
+            || str.bytes_eq(bs, "gpu_instance_index".as_bytes())
+            || str.bytes_eq(bs, "gpu_frag_coord".as_bytes())
+        {
+            let kind: cfg_ir.CfgBuiltinOpKind = if str.bytes_eq(bs, "gpu_vertex_index".as_bytes()) {
+                .GpuVertexIndex
+            } else if str.bytes_eq(bs, "gpu_instance_index".as_bytes()) {
+                .GpuInstanceIndex
+            } else {
+                .GpuFragCoord
+            };
+            let dst = try self.new_temp_place(ty, sp);
             let dummy_ops: [1]cfg_ir.CfgOperand = [cfg_ir.op_none()];
             let dummy_sps: [1]span.Span = [span.span_dummy()];
             let cid = try self.cfg.add_call_data(
                 self.alloc,
-                cfg_ir.callee_builtin(cfg_ir.builtin_op_simple(.GpuWorkgroupBarrier)),
+                cfg_ir.callee_builtin(cfg_ir.builtin_op_simple(kind)),
+                dummy_ops[0_usize..0_usize],
+                dummy_sps[0_usize..0_usize],
+                false,
+                cfg_ir.CFG_NONE,
+                false,
+                span.span_dummy(),
+                false,
+                false,
+            );
+            try self.push_stmt(cfg_ir.stmt_call(sp, dst, cid));
+            return cfg_ir.op_copy(dst);
+        }
+        if str.bytes_eq(bs, "gpu_workgroup_barrier".as_bytes()) || str.bytes_eq(bs, "gpu_discard".as_bytes()) {
+            let kind: cfg_ir.CfgBuiltinOpKind = if str.bytes_eq(bs, "gpu_discard".as_bytes()) {
+                .GpuDiscard
+            } else {
+                .GpuWorkgroupBarrier
+            };
+            let dummy_ops: [1]cfg_ir.CfgOperand = [cfg_ir.op_none()];
+            let dummy_sps: [1]span.Span = [span.span_dummy()];
+            let cid = try self.cfg.add_call_data(
+                self.alloc,
+                cfg_ir.callee_builtin(cfg_ir.builtin_op_simple(kind)),
                 dummy_ops[0_usize..0_usize],
                 dummy_sps[0_usize..0_usize],
                 false,
@@ -5346,8 +5395,116 @@ impl CfgBuilder {
             try self.push_stmt(cfg_ir.stmt_call(sp, cfg_ir.CFG_NONE, cid));
             return try self.cfg.add_const_op(self.alloc, cfg_ir.const_void());
         }
+        if str.bytes_eq(bs, "embed_gpu_spirv".as_bytes()) || str.bytes_eq(bs, "embed_gpu_msl".as_bytes()) {
+            var target_sym = span.SYM_EMPTY;
+            if let iv = self.table.get_const_int(expr_id) {
+                target_sym = iv.lo.trunc.[u32]();
+            } else if let ga0 = arena_generic_arg_at(self.arena, args_range, 0_usize) {
+                if ga0.kind == .Expr {
+                    if let ae = self.arena.get_expr(ga0.node_id) {
+                        if ae.kind == .Ident {
+                            target_sym = ae.a;
+                        } else if ae.kind == .Field {
+                            target_sym = ae.ident.sym;
+                        }
+                    }
+                }
+            }
+            var bop = cfg_ir.builtin_op_simple(
+                if str.bytes_eq(bs, "embed_gpu_spirv".as_bytes()) { .EmbedGpuSpirv } else { .EmbedGpuMsl },
+            );
+            bop.sym = target_sym;
+            let dst = try self.new_temp_place(ty, sp);
+            let dummy_ops: [1]cfg_ir.CfgOperand = [cfg_ir.op_none()];
+            let dummy_sps: [1]span.Span = [span.span_dummy()];
+            let cid = try self.cfg.add_call_data(
+                self.alloc,
+                cfg_ir.callee_builtin(bop),
+                dummy_ops[0_usize..0_usize],
+                dummy_sps[0_usize..0_usize],
+                false,
+                cfg_ir.CFG_NONE,
+                false,
+                span.span_dummy(),
+                false,
+                false,
+            );
+            try self.push_stmt(cfg_ir.stmt_call(sp, dst, cid));
+            return cfg_ir.op_copy(dst);
+        }
+        let gm_op = match_gpu_math_builtin(bs);
+        if gm_op.matched {
+            let n_args = args_range.len.widen.[usize]();
+            var cargs = try col.DynBuf.[cfg_ir.CfgOperand].init(self.alloc, n_args +% 1_usize);
+            errdefer cargs.destroy(self.alloc);
+            var arg_spans = try col.DynBuf.[span.Span].init(self.alloc, n_args +% 1_usize);
+            errdefer arg_spans.destroy(self.alloc);
+            var gi: usize = 0_usize;
+            while gi < n_args {
+                let ga = arena_generic_arg_at(self.arena, args_range, gi) orelse { break; };
+                if ga.kind == .Expr {
+                    let hint = if gm_op.kind == .GpuMath1 && gm_op.sub == 8_u8 {
+                        types.TY_NONE
+                    } else if gm_op.kind == .GpuMath2 && gm_op.sub == 3_u8 {
+                        types.TY_NONE
+                    } else {
+                        ty
+                    };
+                    try cargs.push(self.alloc, try self.lower_expr_rvalue(ga.node_id, hint));
+                    try arg_spans.push(self.alloc, ga.span);
+                }
+                gi = gi +% 1_usize;
+            }
+            var bop = cfg_ir.builtin_op_len(gm_op.kind, gm_op.sub);
+            bop.ty0 = ty;
+            let dst = try self.new_temp_place(ty, sp);
+            let cid = try self.cfg.add_call_data(
+                self.alloc,
+                cfg_ir.callee_builtin(bop),
+                cargs.as_slice(),
+                arg_spans.as_slice(),
+                false,
+                cfg_ir.CFG_NONE,
+                false,
+                span.span_dummy(),
+                false,
+                false,
+            );
+            try self.push_stmt(cfg_ir.stmt_call(sp, dst, cid));
+            arg_spans.destroy(self.alloc);
+            cargs.destroy(self.alloc);
+            return cfg_ir.op_copy(dst);
+        }
         return try self.cfg.add_const_op(self.alloc, cfg_ir.const_void());
     }
+}
+
+struct GpuMathMatch {
+    matched: bool;
+    kind: cfg_ir.CfgBuiltinOpKind;
+    sub: u8;
+}
+
+fn match_gpu_math_builtin(bs: *[u8]) -> GpuMathMatch {
+    if str.bytes_eq(bs, "gpu_abs".as_bytes()) { return GpuMathMatch.{ matched: true, kind: .GpuMath1, sub: 0_u8 }; }
+    if str.bytes_eq(bs, "gpu_floor".as_bytes()) { return GpuMathMatch.{ matched: true, kind: .GpuMath1, sub: 1_u8 }; }
+    if str.bytes_eq(bs, "gpu_ceil".as_bytes()) { return GpuMathMatch.{ matched: true, kind: .GpuMath1, sub: 2_u8 }; }
+    if str.bytes_eq(bs, "gpu_fract".as_bytes()) { return GpuMathMatch.{ matched: true, kind: .GpuMath1, sub: 3_u8 }; }
+    if str.bytes_eq(bs, "gpu_exp".as_bytes()) { return GpuMathMatch.{ matched: true, kind: .GpuMath1, sub: 4_u8 }; }
+    if str.bytes_eq(bs, "gpu_sin".as_bytes()) { return GpuMathMatch.{ matched: true, kind: .GpuMath1, sub: 5_u8 }; }
+    if str.bytes_eq(bs, "gpu_cos".as_bytes()) { return GpuMathMatch.{ matched: true, kind: .GpuMath1, sub: 6_u8 }; }
+    if str.bytes_eq(bs, "gpu_sqrt".as_bytes()) { return GpuMathMatch.{ matched: true, kind: .GpuMath1, sub: 7_u8 }; }
+    if str.bytes_eq(bs, "gpu_length".as_bytes()) { return GpuMathMatch.{ matched: true, kind: .GpuMath1, sub: 8_u8 }; }
+    if str.bytes_eq(bs, "gpu_normalize".as_bytes()) { return GpuMathMatch.{ matched: true, kind: .GpuMath1, sub: 9_u8 }; }
+    if str.bytes_eq(bs, "gpu_min".as_bytes()) { return GpuMathMatch.{ matched: true, kind: .GpuMath2, sub: 0_u8 }; }
+    if str.bytes_eq(bs, "gpu_max".as_bytes()) { return GpuMathMatch.{ matched: true, kind: .GpuMath2, sub: 1_u8 }; }
+    if str.bytes_eq(bs, "gpu_pow".as_bytes()) { return GpuMathMatch.{ matched: true, kind: .GpuMath2, sub: 2_u8 }; }
+    if str.bytes_eq(bs, "gpu_dot".as_bytes()) { return GpuMathMatch.{ matched: true, kind: .GpuMath2, sub: 3_u8 }; }
+    if str.bytes_eq(bs, "gpu_step".as_bytes()) { return GpuMathMatch.{ matched: true, kind: .GpuMath2, sub: 4_u8 }; }
+    if str.bytes_eq(bs, "gpu_clamp".as_bytes()) { return GpuMathMatch.{ matched: true, kind: .GpuMath3, sub: 0_u8 }; }
+    if str.bytes_eq(bs, "gpu_mix".as_bytes()) { return GpuMathMatch.{ matched: true, kind: .GpuMath3, sub: 1_u8 }; }
+    if str.bytes_eq(bs, "gpu_smoothstep".as_bytes()) { return GpuMathMatch.{ matched: true, kind: .GpuMath3, sub: 2_u8 }; }
+    return GpuMathMatch.{ matched: false, kind: .GpuMath1, sub: 0_u8 };
 }
 
 // ===========================================================================
@@ -5885,6 +6042,12 @@ impl CfgBuilder {
                 if str.bytes_eq(mname, "read".as_bytes()) { return mk_bmatch(cfg_ir.builtin_op_ty(.MmioRead, elem), false, false); }
                 if str.bytes_eq(mname, "write".as_bytes()) { return mk_bmatch(cfg_ir.builtin_op_ty(.MmioWrite, elem), true, false); }
             }
+            .GpuImage2D => {
+                let elem = if first_ty != types.TY_ERROR { first_ty } else { types.TY_U32 };
+                if str.bytes_eq(mname, "load".as_bytes()) { return mk_bmatch(cfg_ir.builtin_op_ty(.GpuImageLoad, elem), false, false); }
+                if str.bytes_eq(mname, "store".as_bytes()) { return mk_bmatch(cfg_ir.builtin_op_ty(.GpuImageStore, elem), false, false); }
+                if str.bytes_eq(mname, "sample".as_bytes()) { return mk_bmatch(cfg_ir.builtin_op_ty(.GpuImageSample, elem), false, false); }
+            }
             _ => {}
         }
         return no_builtin_match();
@@ -5982,6 +6145,13 @@ impl CfgBuilder {
                 return types.TY_NONE;
             }
             .MmioWrite => { return if arg_idx == 0_usize { bop.ty0 } else { types.TY_NONE }; }
+            .GpuImageLoad => { return if arg_idx == 0_usize { try self.env.intern_vec(self.alloc, types.TY_U32, 2_u8) } else { types.TY_NONE }; }
+            .GpuImageStore => {
+                if arg_idx == 0_usize { return try self.env.intern_vec(self.alloc, types.TY_U32, 2_u8); }
+                if arg_idx == 1_usize { return bop.ty0; }
+                return types.TY_NONE;
+            }
+            .GpuImageSample => { return if arg_idx == 0_usize { try self.env.intern_vec(self.alloc, types.TY_F32, 2_u8) } else { types.TY_NONE }; }
             .VecCmp => { return if arg_idx == 0_usize { bop.ty0 } else { types.TY_NONE }; }
             .VecMin => { return if arg_idx == 0_usize { bop.ty0 } else { types.TY_NONE }; }
             .VecMax => { return if arg_idx == 0_usize { bop.ty0 } else { types.TY_NONE }; }

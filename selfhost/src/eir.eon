@@ -422,6 +422,7 @@ pub struct EirSlotInfo {
     pub has_name: bool;
     pub name: u32;
     pub is_mut: bool;
+    pub is_gpu_shared: bool;
 }
 
 pub struct EirParForRegion {
@@ -4764,7 +4765,7 @@ fn partition_locals(
     var idx: usize = 0_usize;
     while idx < locals.len {
         let loc = locals[idx];
-        if must_slot.test(idx) {
+        if must_slot.test(idx) || loc.is_gpu_shared {
             let sid = core.slots.len().trunc.[u32]();
             try core.slots.push(
                 alloc,
@@ -4774,6 +4775,7 @@ fn partition_locals(
                     has_name: loc.has_name,
                     name: loc.name,
                     is_mut: loc.is_mut,
+                    is_gpu_shared: loc.is_gpu_shared,
                 },
             );
             let sof = core.slot_of.as_mut_slice();
@@ -9867,6 +9869,18 @@ fn write_builtin_name_hi(
         .GpuLocalId => { try out.push_str_grow(alloc, "GpuLocalId"); }
         .GpuWorkgroupId => { try out.push_str_grow(alloc, "GpuWorkgroupId"); }
         .GpuWorkgroupBarrier => { try out.push_str_grow(alloc, "GpuWorkgroupBarrier"); }
+        .GpuVertexIndex => { try out.push_str_grow(alloc, "GpuVertexIndex"); }
+        .GpuInstanceIndex => { try out.push_str_grow(alloc, "GpuInstanceIndex"); }
+        .GpuFragCoord => { try out.push_str_grow(alloc, "GpuFragCoord"); }
+        .GpuDiscard => { try out.push_str_grow(alloc, "GpuDiscard"); }
+        .GpuImageLoad => { try out.push_str_grow(alloc, "GpuImageLoad"); }
+        .GpuImageStore => { try out.push_str_grow(alloc, "GpuImageStore"); }
+        .GpuImageSample => { try out.push_str_grow(alloc, "GpuImageSample"); }
+        .GpuMath1 => { try out.push_str_grow(alloc, "GpuMath1"); }
+        .GpuMath2 => { try out.push_str_grow(alloc, "GpuMath2"); }
+        .GpuMath3 => { try out.push_str_grow(alloc, "GpuMath3"); }
+        .EmbedGpuSpirv => { try out.push_str_grow(alloc, "EmbedGpuSpirv"); }
+        .EmbedGpuMsl => { try out.push_str_grow(alloc, "EmbedGpuMsl"); }
         .VecSplat => { try out.push_str_grow(alloc, "VecSplat"); }
         .VecLen => { try out.push_str_grow(alloc, "VecLen"); }
         .VecCmp => { try out.push_str_grow(alloc, "VecCmp"); }

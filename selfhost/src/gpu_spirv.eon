@@ -1,0 +1,2743 @@
+module eonc.gpu_spirv;
+
+import core.col;
+import core.str;
+import eonc.span;
+import eonc.ast;
+import eonc.types;
+import eonc.cfg_ir;
+import eonc.eir;
+import eonc.gpu_check;
+
+// ===========================================================================
+// SPIR-V 1.3 (Vulkan 1.1) Constants
+// ===========================================================================
+
+const SPIRV_MAGIC: u32 = 0x07230203_u32;
+const SPIRV_VERSION_1_3: u32 = 0x00010300_u32;
+const SPIRV_GENERATOR_EON: u32 = 0x00454F4E_u32;
+
+const OP_NAME: u16 = 5_u16;
+const OP_EXT_INST_IMPORT: u16 = 11_u16;
+const OP_EXT_INST: u16 = 12_u16;
+const OP_MEMORY_MODEL: u16 = 14_u16;
+const OP_ENTRY_POINT: u16 = 15_u16;
+const OP_EXECUTION_MODE: u16 = 16_u16;
+const OP_CAPABILITY: u16 = 17_u16;
+const OP_TYPE_VOID: u16 = 19_u16;
+const OP_TYPE_BOOL: u16 = 20_u16;
+const OP_TYPE_INT: u16 = 21_u16;
+const OP_TYPE_FLOAT: u16 = 22_u16;
+const OP_TYPE_VECTOR: u16 = 23_u16;
+const OP_TYPE_IMAGE: u16 = 25_u16;
+const OP_TYPE_SAMPLED_IMAGE: u16 = 27_u16;
+const OP_TYPE_ARRAY: u16 = 28_u16;
+const OP_TYPE_RUNTIME_ARRAY: u16 = 29_u16;
+const OP_TYPE_STRUCT: u16 = 30_u16;
+const OP_TYPE_POINTER: u16 = 32_u16;
+const OP_TYPE_FUNCTION: u16 = 33_u16;
+const OP_CONSTANT_TRUE: u16 = 41_u16;
+const OP_CONSTANT_FALSE: u16 = 42_u16;
+const OP_CONSTANT: u16 = 43_u16;
+const OP_FUNCTION: u16 = 54_u16;
+const OP_FUNCTION_PARAMETER: u16 = 55_u16;
+const OP_FUNCTION_END: u16 = 56_u16;
+const OP_FUNCTION_CALL: u16 = 57_u16;
+const OP_VARIABLE: u16 = 59_u16;
+const OP_LOAD: u16 = 61_u16;
+const OP_STORE: u16 = 62_u16;
+const OP_ACCESS_CHAIN: u16 = 65_u16;
+const OP_DECORATE: u16 = 71_u16;
+const OP_MEMBER_DECORATE: u16 = 72_u16;
+const OP_COMPOSITE_CONSTRUCT: u16 = 80_u16;
+const OP_COMPOSITE_EXTRACT: u16 = 81_u16;
+const OP_COPY_OBJECT: u16 = 83_u16;
+const OP_IMAGE_SAMPLE_EXPLICIT_LOD: u16 = 88_u16;
+const OP_IMAGE_FETCH: u16 = 95_u16;
+const OP_IMAGE_READ: u16 = 98_u16;
+const OP_IMAGE_WRITE: u16 = 99_u16;
+const OP_CONVERT_F_TO_U: u16 = 109_u16;
+const OP_CONVERT_F_TO_S: u16 = 110_u16;
+const OP_CONVERT_S_TO_F: u16 = 111_u16;
+const OP_CONVERT_U_TO_F: u16 = 112_u16;
+const OP_UCONVERT: u16 = 113_u16;
+const OP_SCONVERT: u16 = 114_u16;
+const OP_BITCAST: u16 = 124_u16;
+const OP_SNEGATE: u16 = 126_u16;
+const OP_FNEGATE: u16 = 127_u16;
+const OP_IADD: u16 = 128_u16;
+const OP_FADD: u16 = 129_u16;
+const OP_ISUB: u16 = 130_u16;
+const OP_FSUB: u16 = 131_u16;
+const OP_IMUL: u16 = 132_u16;
+const OP_FMUL: u16 = 133_u16;
+const OP_UDIV: u16 = 134_u16;
+const OP_SDIV: u16 = 135_u16;
+const OP_FDIV: u16 = 136_u16;
+const OP_UMOD: u16 = 137_u16;
+const OP_SREM: u16 = 138_u16;
+const OP_DOT: u16 = 148_u16;
+const OP_LOGICAL_OR: u16 = 166_u16;
+const OP_LOGICAL_AND: u16 = 167_u16;
+const OP_LOGICAL_NOT: u16 = 168_u16;
+const OP_SELECT: u16 = 169_u16;
+const OP_IEQUAL: u16 = 170_u16;
+const OP_INOT_EQUAL: u16 = 171_u16;
+const OP_UGREATER_THAN: u16 = 172_u16;
+const OP_SGREATER_THAN: u16 = 173_u16;
+const OP_UGREATER_THAN_EQUAL: u16 = 174_u16;
+const OP_SGREATER_THAN_EQUAL: u16 = 175_u16;
+const OP_ULESS_THAN: u16 = 176_u16;
+const OP_SLESS_THAN: u16 = 177_u16;
+const OP_ULESS_THAN_EQUAL: u16 = 178_u16;
+const OP_SLESS_THAN_EQUAL: u16 = 179_u16;
+const OP_FORD_EQUAL: u16 = 180_u16;
+const OP_FORD_NOT_EQUAL: u16 = 182_u16;
+const OP_FORD_LESS_THAN: u16 = 184_u16;
+const OP_FORD_GREATER_THAN: u16 = 186_u16;
+const OP_FORD_LESS_THAN_EQUAL: u16 = 188_u16;
+const OP_FORD_GREATER_THAN_EQUAL: u16 = 190_u16;
+const OP_SHIFT_RIGHT_LOGICAL: u16 = 194_u16;
+const OP_SHIFT_RIGHT_ARITHMETIC: u16 = 195_u16;
+const OP_SHIFT_LEFT_LOGICAL: u16 = 196_u16;
+const OP_BITWISE_OR: u16 = 197_u16;
+const OP_BITWISE_XOR: u16 = 198_u16;
+const OP_BITWISE_AND: u16 = 199_u16;
+const OP_NOT: u16 = 200_u16;
+const OP_CONTROL_BARRIER: u16 = 224_u16;
+const OP_PHI: u16 = 245_u16;
+const OP_LOOP_MERGE: u16 = 246_u16;
+const OP_SELECTION_MERGE: u16 = 247_u16;
+const OP_LABEL: u16 = 248_u16;
+const OP_BRANCH: u16 = 249_u16;
+const OP_BRANCH_CONDITIONAL: u16 = 250_u16;
+const OP_SWITCH: u16 = 251_u16;
+const OP_KILL: u16 = 252_u16;
+const OP_RETURN: u16 = 253_u16;
+const OP_RETURN_VALUE: u16 = 254_u16;
+const OP_UNREACHABLE: u16 = 255_u16;
+
+// Storage Classes
+const SC_UNIFORM_CONSTANT: u32 = 0_u32;
+const SC_INPUT: u32 = 1_u32;
+const SC_OUTPUT: u32 = 3_u32;
+const SC_WORKGROUP: u32 = 4_u32;
+const SC_FUNCTION: u32 = 7_u32;
+const SC_PUSH_CONSTANT: u32 = 9_u32;
+const SC_STORAGE_BUFFER: u32 = 12_u32;
+
+// Decorations
+const DEC_BLOCK: u32 = 2_u32;
+const DEC_ARRAY_STRIDE: u32 = 6_u32;
+const DEC_BUILTIN: u32 = 11_u32;
+const DEC_FLAT: u32 = 14_u32;
+const DEC_NON_WRITABLE: u32 = 24_u32;
+const DEC_LOCATION: u32 = 30_u32;
+const DEC_BINDING: u32 = 33_u32;
+const DEC_DESCRIPTOR_SET: u32 = 34_u32;
+const DEC_OFFSET: u32 = 35_u32;
+
+// BuiltIns
+const BUILTIN_POSITION: u32 = 0_u32;
+const BUILTIN_FRAG_COORD: u32 = 15_u32;
+const BUILTIN_WORKGROUP_ID: u32 = 26_u32;
+const BUILTIN_LOCAL_INVOCATION_ID: u32 = 27_u32;
+const BUILTIN_GLOBAL_INVOCATION_ID: u32 = 28_u32;
+const BUILTIN_VERTEX_INDEX: u32 = 42_u32;
+const BUILTIN_INSTANCE_INDEX: u32 = 43_u32;
+
+// GLSL.std.450 instruction numbers
+const GLSL_FABS: u32 = 4_u32;
+const GLSL_SABS: u32 = 5_u32;
+const GLSL_FLOOR: u32 = 8_u32;
+const GLSL_CEIL: u32 = 9_u32;
+const GLSL_FRACT: u32 = 10_u32;
+const GLSL_SIN: u32 = 13_u32;
+const GLSL_COS: u32 = 14_u32;
+const GLSL_POW: u32 = 26_u32;
+const GLSL_EXP: u32 = 27_u32;
+const GLSL_SQRT: u32 = 31_u32;
+const GLSL_FMIN: u32 = 37_u32;
+const GLSL_UMIN: u32 = 38_u32;
+const GLSL_SMIN: u32 = 39_u32;
+const GLSL_FMAX: u32 = 40_u32;
+const GLSL_UMAX: u32 = 41_u32;
+const GLSL_SMAX: u32 = 42_u32;
+const GLSL_FCLAMP: u32 = 43_u32;
+const GLSL_UCLAMP: u32 = 44_u32;
+const GLSL_SCLAMP: u32 = 45_u32;
+const GLSL_FMIX: u32 = 46_u32;
+const GLSL_STEP: u32 = 48_u32;
+const GLSL_SMOOTHSTEP: u32 = 49_u32;
+const GLSL_FMA: u32 = 50_u32;
+const GLSL_LENGTH: u32 = 66_u32;
+const GLSL_NORMALIZE: u32 = 69_u32;
+
+// ===========================================================================
+// Sticky-OOM Word Buffer & Public Output Struct
+// ===========================================================================
+
+pub linear struct SpirvOut {
+    pub ok: bool;
+    pub bytes: col.DynBuf[u8];
+    pub err_msg: str.StrBuf;
+}
+
+impl SpirvOut {
+    pub fn destroy(self: SpirvOut, alloc: *mut AllocCap) {
+        let SpirvOut.{ ok: _, bytes, err_msg } = self;
+        bytes.destroy(alloc);
+        err_msg.destroy(alloc);
+    }
+}
+
+linear struct SpvWords {
+    pub data: col.DynBuf[u32];
+    pub oom: bool;
+}
+
+impl SpvWords {
+    fn init(alloc: *mut AllocCap, cap: usize) -> SpvWords ! OutOfMemory {
+        return SpvWords.{ data: try col.DynBuf.[u32].init(alloc, cap), oom: false };
+    }
+
+    fn destroy(self: SpvWords, alloc: *mut AllocCap) {
+        let SpvWords.{ data, oom: _ } = self;
+        data.destroy(alloc);
+    }
+
+    fn push(self: *mut Self, alloc: *mut AllocCap, w: u32) {
+        if self.oom { return; }
+        self.data.push(alloc, w) catch { self.oom = true; };
+    }
+
+    fn push_slice(self: *mut Self, alloc: *mut AllocCap, ws: *[u32]) {
+        if self.oom || ws.len == 0_usize { return; }
+        self.data.push_slice(alloc, ws) catch { self.oom = true; };
+    }
+
+    fn op0(self: *mut Self, alloc: *mut AllocCap, opcode: u16) {
+        self.push(alloc, (1_u32 <<% 16_u32) | opcode.widen.[u32]());
+    }
+
+    fn op1(self: *mut Self, alloc: *mut AllocCap, opcode: u16, a0: u32) {
+        self.push(alloc, (2_u32 <<% 16_u32) | opcode.widen.[u32]());
+        self.push(alloc, a0);
+    }
+
+    fn op2(self: *mut Self, alloc: *mut AllocCap, opcode: u16, a0: u32, a1: u32) {
+        self.push(alloc, (3_u32 <<% 16_u32) | opcode.widen.[u32]());
+        self.push(alloc, a0);
+        self.push(alloc, a1);
+    }
+
+    fn op3(self: *mut Self, alloc: *mut AllocCap, opcode: u16, a0: u32, a1: u32, a2: u32) {
+        self.push(alloc, (4_u32 <<% 16_u32) | opcode.widen.[u32]());
+        self.push(alloc, a0);
+        self.push(alloc, a1);
+        self.push(alloc, a2);
+    }
+
+    fn op4(self: *mut Self, alloc: *mut AllocCap, opcode: u16, a0: u32, a1: u32, a2: u32, a3: u32) {
+        self.push(alloc, (5_u32 <<% 16_u32) | opcode.widen.[u32]());
+        self.push(alloc, a0);
+        self.push(alloc, a1);
+        self.push(alloc, a2);
+        self.push(alloc, a3);
+    }
+
+    fn op5(self: *mut Self, alloc: *mut AllocCap, opcode: u16, a0: u32, a1: u32, a2: u32, a3: u32, a4: u32) {
+        self.push(alloc, (6_u32 <<% 16_u32) | opcode.widen.[u32]());
+        self.push(alloc, a0);
+        self.push(alloc, a1);
+        self.push(alloc, a2);
+        self.push(alloc, a3);
+        self.push(alloc, a4);
+    }
+
+    fn op_n(self: *mut Self, alloc: *mut AllocCap, opcode: u16, ops: *[u32]) {
+        let wc = (1_usize +% ops.len).trunc.[u32]();
+        self.push(alloc, (wc <<% 16_u32) | opcode.widen.[u32]());
+        self.push_slice(alloc, ops);
+    }
+}
+
+fn push_str_as_spv_words(alloc: *mut AllocCap, out: *mut col.DynBuf[u32], bs: *[u8]) -> bool {
+    let nwords = (bs.len +% 4_usize) >> 2_usize;
+    var wi: usize = 0_usize;
+    while wi < nwords {
+        let base = wi *% 4_usize;
+        let i1 = base +% 1_usize;
+        let i2 = base +% 2_usize;
+        let i3 = base +% 3_usize;
+        let b0: u32 = if base < bs.len { bs[base].widen.[u32]() } else { 0_u32 };
+        let b1: u32 = if i1 < bs.len { bs[i1].widen.[u32]() } else { 0_u32 };
+        let b2: u32 = if i2 < bs.len { bs[i2].widen.[u32]() } else { 0_u32 };
+        let b3: u32 = if i3 < bs.len { bs[i3].widen.[u32]() } else { 0_u32 };
+        let w = b0 | (b1 <<% 8_u32) | (b2 <<% 16_u32) | (b3 <<% 24_u32);
+        out.push(alloc, w) catch { return false; };
+        wi = wi +% 1_usize;
+    }
+    return true;
+}
+
+// ===========================================================================
+// Interned SPIR-V Type & Constant Tables
+// ===========================================================================
+
+enum SpvTyKind : u8 {
+    Void = 0,
+    Bool = 1,
+    Int = 2,
+    Float = 3,
+    Vec = 4,
+    Array = 5,
+    RuntimeArray = 6,
+    UserStruct = 7,
+    SsboWrap = 8,
+    PushWrap = 9,
+    Ptr = 10,
+    Image2D = 11,
+    SampledImage = 12,
+    FnTy = 13,
+}
+
+struct SpvTyEntry {
+    kind: SpvTyKind;
+    a: u32;   // Int:bits, Float:bits, Vec:elem_tidx, Array:elem_tidx, RuntimeArray:elem_tidx, Struct:def_id, SsboWrap:elem_tidx, PushWrap:fn_id, Ptr:sc, Image2D:mode, SampledImage:img_tidx, FnTy:ret_tidx
+    b: u32;   // Int:signed(0/1), Vec:len, Array:len, Struct:layout_flag(0/1), Ptr:pointee_tidx, FnTy:param_start
+    c: u32;   // FnTy:param_len
+    spv_id: u32;
+}
+
+struct SpvConstEntry {
+    kind: u8; // 0=u32, 1=i32, 2=f32, 3=bool
+    bits: u32;
+    spv_id: u32;
+}
+
+struct ResBinding {
+    kind: u8; // 0=none, 1=ssbo, 2=sampled_img, 3=storage_img, 4=push_const_member, 5=stage_input
+    var_id: u32;
+    elem_tidx: u32; // elem tidx for SSBO/Push/Input, img mode for Image
+    aux: u32;       // push_const member index for kind=4
+}
+
+struct SlotBinding {
+    kind: u8; // 0=none, 1=ssbo, 2=sampled_img, 3=storage_img, 4=fn_var, 5=workgroup_var
+    var_id: u32;
+    tidx: u32;
+}
+
+struct OutFieldBinding {
+    field_idx: u32;
+    var_id: u32;
+    tidx: u32;
+}
+
+struct HelperFnEntry {
+    eir_fn_id: u32;
+    spv_fn_id: u32;
+    ret_tidx: u32;
+}
+
+linear struct SpvCtx {
+    next_id: u32;
+    glsl_ext_id: u32;
+    names: SpvWords;
+    decs: SpvWords;
+    types_consts: SpvWords;
+    globals: SpvWords;
+    fns: SpvWords;
+    tys: col.DynBuf[SpvTyEntry];
+    fn_param_tidxs: col.DynBuf[u32];
+    consts: col.DynBuf[SpvConstEntry];
+    iface_vars: col.DynBuf[u32];
+    helpers: col.DynBuf[HelperFnEntry];
+    // Cached BuiltIn globals
+    bi_global_id: u32;
+    bi_local_id: u32;
+    bi_workgroup_id: u32;
+    bi_vertex_idx: u32;
+    bi_instance_idx: u32;
+    bi_frag_coord: u32;
+    bi_position_out: u32;
+    // Current function state
+    val_ids: col.DynBuf[u32];
+    val_vars: col.DynBuf[u32];
+    val_tidxs: col.DynBuf[u32];
+    use_val_vars: bool;
+    bb_labels: col.DynBuf[u32];
+    param_res: col.DynBuf[ResBinding];
+    slot_bind: col.DynBuf[SlotBinding];
+    stage_outs: col.DynBuf[OutFieldBinding];
+    pc_var_id: u32;
+    synth_merge_lbl: u32;
+    oom: bool;
+}
+
+impl SpvCtx {
+    fn init(alloc: *mut AllocCap) -> SpvCtx ! OutOfMemory {
+        let names = try SpvWords.init(alloc, 32_usize);
+        errdefer names.destroy(alloc);
+        let decs = try SpvWords.init(alloc, 64_usize);
+        errdefer decs.destroy(alloc);
+        let types_consts = try SpvWords.init(alloc, 128_usize);
+        errdefer types_consts.destroy(alloc);
+        let globals = try SpvWords.init(alloc, 64_usize);
+        errdefer globals.destroy(alloc);
+        let fns = try SpvWords.init(alloc, 256_usize);
+        errdefer fns.destroy(alloc);
+        let tys = try col.DynBuf.[SpvTyEntry].init(alloc, 32_usize);
+        errdefer tys.destroy(alloc);
+        let fn_param_tidxs = try col.DynBuf.[u32].init(alloc, 16_usize);
+        errdefer fn_param_tidxs.destroy(alloc);
+        let consts = try col.DynBuf.[SpvConstEntry].init(alloc, 32_usize);
+        errdefer consts.destroy(alloc);
+        let iface_vars = try col.DynBuf.[u32].init(alloc, 16_usize);
+        errdefer iface_vars.destroy(alloc);
+        let helpers = try col.DynBuf.[HelperFnEntry].init(alloc, 8_usize);
+        errdefer helpers.destroy(alloc);
+        let val_ids = try col.DynBuf.[u32].init(alloc, 64_usize);
+        errdefer val_ids.destroy(alloc);
+        let val_vars = try col.DynBuf.[u32].init(alloc, 64_usize);
+        errdefer val_vars.destroy(alloc);
+        let val_tidxs = try col.DynBuf.[u32].init(alloc, 64_usize);
+        errdefer val_tidxs.destroy(alloc);
+        let bb_labels = try col.DynBuf.[u32].init(alloc, 16_usize);
+        errdefer bb_labels.destroy(alloc);
+        let param_res = try col.DynBuf.[ResBinding].init(alloc, 8_usize);
+        errdefer param_res.destroy(alloc);
+        let slot_bind = try col.DynBuf.[SlotBinding].init(alloc, 16_usize);
+        errdefer slot_bind.destroy(alloc);
+        let stage_outs = try col.DynBuf.[OutFieldBinding].init(alloc, 8_usize);
+        errdefer stage_outs.destroy(alloc);
+        return SpvCtx.{
+            next_id: 2_u32, // id 1 reserved for GLSL.std.450 OpExtInstImport
+            glsl_ext_id: 1_u32,
+            names: names,
+            decs: decs,
+            types_consts: types_consts,
+            globals: globals,
+            fns: fns,
+            tys: tys,
+            fn_param_tidxs: fn_param_tidxs,
+            consts: consts,
+            iface_vars: iface_vars,
+            helpers: helpers,
+            bi_global_id: 0_u32,
+            bi_local_id: 0_u32,
+            bi_workgroup_id: 0_u32,
+            bi_vertex_idx: 0_u32,
+            bi_instance_idx: 0_u32,
+            bi_frag_coord: 0_u32,
+            bi_position_out: 0_u32,
+            val_ids: val_ids,
+            val_vars: val_vars,
+            val_tidxs: val_tidxs,
+            use_val_vars: false,
+            bb_labels: bb_labels,
+            param_res: param_res,
+            slot_bind: slot_bind,
+            stage_outs: stage_outs,
+            pc_var_id: 0_u32,
+            synth_merge_lbl: 0_u32,
+            oom: false,
+        };
+    }
+
+    fn destroy(self: SpvCtx, alloc: *mut AllocCap) {
+        let SpvCtx.{
+            next_id: _, glsl_ext_id: _, names, decs, types_consts, globals, fns,
+            tys, fn_param_tidxs, consts, iface_vars, helpers,
+            bi_global_id: _, bi_local_id: _, bi_workgroup_id: _,
+            bi_vertex_idx: _, bi_instance_idx: _, bi_frag_coord: _, bi_position_out: _,
+            val_ids, val_vars, val_tidxs, use_val_vars: _, bb_labels, param_res, slot_bind, stage_outs, pc_var_id: _, synth_merge_lbl: _, oom: _,
+        } = self;
+        names.destroy(alloc);
+        decs.destroy(alloc);
+        types_consts.destroy(alloc);
+        globals.destroy(alloc);
+        fns.destroy(alloc);
+        tys.destroy(alloc);
+        fn_param_tidxs.destroy(alloc);
+        consts.destroy(alloc);
+        iface_vars.destroy(alloc);
+        helpers.destroy(alloc);
+        val_ids.destroy(alloc);
+        val_vars.destroy(alloc);
+        val_tidxs.destroy(alloc);
+        bb_labels.destroy(alloc);
+        param_res.destroy(alloc);
+        slot_bind.destroy(alloc);
+        stage_outs.destroy(alloc);
+    }
+
+    fn fresh(self: *mut Self) -> u32 {
+        let id = self.next_id;
+        self.next_id = self.next_id +% 1_u32;
+        return id;
+    }
+
+    fn any_oom(self: *Self) -> bool {
+        return self.oom || self.names.oom || self.decs.oom || self.types_consts.oom || self.globals.oom || self.fns.oom;
+    }
+
+    fn ty_spv_id(self: *Self, tidx: u32) -> u32 {
+        if let e = self.tys.get(tidx.widen.[usize]()) {
+            return e.spv_id;
+        }
+        return 0_u32;
+    }
+}
+
+fn align_up_u32(v: u32, a: u32) -> u32 {
+    if a <= 1_u32 { return v; }
+    let rem = v % a;
+    if rem == 0_u32 { return v; }
+    return v +% (a - rem);
+}
+
+@recursive
+fn std430_stride(ctx: *SpvCtx, env: *types.TypeEnv, tidx: u32) -> u32 {
+    let e = ctx.tys.get(tidx.widen.[usize]()) orelse { return 4_u32; };
+    match e.kind {
+        .Void => { return 4_u32; }
+        .Bool => { return 4_u32; }
+        .Int => { return if e.a == 64_u32 { 8_u32 } else { 4_u32 }; }
+        .Float => { return if e.a == 64_u32 { 8_u32 } else { 4_u32 }; }
+        .Vec => {
+            let es = std430_stride(ctx, env, e.a);
+            return if e.b == 3_u32 { es *% 4_u32 } else { es *% e.b };
+        }
+        .Array => {
+            let es = std430_stride(ctx, env, e.a);
+            let cnt = if e.b == 0_u32 { 1_u32 } else { e.b };
+            return es *% cnt;
+        }
+        .UserStruct => {
+            if let sm = env.get_struct(e.a) {
+                let sz = sm.layout.size.trunc.[u32]();
+                return if sz < 4_u32 { 4_u32 } else { sz };
+            }
+            return 4_u32;
+        }
+        _ => { return 4_u32; }
+    }
+}
+
+@recursive
+fn std430_align(ctx: *SpvCtx, env: *types.TypeEnv, tidx: u32) -> u32 {
+    let e = ctx.tys.get(tidx.widen.[usize]()) orelse { return 4_u32; };
+    match e.kind {
+        .Int => { return if e.a == 64_u32 { 8_u32 } else { 4_u32 }; }
+        .Float => { return if e.a == 64_u32 { 8_u32 } else { 4_u32 }; }
+        .Vec => {
+            let ea = std430_align(ctx, env, e.a);
+            return if e.b == 2_u32 { ea *% 2_u32 } else { ea *% 4_u32 };
+        }
+        .Array => { return std430_align(ctx, env, e.a); }
+        .UserStruct => {
+            if let sm = env.get_struct(e.a) {
+                let al = sm.layout.align.trunc.[u32]();
+                return if al < 4_u32 { 4_u32 } else { al };
+            }
+            return 4_u32;
+        }
+        _ => { return 4_u32; }
+    }
+}
+
+fn find_ty(ctx: *SpvCtx, kind: SpvTyKind, a: u32, b: u32, c: u32) -> ?u32 {
+    let ts = ctx.tys.as_slice();
+    var i: usize = 0_usize;
+    while i < ts.len {
+        let t = ts[i];
+        if t.kind == kind && t.a == a && t.b == b && t.c == c {
+            return i.trunc.[u32]();
+        }
+        i = i +% 1_usize;
+    }
+    return null;
+}
+
+fn push_ty_entry(alloc: *mut AllocCap, ctx: *mut SpvCtx, e: SpvTyEntry) -> u32 {
+    let idx = ctx.tys.len().trunc.[u32]();
+    ctx.tys.push(alloc, e) catch { ctx.oom = true; return 0_u32; };
+    return idx;
+}
+
+fn spv_const_u32(alloc: *mut AllocCap, ctx: *mut SpvCtx, v: u32) -> u32 {
+    let cs = ctx.consts.as_slice();
+    var i: usize = 0_usize;
+    while i < cs.len {
+        if cs[i].kind == 0_u8 && cs[i].bits == v {
+            return cs[i].spv_id;
+        }
+        i = i +% 1_usize;
+    }
+    let u32_tidx = intern_int(alloc, ctx, 32_u32, false);
+    let u32_id = ctx.ty_spv_id(u32_tidx);
+    let id = ctx.fresh();
+    ctx.types_consts.op3(alloc, OP_CONSTANT, u32_id, id, v);
+    ctx.consts.push(alloc, SpvConstEntry.{ kind: 0_u8, bits: v, spv_id: id }) catch { ctx.oom = true; };
+    return id;
+}
+
+fn spv_const_i32(alloc: *mut AllocCap, ctx: *mut SpvCtx, v: i32) -> u32 {
+    let bits = v.bitcast.[u32]();
+    let cs = ctx.consts.as_slice();
+    var i: usize = 0_usize;
+    while i < cs.len {
+        if cs[i].kind == 1_u8 && cs[i].bits == bits {
+            return cs[i].spv_id;
+        }
+        i = i +% 1_usize;
+    }
+    let i32_tidx = intern_int(alloc, ctx, 32_u32, true);
+    let i32_id = ctx.ty_spv_id(i32_tidx);
+    let id = ctx.fresh();
+    ctx.types_consts.op3(alloc, OP_CONSTANT, i32_id, id, bits);
+    ctx.consts.push(alloc, SpvConstEntry.{ kind: 1_u8, bits: bits, spv_id: id }) catch { ctx.oom = true; };
+    return id;
+}
+
+fn spv_const_f32_bits(alloc: *mut AllocCap, ctx: *mut SpvCtx, bits: u32) -> u32 {
+    let cs = ctx.consts.as_slice();
+    var i: usize = 0_usize;
+    while i < cs.len {
+        if cs[i].kind == 2_u8 && cs[i].bits == bits {
+            return cs[i].spv_id;
+        }
+        i = i +% 1_usize;
+    }
+    let f32_tidx = intern_float(alloc, ctx, 32_u32);
+    let f32_id = ctx.ty_spv_id(f32_tidx);
+    let id = ctx.fresh();
+    ctx.types_consts.op3(alloc, OP_CONSTANT, f32_id, id, bits);
+    ctx.consts.push(alloc, SpvConstEntry.{ kind: 2_u8, bits: bits, spv_id: id }) catch { ctx.oom = true; };
+    return id;
+}
+
+fn spv_const_bool(alloc: *mut AllocCap, ctx: *mut SpvCtx, v: bool) -> u32 {
+    let bits: u32 = if v { 1_u32 } else { 0_u32 };
+    let cs = ctx.consts.as_slice();
+    var i: usize = 0_usize;
+    while i < cs.len {
+        if cs[i].kind == 3_u8 && cs[i].bits == bits {
+            return cs[i].spv_id;
+        }
+        i = i +% 1_usize;
+    }
+    let b_tidx = intern_bool(alloc, ctx);
+    let b_id = ctx.ty_spv_id(b_tidx);
+    let id = ctx.fresh();
+    ctx.types_consts.op2(alloc, if v { OP_CONSTANT_TRUE } else { OP_CONSTANT_FALSE }, b_id, id);
+    ctx.consts.push(alloc, SpvConstEntry.{ kind: 3_u8, bits: bits, spv_id: id }) catch { ctx.oom = true; };
+    return id;
+}
+
+fn intern_void(alloc: *mut AllocCap, ctx: *mut SpvCtx) -> u32 {
+    if let i = find_ty(ctx, .Void, 0_u32, 0_u32, 0_u32) { return i; }
+    let id = ctx.fresh();
+    ctx.types_consts.op1(alloc, OP_TYPE_VOID, id);
+    return push_ty_entry(alloc, ctx, SpvTyEntry.{ kind: .Void, a: 0_u32, b: 0_u32, c: 0_u32, spv_id: id });
+}
+
+fn intern_bool(alloc: *mut AllocCap, ctx: *mut SpvCtx) -> u32 {
+    if let i = find_ty(ctx, .Bool, 0_u32, 0_u32, 0_u32) { return i; }
+    let id = ctx.fresh();
+    ctx.types_consts.op1(alloc, OP_TYPE_BOOL, id);
+    return push_ty_entry(alloc, ctx, SpvTyEntry.{ kind: .Bool, a: 0_u32, b: 0_u32, c: 0_u32, spv_id: id });
+}
+
+fn intern_int(alloc: *mut AllocCap, ctx: *mut SpvCtx, bits: u32, signed: bool) -> u32 {
+    let s: u32 = if signed { 1_u32 } else { 0_u32 };
+    if let i = find_ty(ctx, .Int, bits, s, 0_u32) { return i; }
+    let id = ctx.fresh();
+    ctx.types_consts.op3(alloc, OP_TYPE_INT, id, bits, s);
+    return push_ty_entry(alloc, ctx, SpvTyEntry.{ kind: .Int, a: bits, b: s, c: 0_u32, spv_id: id });
+}
+
+fn intern_float(alloc: *mut AllocCap, ctx: *mut SpvCtx, bits: u32) -> u32 {
+    if let i = find_ty(ctx, .Float, bits, 0_u32, 0_u32) { return i; }
+    let id = ctx.fresh();
+    ctx.types_consts.op2(alloc, OP_TYPE_FLOAT, id, bits);
+    return push_ty_entry(alloc, ctx, SpvTyEntry.{ kind: .Float, a: bits, b: 0_u32, c: 0_u32, spv_id: id });
+}
+
+fn intern_vec(alloc: *mut AllocCap, ctx: *mut SpvCtx, elem_tidx: u32, len: u32) -> u32 {
+    if let i = find_ty(ctx, .Vec, elem_tidx, len, 0_u32) { return i; }
+    let el_id = ctx.ty_spv_id(elem_tidx);
+    let id = ctx.fresh();
+    ctx.types_consts.op3(alloc, OP_TYPE_VECTOR, id, el_id, len);
+    return push_ty_entry(alloc, ctx, SpvTyEntry.{ kind: .Vec, a: elem_tidx, b: len, c: 0_u32, spv_id: id });
+}
+
+fn intern_ptr(alloc: *mut AllocCap, ctx: *mut SpvCtx, sc: u32, pointee_tidx: u32) -> u32 {
+    if let i = find_ty(ctx, .Ptr, sc, pointee_tidx, 0_u32) { return i; }
+    let pt_id = ctx.ty_spv_id(pointee_tidx);
+    let id = ctx.fresh();
+    ctx.types_consts.op3(alloc, OP_TYPE_POINTER, id, sc, pt_id);
+    return push_ty_entry(alloc, ctx, SpvTyEntry.{ kind: .Ptr, a: sc, b: pointee_tidx, c: 0_u32, spv_id: id });
+}
+
+fn intern_array(alloc: *mut AllocCap, ctx: *mut SpvCtx, env: *types.TypeEnv, elem_tidx: u32, len: u32, with_stride: bool) -> u32 {
+    let flag: u32 = if with_stride { 1_u32 } else { 0_u32 };
+    if let i = find_ty(ctx, .Array, elem_tidx, len, flag) { return i; }
+    let el_id = ctx.ty_spv_id(elem_tidx);
+    let len_c = spv_const_u32(alloc, ctx, if len == 0_u32 { 1_u32 } else { len });
+    let id = ctx.fresh();
+    if with_stride {
+        let stride = std430_stride(ctx, env, elem_tidx);
+        ctx.decs.op3(alloc, OP_DECORATE, id, DEC_ARRAY_STRIDE, stride);
+    }
+    ctx.types_consts.op3(alloc, OP_TYPE_ARRAY, id, el_id, len_c);
+    return push_ty_entry(alloc, ctx, SpvTyEntry.{ kind: .Array, a: elem_tidx, b: len, c: flag, spv_id: id });
+}
+
+fn intern_runtime_array(alloc: *mut AllocCap, ctx: *mut SpvCtx, env: *types.TypeEnv, elem_tidx: u32) -> u32 {
+    if let i = find_ty(ctx, .RuntimeArray, elem_tidx, 0_u32, 0_u32) { return i; }
+    let el_id = ctx.ty_spv_id(elem_tidx);
+    let stride = std430_stride(ctx, env, elem_tidx);
+    let id = ctx.fresh();
+    ctx.decs.op3(alloc, OP_DECORATE, id, DEC_ARRAY_STRIDE, stride);
+    ctx.types_consts.op2(alloc, OP_TYPE_RUNTIME_ARRAY, id, el_id);
+    return push_ty_entry(alloc, ctx, SpvTyEntry.{ kind: .RuntimeArray, a: elem_tidx, b: 0_u32, c: 0_u32, spv_id: id });
+}
+
+fn intern_ssbo_wrap(alloc: *mut AllocCap, ctx: *mut SpvCtx, env: *types.TypeEnv, elem_tidx: u32) -> u32 {
+    if let i = find_ty(ctx, .SsboWrap, elem_tidx, 0_u32, 0_u32) { return i; }
+    let ra_tidx = intern_runtime_array(alloc, ctx, env, elem_tidx);
+    let ra_id = ctx.ty_spv_id(ra_tidx);
+    let id = ctx.fresh();
+    ctx.decs.op2(alloc, OP_DECORATE, id, DEC_BLOCK);
+    ctx.decs.op4(alloc, OP_MEMBER_DECORATE, id, 0_u32, DEC_OFFSET, 0_u32);
+    ctx.types_consts.op2(alloc, OP_TYPE_STRUCT, id, ra_id);
+    return push_ty_entry(alloc, ctx, SpvTyEntry.{ kind: .SsboWrap, a: elem_tidx, b: 0_u32, c: 0_u32, spv_id: id });
+}
+
+fn intern_image2d(alloc: *mut AllocCap, ctx: *mut SpvCtx, mode: u32) -> u32 {
+    // mode: 0 = sampled float 2D (Sampled=1, Format=Unknown=0)
+    //       1 = storage float rgba8 (Sampled=2, Format=Rgba8=4)
+    //       2 = storage uint rgba8ui (Sampled=2, Format=Rgba8ui=27)
+    if let i = find_ty(ctx, .Image2D, mode, 0_u32, 0_u32) { return i; }
+    let sample_ty_tidx = if mode == 2_u32 {
+        intern_int(alloc, ctx, 32_u32, false)
+    } else {
+        intern_float(alloc, ctx, 32_u32)
+    };
+    let sample_id = ctx.ty_spv_id(sample_ty_tidx);
+    let sampled_flag: u32 = if mode == 0_u32 { 1_u32 } else { 2_u32 };
+    let fmt: u32 = if mode == 0_u32 { 0_u32 } else if mode == 1_u32 { 4_u32 } else { 27_u32 };
+    let id = ctx.fresh();
+    let ops: [8]u32 = [id, sample_id, 1_u32, 0_u32, 0_u32, 0_u32, sampled_flag, fmt];
+    ctx.types_consts.op_n(alloc, OP_TYPE_IMAGE, ops[0_usize..8_usize]);
+    return push_ty_entry(alloc, ctx, SpvTyEntry.{ kind: .Image2D, a: mode, b: 0_u32, c: 0_u32, spv_id: id });
+}
+
+fn intern_sampled_image(alloc: *mut AllocCap, ctx: *mut SpvCtx, img_tidx: u32) -> u32 {
+    if let i = find_ty(ctx, .SampledImage, img_tidx, 0_u32, 0_u32) { return i; }
+    let img_id = ctx.ty_spv_id(img_tidx);
+    let id = ctx.fresh();
+    ctx.types_consts.op2(alloc, OP_TYPE_SAMPLED_IMAGE, id, img_id);
+    return push_ty_entry(alloc, ctx, SpvTyEntry.{ kind: .SampledImage, a: img_tidx, b: 0_u32, c: 0_u32, spv_id: id });
+}
+
+@recursive
+fn intern_eon_ty(alloc: *mut AllocCap, ctx: *mut SpvCtx, env: *types.TypeEnv, ty: types.TyId, explicit_layout: bool) -> u32 {
+    let n = env.get(ty);
+    match n.kind {
+        .Void => { return intern_void(alloc, ctx); }
+        .Never => { return intern_void(alloc, ctx); }
+        .Bool => { return intern_bool(alloc, ctx); }
+        .Int => { return intern_int(alloc, ctx, 32_u32, n.flag0); }
+        .Float => { return intern_float(alloc, ctx, 32_u32); }
+        .Vec => {
+            let et = intern_eon_ty(alloc, ctx, env, n.primary, explicit_layout);
+            return intern_vec(alloc, ctx, et, n.u8_val.widen.[u32]());
+        }
+        .Array => {
+            let et = intern_eon_ty(alloc, ctx, env, n.primary, explicit_layout);
+            return intern_array(alloc, ctx, env, et, n.u64_val.trunc.[u32](), explicit_layout);
+        }
+        .Struct => {
+            if let existing = find_ty(ctx, .UserStruct, n.primary, 1_u32, 0_u32) {
+                return existing;
+            }
+            var m_ids = col.DynBuf.[u32].init(alloc, 8_usize) catch { ctx.oom = true; return 0_u32; };
+            var m_offs = col.DynBuf.[u32].init(alloc, 8_usize) catch { m_ids.destroy(alloc); ctx.oom = true; return 0_u32; };
+            var off: u32 = 0_u32;
+            if let sm = env.get_struct(n.primary) {
+                let fs = env.struct_fields_range(sm.fields);
+                var fi: usize = 0_usize;
+                while fi < fs.len {
+                    let ftidx = intern_eon_ty(alloc, ctx, env, fs[fi].ty, true);
+                    let fa = std430_align(ctx, env, ftidx);
+                    off = align_up_u32(off, fa);
+                    m_offs.push(alloc, off) catch { ctx.oom = true; };
+                    m_ids.push(alloc, ctx.ty_spv_id(ftidx)) catch { ctx.oom = true; };
+                    off = off +% std430_stride(ctx, env, ftidx);
+                    fi = fi +% 1_usize;
+                }
+            }
+            let id = ctx.fresh();
+            let os = m_offs.as_slice();
+            var oi: usize = 0_usize;
+            while oi < os.len {
+                ctx.decs.op4(alloc, OP_MEMBER_DECORATE, id, oi.trunc.[u32](), DEC_OFFSET, os[oi]);
+                oi = oi +% 1_usize;
+            }
+            var ops = col.DynBuf.[u32].init(alloc, m_ids.len() +% 1_usize) catch {
+                m_offs.destroy(alloc);
+                m_ids.destroy(alloc);
+                ctx.oom = true;
+                return 0_u32;
+            };
+            ops.push(alloc, id) catch { ctx.oom = true; };
+            ops.push_slice(alloc, m_ids.as_slice()) catch { ctx.oom = true; };
+            ctx.types_consts.op_n(alloc, OP_TYPE_STRUCT, ops.as_slice());
+            ops.destroy(alloc);
+            m_offs.destroy(alloc);
+            m_ids.destroy(alloc);
+            return push_ty_entry(alloc, ctx, SpvTyEntry.{ kind: .UserStruct, a: n.primary, b: 1_u32, c: 0_u32, spv_id: id });
+        }
+        _ => { return intern_int(alloc, ctx, 32_u32, false); }
+    }
+}
+
+fn intern_fn_ty(alloc: *mut AllocCap, ctx: *mut SpvCtx, ret_tidx: u32, param_tidxs: *[u32]) -> u32 {
+    let ts = ctx.tys.as_slice();
+    let all_ps = ctx.fn_param_tidxs.as_slice();
+    var i: usize = 0_usize;
+    while i < ts.len {
+        let t = ts[i];
+        if t.kind == .FnTy && t.a == ret_tidx && t.c.widen.[usize]() == param_tidxs.len {
+            var same = true;
+            var j: usize = 0_usize;
+            while j < param_tidxs.len {
+                let p_idx = t.b.widen.[usize]() +% j;
+                if p_idx >= all_ps.len || all_ps[p_idx] != param_tidxs[j] {
+                    same = false;
+                    break;
+                }
+                j = j +% 1_usize;
+            }
+            if same {
+                return i.trunc.[u32]();
+            }
+        }
+        i = i +% 1_usize;
+    }
+    let start = ctx.fn_param_tidxs.len().trunc.[u32]();
+    ctx.fn_param_tidxs.push_slice(alloc, param_tidxs) catch { ctx.oom = true; return 0_u32; };
+    let id = ctx.fresh();
+    var ops = col.DynBuf.[u32].init(alloc, param_tidxs.len +% 2_usize) catch { ctx.oom = true; return 0_u32; };
+    ops.push(alloc, id) catch { ctx.oom = true; };
+    ops.push(alloc, ctx.ty_spv_id(ret_tidx)) catch { ctx.oom = true; };
+    var k: usize = 0_usize;
+    while k < param_tidxs.len {
+        ops.push(alloc, ctx.ty_spv_id(param_tidxs[k])) catch { ctx.oom = true; };
+        k = k +% 1_usize;
+    }
+    ctx.types_consts.op_n(alloc, OP_TYPE_FUNCTION, ops.as_slice());
+    ops.destroy(alloc);
+    return push_ty_entry(alloc, ctx, SpvTyEntry.{ kind: .FnTy, a: ret_tidx, b: start, c: param_tidxs.len.trunc.[u32](), spv_id: id });
+}
+
+fn is_int_or_int_vec(env: *types.TypeEnv, ty: types.TyId) -> bool {
+    let n = env.get(ty);
+    if n.kind == .Int { return true; }
+    if n.kind == .Vec { return env.get(n.primary).kind == .Int; }
+    return false;
+}
+
+fn is_float_or_float_vec(env: *types.TypeEnv, ty: types.TyId) -> bool {
+    let n = env.get(ty);
+    if n.kind == .Float { return true; }
+    if n.kind == .Vec { return env.get(n.primary).kind == .Float; }
+    return false;
+}
+
+fn is_signed_int_or_vec(env: *types.TypeEnv, ty: types.TyId) -> bool {
+    let n = env.get(ty);
+    if n.kind == .Int { return n.flag0; }
+    if n.kind == .Vec {
+        let en = env.get(n.primary);
+        return en.kind == .Int && en.flag0;
+    }
+    return false;
+}
+
+fn ensure_builtin_input(alloc: *mut AllocCap, ctx: *mut SpvCtx, bi_code: u32, tidx: u32, cached: *mut u32) -> u32 {
+    if cached.* != 0_u32 {
+        return cached.*;
+    }
+    let ptr_tidx = intern_ptr(alloc, ctx, SC_INPUT, tidx);
+    let ptr_id = ctx.ty_spv_id(ptr_tidx);
+    let var_id = ctx.fresh();
+    ctx.decs.op3(alloc, OP_DECORATE, var_id, DEC_BUILTIN, bi_code);
+    ctx.globals.op3(alloc, OP_VARIABLE, ptr_id, var_id, SC_INPUT);
+    ctx.iface_vars.push(alloc, var_id) catch { ctx.oom = true; };
+    cached.* = var_id;
+    return var_id;
+}
+
+fn ensure_position_out(alloc: *mut AllocCap, ctx: *mut SpvCtx) -> u32 {
+    if ctx.bi_position_out != 0_u32 {
+        return ctx.bi_position_out;
+    }
+    let f32_t = intern_float(alloc, ctx, 32_u32);
+    let vec4_t = intern_vec(alloc, ctx, f32_t, 4_u32);
+    let ptr_t = intern_ptr(alloc, ctx, SC_OUTPUT, vec4_t);
+    let ptr_id = ctx.ty_spv_id(ptr_t);
+    let var_id = ctx.fresh();
+    ctx.decs.op3(alloc, OP_DECORATE, var_id, DEC_BUILTIN, BUILTIN_POSITION);
+    ctx.globals.op3(alloc, OP_VARIABLE, ptr_id, var_id, SC_OUTPUT);
+    ctx.iface_vars.push(alloc, var_id) catch { ctx.oom = true; };
+    ctx.bi_position_out = var_id;
+    return var_id;
+}
+
+// ===========================================================================
+// SSA Value ID Helpers (direct SSA OR Function-OpVariable state-machine mode)
+// ===========================================================================
+
+fn get_val_id(alloc: *mut AllocCap, ctx: *mut SpvCtx, v: eir.EirValue) -> u32 {
+    let vu = v.widen.[usize]();
+    if ctx.use_val_vars {
+        var var_id: u32 = 0_u32;
+        var tidx: u32 = 0_u32;
+        if let vp = ctx.val_vars.get(vu) { var_id = vp.*; }
+        if let tp = ctx.val_tidxs.get(vu) { tidx = tp.*; }
+        if var_id != 0_u32 {
+            let ty_spv = ctx.ty_spv_id(tidx);
+            let lid = ctx.fresh();
+            ctx.fns.op3(alloc, OP_LOAD, ty_spv, lid, var_id);
+            return lid;
+        }
+    }
+    let vlen = ctx.val_ids.len();
+    if vu < vlen {
+        var cur: u32 = 0_u32;
+        if let vp = ctx.val_ids.get(vu) {
+            cur = vp.*;
+        }
+        if cur == 0_u32 {
+            cur = ctx.fresh();
+            let vs = ctx.val_ids.as_mut_slice();
+            if vu < vs.len {
+                vs[vu] = cur;
+            }
+        }
+        return cur;
+    }
+    return ctx.fresh();
+}
+
+fn def_val_id(ctx: *mut SpvCtx, dst: eir.EirValue) -> u32 {
+    let du = dst.widen.[usize]();
+    if ctx.use_val_vars {
+        let nid = ctx.fresh();
+        let vs = ctx.val_ids.as_mut_slice();
+        if du < vs.len {
+            vs[du] = nid;
+        }
+        return nid;
+    }
+    let vlen = ctx.val_ids.len();
+    if du < vlen {
+        var cur: u32 = 0_u32;
+        if let vp = ctx.val_ids.get(du) {
+            cur = vp.*;
+        }
+        if cur == 0_u32 {
+            cur = ctx.fresh();
+            let vs = ctx.val_ids.as_mut_slice();
+            if du < vs.len {
+                vs[du] = cur;
+            }
+        }
+        return cur;
+    }
+    return ctx.fresh();
+}
+
+fn commit_val_def(alloc: *mut AllocCap, ctx: *mut SpvCtx, dst: eir.EirValue) {
+    if !ctx.use_val_vars || dst == eir.EIR_NONE {
+        return;
+    }
+    let du = dst.widen.[usize]();
+    var var_id: u32 = 0_u32;
+    var def_id: u32 = 0_u32;
+    if let vp = ctx.val_vars.get(du) { var_id = vp.*; }
+    if let dp = ctx.val_ids.get(du) { def_id = dp.*; }
+    if var_id != 0_u32 && def_id != 0_u32 {
+        ctx.fns.op2(alloc, OP_STORE, var_id, def_id);
+        let vs = ctx.val_ids.as_mut_slice();
+        if du < vs.len { vs[du] = 0_u32; }
+    }
+}
+
+fn bind_val_alias(
+    alloc: *mut AllocCap,
+    ctx: *mut SpvCtx,
+    env: *types.TypeEnv,
+    dst: eir.EirValue,
+    dst_ty: types.TyId,
+    src_id: u32,
+) {
+    let du = dst.widen.[usize]();
+    if ctx.use_val_vars {
+        var var_id: u32 = 0_u32;
+        if let vp = ctx.val_vars.get(du) { var_id = vp.*; }
+        if var_id != 0_u32 {
+            ctx.fns.op2(alloc, OP_STORE, var_id, src_id);
+        }
+        return;
+    }
+    let vlen = ctx.val_ids.len();
+    if du < vlen {
+        var cur: u32 = 0_u32;
+        if let vp = ctx.val_ids.get(du) {
+            cur = vp.*;
+        }
+        if cur == 0_u32 {
+            let vs = ctx.val_ids.as_mut_slice();
+            if du < vs.len {
+                vs[du] = src_id;
+            }
+            return;
+        }
+        let dt = intern_eon_ty(alloc, ctx, env, dst_ty, false);
+        let dt_id = ctx.ty_spv_id(dt);
+        ctx.fns.op3(alloc, OP_COPY_OBJECT, dt_id, cur, src_id);
+    }
+}
+
+fn bb_label_id(ctx: *SpvCtx, bb: u32) -> u32 {
+    if let lp = ctx.bb_labels.get(bb.widen.[usize]()) {
+        return lp.*;
+    }
+    return 0_u32;
+}
+
+fn emit_place_ptr(
+    alloc: *mut AllocCap,
+    ctx: *mut SpvCtx,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    env: *types.TypeEnv,
+    place: *eir.EirPlace,
+    out_ptr: *mut u32,
+    out_tidx: *mut u32,
+) -> bool {
+    var base_var: u32 = 0_u32;
+    var sc: u32 = SC_FUNCTION;
+    var cur_tidx: u32 = 0_u32;
+    var is_ssbo = false;
+    var is_explicit_layout = false;
+
+    if place.base.kind == .Slot {
+        let su = place.base.id.widen.[usize]();
+        if let sb = ctx.slot_bind.get(su) {
+            if sb.kind == 1_u8 {
+                base_var = sb.var_id;
+                sc = SC_STORAGE_BUFFER;
+                cur_tidx = sb.tidx;
+                is_ssbo = true;
+                is_explicit_layout = true;
+            } else if sb.kind == 4_u8 {
+                base_var = sb.var_id;
+                sc = SC_FUNCTION;
+                cur_tidx = sb.tidx;
+            } else if sb.kind == 5_u8 {
+                base_var = sb.var_id;
+                sc = SC_WORKGROUP;
+                cur_tidx = sb.tidx;
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    } else {
+        // EirPlaceBase.Val -> check if it's a direct GpuBuf parameter value.
+        let pvals = eir_prog.fn_params(fn_id);
+        var found = false;
+        var pi: usize = 0_usize;
+        while pi < pvals.len {
+            if pvals[pi] == place.base.id {
+                if let rb = ctx.param_res.get(pi) {
+                    if rb.kind == 1_u8 {
+                        base_var = rb.var_id;
+                        sc = SC_STORAGE_BUFFER;
+                        cur_tidx = rb.elem_tidx;
+                        is_ssbo = true;
+                        is_explicit_layout = true;
+                        found = true;
+                    }
+                }
+                break;
+            }
+            pi = pi +% 1_usize;
+        }
+        if !found {
+            return false;
+        }
+    }
+
+    var idxs = col.DynBuf.[u32].init(alloc, 4_usize) catch { ctx.oom = true; return false; };
+    let projs = eir_prog.projs_slice(place.projs);
+    var pstart: usize = 0_usize;
+    if is_ssbo {
+        idxs.push(alloc, spv_const_u32(alloc, ctx, 0_u32)) catch { ctx.oom = true; };
+        if projs.len > 0_usize && projs[0_usize].kind == .Index {
+            idxs.push(alloc, get_val_id(alloc, ctx, projs[0_usize].index)) catch { ctx.oom = true; };
+            pstart = 1_usize;
+        }
+    }
+    var i = pstart;
+    while i < projs.len {
+        let pr = projs[i];
+        if pr.kind == .Field || pr.kind == .TupleField {
+            idxs.push(alloc, spv_const_u32(alloc, ctx, pr.index)) catch { ctx.oom = true; };
+            cur_tidx = intern_eon_ty(alloc, ctx, env, pr.ty, is_explicit_layout);
+        } else if pr.kind == .Index {
+            idxs.push(alloc, get_val_id(alloc, ctx, pr.index)) catch { ctx.oom = true; };
+            cur_tidx = intern_eon_ty(alloc, ctx, env, pr.ty, is_explicit_layout);
+        }
+        i = i +% 1_usize;
+    }
+
+    if idxs.len() == 0_usize {
+        idxs.destroy(alloc);
+        out_ptr.* = base_var;
+        out_tidx.* = cur_tidx;
+        return true;
+    }
+
+    let ptr_tidx = intern_ptr(alloc, ctx, sc, cur_tidx);
+    let ptr_id = ctx.fresh();
+    var ops = col.DynBuf.[u32].init(alloc, idxs.len() +% 3_usize) catch {
+        idxs.destroy(alloc);
+        ctx.oom = true;
+        return false;
+    };
+    ops.push(alloc, ctx.ty_spv_id(ptr_tidx)) catch { ctx.oom = true; };
+    ops.push(alloc, ptr_id) catch { ctx.oom = true; };
+    ops.push(alloc, base_var) catch { ctx.oom = true; };
+    ops.push_slice(alloc, idxs.as_slice()) catch { ctx.oom = true; };
+    ctx.fns.op_n(alloc, OP_ACCESS_CHAIN, ops.as_slice());
+    ops.destroy(alloc);
+    idxs.destroy(alloc);
+    out_ptr.* = ptr_id;
+    out_tidx.* = cur_tidx;
+    return true;
+}
+
+struct ImgVarRes {
+    var_id: u32;
+    mode: u32;
+}
+
+fn find_image_var(ctx: *SpvCtx, eir_prog: *eir.EirProgram, fn_id: u32, bc: *eir.EirBuiltinCallData) -> ImgVarRes {
+    let aslots = eir_prog.arg_slots_slice(bc.arg_slots);
+    if aslots.len > 0_usize && aslots[0_usize] != eir.EIR_NONE {
+        if let sb = ctx.slot_bind.get(aslots[0_usize].widen.[usize]()) {
+            if sb.kind == 2_u8 || sb.kind == 3_u8 {
+                return ImgVarRes.{ var_id: sb.var_id, mode: sb.tidx };
+            }
+        }
+    }
+    let args = eir_prog.vals_slice(bc.args);
+    if args.len > 0_usize {
+        let pvals = eir_prog.fn_params(fn_id);
+        var pi: usize = 0_usize;
+        while pi < pvals.len {
+            if pvals[pi] == args[0_usize] {
+                if let rb = ctx.param_res.get(pi) {
+                    if rb.kind == 2_u8 || rb.kind == 3_u8 {
+                        return ImgVarRes.{ var_id: rb.var_id, mode: rb.elem_tidx };
+                    }
+                }
+            }
+            pi = pi +% 1_usize;
+        }
+    }
+    return ImgVarRes.{ var_id: 0_u32, mode: 0_u32 };
+}
+
+fn splat_if_scalar(
+    alloc: *mut AllocCap,
+    ctx: *mut SpvCtx,
+    env: *types.TypeEnv,
+    val_id: u32,
+    val_ty: types.TyId,
+    target_ty: types.TyId,
+) -> u32 {
+    let tn = env.get(target_ty);
+    let vn = env.get(val_ty);
+    if tn.kind == .Vec && vn.kind != .Vec {
+        let vt = intern_eon_ty(alloc, ctx, env, target_ty, false);
+        let id = ctx.fresh();
+        let lanes = tn.u8_val.widen.[usize]();
+        var ops = col.DynBuf.[u32].init(alloc, lanes +% 2_usize) catch { ctx.oom = true; return val_id; };
+        ops.push(alloc, ctx.ty_spv_id(vt)) catch { ctx.oom = true; };
+        ops.push(alloc, id) catch { ctx.oom = true; };
+        var k: usize = 0_usize;
+        while k < lanes {
+            ops.push(alloc, val_id) catch { ctx.oom = true; };
+            k = k +% 1_usize;
+        }
+        ctx.fns.op_n(alloc, OP_COMPOSITE_CONSTRUCT, ops.as_slice());
+        ops.destroy(alloc);
+        return id;
+    }
+    return val_id;
+}
+
+fn emit_glsl_ext1(alloc: *mut AllocCap, ctx: *mut SpvCtx, rty_id: u32, dst_id: u32, ext_op: u32, a0: u32) {
+    let ops: [5]u32 = [rty_id, dst_id, ctx.glsl_ext_id, ext_op, a0];
+    ctx.fns.op_n(alloc, OP_EXT_INST, ops[0_usize..5_usize]);
+}
+
+fn emit_glsl_ext2(alloc: *mut AllocCap, ctx: *mut SpvCtx, rty_id: u32, dst_id: u32, ext_op: u32, a0: u32, a1: u32) {
+    let ops: [6]u32 = [rty_id, dst_id, ctx.glsl_ext_id, ext_op, a0, a1];
+    ctx.fns.op_n(alloc, OP_EXT_INST, ops[0_usize..6_usize]);
+}
+
+fn emit_glsl_ext3(alloc: *mut AllocCap, ctx: *mut SpvCtx, rty_id: u32, dst_id: u32, ext_op: u32, a0: u32, a1: u32, a2: u32) {
+    let ops: [7]u32 = [rty_id, dst_id, ctx.glsl_ext_id, ext_op, a0, a1, a2];
+    ctx.fns.op_n(alloc, OP_EXT_INST, ops[0_usize..7_usize]);
+}
+
+fn emit_builtin_inst(
+    alloc: *mut AllocCap,
+    ctx: *mut SpvCtx,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    env: *types.TypeEnv,
+    inst: *eir.EirInst,
+    bc: *eir.EirBuiltinCallData,
+    terminated: *mut bool,
+) {
+    let k = bc.op.kind;
+    let args = eir_prog.vals_slice(bc.args);
+    if k == .GpuGlobalId || k == .GpuLocalId || k == .GpuWorkgroupId {
+        let u32_t = intern_int(alloc, ctx, 32_u32, false);
+        let uvec3_t = intern_vec(alloc, ctx, u32_t, 3_u32);
+        var var_id: u32 = 0_u32;
+        if k == .GpuGlobalId {
+            var_id = ensure_builtin_input(alloc, ctx, BUILTIN_GLOBAL_INVOCATION_ID, uvec3_t, &mut ctx.bi_global_id);
+        } else if k == .GpuLocalId {
+            var_id = ensure_builtin_input(alloc, ctx, BUILTIN_LOCAL_INVOCATION_ID, uvec3_t, &mut ctx.bi_local_id);
+        } else {
+            var_id = ensure_builtin_input(alloc, ctx, BUILTIN_WORKGROUP_ID, uvec3_t, &mut ctx.bi_workgroup_id);
+        }
+        if inst.dst != eir.EIR_NONE {
+            let did = def_val_id(ctx, inst.dst);
+            let uvec3_id = ctx.ty_spv_id(uvec3_t);
+            ctx.fns.op3(alloc, OP_LOAD, uvec3_id, did, var_id);
+        }
+        return;
+    }
+    if k == .GpuVertexIndex || k == .GpuInstanceIndex {
+        let i32_t = intern_int(alloc, ctx, 32_u32, true);
+        let u32_t = intern_int(alloc, ctx, 32_u32, false);
+        let var_id = if k == .GpuVertexIndex {
+            ensure_builtin_input(alloc, ctx, BUILTIN_VERTEX_INDEX, i32_t, &mut ctx.bi_vertex_idx)
+        } else {
+            ensure_builtin_input(alloc, ctx, BUILTIN_INSTANCE_INDEX, i32_t, &mut ctx.bi_instance_idx)
+        };
+        if inst.dst != eir.EIR_NONE {
+            let i32_id = ctx.ty_spv_id(i32_t);
+            let u32_id = ctx.ty_spv_id(u32_t);
+            let raw_id = ctx.fresh();
+            ctx.fns.op3(alloc, OP_LOAD, i32_id, raw_id, var_id);
+            let did = def_val_id(ctx, inst.dst);
+            ctx.fns.op3(alloc, OP_BITCAST, u32_id, did, raw_id);
+        }
+        return;
+    }
+    if k == .GpuFragCoord {
+        let f32_t = intern_float(alloc, ctx, 32_u32);
+        let vec4_t = intern_vec(alloc, ctx, f32_t, 4_u32);
+        let var_id = ensure_builtin_input(alloc, ctx, BUILTIN_FRAG_COORD, vec4_t, &mut ctx.bi_frag_coord);
+        if inst.dst != eir.EIR_NONE {
+            let vec4_id = ctx.ty_spv_id(vec4_t);
+            let did = def_val_id(ctx, inst.dst);
+            ctx.fns.op3(alloc, OP_LOAD, vec4_id, did, var_id);
+        }
+        return;
+    }
+    if k == .GpuWorkgroupBarrier {
+        let scope = spv_const_u32(alloc, ctx, 2_u32);
+        let sem = spv_const_u32(alloc, ctx, 0x108_u32);
+        ctx.fns.op3(alloc, OP_CONTROL_BARRIER, scope, scope, sem);
+        return;
+    }
+    if k == .GpuDiscard {
+        ctx.fns.op0(alloc, OP_KILL);
+        terminated.* = true;
+        return;
+    }
+    if k == .GpuImageSample {
+        let ir = find_image_var(ctx, eir_prog, fn_id, bc);
+        if ir.var_id != 0_u32 && args.len >= 2_usize && inst.dst != eir.EIR_NONE {
+            let img_t = intern_image2d(alloc, ctx, 0_u32);
+            let si_t = intern_sampled_image(alloc, ctx, img_t);
+            let f32_t = intern_float(alloc, ctx, 32_u32);
+            let vec4_t = intern_vec(alloc, ctx, f32_t, 4_u32);
+            let si_id = ctx.ty_spv_id(si_t);
+            let vec4_id = ctx.ty_spv_id(vec4_t);
+            let loaded_si = ctx.fresh();
+            ctx.fns.op3(alloc, OP_LOAD, si_id, loaded_si, ir.var_id);
+            let uv_id = get_val_id(alloc, ctx, args[1_usize]);
+            let lod0 = spv_const_f32_bits(alloc, ctx, 0_u32);
+            let did = def_val_id(ctx, inst.dst);
+            let ops: [6]u32 = [vec4_id, did, loaded_si, uv_id, 2_u32, lod0];
+            ctx.fns.op_n(alloc, OP_IMAGE_SAMPLE_EXPLICIT_LOD, ops[0_usize..6_usize]);
+        }
+        return;
+    }
+    if k == .GpuImageStore {
+        let ir = find_image_var(ctx, eir_prog, fn_id, bc);
+        if ir.var_id != 0_u32 && args.len >= 3_usize {
+            let img_t = intern_image2d(alloc, ctx, ir.mode);
+            let img_id = ctx.ty_spv_id(img_t);
+            let loaded_img = ctx.fresh();
+            ctx.fns.op3(alloc, OP_LOAD, img_id, loaded_img, ir.var_id);
+            let coord_id = get_val_id(alloc, ctx, args[1_usize]);
+            let val_id = get_val_id(alloc, ctx, args[2_usize]);
+            ctx.fns.op3(alloc, OP_IMAGE_WRITE, loaded_img, coord_id, val_id);
+        }
+        return;
+    }
+    if k == .GpuImageLoad {
+        let ir = find_image_var(ctx, eir_prog, fn_id, bc);
+        if ir.var_id != 0_u32 && args.len >= 2_usize && inst.dst != eir.EIR_NONE {
+            let img_t = intern_image2d(alloc, ctx, ir.mode);
+            let img_id = ctx.ty_spv_id(img_t);
+            let loaded_img = ctx.fresh();
+            ctx.fns.op3(alloc, OP_LOAD, img_id, loaded_img, ir.var_id);
+            let coord_id = get_val_id(alloc, ctx, args[1_usize]);
+            let rt = intern_eon_ty(alloc, ctx, env, bc.ret_ty, false);
+            let rt_id = ctx.ty_spv_id(rt);
+            let did = def_val_id(ctx, inst.dst);
+            if ir.mode == 0_u32 {
+                ctx.fns.op4(alloc, OP_IMAGE_FETCH, rt_id, did, loaded_img, coord_id);
+            } else {
+                ctx.fns.op4(alloc, OP_IMAGE_READ, rt_id, did, loaded_img, coord_id);
+            }
+        }
+        return;
+    }
+    if k == .MathSqrt && args.len >= 1_usize && inst.dst != eir.EIR_NONE {
+        let rt = intern_eon_ty(alloc, ctx, env, bc.ret_ty, false);
+        emit_glsl_ext1(alloc, ctx, ctx.ty_spv_id(rt), def_val_id(ctx, inst.dst), GLSL_SQRT, get_val_id(alloc, ctx, args[0_usize]));
+        return;
+    }
+    if (k == .MathFma || k == .VecFma) && args.len >= 3_usize && inst.dst != eir.EIR_NONE {
+        let rt = intern_eon_ty(alloc, ctx, env, bc.ret_ty, false);
+        emit_glsl_ext3(
+            alloc, ctx, ctx.ty_spv_id(rt), def_val_id(ctx, inst.dst), GLSL_FMA,
+            get_val_id(alloc, ctx, args[0_usize]), get_val_id(alloc, ctx, args[1_usize]), get_val_id(alloc, ctx, args[2_usize]),
+        );
+        return;
+    }
+    if k == .VecSplat && args.len >= 1_usize && inst.dst != eir.EIR_NONE {
+        let tn = env.get(bc.ret_ty);
+        let rt = intern_eon_ty(alloc, ctx, env, bc.ret_ty, false);
+        let s_id = get_val_id(alloc, ctx, args[0_usize]);
+        let did = def_val_id(ctx, inst.dst);
+        let lanes = if tn.kind == .Vec { tn.u8_val.widen.[usize]() } else { 4_usize };
+        var ops = col.DynBuf.[u32].init(alloc, lanes +% 2_usize) catch { ctx.oom = true; return; };
+        ops.push(alloc, ctx.ty_spv_id(rt)) catch { ctx.oom = true; };
+        ops.push(alloc, did) catch { ctx.oom = true; };
+        var li: usize = 0_usize;
+        while li < lanes {
+            ops.push(alloc, s_id) catch { ctx.oom = true; };
+            li = li +% 1_usize;
+        }
+        ctx.fns.op_n(alloc, OP_COMPOSITE_CONSTRUCT, ops.as_slice());
+        ops.destroy(alloc);
+        return;
+    }
+    if (k == .VecMin || k == .VecMax) && args.len >= 2_usize && inst.dst != eir.EIR_NONE {
+        let rt = intern_eon_ty(alloc, ctx, env, bc.ret_ty, false);
+        let is_f = is_float_or_float_vec(env, bc.ret_ty);
+        let is_s = is_signed_int_or_vec(env, bc.ret_ty);
+        let gop = if k == .VecMin {
+            if is_f { GLSL_FMIN } else if is_s { GLSL_SMIN } else { GLSL_UMIN }
+        } else {
+            if is_f { GLSL_FMAX } else if is_s { GLSL_SMAX } else { GLSL_UMAX }
+        };
+        emit_glsl_ext2(alloc, ctx, ctx.ty_spv_id(rt), def_val_id(ctx, inst.dst), gop, get_val_id(alloc, ctx, args[0_usize]), get_val_id(alloc, ctx, args[1_usize]));
+        return;
+    }
+    if k == .VecDot && args.len >= 2_usize && inst.dst != eir.EIR_NONE {
+        let rt = intern_eon_ty(alloc, ctx, env, bc.ret_ty, false);
+        let rt_id = ctx.ty_spv_id(rt);
+        let did = def_val_id(ctx, inst.dst);
+        let a0 = get_val_id(alloc, ctx, args[0_usize]);
+        let a1 = get_val_id(alloc, ctx, args[1_usize]);
+        ctx.fns.op4(alloc, OP_DOT, rt_id, did, a0, a1);
+        return;
+    }
+    if k == .VecSelect && args.len >= 3_usize && inst.dst != eir.EIR_NONE {
+        let rt = intern_eon_ty(alloc, ctx, env, bc.ret_ty, false);
+        let rt_id = ctx.ty_spv_id(rt);
+        let did = def_val_id(ctx, inst.dst);
+        let a0 = get_val_id(alloc, ctx, args[0_usize]);
+        let a1 = get_val_id(alloc, ctx, args[1_usize]);
+        let a2 = get_val_id(alloc, ctx, args[2_usize]);
+        ctx.fns.op5(alloc, OP_SELECT, rt_id, did, a0, a1, a2);
+        return;
+    }
+    if k == .GpuMath1 && args.len >= 1_usize && inst.dst != eir.EIR_NONE {
+        let rt = intern_eon_ty(alloc, ctx, env, bc.ret_ty, false);
+        let sub = bc.op.len_u8;
+        let is_f = is_float_or_float_vec(env, bc.ret_ty);
+        let gop: u32 = if sub == 0_u8 {
+            if is_f { GLSL_FABS } else { GLSL_SABS }
+        } else if sub == 1_u8 { GLSL_FLOOR }
+        else if sub == 2_u8 { GLSL_CEIL }
+        else if sub == 3_u8 { GLSL_FRACT }
+        else if sub == 4_u8 { GLSL_EXP }
+        else if sub == 5_u8 { GLSL_SIN }
+        else if sub == 6_u8 { GLSL_COS }
+        else if sub == 7_u8 { GLSL_SQRT }
+        else if sub == 8_u8 { GLSL_LENGTH }
+        else { GLSL_NORMALIZE };
+        emit_glsl_ext1(alloc, ctx, ctx.ty_spv_id(rt), def_val_id(ctx, inst.dst), gop, get_val_id(alloc, ctx, args[0_usize]));
+        return;
+    }
+    if k == .GpuMath2 && args.len >= 2_usize && inst.dst != eir.EIR_NONE {
+        let rt = intern_eon_ty(alloc, ctx, env, bc.ret_ty, false);
+        let sub = bc.op.len_u8;
+        let a0 = get_val_id(alloc, ctx, args[0_usize]);
+        let a1 = get_val_id(alloc, ctx, args[1_usize]);
+        if sub == 3_u8 {
+            let rt_id = ctx.ty_spv_id(rt);
+            let did = def_val_id(ctx, inst.dst);
+            ctx.fns.op4(alloc, OP_DOT, rt_id, did, a0, a1);
+            return;
+        }
+        let is_f = is_float_or_float_vec(env, bc.ret_ty);
+        let is_s = is_signed_int_or_vec(env, bc.ret_ty);
+        let s0 = splat_if_scalar(alloc, ctx, env, a0, eir_prog.fn_val_ty(fn_id, args[0_usize]), bc.ret_ty);
+        let s1 = splat_if_scalar(alloc, ctx, env, a1, eir_prog.fn_val_ty(fn_id, args[1_usize]), bc.ret_ty);
+        let gop: u32 = if sub == 0_u8 {
+            if is_f { GLSL_FMIN } else if is_s { GLSL_SMIN } else { GLSL_UMIN }
+        } else if sub == 1_u8 {
+            if is_f { GLSL_FMAX } else if is_s { GLSL_SMAX } else { GLSL_UMAX }
+        } else if sub == 2_u8 { GLSL_POW }
+        else { GLSL_STEP };
+        emit_glsl_ext2(alloc, ctx, ctx.ty_spv_id(rt), def_val_id(ctx, inst.dst), gop, s0, s1);
+        return;
+    }
+    if k == .GpuMath3 && args.len >= 3_usize && inst.dst != eir.EIR_NONE {
+        let rt = intern_eon_ty(alloc, ctx, env, bc.ret_ty, false);
+        let sub = bc.op.len_u8;
+        let s0 = splat_if_scalar(alloc, ctx, env, get_val_id(alloc, ctx, args[0_usize]), eir_prog.fn_val_ty(fn_id, args[0_usize]), bc.ret_ty);
+        let s1 = splat_if_scalar(alloc, ctx, env, get_val_id(alloc, ctx, args[1_usize]), eir_prog.fn_val_ty(fn_id, args[1_usize]), bc.ret_ty);
+        let s2 = splat_if_scalar(alloc, ctx, env, get_val_id(alloc, ctx, args[2_usize]), eir_prog.fn_val_ty(fn_id, args[2_usize]), bc.ret_ty);
+        let is_f = is_float_or_float_vec(env, bc.ret_ty);
+        let is_s = is_signed_int_or_vec(env, bc.ret_ty);
+        let gop: u32 = if sub == 0_u8 {
+            if is_f { GLSL_FCLAMP } else if is_s { GLSL_SCLAMP } else { GLSL_UCLAMP }
+        } else if sub == 1_u8 { GLSL_FMIX }
+        else { GLSL_SMOOTHSTEP };
+        emit_glsl_ext3(alloc, ctx, ctx.ty_spv_id(rt), def_val_id(ctx, inst.dst), gop, s0, s1, s2);
+        return;
+    }
+}
+
+fn find_helper_spv_id(ctx: *SpvCtx, eir_prog: *eir.EirProgram, callee: *eir.EirCallee) -> u32 {
+    var target: u32 = eir.EIR_NONE;
+    if callee.kind == .DirectFn {
+        if let f = eir_prog.find_fn_by_key(cfg_ir.fn_key_top_def(callee.a)) { target = f; }
+    } else if callee.kind == .Method {
+        if let f = eir_prog.find_fn_by_key(cfg_ir.fn_key_impl_method(callee.a, callee.b)) { target = f; }
+    } else if callee.kind == .GenericInst {
+        if let f = eir_prog.find_fn_by_key(cfg_ir.fn_key_generic_inst(callee.a)) { target = f; }
+    }
+    if target == eir.EIR_NONE { return 0_u32; }
+    let hs = ctx.helpers.as_slice();
+    var i: usize = 0_usize;
+    while i < hs.len {
+        if hs[i].eir_fn_id == target {
+            return hs[i].spv_fn_id;
+        }
+        i = i +% 1_usize;
+    }
+    return 0_u32;
+}
+
+fn emit_binary_spv_op(op: ast.BinaryOp, is_f: bool, is_s: bool) -> u16 {
+    match op {
+        .Add => { return if is_f { OP_FADD } else { OP_IADD }; }
+        .AddWrap => { return if is_f { OP_FADD } else { OP_IADD }; }
+        .Sub => { return if is_f { OP_FSUB } else { OP_ISUB }; }
+        .SubWrap => { return if is_f { OP_FSUB } else { OP_ISUB }; }
+        .Mul => { return if is_f { OP_FMUL } else { OP_IMUL }; }
+        .MulWrap => { return if is_f { OP_FMUL } else { OP_IMUL }; }
+        .Div => { return if is_f { OP_FDIV } else if is_s { OP_SDIV } else { OP_UDIV }; }
+        .Mod => { return if is_s { OP_SREM } else { OP_UMOD }; }
+        .BitAnd => { return OP_BITWISE_AND; }
+        .BitOr => { return OP_BITWISE_OR; }
+        .BitXor => { return OP_BITWISE_XOR; }
+        .And => { return OP_LOGICAL_AND; }
+        .Or => { return OP_LOGICAL_OR; }
+        .Shl => { return OP_SHIFT_LEFT_LOGICAL; }
+        .ShlWrap => { return OP_SHIFT_LEFT_LOGICAL; }
+        .Shr => { return if is_s { OP_SHIFT_RIGHT_ARITHMETIC } else { OP_SHIFT_RIGHT_LOGICAL }; }
+        .Eq => { return if is_f { OP_FORD_EQUAL } else { OP_IEQUAL }; }
+        .NotEq => { return if is_f { OP_FORD_NOT_EQUAL } else { OP_INOT_EQUAL }; }
+        .Lt => { return if is_f { OP_FORD_LESS_THAN } else if is_s { OP_SLESS_THAN } else { OP_ULESS_THAN }; }
+        .LtEq => { return if is_f { OP_FORD_LESS_THAN_EQUAL } else if is_s { OP_SLESS_THAN_EQUAL } else { OP_ULESS_THAN_EQUAL }; }
+        .Gt => { return if is_f { OP_FORD_GREATER_THAN } else if is_s { OP_SGREATER_THAN } else { OP_UGREATER_THAN }; }
+        .GtEq => { return if is_f { OP_FORD_GREATER_THAN_EQUAL } else if is_s { OP_SGREATER_THAN_EQUAL } else { OP_UGREATER_THAN_EQUAL }; }
+        _ => { return 0_u16; }
+    }
+}
+
+fn emit_inst(
+    alloc: *mut AllocCap,
+    ctx: *mut SpvCtx,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    env: *types.TypeEnv,
+    inst: *eir.EirInst,
+    terminated: *mut bool,
+) {
+    if terminated.* {
+        return;
+    }
+    match inst.kind {
+        .Const => {
+            if let c = eir_prog.get_const(inst.aux0) {
+                var cid: u32 = 0_u32;
+                if c.kind == .Bool {
+                    cid = spv_const_bool(alloc, ctx, c.bool_val);
+                } else if c.kind == .Int {
+                    if is_signed_int_or_vec(env, inst.ty0) {
+                        cid = spv_const_i32(alloc, ctx, c.int_val.lo.trunc.[i32]());
+                    } else {
+                        cid = spv_const_u32(alloc, ctx, c.int_val.lo.trunc.[u32]());
+                    }
+                } else if c.kind == .Float {
+                    let fval = gpu_check.parse_f64_lit(eir_prog.bytes_slice(c.bytes));
+                    let f32b = gpu_check.f64_bits_to_f32_bits(fval.bitcast.[u64]());
+                    cid = spv_const_f32_bits(alloc, ctx, f32b);
+                } else if c.kind == .EnumTag {
+                    cid = spv_const_u32(alloc, ctx, c.int_val.lo.trunc.[u32]());
+                }
+                if cid != 0_u32 && inst.dst != eir.EIR_NONE {
+                    bind_val_alias(alloc, ctx, env, inst.dst, inst.ty0, cid);
+                }
+            }
+        }
+        .Copy => {
+            if inst.dst != eir.EIR_NONE {
+                let sid = get_val_id(alloc, ctx, inst.v0);
+                bind_val_alias(alloc, ctx, env, inst.dst, eir_prog.fn_val_ty(fn_id, inst.dst), sid);
+            }
+        }
+        .LoadSlot => {
+            if inst.dst != eir.EIR_NONE {
+                var sk: u8 = 0_u8;
+                var sv_id: u32 = 0_u32;
+                var stidx: u32 = 0_u32;
+                if let sb = ctx.slot_bind.get(inst.aux0.widen.[usize]()) {
+                    sk = sb.kind;
+                    sv_id = sb.var_id;
+                    stidx = sb.tidx;
+                }
+                if sk == 4_u8 || sk == 5_u8 {
+                    let st_id = ctx.ty_spv_id(stidx);
+                    let did = def_val_id(ctx, inst.dst);
+                    ctx.fns.op3(alloc, OP_LOAD, st_id, did, sv_id);
+                }
+            }
+        }
+        .StoreSlot => {
+            var sk: u8 = 0_u8;
+            var sv_id: u32 = 0_u32;
+            if let sb = ctx.slot_bind.get(inst.aux0.widen.[usize]()) {
+                sk = sb.kind;
+                sv_id = sb.var_id;
+            }
+            if sk == 4_u8 || sk == 5_u8 {
+                let vid = get_val_id(alloc, ctx, inst.v0);
+                ctx.fns.op2(alloc, OP_STORE, sv_id, vid);
+            }
+        }
+        .LoadPlace => {
+            if let pl = eir_prog.get_place(inst.aux0) {
+                var ptr_id: u32 = 0_u32;
+                var elem_tidx: u32 = 0_u32;
+                if emit_place_ptr(alloc, ctx, eir_prog, fn_id, env, pl, &mut ptr_id, &mut elem_tidx) {
+                    if inst.dst != eir.EIR_NONE {
+                        let et_id = ctx.ty_spv_id(elem_tidx);
+                        let did = def_val_id(ctx, inst.dst);
+                        ctx.fns.op3(alloc, OP_LOAD, et_id, did, ptr_id);
+                    }
+                    return;
+                }
+                if pl.base.kind == .Val && inst.dst != eir.EIR_NONE {
+                    let projs = eir_prog.projs_slice(pl.projs);
+                    if projs.len > 0_usize {
+                        var cur_id = get_val_id(alloc, ctx, pl.base.id);
+                        var pi: usize = 0_usize;
+                        while pi < projs.len {
+                            let pr = projs[pi];
+                            if pr.kind == .Field || pr.kind == .TupleField {
+                                let rt = intern_eon_ty(alloc, ctx, env, pr.ty, false);
+                                let rt_id = ctx.ty_spv_id(rt);
+                                let next_id = if pi +% 1_usize == projs.len { def_val_id(ctx, inst.dst) } else { ctx.fresh() };
+                                ctx.fns.op4(alloc, OP_COMPOSITE_EXTRACT, rt_id, next_id, cur_id, pr.index);
+                                cur_id = next_id;
+                            }
+                            pi = pi +% 1_usize;
+                        }
+                    }
+                }
+            }
+        }
+        .StorePlace => {
+            if let pl = eir_prog.get_place(inst.aux0) {
+                var ptr_id: u32 = 0_u32;
+                var elem_tidx: u32 = 0_u32;
+                if emit_place_ptr(alloc, ctx, eir_prog, fn_id, env, pl, &mut ptr_id, &mut elem_tidx) {
+                    let vid = get_val_id(alloc, ctx, inst.v0);
+                    ctx.fns.op2(alloc, OP_STORE, ptr_id, vid);
+                }
+            }
+        }
+        .FieldExtract => {
+            if inst.dst != eir.EIR_NONE {
+                let sv = get_val_id(alloc, ctx, inst.v0);
+                let rt = intern_eon_ty(alloc, ctx, env, inst.ty0, false);
+                let rt_id = ctx.ty_spv_id(rt);
+                let did = def_val_id(ctx, inst.dst);
+                ctx.fns.op4(alloc, OP_COMPOSITE_EXTRACT, rt_id, did, sv, inst.aux0);
+            }
+        }
+        .Aggregate => {
+            if inst.dst != eir.EIR_NONE {
+                let rt = intern_eon_ty(alloc, ctx, env, inst.ty0, false);
+                let did = def_val_id(ctx, inst.dst);
+                let evs = eir_prog.vals_slice(inst.range);
+                var repeat_cnt: usize = 0_usize;
+                if let agg = eir_prog.get_aggregate(inst.aux0) {
+                    if agg.tag == .ArrayRepeat {
+                        repeat_cnt = agg.count.trunc.[usize]();
+                    }
+                }
+                if repeat_cnt > 0_usize && evs.len > 0_usize {
+                    let fill_id = get_val_id(alloc, ctx, evs[0_usize]);
+                    var ops = col.DynBuf.[u32].init(alloc, repeat_cnt +% 2_usize) catch { ctx.oom = true; return; };
+                    ops.push(alloc, ctx.ty_spv_id(rt)) catch { ctx.oom = true; };
+                    ops.push(alloc, did) catch { ctx.oom = true; };
+                    var ri: usize = 0_usize;
+                    while ri < repeat_cnt {
+                        ops.push(alloc, fill_id) catch { ctx.oom = true; };
+                        ri = ri +% 1_usize;
+                    }
+                    ctx.fns.op_n(alloc, OP_COMPOSITE_CONSTRUCT, ops.as_slice());
+                    ops.destroy(alloc);
+                } else {
+                    var ops = col.DynBuf.[u32].init(alloc, evs.len +% 2_usize) catch { ctx.oom = true; return; };
+                    ops.push(alloc, ctx.ty_spv_id(rt)) catch { ctx.oom = true; };
+                    ops.push(alloc, did) catch { ctx.oom = true; };
+                    var ei: usize = 0_usize;
+                    while ei < evs.len {
+                        ops.push(alloc, get_val_id(alloc, ctx, evs[ei])) catch { ctx.oom = true; };
+                        ei = ei +% 1_usize;
+                    }
+                    ctx.fns.op_n(alloc, OP_COMPOSITE_CONSTRUCT, ops.as_slice());
+                    ops.destroy(alloc);
+                }
+            }
+        }
+        .Unary => {
+            if inst.dst != eir.EIR_NONE {
+                let sv = get_val_id(alloc, ctx, inst.v0);
+                let rt = intern_eon_ty(alloc, ctx, env, inst.ty0, false);
+                let rt_id = ctx.ty_spv_id(rt);
+                let did = def_val_id(ctx, inst.dst);
+                let spv_op: u16 = if inst.unary_op == .Neg {
+                    if is_float_or_float_vec(env, inst.ty0) { OP_FNEGATE } else { OP_SNEGATE }
+                } else if inst.unary_op == .Not {
+                    OP_LOGICAL_NOT
+                } else {
+                    OP_NOT
+                };
+                ctx.fns.op3(alloc, spv_op, rt_id, did, sv);
+            }
+        }
+        .Binary => {
+            if inst.dst != eir.EIR_NONE {
+                let lv = get_val_id(alloc, ctx, inst.v0);
+                let rv = get_val_id(alloc, ctx, inst.v1);
+                let rt = intern_eon_ty(alloc, ctx, env, inst.ty0, false);
+                let rt_id = ctx.ty_spv_id(rt);
+                let did = def_val_id(ctx, inst.dst);
+                let is_f = is_float_or_float_vec(env, inst.ty1);
+                let is_s = is_signed_int_or_vec(env, inst.ty1);
+                let spv_op = emit_binary_spv_op(inst.bin_op, is_f, is_s);
+                if spv_op != 0_u16 {
+                    ctx.fns.op4(alloc, spv_op, rt_id, did, lv, rv);
+                }
+            }
+        }
+        .Cast => {
+            if inst.dst != eir.EIR_NONE {
+                let sv = get_val_id(alloc, ctx, inst.v0);
+                let fk = intern_eon_ty(alloc, ctx, env, inst.ty1, false);
+                let tk = intern_eon_ty(alloc, ctx, env, inst.ty0, false);
+                if fk == tk {
+                    bind_val_alias(alloc, ctx, env, inst.dst, inst.ty0, sv);
+                    return;
+                }
+                let tk_id = ctx.ty_spv_id(tk);
+                let did = def_val_id(ctx, inst.dst);
+                let from_s = is_signed_int_or_vec(env, inst.ty1);
+                let to_s = is_signed_int_or_vec(env, inst.ty0);
+                let spv_op: u16 = if inst.cast_kind == .ToFloat {
+                    if from_s { OP_CONVERT_S_TO_F } else { OP_CONVERT_U_TO_F }
+                } else if inst.cast_kind == .TruncToInt {
+                    if to_s { OP_CONVERT_F_TO_S } else { OP_CONVERT_F_TO_U }
+                } else if inst.cast_kind == .Bitcast || (is_int_or_int_vec(env, inst.ty1) && is_int_or_int_vec(env, inst.ty0)) {
+                    OP_BITCAST
+                } else {
+                    if to_s { OP_SCONVERT } else { OP_UCONVERT }
+                };
+                ctx.fns.op3(alloc, spv_op, tk_id, did, sv);
+            }
+        }
+        .Call => {
+            if let cd = eir_prog.get_call(inst.aux0) {
+                let target_spv = find_helper_spv_id(ctx, eir_prog, &cd.callee);
+                if target_spv != 0_u32 {
+                    let rt = intern_eon_ty(alloc, ctx, env, cd.ret_ty, false);
+                    let did = if inst.dst != eir.EIR_NONE { def_val_id(ctx, inst.dst) } else { ctx.fresh() };
+                    let cargs = eir_prog.vals_slice(cd.args);
+                    var ops = col.DynBuf.[u32].init(alloc, cargs.len +% 3_usize) catch { ctx.oom = true; return; };
+                    ops.push(alloc, ctx.ty_spv_id(rt)) catch { ctx.oom = true; };
+                    ops.push(alloc, did) catch { ctx.oom = true; };
+                    ops.push(alloc, target_spv) catch { ctx.oom = true; };
+                    var ci: usize = 0_usize;
+                    while ci < cargs.len {
+                        ops.push(alloc, get_val_id(alloc, ctx, cargs[ci])) catch { ctx.oom = true; };
+                        ci = ci +% 1_usize;
+                    }
+                    ctx.fns.op_n(alloc, OP_FUNCTION_CALL, ops.as_slice());
+                    ops.destroy(alloc);
+                }
+            }
+        }
+        .BuiltinCall => {
+            if let bc = eir_prog.get_builtin_call(inst.aux0) {
+                emit_builtin_inst(alloc, ctx, eir_prog, fn_id, env, inst, bc, terminated);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rpo_pos_of(rpo: *[u32], bb: u32) -> usize {
+    var i: usize = 0_usize;
+    while i < rpo.len {
+        if rpo[i] == bb { return i; }
+        i = i +% 1_usize;
+    }
+    return 0_usize;
+}
+
+fn emit_entry_return_stores(
+    alloc: *mut AllocCap,
+    ctx: *mut SpvCtx,
+    env: *types.TypeEnv,
+    ret_ty: types.TyId,
+    ret_val: eir.EirValue,
+) {
+    let n_outs = ctx.stage_outs.len();
+    if n_outs == 0_usize || ret_val == eir.EIR_NONE {
+        return;
+    }
+    let rv_id = get_val_id(alloc, ctx, ret_val);
+    let rn = env.get(ret_ty);
+    if rn.kind == .Struct {
+        var i: usize = 0_usize;
+        while i < n_outs {
+            var of = OutFieldBinding.{ field_idx: 0_u32, var_id: 0_u32, tidx: 0_u32 };
+            if let op = ctx.stage_outs.get(i) {
+                of = op.*;
+            }
+            let of_tid = ctx.ty_spv_id(of.tidx);
+            let ext_id = ctx.fresh();
+            ctx.fns.op4(alloc, OP_COMPOSITE_EXTRACT, of_tid, ext_id, rv_id, of.field_idx);
+            ctx.fns.op2(alloc, OP_STORE, of.var_id, ext_id);
+            i = i +% 1_usize;
+        }
+    } else {
+        var ovar: u32 = 0_u32;
+        if let op = ctx.stage_outs.get(0_usize) {
+            ovar = op.var_id;
+        }
+        ctx.fns.op2(alloc, OP_STORE, ovar, rv_id);
+    }
+}
+
+fn emit_term(
+    alloc: *mut AllocCap,
+    ctx: *mut SpvCtx,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    env: *types.TypeEnv,
+    bb: u32,
+    term: *eir.EirTerm,
+    pdom: *gpu_check.PdomInfo,
+    is_entry: bool,
+    ret_ty: types.TyId,
+    terminated: bool,
+) {
+    if terminated {
+        return;
+    }
+    match term.kind {
+        .Goto => {
+            let lbl = bb_label_id(ctx, term.bb0);
+            ctx.fns.op1(alloc, OP_BRANCH, lbl);
+        }
+        .Branch => {
+            let cid = get_val_id(alloc, ctx, term.val);
+            let tl = bb_label_id(ctx, term.bb0);
+            let el = bb_label_id(ctx, term.bb1);
+            let rpo = eir_prog.fn_rpo(fn_id);
+            let my_pos = rpo_pos_of(rpo, bb);
+            let preds = eir_prog.block_preds(fn_id, bb);
+            var is_loop = false;
+            var latch = term.bb0;
+            var pi: usize = 0_usize;
+            while pi < preds.len {
+                if rpo_pos_of(rpo, preds[pi]) >= my_pos {
+                    is_loop = true;
+                    latch = preds[pi];
+                    break;
+                }
+                pi = pi +% 1_usize;
+            }
+            if is_loop {
+                let latch_lbl = bb_label_id(ctx, latch);
+                ctx.fns.op3(alloc, OP_LOOP_MERGE, el, latch_lbl, 0_u32);
+            } else {
+                var merge_lbl: u32 = 0_u32;
+                let ip = pdom.ipdom_of(bb);
+                if ip != eir.EIR_NONE {
+                    merge_lbl = bb_label_id(ctx, ip);
+                } else {
+                    var then_exits = false;
+                    var else_exits = false;
+                    if let tb = eir_prog.fn_block(fn_id, term.bb0) {
+                        then_exits = tb.term.kind == .Return || tb.term.kind == .Unreachable;
+                    }
+                    if let eb = eir_prog.fn_block(fn_id, term.bb1) {
+                        else_exits = eb.term.kind == .Return || eb.term.kind == .Unreachable;
+                    }
+                    if then_exits && !else_exits {
+                        merge_lbl = el;
+                    } else if else_exits && !then_exits {
+                        merge_lbl = tl;
+                    } else {
+                        if ctx.synth_merge_lbl == 0_u32 {
+                            ctx.synth_merge_lbl = ctx.fresh();
+                        }
+                        merge_lbl = ctx.synth_merge_lbl;
+                    }
+                }
+                ctx.fns.op2(alloc, OP_SELECTION_MERGE, merge_lbl, 0_u32);
+            }
+            ctx.fns.op3(alloc, OP_BRANCH_CONDITIONAL, cid, tl, el);
+        }
+        .SwitchInt => {
+            let ip = pdom.ipdom_of(bb);
+            let merge_lbl = if ip != eir.EIR_NONE {
+                bb_label_id(ctx, ip)
+            } else {
+                bb_label_id(ctx, term.bb0)
+            };
+            ctx.fns.op2(alloc, OP_SELECTION_MERGE, merge_lbl, 0_u32);
+            let ts = eir_prog.switch_targets_slice(term.targets);
+            var ops = col.DynBuf.[u32].init(alloc, ts.len *% 2_usize +% 2_usize) catch { ctx.oom = true; return; };
+            ops.push(alloc, get_val_id(alloc, ctx, term.val)) catch { ctx.oom = true; };
+            ops.push(alloc, bb_label_id(ctx, term.bb0)) catch { ctx.oom = true; };
+            var ti: usize = 0_usize;
+            while ti < ts.len {
+                ops.push(alloc, ts[ti].val.lo.trunc.[u32]()) catch { ctx.oom = true; };
+                ops.push(alloc, bb_label_id(ctx, ts[ti].target)) catch { ctx.oom = true; };
+                ti = ti +% 1_usize;
+            }
+            ctx.fns.op_n(alloc, OP_SWITCH, ops.as_slice());
+            ops.destroy(alloc);
+        }
+        .Return => {
+            if is_entry {
+                if term.flag {
+                    emit_entry_return_stores(alloc, ctx, env, ret_ty, term.val);
+                }
+                ctx.fns.op0(alloc, OP_RETURN);
+            } else if term.flag && ret_ty != types.TY_VOID && ret_ty != types.TY_NEVER {
+                let rv = get_val_id(alloc, ctx, term.val);
+                ctx.fns.op1(alloc, OP_RETURN_VALUE, rv);
+            } else {
+                ctx.fns.op0(alloc, OP_RETURN);
+            }
+        }
+        .Unreachable => {
+            ctx.fns.op0(alloc, OP_UNREACHABLE);
+        }
+    }
+}
+
+fn emit_phi_stores_on_edge(
+    alloc: *mut AllocCap,
+    ctx: *mut SpvCtx,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    from_bb: u32,
+    to_bb: u32,
+) {
+    let phis = eir_prog.block_phis(fn_id, to_bb);
+    var pi: usize = 0_usize;
+    while pi < phis.len {
+        let incs = eir_prog.phi_incoming(phis[pi].incoming);
+        var k: usize = 0_usize;
+        while k < incs.len {
+            if incs[k].pred_bb == from_bb {
+                let sv = get_val_id(alloc, ctx, incs[k].val);
+                let du = phis[pi].dst.widen.[usize]();
+                var dvar: u32 = 0_u32;
+                if let vp = ctx.val_vars.get(du) { dvar = vp.*; }
+                if dvar != 0_u32 {
+                    ctx.fns.op2(alloc, OP_STORE, dvar, sv);
+                }
+                break;
+            }
+            k = k +% 1_usize;
+        }
+        pi = pi +% 1_usize;
+    }
+}
+
+fn needs_cfg_state_machine(
+    alloc: *mut AllocCap,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    pdom: *gpu_check.PdomInfo,
+) -> bool ! OutOfMemory {
+    let rpo = eir_prog.fn_rpo(fn_id);
+    let blks = eir_prog.fn_blocks(fn_id);
+    if blks.len <= 1_usize {
+        return false;
+    }
+    var claimed = try col.BitSet.init(alloc, blks.len +% 1_usize);
+    errdefer claimed.destroy(alloc);
+    var need_sm = false;
+    var ri: usize = 0_usize;
+    while ri < rpo.len && !need_sm {
+        let bb = rpo[ri];
+        if let blk = eir_prog.fn_block(fn_id, bb) {
+            if blk.term.kind == .Branch || blk.term.kind == .SwitchInt {
+                let preds = eir_prog.block_preds(fn_id, bb);
+                var is_loop = false;
+                var pi: usize = 0_usize;
+                while pi < preds.len {
+                    if rpo_pos_of(rpo, preds[pi]) >= ri {
+                        is_loop = true;
+                        break;
+                    }
+                    pi = pi +% 1_usize;
+                }
+                if is_loop {
+                    need_sm = true;
+                } else {
+                    let ip = pdom.ipdom_of(bb);
+                    if ip != eir.EIR_NONE {
+                        if claimed.test(ip.widen.[usize]()) {
+                            need_sm = true;
+                        } else {
+                            claimed.set(ip.widen.[usize]());
+                        }
+                    }
+                }
+            }
+        }
+        ri = ri +% 1_usize;
+    }
+    // Also check if any non-merge block has >= 2 predecessors (e.g. short-circuit shared target).
+    var ri2: usize = 1_usize;
+    while ri2 < rpo.len && !need_sm {
+        let bb = rpo[ri2];
+        let preds = eir_prog.block_preds(fn_id, bb);
+        if preds.len >= 2_usize && !claimed.test(bb.widen.[usize]()) {
+            need_sm = true;
+        }
+        ri2 = ri2 +% 1_usize;
+    }
+    claimed.destroy(alloc);
+    return need_sm;
+}
+
+fn reset_fn_tables(alloc: *mut AllocCap, ctx: *mut SpvCtx, nvals: usize, nblks: usize, nslots: usize) {
+    ctx.val_ids.clear();
+    ctx.val_vars.clear();
+    ctx.val_tidxs.clear();
+    ctx.use_val_vars = false;
+    var vi: usize = 0_usize;
+    while vi < nvals {
+        ctx.val_ids.push(alloc, 0_u32) catch { ctx.oom = true; };
+        ctx.val_vars.push(alloc, 0_u32) catch { ctx.oom = true; };
+        ctx.val_tidxs.push(alloc, 0_u32) catch { ctx.oom = true; };
+        vi = vi +% 1_usize;
+    }
+    ctx.bb_labels.clear();
+    var bi: usize = 0_usize;
+    while bi < nblks {
+        let lbl = ctx.fresh();
+        ctx.bb_labels.push(alloc, lbl) catch { ctx.oom = true; };
+        bi = bi +% 1_usize;
+    }
+    ctx.slot_bind.clear();
+    var si: usize = 0_usize;
+    while si < nslots {
+        ctx.slot_bind.push(alloc, SlotBinding.{ kind: 0_u8, var_id: 0_u32, tidx: 0_u32 }) catch { ctx.oom = true; };
+        si = si +% 1_usize;
+    }
+    ctx.synth_merge_lbl = 0_u32;
+}
+
+fn emit_slot_and_param_preamble(
+    alloc: *mut AllocCap,
+    ctx: *mut SpvCtx,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    env: *types.TypeEnv,
+    is_entry: bool,
+    helper_param_ids: *[u32],
+    alloc_val_vars: bool,
+) {
+    let slots = eir_prog.fn_slots(fn_id);
+    var si: usize = 0_usize;
+    while si < slots.len {
+        var cur_sk: u8 = 255_u8;
+        if let sbp = ctx.slot_bind.get(si) { cur_sk = sbp.kind; }
+        if cur_sk == 0_u8 {
+            let st = slots[si].ty;
+            let sn = env.get(st);
+            let is_res = sn.kind == .Builtin && (sn.builtin_kind == .GpuBuf || sn.builtin_kind == .GpuImage2D);
+            if !is_res && st != types.TY_VOID && st != types.TY_NEVER {
+                let stidx = intern_eon_ty(alloc, ctx, env, st, false);
+                if slots[si].is_gpu_shared {
+                    let wptr = intern_ptr(alloc, ctx, SC_WORKGROUP, stidx);
+                    let wptr_id = ctx.ty_spv_id(wptr);
+                    let wvar = ctx.fresh();
+                    ctx.globals.op3(alloc, OP_VARIABLE, wptr_id, wvar, SC_WORKGROUP);
+                    let sbm = ctx.slot_bind.as_mut_slice();
+                    if si < sbm.len { sbm[si] = SlotBinding.{ kind: 5_u8, var_id: wvar, tidx: stidx }; }
+                } else {
+                    let fptr = intern_ptr(alloc, ctx, SC_FUNCTION, stidx);
+                    let fptr_id = ctx.ty_spv_id(fptr);
+                    let fvar = ctx.fresh();
+                    ctx.fns.op3(alloc, OP_VARIABLE, fptr_id, fvar, SC_FUNCTION);
+                    let sbm = ctx.slot_bind.as_mut_slice();
+                    if si < sbm.len { sbm[si] = SlotBinding.{ kind: 4_u8, var_id: fvar, tidx: stidx }; }
+                }
+            }
+        }
+        si = si +% 1_usize;
+    }
+
+    if alloc_val_vars {
+        let vtys = eir_prog.fn_value_tys(fn_id);
+        var vi: usize = 0_usize;
+        while vi < vtys.len {
+            let vt = vtys[vi];
+            let vn = env.get(vt);
+            let is_res = vn.kind == .Builtin && (vn.builtin_kind == .GpuBuf || vn.builtin_kind == .GpuImage2D);
+            if !is_res && vt != types.TY_VOID && vt != types.TY_NEVER {
+                let vtidx = intern_eon_ty(alloc, ctx, env, vt, false);
+                let vptr = intern_ptr(alloc, ctx, SC_FUNCTION, vtidx);
+                let vptr_id = ctx.ty_spv_id(vptr);
+                let vvar = ctx.fresh();
+                ctx.fns.op3(alloc, OP_VARIABLE, vptr_id, vvar, SC_FUNCTION);
+                let vvm = ctx.val_vars.as_mut_slice();
+                if vi < vvm.len { vvm[vi] = vvar; }
+                let vtm = ctx.val_tidxs.as_mut_slice();
+                if vi < vtm.len { vtm[vi] = vtidx; }
+            }
+            vi = vi +% 1_usize;
+        }
+    }
+
+    let pvals = eir_prog.fn_params(fn_id);
+    if is_entry {
+        var pi: usize = 0_usize;
+        while pi < pvals.len {
+            var rb = ResBinding.{ kind: 0_u8, var_id: 0_u32, elem_tidx: 0_u32, aux: 0_u32 };
+            if let rbp = ctx.param_res.get(pi) { rb = rbp.*; }
+            if rb.kind == 5_u8 {
+                let et_id = ctx.ty_spv_id(rb.elem_tidx);
+                let pid = def_val_id(ctx, pvals[pi]);
+                ctx.fns.op3(alloc, OP_LOAD, et_id, pid, rb.var_id);
+                commit_val_def(alloc, ctx, pvals[pi]);
+            } else if rb.kind == 4_u8 {
+                let mptr_t = intern_ptr(alloc, ctx, SC_PUSH_CONSTANT, rb.elem_tidx);
+                let mptr_tid = ctx.ty_spv_id(mptr_t);
+                let mptr_id = ctx.fresh();
+                let idx_c = spv_const_u32(alloc, ctx, rb.aux);
+                let pcv = ctx.pc_var_id;
+                ctx.fns.op4(alloc, OP_ACCESS_CHAIN, mptr_tid, mptr_id, pcv, idx_c);
+                let et_id = ctx.ty_spv_id(rb.elem_tidx);
+                let pid = def_val_id(ctx, pvals[pi]);
+                ctx.fns.op3(alloc, OP_LOAD, et_id, pid, mptr_id);
+                commit_val_def(alloc, ctx, pvals[pi]);
+            }
+            pi = pi +% 1_usize;
+        }
+    } else if alloc_val_vars {
+        var pi: usize = 0_usize;
+        while pi < pvals.len && pi < helper_param_ids.len {
+            let pu = pvals[pi].widen.[usize]();
+            var dvar: u32 = 0_u32;
+            if let vp = ctx.val_vars.get(pu) { dvar = vp.*; }
+            if dvar != 0_u32 {
+                ctx.fns.op2(alloc, OP_STORE, dvar, helper_param_ids[pi]);
+            }
+            pi = pi +% 1_usize;
+        }
+    }
+}
+
+fn emit_fn_body_state_machine(
+    alloc: *mut AllocCap,
+    ctx: *mut SpvCtx,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    env: *types.TypeEnv,
+    is_entry: bool,
+    ret_ty: types.TyId,
+    helper_param_ids: *[u32],
+) {
+    let rpo = eir_prog.fn_rpo(fn_id);
+    if rpo.len == 0_usize {
+        ctx.fns.op0(alloc, OP_FUNCTION_END);
+        return;
+    }
+    ctx.use_val_vars = true;
+
+    let u32_t = intern_int(alloc, ctx, 32_u32, false);
+    let u32_spv = ctx.ty_spv_id(u32_t);
+    let bb_ptr_t = intern_ptr(alloc, ctx, SC_FUNCTION, u32_t);
+    let bb_ptr_spv = ctx.ty_spv_id(bb_ptr_t);
+
+    let entry_lbl = ctx.fresh();
+    let loop_hdr = ctx.fresh();
+    let loop_body = ctx.fresh();
+    let sw_default = ctx.fresh();
+    let sw_merge = ctx.fresh();
+    let loop_cont = ctx.fresh();
+    let loop_exit = ctx.fresh();
+
+    // Entry block: all Function OpVariables MUST precede any other instructions.
+    ctx.fns.op1(alloc, OP_LABEL, entry_lbl);
+    let bb_var = ctx.fresh();
+    ctx.fns.op3(alloc, OP_VARIABLE, bb_ptr_spv, bb_var, SC_FUNCTION);
+    emit_slot_and_param_preamble(alloc, ctx, eir_prog, fn_id, env, is_entry, helper_param_ids, true);
+    let rpo0_c = spv_const_u32(alloc, ctx, rpo[0_usize]);
+    ctx.fns.op2(alloc, OP_STORE, bb_var, rpo0_c);
+    ctx.fns.op1(alloc, OP_BRANCH, loop_hdr);
+
+    // Structured loop header -> switch dispatcher over basic blocks.
+    ctx.fns.op1(alloc, OP_LABEL, loop_hdr);
+    ctx.fns.op3(alloc, OP_LOOP_MERGE, loop_exit, loop_cont, 0_u32);
+    ctx.fns.op1(alloc, OP_BRANCH, loop_body);
+
+    ctx.fns.op1(alloc, OP_LABEL, loop_body);
+    let cur_bb_val = ctx.fresh();
+    ctx.fns.op3(alloc, OP_LOAD, u32_spv, cur_bb_val, bb_var);
+    ctx.fns.op2(alloc, OP_SELECTION_MERGE, sw_merge, 0_u32);
+    var sw_ops = col.DynBuf.[u32].init(alloc, rpo.len *% 2_usize +% 2_usize) catch { ctx.oom = true; return; };
+    sw_ops.push(alloc, cur_bb_val) catch { ctx.oom = true; };
+    sw_ops.push(alloc, sw_default) catch { ctx.oom = true; };
+    var si0: usize = 0_usize;
+    while si0 < rpo.len {
+        sw_ops.push(alloc, rpo[si0]) catch { ctx.oom = true; };
+        sw_ops.push(alloc, bb_label_id(ctx, rpo[si0])) catch { ctx.oom = true; };
+        si0 = si0 +% 1_usize;
+    }
+    ctx.fns.op_n(alloc, OP_SWITCH, sw_ops.as_slice());
+    sw_ops.destroy(alloc);
+
+    // Emit each block case cleanly inside the structured switch.
+    var ri: usize = 0_usize;
+    while ri < rpo.len {
+        let bb = rpo[ri];
+        let b_lbl = bb_label_id(ctx, bb);
+        ctx.fns.op1(alloc, OP_LABEL, b_lbl);
+        if let blk = eir_prog.fn_block(fn_id, bb) {
+            let insts = eir_prog.insts_slice(blk.insts);
+            var terminated = false;
+            var ii: usize = 0_usize;
+            while ii < insts.len {
+                emit_inst(alloc, ctx, eir_prog, fn_id, env, &insts[ii], &mut terminated);
+                commit_val_def(alloc, ctx, insts[ii].dst);
+                ii = ii +% 1_usize;
+            }
+            if !terminated {
+                let term = blk.term;
+                if term.kind == .Goto {
+                    emit_phi_stores_on_edge(alloc, ctx, eir_prog, fn_id, bb, term.bb0);
+                    let tc = spv_const_u32(alloc, ctx, term.bb0);
+                    ctx.fns.op2(alloc, OP_STORE, bb_var, tc);
+                    ctx.fns.op1(alloc, OP_BRANCH, sw_merge);
+                } else if term.kind == .Branch {
+                    let cid = get_val_id(alloc, ctx, term.val);
+                    let br_t = ctx.fresh();
+                    let br_f = ctx.fresh();
+                    let br_m = ctx.fresh();
+                    ctx.fns.op2(alloc, OP_SELECTION_MERGE, br_m, 0_u32);
+                    ctx.fns.op3(alloc, OP_BRANCH_CONDITIONAL, cid, br_t, br_f);
+                    ctx.fns.op1(alloc, OP_LABEL, br_t);
+                    emit_phi_stores_on_edge(alloc, ctx, eir_prog, fn_id, bb, term.bb0);
+                    let c0 = spv_const_u32(alloc, ctx, term.bb0);
+                    ctx.fns.op2(alloc, OP_STORE, bb_var, c0);
+                    ctx.fns.op1(alloc, OP_BRANCH, br_m);
+                    ctx.fns.op1(alloc, OP_LABEL, br_f);
+                    emit_phi_stores_on_edge(alloc, ctx, eir_prog, fn_id, bb, term.bb1);
+                    let c1 = spv_const_u32(alloc, ctx, term.bb1);
+                    ctx.fns.op2(alloc, OP_STORE, bb_var, c1);
+                    ctx.fns.op1(alloc, OP_BRANCH, br_m);
+                    ctx.fns.op1(alloc, OP_LABEL, br_m);
+                    ctx.fns.op1(alloc, OP_BRANCH, sw_merge);
+                } else if term.kind == .SwitchInt {
+                    let dv = get_val_id(alloc, ctx, term.val);
+                    let ts = eir_prog.switch_targets_slice(term.targets);
+                    let in_m = ctx.fresh();
+                    let in_def = ctx.fresh();
+                    var arm_lbls = col.DynBuf.[u32].init(alloc, ts.len +% 1_usize) catch { ctx.oom = true; return; };
+                    var in_ops = col.DynBuf.[u32].init(alloc, ts.len *% 2_usize +% 2_usize) catch {
+                        arm_lbls.destroy(alloc);
+                        ctx.oom = true;
+                        return;
+                    };
+                    in_ops.push(alloc, dv) catch { ctx.oom = true; };
+                    in_ops.push(alloc, in_def) catch { ctx.oom = true; };
+                    var ti: usize = 0_usize;
+                    while ti < ts.len {
+                        let al = ctx.fresh();
+                        arm_lbls.push(alloc, al) catch { ctx.oom = true; };
+                        in_ops.push(alloc, ts[ti].val.lo.trunc.[u32]()) catch { ctx.oom = true; };
+                        in_ops.push(alloc, al) catch { ctx.oom = true; };
+                        ti = ti +% 1_usize;
+                    }
+                    ctx.fns.op2(alloc, OP_SELECTION_MERGE, in_m, 0_u32);
+                    ctx.fns.op_n(alloc, OP_SWITCH, in_ops.as_slice());
+                    in_ops.destroy(alloc);
+                    let als = arm_lbls.as_slice();
+                    var ti2: usize = 0_usize;
+                    while ti2 < ts.len && ti2 < als.len {
+                        ctx.fns.op1(alloc, OP_LABEL, als[ti2]);
+                        emit_phi_stores_on_edge(alloc, ctx, eir_prog, fn_id, bb, ts[ti2].target);
+                        let ct = spv_const_u32(alloc, ctx, ts[ti2].target);
+                        ctx.fns.op2(alloc, OP_STORE, bb_var, ct);
+                        ctx.fns.op1(alloc, OP_BRANCH, in_m);
+                        ti2 = ti2 +% 1_usize;
+                    }
+                    arm_lbls.destroy(alloc);
+                    ctx.fns.op1(alloc, OP_LABEL, in_def);
+                    emit_phi_stores_on_edge(alloc, ctx, eir_prog, fn_id, bb, term.bb0);
+                    let cd = spv_const_u32(alloc, ctx, term.bb0);
+                    ctx.fns.op2(alloc, OP_STORE, bb_var, cd);
+                    ctx.fns.op1(alloc, OP_BRANCH, in_m);
+                    ctx.fns.op1(alloc, OP_LABEL, in_m);
+                    ctx.fns.op1(alloc, OP_BRANCH, sw_merge);
+                } else if term.kind == .Return {
+                    if is_entry {
+                        if term.flag {
+                            emit_entry_return_stores(alloc, ctx, env, ret_ty, term.val);
+                        }
+                        ctx.fns.op0(alloc, OP_RETURN);
+                    } else if term.flag && ret_ty != types.TY_VOID && ret_ty != types.TY_NEVER {
+                        let rv = get_val_id(alloc, ctx, term.val);
+                        ctx.fns.op1(alloc, OP_RETURN_VALUE, rv);
+                    } else {
+                        ctx.fns.op0(alloc, OP_RETURN);
+                    }
+                } else {
+                    ctx.fns.op0(alloc, OP_UNREACHABLE);
+                }
+            }
+        }
+        ri = ri +% 1_usize;
+    }
+
+    ctx.fns.op1(alloc, OP_LABEL, sw_default);
+    ctx.fns.op1(alloc, OP_BRANCH, loop_exit);
+    ctx.fns.op1(alloc, OP_LABEL, sw_merge);
+    ctx.fns.op1(alloc, OP_BRANCH, loop_cont);
+    ctx.fns.op1(alloc, OP_LABEL, loop_cont);
+    ctx.fns.op1(alloc, OP_BRANCH, loop_hdr);
+    ctx.fns.op1(alloc, OP_LABEL, loop_exit);
+    ctx.fns.op0(alloc, OP_UNREACHABLE);
+    ctx.fns.op0(alloc, OP_FUNCTION_END);
+    ctx.use_val_vars = false;
+}
+
+fn emit_fn_body_blocks(
+    alloc: *mut AllocCap,
+    ctx: *mut SpvCtx,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    env: *types.TypeEnv,
+    is_entry: bool,
+    ret_ty: types.TyId,
+    helper_param_ids: *[u32],
+) -> !OutOfMemory {
+    let pdom = try gpu_check.compute_pdom(alloc, eir_prog, fn_id);
+    errdefer pdom.destroy(alloc);
+    if try needs_cfg_state_machine(alloc, eir_prog, fn_id, &pdom) {
+        emit_fn_body_state_machine(alloc, ctx, eir_prog, fn_id, env, is_entry, ret_ty, helper_param_ids);
+        pdom.destroy(alloc);
+        return;
+    }
+
+    let rpo = eir_prog.fn_rpo(fn_id);
+    var ri: usize = 0_usize;
+    while ri < rpo.len {
+        let bb = rpo[ri];
+        let b_lbl = bb_label_id(ctx, bb);
+        ctx.fns.op1(alloc, OP_LABEL, b_lbl);
+
+        if ri == 0_usize {
+            emit_slot_and_param_preamble(alloc, ctx, eir_prog, fn_id, env, is_entry, helper_param_ids, false);
+        }
+
+        if let blk = eir_prog.fn_block(fn_id, bb) {
+            // Emit OpPhi instructions immediately after OpLabel (never in entry block).
+            let phis = eir_prog.phis_slice(blk.phis);
+            var phi_i: usize = 0_usize;
+            while phi_i < phis.len {
+                let phi = phis[phi_i];
+                let pt = intern_eon_ty(alloc, ctx, env, phi.ty, false);
+                let dst_id = def_val_id(ctx, phi.dst);
+                let incs = eir_prog.phi_incoming(phi.incoming);
+                var pops = col.DynBuf.[u32].init(alloc, incs.len *% 2_usize +% 2_usize) catch { ctx.oom = true; break; };
+                pops.push(alloc, ctx.ty_spv_id(pt)) catch { ctx.oom = true; };
+                pops.push(alloc, dst_id) catch { ctx.oom = true; };
+                var k: usize = 0_usize;
+                while k < incs.len {
+                    pops.push(alloc, get_val_id(alloc, ctx, incs[k].val)) catch { ctx.oom = true; };
+                    pops.push(alloc, bb_label_id(ctx, incs[k].pred_bb)) catch { ctx.oom = true; };
+                    k = k +% 1_usize;
+                }
+                ctx.fns.op_n(alloc, OP_PHI, pops.as_slice());
+                pops.destroy(alloc);
+                phi_i = phi_i +% 1_usize;
+            }
+
+            let insts = eir_prog.insts_slice(blk.insts);
+            var terminated = false;
+            var ii: usize = 0_usize;
+            while ii < insts.len {
+                emit_inst(alloc, ctx, eir_prog, fn_id, env, &insts[ii], &mut terminated);
+                ii = ii +% 1_usize;
+            }
+            emit_term(alloc, ctx, eir_prog, fn_id, env, bb, &blk.term, &pdom, is_entry, ret_ty, terminated);
+        }
+        ri = ri +% 1_usize;
+    }
+
+    if ctx.synth_merge_lbl != 0_u32 {
+        ctx.fns.op1(alloc, OP_LABEL, ctx.synth_merge_lbl);
+        ctx.fns.op0(alloc, OP_UNREACHABLE);
+    }
+
+    ctx.fns.op0(alloc, OP_FUNCTION_END);
+    pdom.destroy(alloc);
+    return;
+}
+
+fn emit_helper_fn(
+    alloc: *mut AllocCap,
+    ctx: *mut SpvCtx,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    env: *types.TypeEnv,
+) -> !OutOfMemory {
+    let f = eir_prog.get_fn(fn_id) orelse { return; };
+    let ret_tidx = intern_eon_ty(alloc, ctx, env, f.sig.ret, false);
+    let ps = env.params_range(f.sig.params);
+    var ptidxs = try col.DynBuf.[u32].init(alloc, ps.len +% 1_usize);
+    errdefer ptidxs.destroy(alloc);
+    var pi: usize = 0_usize;
+    while pi < ps.len {
+        try ptidxs.push(alloc, intern_eon_ty(alloc, ctx, env, ps[pi].ty, false));
+        pi = pi +% 1_usize;
+    }
+    let fn_tidx = intern_fn_ty(alloc, ctx, ret_tidx, ptidxs.as_slice());
+    let spv_fn_id = ctx.fresh();
+    try ctx.helpers.push(alloc, HelperFnEntry.{ eir_fn_id: fn_id, spv_fn_id: spv_fn_id, ret_tidx: ret_tidx });
+
+    ctx.param_res.clear();
+    reset_fn_tables(alloc, ctx, eir_prog.fn_value_tys(fn_id).len, eir_prog.fn_blocks(fn_id).len, eir_prog.fn_slots(fn_id).len);
+
+    let ret_spv = ctx.ty_spv_id(ret_tidx);
+    let fn_spv = ctx.ty_spv_id(fn_tidx);
+    ctx.fns.op4(alloc, OP_FUNCTION, ret_spv, spv_fn_id, 0_u32, fn_spv);
+    let pvals = eir_prog.fn_params(fn_id);
+    let pts = ptidxs.as_slice();
+    var h_pids = try col.DynBuf.[u32].init(alloc, pvals.len +% 1_usize);
+    errdefer h_pids.destroy(alloc);
+    var pvi: usize = 0_usize;
+    while pvi < pvals.len && pvi < pts.len {
+        let pt_spv = ctx.ty_spv_id(pts[pvi]);
+        let pid = def_val_id(ctx, pvals[pvi]);
+        ctx.fns.op2(alloc, OP_FUNCTION_PARAMETER, pt_spv, pid);
+        try h_pids.push(alloc, pid);
+        pvi = pvi +% 1_usize;
+    }
+    try emit_fn_body_blocks(alloc, ctx, eir_prog, fn_id, env, false, f.sig.ret, h_pids.as_slice());
+    h_pids.destroy(alloc);
+    ptidxs.destroy(alloc);
+    return;
+}
+
+pub fn emit_spirv(
+    alloc: *mut AllocCap,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+) -> SpirvOut ! OutOfMemory {
+    var out_bytes = try col.DynBuf.[u8].init(alloc, 256_usize);
+    errdefer out_bytes.destroy(alloc);
+    var err_msg = try str.StrBuf.init(alloc, 32_usize);
+    errdefer err_msg.destroy(alloc);
+
+    let f = eir_prog.get_fn(fn_id) orelse {
+        try err_msg.push_str_grow(alloc, "invalid GPU function id");
+        return SpirvOut.{ ok: false, bytes: out_bytes, err_msg: err_msg };
+    };
+    let stage = f.sig.effects.gpu_stage;
+    let entry_name = interner.get(f.name);
+
+    var ctx = try SpvCtx.init(alloc);
+    errdefer ctx.destroy(alloc);
+
+    // 1. Emit transitive pure helper functions first (callees before callers).
+    if !ctx.any_oom() {
+        var callees = try col.DynBuf.[u32].init(alloc, 8_usize);
+        errdefer callees.destroy(alloc);
+        try gpu_check.collect_gpu_callees(alloc, eir_prog, fn_id, &mut callees);
+        let cs = callees.as_slice();
+        var ci: usize = 0_usize;
+        while ci < cs.len {
+            try emit_helper_fn(alloc, &mut ctx, eir_prog, cs[ci], env);
+            ci = ci +% 1_usize;
+        }
+        callees.destroy(alloc);
+    }
+
+    // 2. Entry point signature & resource/interface global variables.
+    let void_t = intern_void(alloc, &mut ctx);
+    let empty_ps: [1]u32 = [0_u32];
+    let ep_fn_tidx = intern_fn_ty(alloc, &mut ctx, void_t, empty_ps[0_usize..0_usize]);
+    let ep_fn_id = ctx.fresh();
+
+    if !ctx.any_oom() {
+        var name_ops = try col.DynBuf.[u32].init(alloc, 8_usize);
+        errdefer name_ops.destroy(alloc);
+        try name_ops.push(alloc, ep_fn_id);
+        _ = push_str_as_spv_words(alloc, &mut name_ops, entry_name);
+        ctx.names.op_n(alloc, OP_NAME, name_ops.as_slice());
+        name_ops.destroy(alloc);
+    }
+
+    let ps = env.params_range(f.sig.params);
+    ctx.param_res.clear();
+    if !ctx.any_oom() {
+        var pc_member_tidxs = try col.DynBuf.[u32].init(alloc, 4_usize);
+        errdefer pc_member_tidxs.destroy(alloc);
+        var pc_member_offs = try col.DynBuf.[u32].init(alloc, 4_usize);
+        errdefer pc_member_offs.destroy(alloc);
+        var pc_off: u32 = 0_u32;
+
+        var pi: usize = 0_usize;
+        while pi < ps.len {
+            let p = ps[pi];
+            let pn = env.get(p.ty);
+            if pn.kind == .Builtin && pn.builtin_kind == .GpuBuf {
+                let gs = env.node_gval_list(&pn);
+                let elem_ty = if gs.len > 0_usize && gs[0_usize].kind == .Ty { gs[0_usize].id } else { types.TY_U32 };
+                let elem_tidx = intern_eon_ty(alloc, &mut ctx, env, elem_ty, true);
+                let wrap_tidx = intern_ssbo_wrap(alloc, &mut ctx, env, elem_tidx);
+                let ptr_tidx = intern_ptr(alloc, &mut ctx, SC_STORAGE_BUFFER, wrap_tidx);
+                let ptr_spv = ctx.ty_spv_id(ptr_tidx);
+                let var_id = ctx.fresh();
+                let dset = if p.has_gpu_binding { p.gpu_set } else { 0_u32 };
+                let bind = if p.has_gpu_binding { p.gpu_binding } else { pi.trunc.[u32]() };
+                ctx.decs.op3(alloc, OP_DECORATE, var_id, DEC_DESCRIPTOR_SET, dset);
+                ctx.decs.op3(alloc, OP_DECORATE, var_id, DEC_BINDING, bind);
+                if p.access == .Read {
+                    ctx.decs.op2(alloc, OP_DECORATE, var_id, DEC_NON_WRITABLE);
+                }
+                ctx.globals.op3(alloc, OP_VARIABLE, ptr_spv, var_id, SC_STORAGE_BUFFER);
+                try ctx.param_res.push(alloc, ResBinding.{ kind: 1_u8, var_id: var_id, elem_tidx: elem_tidx, aux: 0_u32 });
+            } else if pn.kind == .Builtin && pn.builtin_kind == .GpuImage2D {
+                let gs = env.node_gval_list(&pn);
+                let elem_ty = if gs.len > 0_usize && gs[0_usize].kind == .Ty { gs[0_usize].id } else { types.TY_F32 };
+                let dset = if p.has_gpu_binding { p.gpu_set } else { 0_u32 };
+                let bind = if p.has_gpu_binding { p.gpu_binding } else { pi.trunc.[u32]() };
+                if p.access == .Write {
+                    let mode: u32 = if is_float_or_float_vec(env, elem_ty) { 1_u32 } else { 2_u32 };
+                    let img_t = intern_image2d(alloc, &mut ctx, mode);
+                    let ptr_t = intern_ptr(alloc, &mut ctx, SC_UNIFORM_CONSTANT, img_t);
+                    let ptr_spv = ctx.ty_spv_id(ptr_t);
+                    let var_id = ctx.fresh();
+                    ctx.decs.op3(alloc, OP_DECORATE, var_id, DEC_DESCRIPTOR_SET, dset);
+                    ctx.decs.op3(alloc, OP_DECORATE, var_id, DEC_BINDING, bind);
+                    ctx.globals.op3(alloc, OP_VARIABLE, ptr_spv, var_id, SC_UNIFORM_CONSTANT);
+                    try ctx.param_res.push(alloc, ResBinding.{ kind: 3_u8, var_id: var_id, elem_tidx: mode, aux: 0_u32 });
+                } else {
+                    let img_t = intern_image2d(alloc, &mut ctx, 0_u32);
+                    let si_t = intern_sampled_image(alloc, &mut ctx, img_t);
+                    let ptr_t = intern_ptr(alloc, &mut ctx, SC_UNIFORM_CONSTANT, si_t);
+                    let ptr_spv = ctx.ty_spv_id(ptr_t);
+                    let var_id = ctx.fresh();
+                    ctx.decs.op3(alloc, OP_DECORATE, var_id, DEC_DESCRIPTOR_SET, dset);
+                    ctx.decs.op3(alloc, OP_DECORATE, var_id, DEC_BINDING, bind);
+                    ctx.globals.op3(alloc, OP_VARIABLE, ptr_spv, var_id, SC_UNIFORM_CONSTANT);
+                    try ctx.param_res.push(alloc, ResBinding.{ kind: 2_u8, var_id: var_id, elem_tidx: 0_u32, aux: 0_u32 });
+                }
+            } else if p.is_push_const {
+                let mtidx = intern_eon_ty(alloc, &mut ctx, env, p.ty, true);
+                let ma = std430_align(&ctx, env, mtidx);
+                pc_off = align_up_u32(pc_off, ma);
+                let midx = pc_member_tidxs.len().trunc.[u32]();
+                try pc_member_tidxs.push(alloc, mtidx);
+                try pc_member_offs.push(alloc, pc_off);
+                pc_off = pc_off +% std430_stride(&ctx, env, mtidx);
+                try ctx.param_res.push(alloc, ResBinding.{ kind: 4_u8, var_id: 0_u32, elem_tidx: mtidx, aux: midx });
+            } else if p.has_gpu_location {
+                let itidx = intern_eon_ty(alloc, &mut ctx, env, p.ty, false);
+                let ptr_t = intern_ptr(alloc, &mut ctx, SC_INPUT, itidx);
+                let ptr_spv = ctx.ty_spv_id(ptr_t);
+                let var_id = ctx.fresh();
+                ctx.decs.op3(alloc, OP_DECORATE, var_id, DEC_LOCATION, p.gpu_location);
+                if stage == .Fragment && is_int_or_int_vec(env, p.ty) {
+                    ctx.decs.op2(alloc, OP_DECORATE, var_id, DEC_FLAT);
+                }
+                ctx.globals.op3(alloc, OP_VARIABLE, ptr_spv, var_id, SC_INPUT);
+                try ctx.iface_vars.push(alloc, var_id);
+                try ctx.param_res.push(alloc, ResBinding.{ kind: 5_u8, var_id: var_id, elem_tidx: itidx, aux: p.gpu_location });
+            } else {
+                try ctx.param_res.push(alloc, ResBinding.{ kind: 0_u8, var_id: 0_u32, elem_tidx: 0_u32, aux: 0_u32 });
+            }
+            pi = pi +% 1_usize;
+        }
+
+        if pc_member_tidxs.len() > 0_usize {
+            let pc_struct_id = ctx.fresh();
+            ctx.decs.op2(alloc, OP_DECORATE, pc_struct_id, DEC_BLOCK);
+            let pms = pc_member_tidxs.as_slice();
+            let pos = pc_member_offs.as_slice();
+            var ops = try col.DynBuf.[u32].init(alloc, pms.len +% 1_usize);
+            errdefer ops.destroy(alloc);
+            try ops.push(alloc, pc_struct_id);
+            var mi: usize = 0_usize;
+            while mi < pms.len && mi < pos.len {
+                ctx.decs.op4(alloc, OP_MEMBER_DECORATE, pc_struct_id, mi.trunc.[u32](), DEC_OFFSET, pos[mi]);
+                try ops.push(alloc, ctx.ty_spv_id(pms[mi]));
+                mi = mi +% 1_usize;
+            }
+            ctx.types_consts.op_n(alloc, OP_TYPE_STRUCT, ops.as_slice());
+            ops.destroy(alloc);
+            let pc_tidx = push_ty_entry(alloc, &mut ctx, SpvTyEntry.{ kind: .PushWrap, a: fn_id, b: 0_u32, c: 0_u32, spv_id: pc_struct_id });
+            let pc_ptr_t = intern_ptr(alloc, &mut ctx, SC_PUSH_CONSTANT, pc_tidx);
+            let pc_ptr_spv = ctx.ty_spv_id(pc_ptr_t);
+            let pc_var = ctx.fresh();
+            ctx.globals.op3(alloc, OP_VARIABLE, pc_ptr_spv, pc_var, SC_PUSH_CONSTANT);
+            ctx.pc_var_id = pc_var;
+        }
+        pc_member_offs.destroy(alloc);
+        pc_member_tidxs.destroy(alloc);
+    }
+
+    // 3. Emit stage Output variables (Vertex @position + @location(N), or Fragment color output(s)).
+    ctx.stage_outs.clear();
+    if f.sig.ret != types.TY_VOID && f.sig.ret != types.TY_NEVER {
+        let rn = env.get(f.sig.ret);
+        if rn.kind == .Struct {
+            if let sm = env.get_struct(rn.primary) {
+                let fs = env.struct_fields_range(sm.fields);
+                var fi: usize = 0_usize;
+                while fi < fs.len {
+                    let fld = fs[fi];
+                    let ftidx = intern_eon_ty(alloc, &mut ctx, env, fld.ty, false);
+                    if fld.is_gpu_position {
+                        let pv = ensure_position_out(alloc, &mut ctx);
+                        try ctx.stage_outs.push(alloc, OutFieldBinding.{ field_idx: fi.trunc.[u32](), var_id: pv, tidx: ftidx });
+                    } else if fld.has_gpu_location {
+                        let ptr_t = intern_ptr(alloc, &mut ctx, SC_OUTPUT, ftidx);
+                        let ptr_spv = ctx.ty_spv_id(ptr_t);
+                        let ov = ctx.fresh();
+                        ctx.decs.op3(alloc, OP_DECORATE, ov, DEC_LOCATION, fld.gpu_location);
+                        if is_int_or_int_vec(env, fld.ty) {
+                            ctx.decs.op2(alloc, OP_DECORATE, ov, DEC_FLAT);
+                        }
+                        ctx.globals.op3(alloc, OP_VARIABLE, ptr_spv, ov, SC_OUTPUT);
+                        try ctx.iface_vars.push(alloc, ov);
+                        try ctx.stage_outs.push(alloc, OutFieldBinding.{ field_idx: fi.trunc.[u32](), var_id: ov, tidx: ftidx });
+                    }
+                    fi = fi +% 1_usize;
+                }
+            }
+        } else if stage == .Vertex {
+            let ftidx = intern_eon_ty(alloc, &mut ctx, env, f.sig.ret, false);
+            let pv = ensure_position_out(alloc, &mut ctx);
+            try ctx.stage_outs.push(alloc, OutFieldBinding.{ field_idx: 0_u32, var_id: pv, tidx: ftidx });
+        } else if stage == .Fragment {
+            let ftidx = intern_eon_ty(alloc, &mut ctx, env, f.sig.ret, false);
+            let ptr_t = intern_ptr(alloc, &mut ctx, SC_OUTPUT, ftidx);
+            let ptr_spv = ctx.ty_spv_id(ptr_t);
+            let ov = ctx.fresh();
+            ctx.decs.op3(alloc, OP_DECORATE, ov, DEC_LOCATION, 0_u32);
+            ctx.globals.op3(alloc, OP_VARIABLE, ptr_spv, ov, SC_OUTPUT);
+            try ctx.iface_vars.push(alloc, ov);
+            try ctx.stage_outs.push(alloc, OutFieldBinding.{ field_idx: 0_u32, var_id: ov, tidx: ftidx });
+        }
+    }
+
+    // 4. Map slots that hold GpuBuf / GpuImage2D parameters via StoreSlot(slot, param_val).
+    reset_fn_tables(alloc, &mut ctx, eir_prog.fn_value_tys(fn_id).len, eir_prog.fn_blocks(fn_id).len, eir_prog.fn_slots(fn_id).len);
+    let pvals = eir_prog.fn_params(fn_id);
+    let blks = eir_prog.fn_blocks(fn_id);
+    var bi: usize = 0_usize;
+    while bi < blks.len {
+        let insts = eir_prog.insts_slice(blks[bi].insts);
+        var ii: usize = 0_usize;
+        while ii < insts.len {
+            if insts[ii].kind == .StoreSlot {
+                var pmatch: usize = pvals.len;
+                var pk: usize = 0_usize;
+                while pk < pvals.len {
+                    if pvals[pk] == insts[ii].v0 {
+                        pmatch = pk;
+                        break;
+                    }
+                    pk = pk +% 1_usize;
+                }
+                if pmatch < pvals.len {
+                    var rb = ResBinding.{ kind: 0_u8, var_id: 0_u32, elem_tidx: 0_u32, aux: 0_u32 };
+                    if let rbp = ctx.param_res.get(pmatch) {
+                        rb = rbp.*;
+                    }
+                    if rb.kind == 1_u8 || rb.kind == 2_u8 || rb.kind == 3_u8 {
+                        let su = insts[ii].aux0.widen.[usize]();
+                        if let sbp = ctx.slot_bind.get_mut(su) {
+                            sbp.* = SlotBinding.{ kind: rb.kind, var_id: rb.var_id, tidx: rb.elem_tidx };
+                        }
+                    }
+                }
+            }
+            ii = ii +% 1_usize;
+        }
+        bi = bi +% 1_usize;
+    }
+
+    // 5. Emit entry function body.
+    let void_spv = ctx.ty_spv_id(void_t);
+    let ep_fn_spv = ctx.ty_spv_id(ep_fn_tidx);
+    ctx.fns.op4(alloc, OP_FUNCTION, void_spv, ep_fn_id, 0_u32, ep_fn_spv);
+    let empty_hp: [1]u32 = [0_u32];
+    try emit_fn_body_blocks(alloc, &mut ctx, eir_prog, fn_id, env, true, f.sig.ret, empty_hp[0_usize..0_usize]);
+
+    if ctx.any_oom() {
+        ctx.destroy(alloc);
+        err_msg.destroy(alloc);
+        out_bytes.destroy(alloc);
+        return OutOfMemory;
+    }
+
+    // 6. Assemble final SPIR-V 1.3 binary in exact required section order.
+    var hdr = try SpvWords.init(alloc, 256_usize);
+    errdefer hdr.destroy(alloc);
+    hdr.push(alloc, SPIRV_MAGIC);
+    hdr.push(alloc, SPIRV_VERSION_1_3);
+    hdr.push(alloc, SPIRV_GENERATOR_EON);
+    hdr.push(alloc, ctx.next_id);
+    hdr.push(alloc, 0_u32);
+
+    hdr.op1(alloc, OP_CAPABILITY, 1_u32);
+    if !hdr.oom {
+        var ext_ops = try col.DynBuf.[u32].init(alloc, 6_usize);
+        errdefer ext_ops.destroy(alloc);
+        try ext_ops.push(alloc, ctx.glsl_ext_id);
+        _ = push_str_as_spv_words(alloc, &mut ext_ops, "GLSL.std.450".as_bytes());
+        hdr.op_n(alloc, OP_EXT_INST_IMPORT, ext_ops.as_slice());
+        ext_ops.destroy(alloc);
+    }
+    hdr.op2(alloc, OP_MEMORY_MODEL, 0_u32, 1_u32);
+    let exec_model: u32 = if stage == .Vertex { 0_u32 } else if stage == .Fragment { 4_u32 } else { 5_u32 };
+    if !hdr.oom {
+        var ep_ops = try col.DynBuf.[u32].init(alloc, 16_usize);
+        errdefer ep_ops.destroy(alloc);
+        try ep_ops.push(alloc, exec_model);
+        try ep_ops.push(alloc, ep_fn_id);
+        _ = push_str_as_spv_words(alloc, &mut ep_ops, entry_name);
+        try ep_ops.push_slice(alloc, ctx.iface_vars.as_slice());
+        hdr.op_n(alloc, OP_ENTRY_POINT, ep_ops.as_slice());
+        ep_ops.destroy(alloc);
+    }
+    if stage == .Compute {
+        let lx = if f.sig.effects.gpu_local_x == 0_u32 { 1_u32 } else { f.sig.effects.gpu_local_x };
+        let ly = if f.sig.effects.gpu_local_y == 0_u32 { 1_u32 } else { f.sig.effects.gpu_local_y };
+        let lz = if f.sig.effects.gpu_local_z == 0_u32 { 1_u32 } else { f.sig.effects.gpu_local_z };
+        hdr.op5(alloc, OP_EXECUTION_MODE, ep_fn_id, 17_u32, lx, ly, lz);
+    } else if stage == .Fragment {
+        hdr.op2(alloc, OP_EXECUTION_MODE, ep_fn_id, 7_u32);
+    }
+
+    hdr.push_slice(alloc, ctx.names.data.as_slice());
+    hdr.push_slice(alloc, ctx.decs.data.as_slice());
+    hdr.push_slice(alloc, ctx.types_consts.data.as_slice());
+    hdr.push_slice(alloc, ctx.globals.data.as_slice());
+    hdr.push_slice(alloc, ctx.fns.data.as_slice());
+
+    if hdr.oom {
+        hdr.destroy(alloc);
+        ctx.destroy(alloc);
+        err_msg.destroy(alloc);
+        out_bytes.destroy(alloc);
+        return OutOfMemory;
+    }
+
+    let ws = hdr.data.as_slice();
+    var wi: usize = 0_usize;
+    while wi < ws.len {
+        let w = ws[wi];
+        try out_bytes.push(alloc, (w & 0xFF_u32).trunc.[u8]());
+        try out_bytes.push(alloc, ((w >> 8_u32) & 0xFF_u32).trunc.[u8]());
+        try out_bytes.push(alloc, ((w >> 16_u32) & 0xFF_u32).trunc.[u8]());
+        try out_bytes.push(alloc, ((w >> 24_u32) & 0xFF_u32).trunc.[u8]());
+        wi = wi +% 1_usize;
+    }
+
+    hdr.destroy(alloc);
+    ctx.destroy(alloc);
+    return SpirvOut.{ ok: true, bytes: out_bytes, err_msg: err_msg };
+}

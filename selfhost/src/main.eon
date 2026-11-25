@@ -35,6 +35,9 @@ import eonc.mach_rv64;
 import eonc.ui_test;
 import eonc.fmt;
 import eonc.lsp;
+import eonc.gpu_check;
+import eonc.gpu_spirv;
+import eonc.gpu_msl;
 
 // ---------------------------------------------------------------------------
 // Path component comparison (matches Rust `std::path::Path::cmp` on POSIX)
@@ -476,7 +479,7 @@ fn lex_and_print_file(
 
 fn print_usage() {
     rt.eprint_str(
-        "eonc1 — self-hosted Eon compiler\n\nUSAGE:\n\teonc1 lex [--dump] <path...>\n\teonc1 parse [--dump-ast | --dump-ast-full] [--repeat N] <path...>\n\teonc1 resolve [--dump] [--no-stdlib] <path...>\n\teonc1 check [--dump-types] [--dump-cfg] [--dump-eir] [--dump-verify] [--no-stdlib] <path...>\n\teonc1 build [--native] [--freestanding] [--shared] [--soname NAME] [-l LIB] [--sanitize] [--audit-tcb] [--emi-cache DIR] [-o out_path] [path...|build.eon]\n\teonc1 run [--native | --interp] [--sanitize] [-l LIB] [--emi-cache DIR] <path...> [-- <prog_args...>]\n\teonc1 test [tests/ui]\n\teonc1 fmt [--check] <path...>\n\teonc1 lsp\n\teonc1 --help\n",
+        "eonc1 — self-hosted Eon compiler\n\nUSAGE:\n\teonc1 lex [--dump] <path...>\n\teonc1 parse [--dump-ast | --dump-ast-full] [--repeat N] <path...>\n\teonc1 resolve [--dump] [--no-stdlib] <path...>\n\teonc1 check [--dump-types] [--dump-cfg] [--dump-eir] [--dump-verify] [--no-stdlib] <path...>\n\teonc1 build [--native] [--freestanding] [--shared] [--soname NAME] [-l LIB] [--sanitize] [--audit-tcb] [--emi-cache DIR] [-o out_path] [path...|build.eon]\n\teonc1 run [--native | --interp] [--sanitize] [-l LIB] [--emi-cache DIR] <path...> [-- <prog_args...>]\n\teonc1 test [tests/ui]\n\teonc1 fmt [--check] <path...>\n\teonc1 lsp\n\teonc1 emit-spirv [--entry NAME] [-o out.spv] <path...>\n\teonc1 emit-msl [--entry NAME] [-o out.metal] <path...>\n\teonc1 --help\n",
     );
 }
 
@@ -2245,6 +2248,7 @@ fn run_check_pipeline(
         );
         errdefer vr.destroy(alloc);
         try eir.apply_layout_sharing(alloc, &mut eir_prog, &tenv);
+        try gpu_check.validate_all_gpu_fns(alloc, &eir_prog, &tenv, interner, diags);
         vr
     } else {
         try verify.VerifyReport.init(alloc)
@@ -3500,6 +3504,10 @@ fn inc_compile_partial_units(
         vr.destroy(alloc);
         try eir.apply_layout_sharing(alloc, &mut eir_prog, &tenv);
         try eir_prog.release_verify_dump_meta(alloc);
+        try gpu_check.validate_all_gpu_fns(alloc, &eir_prog, &tenv, interner, diags);
+        if !diags.has_errors() {
+            try materialize_embedded_gpu_shaders(alloc, &mut eir_prog, &tenv, interner, diags);
+        }
     }
 
     if !diags.has_errors() {
@@ -5029,6 +5037,10 @@ fn compile_loaded_to_elf_file(
         }
         try eir.apply_layout_sharing(alloc, &mut eir_prog, &tenv);
         try eir_prog.release_verify_dump_meta(alloc);
+        try gpu_check.validate_all_gpu_fns(alloc, &eir_prog, &tenv, interner, diags);
+        if !diags.has_errors() {
+            try materialize_embedded_gpu_shaders(alloc, &mut eir_prog, &tenv, interner, diags);
+        }
     }
     if can_free_arena {
         try arena.release_all_pools(alloc);
@@ -7174,6 +7186,10 @@ fn run_loaded_interp(
         vr.destroy(alloc);
         try eir.apply_layout_sharing(alloc, &mut eir_prog, &tenv);
         try eir_prog.release_verify_dump_meta(alloc);
+        try gpu_check.validate_all_gpu_fns(alloc, &eir_prog, &tenv, interner, diags);
+        if !diags.has_errors() {
+            try materialize_embedded_gpu_shaders(alloc, &mut eir_prog, &tenv, interner, diags);
+        }
     }
     if !diags.has_errors() {
         try emit_unsupported_cfg_diags(alloc, &cfg_prog, diags, "` to EIR");
@@ -7543,6 +7559,339 @@ fn cmd_lsp(env: *mut Env) -> i32 ! OutOfMemory | Utf8Error {
     return try lsp.run_lsp_server(env);
 }
 
+// ---------------------------------------------------------------------------
+// GPU Shader Materialization (`@embed_gpu_spirv` / `@embed_gpu_msl`) & CLI
+// ---------------------------------------------------------------------------
+
+struct EmbeddedShaderCacheEntry {
+    fn_id: u32;
+    is_msl: bool;
+    bytes_range: ast.IdRange;
+}
+
+fn find_gpu_fn_by_sym(eir_prog: *eir.EirProgram, sym: u32) -> ?u32 {
+    let nfns = eir_prog.fn_count();
+    var fi: u32 = 0_u32;
+    while fi < nfns {
+        if let f = eir_prog.get_fn(fi) {
+            if f.sig.effects.is_gpu && !f.is_emi_stub && f.blocks.len > 0_u32 && f.name == sym {
+                return fi;
+            }
+        }
+        fi = fi +% 1_u32;
+    }
+    return null;
+}
+
+fn materialize_embedded_gpu_shaders(
+    alloc: *mut AllocCap,
+    eir_prog: *mut eir.EirProgram,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+) -> !OutOfMemory {
+    var cache = try col.DynBuf.[EmbeddedShaderCacheEntry].init(alloc, 8_usize);
+    errdefer cache.destroy(alloc);
+
+    let nfns = eir_prog.fn_count();
+    var fi: u32 = 0_u32;
+    while fi < nfns {
+        var skip = true;
+        var blk_start: u32 = 0_u32;
+        var blk_len: u32 = 0_u32;
+        if let f = eir_prog.get_fn(fi) {
+            if !f.sig.effects.is_gpu && !f.is_emi_stub && f.blocks.len > 0_u32 {
+                skip = false;
+                blk_start = f.blocks.start;
+                blk_len = f.blocks.len;
+            }
+        }
+        if !skip {
+            var bi: u32 = 0_u32;
+            while bi < blk_len {
+                var inst_start: u32 = 0_u32;
+                var inst_len: u32 = 0_u32;
+                if let blk = eir_prog.funcs.blocks.get((blk_start +% bi).widen.[usize]()) {
+                    inst_start = blk.insts.start;
+                    inst_len = blk.insts.len;
+                }
+                var ii: u32 = 0_u32;
+                while ii < inst_len {
+                    let igid = inst_start +% ii;
+                    var is_embed = false;
+                    var is_msl = false;
+                    var target_sym = span.SYM_EMPTY;
+                    var ret_ty = types.TY_VOID;
+                    var isp = span.span_dummy();
+                    if let inst = eir_prog.funcs.insts.get(igid.widen.[usize]()) {
+                        if inst.kind == .BuiltinCall {
+                            if let bc = eir_prog.get_builtin_call(inst.aux0) {
+                                if bc.op.kind == .EmbedGpuSpirv || bc.op.kind == .EmbedGpuMsl {
+                                    is_embed = true;
+                                    is_msl = bc.op.kind == .EmbedGpuMsl;
+                                    target_sym = bc.op.sym;
+                                    ret_ty = bc.ret_ty;
+                                    isp = inst.span;
+                                }
+                            }
+                        }
+                    }
+                    if is_embed {
+                        let target_opt = find_gpu_fn_by_sym(eir_prog, target_sym);
+                        if let tfid = target_opt {
+                            var found_cached = false;
+                            var br = ast.range_empty();
+                            let cs = cache.as_slice();
+                            var ci: usize = 0_usize;
+                            while ci < cs.len {
+                                if cs[ci].fn_id == tfid && cs[ci].is_msl == is_msl {
+                                    found_cached = true;
+                                    br = cs[ci].bytes_range;
+                                    break;
+                                }
+                                ci = ci +% 1_usize;
+                            }
+                            if !found_cached {
+                                if is_msl {
+                                    let mout = try gpu_msl.emit_msl(alloc, eir_prog, tfid, env, interner);
+                                    errdefer mout.destroy(alloc);
+                                    if mout.ok {
+                                        br = try eir_prog.add_bytes(alloc, mout.text.as_bytes());
+                                        try cache.push(alloc, EmbeddedShaderCacheEntry.{ fn_id: tfid, is_msl: true, bytes_range: br });
+                                    } else {
+                                        _ = try diags.emit_error_bytes(alloc, diag.E0821, isp, mout.err_msg.as_bytes());
+                                    }
+                                    mout.destroy(alloc);
+                                } else {
+                                    let sout = try gpu_spirv.emit_spirv(alloc, eir_prog, tfid, env, interner);
+                                    errdefer sout.destroy(alloc);
+                                    if sout.ok {
+                                        br = try eir_prog.add_bytes(alloc, sout.bytes.as_slice());
+                                        try cache.push(alloc, EmbeddedShaderCacheEntry.{ fn_id: tfid, is_msl: false, bytes_range: br });
+                                    } else {
+                                        _ = try diags.emit_error_bytes(alloc, diag.E0821, isp, sout.err_msg.as_bytes());
+                                    }
+                                    sout.destroy(alloc);
+                                }
+                            }
+                            let cid = try eir_prog.push_const(alloc, cfg_ir.const_bytes_typed(br, ret_ty));
+                            if let im = eir_prog.get_inst_mut(igid) {
+                                im.kind = .Const;
+                                im.aux0 = cid;
+                                im.ty0 = ret_ty;
+                            }
+                        } else {
+                            _ = try diags.emit_error(
+                                alloc, diag.E0821, isp,
+                                "`@embed_gpu_spirv`/`@embed_gpu_msl` target is not a known `@gpu` function",
+                            );
+                        }
+                    }
+                    ii = ii +% 1_u32;
+                }
+                bi = bi +% 1_u32;
+            }
+        }
+        fi = fi +% 1_u32;
+    }
+
+    cache.destroy(alloc);
+    return;
+}
+
+fn cmd_emit_gpu(env: *mut Env, is_msl: bool) -> i32 ! OutOfMemory | Utf8Error {
+    var inputs = try PathList.init(&mut env.alloc);
+    errdefer inputs.destroy(&mut env.alloc);
+    var err_buf = try str.StrBuf.init(&mut env.alloc, 256_usize);
+    errdefer err_buf.destroy(&mut env.alloc);
+    var entry_name = try str.StrBuf.init(&mut env.alloc, 32_usize);
+    errdefer entry_name.destroy(&mut env.alloc);
+    var out_path = try str.StrBuf.init(&mut env.alloc, 64_usize);
+    errdefer out_path.destroy(&mut env.alloc);
+    var no_stdlib = false;
+
+    let argc = env.args.len();
+    var ai: usize = 2_usize;
+    while ai < argc {
+        if let arg = env.args.get(ai) {
+            if rt.str_eq(arg, "-h") || rt.str_eq(arg, "--help") {
+                if is_msl {
+                    rt.eprint_str("usage: eonc emit-msl [--entry NAME] [-o out.metal] [--no-stdlib] <path...>\n");
+                } else {
+                    rt.eprint_str("usage: eonc emit-spirv [--entry NAME] [-o out.spv] [--no-stdlib] <path...>\n");
+                }
+                out_path.destroy(&mut env.alloc);
+                entry_name.destroy(&mut env.alloc);
+                err_buf.destroy(&mut env.alloc);
+                inputs.destroy(&mut env.alloc);
+                return 0_i32;
+            } else if rt.str_eq(arg, "--no-stdlib") {
+                no_stdlib = true;
+            } else if rt.str_eq(arg, "--entry") && ai +% 1_usize < argc {
+                ai = ai +% 1_usize;
+                if let ev = env.args.get(ai) {
+                    entry_name.clear();
+                    try entry_name.push_bytes_grow(&mut env.alloc, ev.as_bytes());
+                }
+            } else if rt.str_eq(arg, "-o") && ai +% 1_usize < argc {
+                ai = ai +% 1_usize;
+                if let ov = env.args.get(ai) {
+                    out_path.clear();
+                    try out_path.push_bytes_grow(&mut env.alloc, ov.as_bytes());
+                }
+            } else {
+                try inputs.push(&mut env.alloc, arg.as_bytes());
+            }
+        }
+        ai = ai +% 1_usize;
+    }
+
+    if inputs.len() == 0_usize {
+        rt.eprint_str("emit-gpu: missing input path(s)\n");
+        out_path.destroy(&mut env.alloc);
+        entry_name.destroy(&mut env.alloc);
+        err_buf.destroy(&mut env.alloc);
+        inputs.destroy(&mut env.alloc);
+        return 1_i32;
+    }
+
+    var sm = try span.SourceMap.init(&mut env.alloc);
+    errdefer sm.destroy(&mut env.alloc);
+    var interner = try span.SymInterner.init(&mut env.alloc);
+    errdefer interner.destroy(&mut env.alloc);
+    var diags = try diag.DiagBag.init(&mut env.alloc);
+    errdefer diags.destroy(&mut env.alloc);
+    var arena = try ast.AstArena.init(&mut env.alloc);
+    errdefer arena.destroy(&mut env.alloc);
+    var unit_ids = try col.DynBuf.[u32].init(&mut env.alloc, 16_usize);
+    errdefer unit_ids.destroy(&mut env.alloc);
+
+    let load_ok = try load_eon_sources_with_jobs(
+        env, &inputs, !no_stdlib, &mut sm, &mut interner, &mut diags, &mut arena, &mut unit_ids, &mut err_buf, 0_u32,
+    );
+    var rc: i32 = 1_i32;
+    if load_ok {
+        var resolved = try resolve.resolve_program(&mut env.alloc, &arena, unit_ids.as_slice(), &mut interner, &mut diags);
+        errdefer resolved.destroy(&mut env.alloc);
+        var tenv = try types.build_type_env(&mut env.alloc, &arena, &mut resolved, &mut interner, &mut diags);
+        errdefer tenv.destroy(&mut env.alloc);
+        var ct = try ctvm.CtArena.init(&mut env.alloc);
+        errdefer ct.destroy(&mut env.alloc);
+        let ttable = try check.check_program_with_jobs(
+            &mut env.alloc, &arena, unit_ids.as_slice(), &mut resolved, &mut tenv, &mut ct, &mut interner, &mut diags, 0_u32,
+        );
+        errdefer ttable.destroy(&mut env.alloc);
+        let pre_err = diags.count();
+        let cfg_prog = try cfg.lower_program_with_jobs(
+            &mut env.alloc, &arena, unit_ids.as_slice(), &resolved, &mut tenv, &ct, &ttable, &mut interner, 0_u32,
+        );
+        errdefer cfg_prog.destroy(&mut env.alloc);
+        try borrow.analyze_program_with_jobs(&mut env.alloc, &resolved, &tenv, &cfg_prog, &mut interner, &mut diags, 0_u32);
+        if pre_err == 0_usize {
+            let eff_rep = try effects.check_effects_and_concurrency_with_jobs(
+                &mut env.alloc, &arena, unit_ids.as_slice(), &resolved, &tenv, &cfg_prog, &mut interner, &mut diags, 0_u32,
+            );
+            eff_rep.destroy(&mut env.alloc);
+        }
+        var eir_prog = try eir.lower_cfg_to_eir_with_diags_and_jobs(
+            &mut env.alloc, &cfg_prog, &resolved, &tenv, &interner, &mut diags, false, 0_u32,
+        );
+        errdefer eir_prog.destroy(&mut env.alloc);
+        if pre_err == 0_usize {
+            let vr = try verify.verify_program_with_jobs(
+                &mut env.alloc, &arena, &resolved, &tenv, &mut eir_prog, &interner, &mut diags, 0_u32,
+            );
+            vr.destroy(&mut env.alloc);
+            try gpu_check.validate_all_gpu_fns(&mut env.alloc, &eir_prog, &tenv, &interner, &mut diags);
+        }
+
+        if diags.has_errors() {
+            err_buf.clear();
+            try diags.render_all(&mut env.alloc, &sm, &mut err_buf);
+            rt.eprint_bytes(err_buf.as_bytes());
+        } else {
+            var target_fid = eir.EIR_NONE;
+            let nfns = eir_prog.fn_count();
+            var fi: u32 = 0_u32;
+            while fi < nfns {
+                if let f = eir_prog.get_fn(fi) {
+                    if f.sig.effects.is_gpu && !f.is_emi_stub && f.blocks.len > 0_u32 {
+                        if entry_name.len() == 0_usize {
+                            target_fid = fi;
+                            break;
+                        } else if str.bytes_eq(interner.get(f.name), entry_name.as_bytes()) {
+                            target_fid = fi;
+                            break;
+                        }
+                    }
+                }
+                fi = fi +% 1_u32;
+            }
+            if target_fid == eir.EIR_NONE {
+                rt.eprint_str("emit-gpu: no matching `@gpu` entry function found\n");
+            } else if is_msl {
+                let mout = try gpu_msl.emit_msl(&mut env.alloc, &eir_prog, target_fid, &tenv, &interner);
+                errdefer mout.destroy(&mut env.alloc);
+                if mout.ok {
+                    if out_path.len() > 0_usize {
+                        let ostr = try out_path.as_bytes().as_str();
+                        env.fs.write_file(ostr, mout.text.as_bytes()) catch {
+                            rt.eprint_str("emit-msl: failed to write output file\n");
+                            rc = 1_i32;
+                        };
+                        rc = 0_i32;
+                    } else {
+                        rt.print_bytes(mout.text.as_bytes());
+                        rc = 0_i32;
+                    }
+                } else {
+                    rt.eprint_bytes(mout.err_msg.as_bytes());
+                    rt.eprint_nl();
+                }
+                mout.destroy(&mut env.alloc);
+            } else {
+                let sout = try gpu_spirv.emit_spirv(&mut env.alloc, &eir_prog, target_fid, &tenv, &interner);
+                errdefer sout.destroy(&mut env.alloc);
+                if sout.ok {
+                    if out_path.len() > 0_usize {
+                        let ostr = try out_path.as_bytes().as_str();
+                        env.fs.write_file(ostr, sout.bytes.as_slice()) catch {
+                            rt.eprint_str("emit-spirv: failed to write output file\n");
+                            rc = 1_i32;
+                        };
+                        rc = 0_i32;
+                    } else {
+                        rt.print_bytes(sout.bytes.as_slice());
+                        rc = 0_i32;
+                    }
+                } else {
+                    rt.eprint_bytes(sout.err_msg.as_bytes());
+                    rt.eprint_nl();
+                }
+                sout.destroy(&mut env.alloc);
+            }
+        }
+
+        eir_prog.destroy(&mut env.alloc);
+        cfg_prog.destroy(&mut env.alloc);
+        ttable.destroy(&mut env.alloc);
+        ct.destroy(&mut env.alloc);
+        tenv.destroy(&mut env.alloc);
+        resolved.destroy(&mut env.alloc);
+    }
+
+    unit_ids.destroy(&mut env.alloc);
+    arena.destroy(&mut env.alloc);
+    diags.destroy(&mut env.alloc);
+    interner.destroy(&mut env.alloc);
+    sm.destroy(&mut env.alloc);
+    out_path.destroy(&mut env.alloc);
+    entry_name.destroy(&mut env.alloc);
+    err_buf.destroy(&mut env.alloc);
+    inputs.destroy(&mut env.alloc);
+    return rc;
+}
+
 pub fn main(env: *mut Env) -> i32 ! OutOfMemory | IoError | Utf8Error {
     let argc = env.args.len();
     if argc < 2_usize {
@@ -7571,6 +7920,10 @@ pub fn main(env: *mut Env) -> i32 ! OutOfMemory | IoError | Utf8Error {
             mode = 9_u8;
         } else if rt.str_eq(s, "lsp") {
             mode = 10_u8;
+        } else if rt.str_eq(s, "emit-spirv") {
+            mode = 11_u8;
+        } else if rt.str_eq(s, "emit-msl") {
+            mode = 12_u8;
         }
     }
     if mode == 2_u8 {
@@ -7606,6 +7959,10 @@ pub fn main(env: *mut Env) -> i32 ! OutOfMemory | IoError | Utf8Error {
         rc = try cmd_fmt(env);
     } else if mode == 10_u8 {
         rc = try cmd_lsp(env);
+    } else if mode == 11_u8 {
+        rc = try cmd_emit_gpu(env, false);
+    } else if mode == 12_u8 {
+        rc = try cmd_emit_gpu(env, true);
     }
 
     if env.alloc.live_allocs() != 0_usize {

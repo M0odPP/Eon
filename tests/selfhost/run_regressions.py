@@ -1791,6 +1791,237 @@ def test_m24_linkers_and_nostd_fb(eonc: str):
     print("[PASS] M2.4 Zero-C Linkers (PE32+ live in Wine, Mach-O SHA-256 + .app, Android APK OpenSSL ECDSA-P256) & 3x QEMU nostd Framebuffers")
 
 
+def test_m25_gpu_spirv_and_msl(eonc: str) -> None:
+    print("[TEST] M2.5 Unified @gpu Compiler (E0820-E0822, SPIR-V 1.3 Vulkan 1.1 spirv-val, MSL 2.4, @embed_gpu_*)")
+    spirv_val = shutil.which("spirv-val")
+    assert spirv_val, "spirv-val is required for M2.5 SPIR-V validation"
+
+    with tempfile.TemporaryDirectory(prefix="eon_m25_") as tmp:
+        p = Path(tmp)
+
+        # 1. Negative validation tests: E0820, E0821, E0822
+        bad_std430 = p / "bad_std430.eon"
+        bad_std430.write_text(
+            "module test;\n"
+            "struct BadS { x: f32; }\n"
+            "@gpu(.Compute, local_size = (4, 1, 1))\n"
+            "pub fn k(@binding(0, 0) b: write GpuBuf[BadS]) {\n"
+            "    let g = @gpu_global_id();\n"
+            "    b[g.x] = BadS.{ x: 1.0_f32 };\n"
+            "}\n"
+            "pub fn main() -> i32 { return 0_i32; }\n",
+            encoding="utf-8",
+        )
+        r = run_cmd([eonc, "check", str(bad_std430)])
+        assert r.returncode != 0 and "E0820" in r.stderr, f"expected E0820, got rc={r.returncode} err={r.stderr}"
+
+        bad_cap = p / "bad_cap.eon"
+        bad_cap.write_text(
+            "module test;\n"
+            "@gpu(.Compute, local_size = (4, 1, 1))\n"
+            "pub fn k(a: *mut AllocCap) { let _ = a; }\n"
+            "pub fn main() -> i32 { return 0_i32; }\n",
+            encoding="utf-8",
+        )
+        r = run_cmd([eonc, "check", str(bad_cap)])
+        assert r.returncode != 0 and "E0821" in r.stderr, f"expected E0821, got rc={r.returncode} err={r.stderr}"
+
+        bad_bar = p / "bad_bar.eon"
+        bad_bar.write_text(
+            "module test;\n"
+            "@gpu(.Compute, local_size = (8, 1, 1))\n"
+            "pub fn k(@binding(0, 0) b: write GpuBuf[u32]) {\n"
+            "    let tid = @gpu_local_id().x;\n"
+            "    if tid < 4_u32 { @gpu_workgroup_barrier(); }\n"
+            "    b[tid] = tid;\n"
+            "}\n"
+            "pub fn main() -> i32 { return 0_i32; }\n",
+            encoding="utf-8",
+        )
+        r = run_cmd([eonc, "check", str(bad_bar)])
+        assert r.returncode != 0 and "E0822" in r.stderr, f"expected E0822, got rc={r.returncode} err={r.stderr}"
+
+        # 2. Full GPUI-class Vertex + Fragment (with helper SDF, discard, texture sample, flat int) + Compute (@gpu_shared + barrier + while)
+        shaders = p / "shaders.eon"
+        shaders.write_text(
+            "module gpu_demo;\n\n"
+            "@layout(std430)\n"
+            "pub struct Quad {\n"
+            "    pub bounds: f32x4;\n"
+            "    pub color: f32x4;\n"
+            "    pub corner_radius: f32;\n"
+            "    pub border_width: f32;\n"
+            "    pub flags: u32;\n"
+            "    pub _pad: u32;\n"
+            "}\n\n"
+            "@layout(std430)\n"
+            "pub struct QuadVsOut {\n"
+            "    @position pub pos: f32x4;\n"
+            "    @location(0) pub local_pos: f32x2;\n"
+            "    @location(1) pub half_size: f32x2;\n"
+            "    @location(2) pub color: f32x4;\n"
+            "    @location(3) pub params: f32x2;\n"
+            "    @location(4) pub flags: u32;\n"
+            "}\n\n"
+            "fn rounded_box_sdf(p: f32x2, b: f32x2, r: f32) -> f32 {\n"
+            "    let qx = @gpu_abs(p.x) - b.x + r;\n"
+            "    let qy = @gpu_abs(p.y) - b.y + r;\n"
+            "    let ox = @gpu_max(qx, 0.0_f32);\n"
+            "    let oy = @gpu_max(qy, 0.0_f32);\n"
+            "    let outside = @gpu_length(f32x2.{ ox, oy });\n"
+            "    let inside = @gpu_min(@gpu_max(qx, qy), 0.0_f32);\n"
+            "    return outside + inside - r;\n"
+            "}\n\n"
+            "@gpu(.Vertex)\n"
+            "pub fn quad_vs(\n"
+            "    @binding(0, 0) quads: read GpuBuf[Quad],\n"
+            "    @push_const viewport: f32x4,\n"
+            ") -> QuadVsOut {\n"
+            "    let vi = @gpu_vertex_index();\n"
+            "    let ii = @gpu_instance_index();\n"
+            "    let q = quads[ii];\n"
+            "    let ux: f32 = if (vi == 1_u32) || (vi == 2_u32) || (vi == 5_u32) { 1.0_f32 } else { 0.0_f32 };\n"
+            "    let uy: f32 = if (vi == 2_u32) || (vi == 4_u32) || (vi == 5_u32) { 1.0_f32 } else { 0.0_f32 };\n"
+            "    let px = q.bounds.x + ux * q.bounds.z;\n"
+            "    let py = q.bounds.y + uy * q.bounds.w;\n"
+            "    let ndc_x = (px / viewport.x) * 2.0_f32 - 1.0_f32;\n"
+            "    let ndc_y = (py / viewport.y) * 2.0_f32 - 1.0_f32;\n"
+            "    let hs = f32x2.{ q.bounds.z * 0.5_f32, q.bounds.w * 0.5_f32 };\n"
+            "    let lp = f32x2.{ (ux - 0.5_f32) * q.bounds.z, (uy - 0.5_f32) * q.bounds.w };\n"
+            "    return QuadVsOut.{\n"
+            "        pos: f32x4.{ ndc_x, ndc_y, 0.0_f32, 1.0_f32 },\n"
+            "        local_pos: lp,\n"
+            "        half_size: hs,\n"
+            "        color: q.color,\n"
+            "        params: f32x2.{ q.corner_radius, q.border_width },\n"
+            "        flags: q.flags,\n"
+            "    };\n"
+            "}\n\n"
+            "@gpu(.Fragment)\n"
+            "pub fn quad_fs(\n"
+            "    @binding(0, 1) atlas: read GpuImage2D[f32x4],\n"
+            "    @location(0) local_pos: f32x2,\n"
+            "    @location(1) half_size: f32x2,\n"
+            "    @location(2) color: f32x4,\n"
+            "    @location(3) params: f32x2,\n"
+            "    @location(4) flags: u32,\n"
+            ") -> f32x4 {\n"
+            "    let fc = @gpu_frag_coord();\n"
+            "    let d = rounded_box_sdf(local_pos, half_size, params.x);\n"
+            "    let alpha = 1.0_f32 - @gpu_smoothstep(-0.5_f32, 0.5_f32, d);\n"
+            "    if alpha <= 0.001_f32 {\n"
+            "        @gpu_discard();\n"
+            "    }\n"
+            "    let uv = f32x2.{ @gpu_clamp(fc.x * 0.001_f32, 0.0_f32, 1.0_f32), @gpu_clamp(fc.y * 0.001_f32, 0.0_f32, 1.0_f32) };\n"
+            "    let tex = atlas.sample(uv);\n"
+            "    let mul: f32 = if flags == 1_u32 { tex.x } else { 1.0_f32 };\n"
+            "    let a = color.w * alpha * mul;\n"
+            "    return f32x4.{ color.x * a, color.y * a, color.z * a, a };\n"
+            "}\n\n"
+            "@gpu(.Compute, local_size = (8, 8, 1))\n"
+            "pub fn tile_cs(\n"
+            "    @binding(0, 0) quads: read GpuBuf[Quad],\n"
+            "    @binding(0, 1) out_buf: write GpuBuf[f32],\n"
+            "    @push_const screen: u32x2,\n"
+            ") {\n"
+            "    @gpu_shared var tile: [64]f32 = [0.0_f32; 64];\n"
+            "    let gid = @gpu_global_id();\n"
+            "    let lid = @gpu_local_id();\n"
+            "    let lidx = (lid.y *% 8_u32 +% lid.x) & 63_u32;\n"
+            "    tile[lidx] = quads[0_u32].corner_radius;\n"
+            "    @gpu_workgroup_barrier();\n"
+            "    if gid.x < screen.x && gid.y < screen.y {\n"
+            "        let idx = gid.y *% screen.x +% gid.x;\n"
+            "        var acc: f32 = tile[lidx];\n"
+            "        var k: u32 = 0_u32;\n"
+            "        while k < 4_u32 {\n"
+            "            acc = acc + @gpu_exp(-0.5_f32 * k.to_float.[f32]());\n"
+            "            k = k +% 1_u32;\n"
+            "        }\n"
+            "        out_buf[idx] = acc;\n"
+            "    }\n"
+            "}\n\n"
+            "pub fn main() -> i32 {\n"
+            "    let vs_spv = @embed_gpu_spirv(\"quad_vs\");\n"
+            "    let fs_spv = @embed_gpu_spirv(quad_fs);\n"
+            "    let cs_spv = @embed_gpu_spirv(\"tile_cs\");\n"
+            "    let vs_msl = @embed_gpu_msl(\"quad_vs\");\n"
+            "    let fs_msl = @embed_gpu_msl(quad_fs);\n"
+            "    let cs_msl = @embed_gpu_msl(\"tile_cs\");\n"
+            "    if vs_spv.len < 20_usize || (vs_spv.len % 4_usize) != 0_usize { return 1_i32; }\n"
+            "    if fs_spv.len < 20_usize || (fs_spv.len % 4_usize) != 0_usize { return 2_i32; }\n"
+            "    if cs_spv.len < 20_usize || (cs_spv.len % 4_usize) != 0_usize { return 3_i32; }\n"
+            "    if vs_spv[0_usize] != 0x03_u8 || vs_spv[1_usize] != 0x02_u8 || vs_spv[2_usize] != 0x23_u8 || vs_spv[3_usize] != 0x07_u8 { return 4_i32; }\n"
+            "    if fs_spv[0_usize] != 0x03_u8 || fs_spv[1_usize] != 0x02_u8 || fs_spv[2_usize] != 0x23_u8 || fs_spv[3_usize] != 0x07_u8 { return 5_i32; }\n"
+            "    if cs_spv[0_usize] != 0x03_u8 || cs_spv[1_usize] != 0x02_u8 || cs_spv[2_usize] != 0x23_u8 || cs_spv[3_usize] != 0x07_u8 { return 6_i32; }\n"
+            "    if vs_msl.len < 50_usize || fs_msl.len < 50_usize || cs_msl.len < 50_usize { return 7_i32; }\n"
+            "    return 42_i32;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+
+        msl_checks = {
+            "quad_vs": ["vertex EonVsOut quad_vs", "[[position]]", "[[user(locn0)]]", "[[flat]]", "[[vertex_id]]", "[[instance_id]]"],
+            "quad_fs": ["fragment float4 quad_fs", "static inline float eon_fn_", "discard_fragment()", "smoothstep(", ".sample(_smp,", "[[stage_in]]"],
+            "tile_cs": ["kernel void tile_cs", "threadgroup float _s", "threadgroup_barrier(mem_flags::mem_threadgroup)", "exp(", "[[thread_position_in_grid]]"],
+        }
+        for entry, must_have in msl_checks.items():
+            spv1 = p / f"{entry}_1.spv"
+            spv2 = p / f"{entry}_2.spv"
+            msl1 = p / f"{entry}_1.metal"
+            msl2 = p / f"{entry}_2.metal"
+            r1 = run_cmd([eonc, "emit-spirv", "--entry", entry, "-o", str(spv1), str(shaders)])
+            assert r1.returncode == 0, f"emit-spirv {entry} failed:\n{r1.stderr}"
+            r2 = run_cmd([eonc, "emit-spirv", "--entry", entry, "-o", str(spv2), str(shaders)])
+            assert r2.returncode == 0 and spv1.read_bytes() == spv2.read_bytes(), f"emit-spirv {entry} non-deterministic"
+            rv = run_cmd([spirv_val, "--target-env", "vulkan1.1", str(spv1)])
+            assert rv.returncode == 0, f"spirv-val vulkan1.1 failed on {entry}:\n{rv.stdout}\n{rv.stderr}"
+            rv0 = run_cmd([spirv_val, str(spv1)])
+            assert rv0.returncode == 0, f"spirv-val default failed on {entry}:\n{rv0.stdout}\n{rv0.stderr}"
+
+            m1 = run_cmd([eonc, "emit-msl", "--entry", entry, "-o", str(msl1), str(shaders)])
+            assert m1.returncode == 0, f"emit-msl {entry} failed:\n{m1.stderr}"
+            m2 = run_cmd([eonc, "emit-msl", "--entry", entry, "-o", str(msl2), str(shaders)])
+            assert m2.returncode == 0 and msl1.read_text() == msl2.read_text(), f"emit-msl {entry} non-deterministic"
+            mtxt = msl1.read_text(encoding="utf-8")
+            assert "#include <metal_stdlib>" in mtxt and "goto " not in mtxt, f"invalid MSL in {entry}"
+            for tok in must_have:
+                assert tok in mtxt, f"missing `{tok}` in emitted MSL for {entry}"
+
+        # 3. Live @embed_gpu_spirv & @embed_gpu_msl across interp, x86_64, aarch64, riscv64, windows
+        ri = run_cmd([eonc, "run", "--interp", str(shaders)])
+        assert ri.returncode == 42, f"interp embed_gpu failed rc={ri.returncode}: {ri.stderr}"
+
+        exe_x64 = p / "embed_x64"
+        rx = run_cmd([eonc, "build", "--native", "--release", str(shaders), "-o", str(exe_x64)])
+        assert rx.returncode == 0, f"x64 embed_gpu build failed: {rx.stderr}"
+        assert run_cmd([str(exe_x64)]).returncode == 42
+
+        qa64 = shutil.which("qemu-aarch64")
+        if qa64:
+            exe_a64 = p / "embed_a64"
+            ra = run_cmd([eonc, "build", "--native", "--target=aarch64-linux", str(shaders), "-o", str(exe_a64)])
+            assert ra.returncode == 0, f"a64 embed_gpu build failed: {ra.stderr}"
+            assert run_cmd([qa64, str(exe_a64)]).returncode == 42
+
+        qrv64 = shutil.which("qemu-riscv64")
+        if qrv64:
+            exe_rv64 = p / "embed_rv64"
+            rr = run_cmd([eonc, "build", "--native", "--target=riscv64-linux", str(shaders), "-o", str(exe_rv64)])
+            assert rr.returncode == 0, f"rv64 embed_gpu build failed: {rr.stderr}"
+            assert run_cmd([qrv64, str(exe_rv64)]).returncode == 42
+
+        wine = shutil.which("wine")
+        if wine:
+            exe_win = p / "embed_win.exe"
+            rw = run_cmd([eonc, "build", "--native", "--release", "--target=x86_64-windows", str(shaders), "-o", str(exe_win)])
+            assert rw.returncode == 0, f"windows embed_gpu build failed: {rw.stderr}"
+            wr = subprocess.run([wine, str(exe_win)], env={**os.environ, "WINEDEBUG": "-all"}, capture_output=True)
+            assert wr.returncode == 42, f"wine embed_gpu rc={wr.returncode}"
+
+    print("[PASS] M2.5 Unified @gpu Compiler (E0820-E0822, SPIR-V 1.3 Vulkan 1.1 spirv-val, MSL 2.4, @embed_gpu_*)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--eonc", default=str(ROOT / "selfhost/out/eonc2_rel"))
@@ -1808,6 +2039,7 @@ def main() -> int:
     test_m22_aarch64_backend(eonc)
     test_m23_riscv64_backend(eonc)
     test_m24_linkers_and_nostd_fb(eonc)
+    test_m25_gpu_spirv_and_msl(eonc)
     print("ALL SELFHOST SOUNDNESS REGRESSIONS PASSED!")
     return 0
 

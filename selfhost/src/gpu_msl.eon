@@ -1,0 +1,1392 @@
+module eonc.gpu_msl;
+
+import core.col;
+import core.str;
+import eonc.span;
+import eonc.ast;
+import eonc.types;
+import eonc.cfg_ir;
+import eonc.eir;
+import eonc.gpu_check;
+
+// ===========================================================================
+// Deterministic Metal Shading Language 2.4 Emitter (Zero-goto structured MSL)
+// ===========================================================================
+
+pub linear struct MslOut {
+    pub ok: bool;
+    pub text: str.StrBuf;
+    pub err_msg: str.StrBuf;
+}
+
+impl MslOut {
+    pub fn destroy(self: MslOut, alloc: *mut AllocCap) {
+        let MslOut.{ ok: _, text, err_msg } = self;
+        text.destroy(alloc);
+        err_msg.destroy(alloc);
+    }
+}
+
+linear struct MslBuf {
+    pub sb: str.StrBuf;
+    pub oom: bool;
+}
+
+impl MslBuf {
+    fn init(alloc: *mut AllocCap, cap: usize) -> MslBuf ! OutOfMemory {
+        return MslBuf.{ sb: try str.StrBuf.init(alloc, cap), oom: false };
+    }
+
+    fn destroy(self: MslBuf, alloc: *mut AllocCap) {
+        let MslBuf.{ sb, oom: _ } = self;
+        sb.destroy(alloc);
+    }
+
+    fn ps(self: *mut Self, alloc: *mut AllocCap, s: *str) {
+        if self.oom { return; }
+        self.sb.push_str_grow(alloc, s) catch { self.oom = true; };
+    }
+
+    fn pb(self: *mut Self, alloc: *mut AllocCap, bs: *[u8]) {
+        if self.oom { return; }
+        self.sb.push_bytes_grow(alloc, bs) catch { self.oom = true; };
+    }
+
+    fn pu(self: *mut Self, alloc: *mut AllocCap, v: u64) {
+        if self.oom { return; }
+        self.sb.push_u64_grow(alloc, v) catch { self.oom = true; };
+    }
+
+    fn pi(self: *mut Self, alloc: *mut AllocCap, v: i64) {
+        if self.oom { return; }
+        if v < 0_i64 {
+            self.ps(alloc, "-");
+            let u = (0_u64 -% v.bitcast.[u64]());
+            self.pu(alloc, u);
+        } else {
+            self.pu(alloc, v.bitcast.[u64]());
+        }
+    }
+
+    fn indent(self: *mut Self, alloc: *mut AllocCap, depth: u32) {
+        var i: u32 = 0_u32;
+        while i < depth {
+            self.ps(alloc, "    ");
+            i = i +% 1_u32;
+        }
+    }
+}
+
+fn push_msl_scalar_ty(alloc: *mut AllocCap, out: *mut MslBuf, env: *types.TypeEnv, ty: types.TyId) {
+    let n = env.get(ty);
+    if n.kind == .Bool {
+        out.ps(alloc, "bool");
+    } else if n.kind == .Float {
+        out.ps(alloc, "float");
+    } else if n.kind == .Int {
+        if n.flag0 { out.ps(alloc, "int"); } else { out.ps(alloc, "uint"); }
+    } else {
+        out.ps(alloc, "uint");
+    }
+}
+
+@recursive
+fn push_msl_ty(
+    alloc: *mut AllocCap,
+    out: *mut MslBuf,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    ty: types.TyId,
+) {
+    let n = env.get(ty);
+    match n.kind {
+        .Void => { out.ps(alloc, "void"); }
+        .Never => { out.ps(alloc, "void"); }
+        .Bool => { out.ps(alloc, "bool"); }
+        .Float => { out.ps(alloc, "float"); }
+        .Int => {
+            if n.flag0 { out.ps(alloc, "int"); } else { out.ps(alloc, "uint"); }
+        }
+        .Vec => {
+            push_msl_scalar_ty(alloc, out, env, n.primary);
+            out.pu(alloc, n.u8_val.widen.[u64]());
+        }
+        .Struct => {
+            out.ps(alloc, "EonS_");
+            out.pu(alloc, n.primary.widen.[u64]());
+        }
+        .Array => {
+            // Arrays in MSL expressions use wrapper or element type; declarations emit `[N]` after name.
+            push_msl_ty(alloc, out, env, interner, n.primary);
+        }
+        _ => {
+            let _ = interner;
+            out.ps(alloc, "uint");
+        }
+    }
+}
+
+fn push_msl_var_decl(
+    alloc: *mut AllocCap,
+    out: *mut MslBuf,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    ty: types.TyId,
+    prefix: *str,
+    idx: u32,
+) {
+    let n = env.get(ty);
+    if n.kind == .Array {
+        push_msl_ty(alloc, out, env, interner, n.primary);
+        out.ps(alloc, " ");
+        out.ps(alloc, prefix);
+        out.pu(alloc, idx.widen.[u64]());
+        out.ps(alloc, "[");
+        out.pu(alloc, if n.u64_val == 0_u64 { 1_u64 } else { n.u64_val });
+        out.ps(alloc, "]");
+    } else {
+        push_msl_ty(alloc, out, env, interner, ty);
+        out.ps(alloc, " ");
+        out.ps(alloc, prefix);
+        out.pu(alloc, idx.widen.[u64]());
+    }
+}
+
+fn is_msl_int_or_vec(env: *types.TypeEnv, ty: types.TyId) -> bool {
+    let n = env.get(ty);
+    if n.kind == .Int { return true; }
+    if n.kind == .Vec { return env.get(n.primary).kind == .Int; }
+    return false;
+}
+
+@recursive
+fn collect_structs_from_ty(
+    alloc: *mut AllocCap,
+    env: *types.TypeEnv,
+    ty: types.TyId,
+    seen: *mut col.HashMap[u32],
+    order: *mut col.DynBuf[u32],
+) -> !OutOfMemory {
+    let n = env.get(ty);
+    if n.kind == .Struct {
+        let def_id = n.primary;
+        if seen.get(def_id.widen.[u64]()) == null {
+            try seen.insert(alloc, def_id.widen.[u64](), 1_u32);
+            if let sm = env.get_struct(def_id) {
+                let fs = env.struct_fields_range(sm.fields);
+                var fi: usize = 0_usize;
+                while fi < fs.len {
+                    try collect_structs_from_ty(alloc, env, fs[fi].ty, seen, order);
+                    fi = fi +% 1_usize;
+                }
+            }
+            try order.push(alloc, def_id);
+        }
+        return;
+    }
+    if n.kind == .Array || n.kind == .Vec {
+        try collect_structs_from_ty(alloc, env, n.primary, seen, order);
+        return;
+    }
+    if n.kind == .Builtin && (n.builtin_kind == .GpuBuf || n.builtin_kind == .GpuImage2D) {
+        let gs = env.node_gval_list(&n);
+        if gs.len > 0_usize && gs[0_usize].kind == .Ty {
+            try collect_structs_from_ty(alloc, env, gs[0_usize].id, seen, order);
+        }
+    }
+    return;
+}
+
+fn collect_fn_structs(
+    alloc: *mut AllocCap,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    env: *types.TypeEnv,
+    seen: *mut col.HashMap[u32],
+    order: *mut col.DynBuf[u32],
+) -> !OutOfMemory {
+    let f = eir_prog.get_fn(fn_id) orelse { return; };
+    let ps = env.params_range(f.sig.params);
+    var pi: usize = 0_usize;
+    while pi < ps.len {
+        try collect_structs_from_ty(alloc, env, ps[pi].ty, seen, order);
+        pi = pi +% 1_usize;
+    }
+    try collect_structs_from_ty(alloc, env, f.sig.ret, seen, order);
+    let slots = eir_prog.fn_slots(fn_id);
+    var si: usize = 0_usize;
+    while si < slots.len {
+        try collect_structs_from_ty(alloc, env, slots[si].ty, seen, order);
+        si = si +% 1_usize;
+    }
+    let vtys = eir_prog.fn_value_tys(fn_id);
+    var vi: usize = 0_usize;
+    while vi < vtys.len {
+        try collect_structs_from_ty(alloc, env, vtys[vi], seen, order);
+        vi = vi +% 1_usize;
+    }
+    return;
+}
+
+fn emit_struct_defs(
+    alloc: *mut AllocCap,
+    out: *mut MslBuf,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    order: *[u32],
+) {
+    var i: usize = 0_usize;
+    while i < order.len {
+        let def_id = order[i];
+        if let sm = env.get_struct(def_id) {
+            out.ps(alloc, "struct EonS_");
+            out.pu(alloc, def_id.widen.[u64]());
+            out.ps(alloc, " {\n");
+            let fs = env.struct_fields_range(sm.fields);
+            var fi: usize = 0_usize;
+            while fi < fs.len {
+                let fld = fs[fi];
+                out.ps(alloc, "    ");
+                let fn_node = env.get(fld.ty);
+                if fn_node.kind == .Array {
+                    push_msl_ty(alloc, out, env, interner, fn_node.primary);
+                    out.ps(alloc, " f");
+                    out.pu(alloc, fi.widen.[u64]());
+                    out.ps(alloc, "[");
+                    out.pu(alloc, if fn_node.u64_val == 0_u64 { 1_u64 } else { fn_node.u64_val });
+                    out.ps(alloc, "];\n");
+                } else {
+                    push_msl_ty(alloc, out, env, interner, fld.ty);
+                    out.ps(alloc, " f");
+                    out.pu(alloc, fi.widen.[u64]());
+                    out.ps(alloc, ";\n");
+                }
+                fi = fi +% 1_usize;
+            }
+            out.ps(alloc, "};\n\n");
+        }
+        i = i +% 1_usize;
+    }
+}
+
+struct MslParamMap {
+    kind: u8; // 0=normal, 1=ssbo, 2=sampled_img, 3=storage_img, 4=push_const, 5=stage_in
+    param_idx: u32;
+}
+
+struct MslFnCtx {
+    fn_id: u32;
+    is_entry: bool;
+    stage: types.GpuStage;
+    ret_ty: types.TyId;
+}
+
+fn push_msl_place_expr(
+    alloc: *mut AllocCap,
+    out: *mut MslBuf,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    env: *types.TypeEnv,
+    slot_param_map: *[MslParamMap],
+    param_map: *[MslParamMap],
+    place: *eir.EirPlace,
+) {
+    var cur_ty = types.TY_VOID;
+    if place.base.kind == .Slot {
+        let su = place.base.id.widen.[usize]();
+        if su < slot_param_map.len && slot_param_map[su].kind == 1_u8 {
+            out.ps(alloc, "_p");
+            out.pu(alloc, slot_param_map[su].param_idx.widen.[u64]());
+        } else {
+            out.ps(alloc, "_s");
+            out.pu(alloc, place.base.id.widen.[u64]());
+        }
+        if let sl = eir_prog.fn_slot(fn_id, place.base.id) {
+            cur_ty = sl.ty;
+        }
+    } else {
+        let pvals = eir_prog.fn_params(fn_id);
+        var matched_p = false;
+        var pi: usize = 0_usize;
+        while pi < pvals.len {
+            if pvals[pi] == place.base.id && pi < param_map.len && param_map[pi].kind == 1_u8 {
+                out.ps(alloc, "_p");
+                out.pu(alloc, pi.widen.[u64]());
+                matched_p = true;
+                break;
+            }
+            pi = pi +% 1_usize;
+        }
+        if !matched_p {
+            out.ps(alloc, "_v");
+            out.pu(alloc, place.base.id.widen.[u64]());
+        }
+        cur_ty = eir_prog.fn_val_ty(fn_id, place.base.id);
+    }
+
+    let projs = eir_prog.projs_slice(place.projs);
+    var i: usize = 0_usize;
+    while i < projs.len {
+        let pr = projs[i];
+        if pr.kind == .Index {
+            out.ps(alloc, "[_v");
+            out.pu(alloc, pr.index.widen.[u64]());
+            out.ps(alloc, "]");
+            cur_ty = pr.ty;
+        } else if pr.kind == .Field || pr.kind == .TupleField {
+            let cn = env.get(cur_ty);
+            if cn.kind == .Vec {
+                if pr.index == 0_u32 { out.ps(alloc, ".x"); }
+                else if pr.index == 1_u32 { out.ps(alloc, ".y"); }
+                else if pr.index == 2_u32 { out.ps(alloc, ".z"); }
+                else { out.ps(alloc, ".w"); }
+            } else {
+                out.ps(alloc, ".f");
+                out.pu(alloc, pr.index.widen.[u64]());
+            }
+            cur_ty = pr.ty;
+        }
+        i = i +% 1_usize;
+    }
+}
+
+fn push_msl_binop(alloc: *mut AllocCap, out: *mut MslBuf, op: ast.BinaryOp) {
+    match op {
+        .Add => { out.ps(alloc, " + "); }
+        .AddWrap => { out.ps(alloc, " + "); }
+        .Sub => { out.ps(alloc, " - "); }
+        .SubWrap => { out.ps(alloc, " - "); }
+        .Mul => { out.ps(alloc, " * "); }
+        .MulWrap => { out.ps(alloc, " * "); }
+        .Div => { out.ps(alloc, " / "); }
+        .Mod => { out.ps(alloc, " % "); }
+        .BitAnd => { out.ps(alloc, " & "); }
+        .BitOr => { out.ps(alloc, " | "); }
+        .BitXor => { out.ps(alloc, " ^ "); }
+        .And => { out.ps(alloc, " && "); }
+        .Or => { out.ps(alloc, " || "); }
+        .Shl => { out.ps(alloc, " << "); }
+        .ShlWrap => { out.ps(alloc, " << "); }
+        .Shr => { out.ps(alloc, " >> "); }
+        .Eq => { out.ps(alloc, " == "); }
+        .NotEq => { out.ps(alloc, " != "); }
+        .Lt => { out.ps(alloc, " < "); }
+        .LtEq => { out.ps(alloc, " <= "); }
+        .Gt => { out.ps(alloc, " > "); }
+        .GtEq => { out.ps(alloc, " >= "); }
+        _ => { out.ps(alloc, " + "); }
+    }
+}
+
+fn push_msl_float_lit(alloc: *mut AllocCap, out: *mut MslBuf, src: *[u8]) {
+    var end = src.len;
+    if end >= 4_usize && src[end - 4_usize] == b'_' && src[end - 3_usize] == b'f' {
+        end = end - 4_usize;
+    } else if end >= 3_usize && src[end - 3_usize] == b'f' {
+        end = end - 3_usize;
+    }
+    var has_dot = false;
+    var i: usize = 0_usize;
+    while i < end {
+        let ch = src[i];
+        if ch != b'_' {
+            if ch == b'.' || ch == b'e' || ch == b'E' { has_dot = true; }
+            let one: [1]u8 = [ch];
+            out.pb(alloc, one[0_usize..1_usize]);
+        }
+        i = i +% 1_usize;
+    }
+    if !has_dot {
+        out.ps(alloc, ".0");
+    }
+    out.ps(alloc, "f");
+}
+
+fn find_msl_img_param(
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    bc: *eir.EirBuiltinCallData,
+    slot_param_map: *[MslParamMap],
+    param_map: *[MslParamMap],
+) -> u32 {
+    let aslots = eir_prog.arg_slots_slice(bc.arg_slots);
+    if aslots.len > 0_usize && aslots[0_usize] != eir.EIR_NONE {
+        let su = aslots[0_usize].widen.[usize]();
+        if su < slot_param_map.len && (slot_param_map[su].kind == 2_u8 || slot_param_map[su].kind == 3_u8) {
+            return slot_param_map[su].param_idx;
+        }
+    }
+    let args = eir_prog.vals_slice(bc.args);
+    if args.len > 0_usize {
+        let pvals = eir_prog.fn_params(fn_id);
+        var pi: usize = 0_usize;
+        while pi < pvals.len {
+            if pvals[pi] == args[0_usize] && pi < param_map.len && (param_map[pi].kind == 2_u8 || param_map[pi].kind == 3_u8) {
+                return pi.trunc.[u32]();
+            }
+            pi = pi +% 1_usize;
+        }
+    }
+    return 0_u32;
+}
+
+fn emit_msl_builtin(
+    alloc: *mut AllocCap,
+    out: *mut MslBuf,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    slot_param_map: *[MslParamMap],
+    param_map: *[MslParamMap],
+    inst: *eir.EirInst,
+    bc: *eir.EirBuiltinCallData,
+    depth: u32,
+) {
+    let k = bc.op.kind;
+    let args = eir_prog.vals_slice(bc.args);
+    if k == .GpuWorkgroupBarrier {
+        out.indent(alloc, depth);
+        out.ps(alloc, "threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+        return;
+    }
+    if k == .GpuDiscard {
+        out.indent(alloc, depth);
+        out.ps(alloc, "discard_fragment();\n");
+        return;
+    }
+    if k == .GpuImageStore && args.len >= 3_usize {
+        let pidx = find_msl_img_param(eir_prog, fn_id, bc, slot_param_map, param_map);
+        out.indent(alloc, depth);
+        out.ps(alloc, "_p");
+        out.pu(alloc, pidx.widen.[u64]());
+        out.ps(alloc, ".write(_v");
+        out.pu(alloc, args[2_usize].widen.[u64]());
+        out.ps(alloc, ", _v");
+        out.pu(alloc, args[1_usize].widen.[u64]());
+        out.ps(alloc, ");\n");
+        return;
+    }
+    if inst.dst == eir.EIR_NONE {
+        return;
+    }
+    out.indent(alloc, depth);
+    out.ps(alloc, "_v");
+    out.pu(alloc, inst.dst.widen.[u64]());
+    out.ps(alloc, " = ");
+    if k == .GpuGlobalId { out.ps(alloc, "_gid;\n"); return; }
+    if k == .GpuLocalId { out.ps(alloc, "_lid;\n"); return; }
+    if k == .GpuWorkgroupId { out.ps(alloc, "_wid;\n"); return; }
+    if k == .GpuVertexIndex { out.ps(alloc, "_vid;\n"); return; }
+    if k == .GpuInstanceIndex { out.ps(alloc, "_iid;\n"); return; }
+    if k == .GpuFragCoord { out.ps(alloc, "_fcoord;\n"); return; }
+    if k == .GpuImageSample && args.len >= 2_usize {
+        let pidx = find_msl_img_param(eir_prog, fn_id, bc, slot_param_map, param_map);
+        out.ps(alloc, "_p");
+        out.pu(alloc, pidx.widen.[u64]());
+        out.ps(alloc, ".sample(_smp, _v");
+        out.pu(alloc, args[1_usize].widen.[u64]());
+        out.ps(alloc, ");\n");
+        return;
+    }
+    if k == .GpuImageLoad && args.len >= 2_usize {
+        let pidx = find_msl_img_param(eir_prog, fn_id, bc, slot_param_map, param_map);
+        out.ps(alloc, "_p");
+        out.pu(alloc, pidx.widen.[u64]());
+        out.ps(alloc, ".read(_v");
+        out.pu(alloc, args[1_usize].widen.[u64]());
+        out.ps(alloc, ");\n");
+        return;
+    }
+    if k == .VecSplat && args.len >= 1_usize {
+        push_msl_ty(alloc, out, env, interner, bc.ret_ty);
+        out.ps(alloc, "(_v");
+        out.pu(alloc, args[0_usize].widen.[u64]());
+        out.ps(alloc, ");\n");
+        return;
+    }
+    if k == .MathSqrt && args.len >= 1_usize {
+        out.ps(alloc, "sqrt(_v");
+        out.pu(alloc, args[0_usize].widen.[u64]());
+        out.ps(alloc, ");\n");
+        return;
+    }
+    if (k == .MathFma || k == .VecFma) && args.len >= 3_usize {
+        out.ps(alloc, "fma(_v");
+        out.pu(alloc, args[0_usize].widen.[u64]());
+        out.ps(alloc, ", _v");
+        out.pu(alloc, args[1_usize].widen.[u64]());
+        out.ps(alloc, ", _v");
+        out.pu(alloc, args[2_usize].widen.[u64]());
+        out.ps(alloc, ");\n");
+        return;
+    }
+    if (k == .VecMin || k == .VecMax || k == .VecDot) && args.len >= 2_usize {
+        if k == .VecMin { out.ps(alloc, "min(_v"); }
+        else if k == .VecMax { out.ps(alloc, "max(_v"); }
+        else { out.ps(alloc, "dot(_v"); }
+        out.pu(alloc, args[0_usize].widen.[u64]());
+        out.ps(alloc, ", _v");
+        out.pu(alloc, args[1_usize].widen.[u64]());
+        out.ps(alloc, ");\n");
+        return;
+    }
+    if k == .VecSelect && args.len >= 3_usize {
+        out.ps(alloc, "select(_v");
+        out.pu(alloc, args[2_usize].widen.[u64]());
+        out.ps(alloc, ", _v");
+        out.pu(alloc, args[1_usize].widen.[u64]());
+        out.ps(alloc, ", _v");
+        out.pu(alloc, args[0_usize].widen.[u64]());
+        out.ps(alloc, ");\n");
+        return;
+    }
+    if k == .GpuMath1 && args.len >= 1_usize {
+        let sub = bc.op.len_u8;
+        if sub == 0_u8 { out.ps(alloc, "abs("); }
+        else if sub == 1_u8 { out.ps(alloc, "floor("); }
+        else if sub == 2_u8 { out.ps(alloc, "ceil("); }
+        else if sub == 3_u8 { out.ps(alloc, "fract("); }
+        else if sub == 4_u8 { out.ps(alloc, "exp("); }
+        else if sub == 5_u8 { out.ps(alloc, "sin("); }
+        else if sub == 6_u8 { out.ps(alloc, "cos("); }
+        else if sub == 7_u8 { out.ps(alloc, "sqrt("); }
+        else if sub == 8_u8 { out.ps(alloc, "length("); }
+        else { out.ps(alloc, "normalize("); }
+        out.ps(alloc, "_v");
+        out.pu(alloc, args[0_usize].widen.[u64]());
+        out.ps(alloc, ");\n");
+        return;
+    }
+    if k == .GpuMath2 && args.len >= 2_usize {
+        let sub = bc.op.len_u8;
+        if sub == 0_u8 { out.ps(alloc, "min("); }
+        else if sub == 1_u8 { out.ps(alloc, "max("); }
+        else if sub == 2_u8 { out.ps(alloc, "pow("); }
+        else if sub == 3_u8 { out.ps(alloc, "dot("); }
+        else { out.ps(alloc, "step("); }
+        out.ps(alloc, "_v");
+        out.pu(alloc, args[0_usize].widen.[u64]());
+        out.ps(alloc, ", _v");
+        out.pu(alloc, args[1_usize].widen.[u64]());
+        out.ps(alloc, ");\n");
+        return;
+    }
+    if k == .GpuMath3 && args.len >= 3_usize {
+        let sub = bc.op.len_u8;
+        if sub == 0_u8 { out.ps(alloc, "clamp("); }
+        else if sub == 1_u8 { out.ps(alloc, "mix("); }
+        else { out.ps(alloc, "smoothstep("); }
+        out.ps(alloc, "_v");
+        out.pu(alloc, args[0_usize].widen.[u64]());
+        out.ps(alloc, ", _v");
+        out.pu(alloc, args[1_usize].widen.[u64]());
+        out.ps(alloc, ", _v");
+        out.pu(alloc, args[2_usize].widen.[u64]());
+        out.ps(alloc, ");\n");
+        return;
+    }
+    out.ps(alloc, "0;\n");
+}
+
+fn emit_msl_inst(
+    alloc: *mut AllocCap,
+    out: *mut MslBuf,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    slot_param_map: *[MslParamMap],
+    param_map: *[MslParamMap],
+    inst: *eir.EirInst,
+    depth: u32,
+) {
+    match inst.kind {
+        .Const => {
+            if inst.dst == eir.EIR_NONE { return; }
+            if let c = eir_prog.get_const(inst.aux0) {
+                if c.kind == .Void { return; }
+                out.indent(alloc, depth);
+                out.ps(alloc, "_v");
+                out.pu(alloc, inst.dst.widen.[u64]());
+                out.ps(alloc, " = ");
+                if c.kind == .Bool {
+                    out.ps(alloc, if c.bool_val { "true" } else { "false" });
+                } else if c.kind == .Int {
+                    let is_s = env.get(inst.ty0).kind == .Int && env.get(inst.ty0).flag0;
+                    if is_s {
+                        out.pi(alloc, c.int_val.lo.trunc.[i32]().widen.[i64]());
+                    } else {
+                        out.pu(alloc, c.int_val.lo.trunc.[u32]().widen.[u64]());
+                        out.ps(alloc, "u");
+                    }
+                } else if c.kind == .Float {
+                    push_msl_float_lit(alloc, out, eir_prog.bytes_slice(c.bytes));
+                } else {
+                    out.pu(alloc, c.int_val.lo.trunc.[u32]().widen.[u64]());
+                    out.ps(alloc, "u");
+                }
+                out.ps(alloc, ";\n");
+            }
+        }
+        .Copy => {
+            if inst.dst == eir.EIR_NONE { return; }
+            let dt = eir_prog.fn_val_ty(fn_id, inst.dst);
+            if dt == types.TY_VOID || dt == types.TY_NEVER { return; }
+            let dn = env.get(dt);
+            if dn.kind == .Builtin && (dn.builtin_kind == .GpuBuf || dn.builtin_kind == .GpuImage2D) { return; }
+            out.indent(alloc, depth);
+            out.ps(alloc, "_v");
+            out.pu(alloc, inst.dst.widen.[u64]());
+            out.ps(alloc, " = _v");
+            out.pu(alloc, inst.v0.widen.[u64]());
+            out.ps(alloc, ";\n");
+        }
+        .LoadSlot => {
+            if inst.dst == eir.EIR_NONE { return; }
+            let su = inst.aux0.widen.[usize]();
+            if su < slot_param_map.len && slot_param_map[su].kind != 0_u8 { return; }
+            let dt = eir_prog.fn_val_ty(fn_id, inst.dst);
+            if dt == types.TY_VOID || dt == types.TY_NEVER { return; }
+            out.indent(alloc, depth);
+            out.ps(alloc, "_v");
+            out.pu(alloc, inst.dst.widen.[u64]());
+            out.ps(alloc, " = _s");
+            out.pu(alloc, inst.aux0.widen.[u64]());
+            out.ps(alloc, ";\n");
+        }
+        .StoreSlot => {
+            let su = inst.aux0.widen.[usize]();
+            if su < slot_param_map.len && slot_param_map[su].kind != 0_u8 { return; }
+            if let sl = eir_prog.fn_slot(fn_id, inst.aux0) {
+                let sn = env.get(sl.ty);
+                if sl.ty == types.TY_VOID || sl.ty == types.TY_NEVER { return; }
+                if sn.kind == .Builtin && (sn.builtin_kind == .GpuBuf || sn.builtin_kind == .GpuImage2D) { return; }
+                if sn.kind == .Array {
+                    // Array initialization from Aggregate(.ArrayRepeat) is handled via loop if needed.
+                    return;
+                }
+            }
+            out.indent(alloc, depth);
+            out.ps(alloc, "_s");
+            out.pu(alloc, inst.aux0.widen.[u64]());
+            out.ps(alloc, " = _v");
+            out.pu(alloc, inst.v0.widen.[u64]());
+            out.ps(alloc, ";\n");
+        }
+        .LoadPlace => {
+            if inst.dst == eir.EIR_NONE { return; }
+            if let pl = eir_prog.get_place(inst.aux0) {
+                out.indent(alloc, depth);
+                out.ps(alloc, "_v");
+                out.pu(alloc, inst.dst.widen.[u64]());
+                out.ps(alloc, " = ");
+                push_msl_place_expr(alloc, out, eir_prog, fn_id, env, slot_param_map, param_map, pl);
+                out.ps(alloc, ";\n");
+            }
+        }
+        .StorePlace => {
+            if let pl = eir_prog.get_place(inst.aux0) {
+                out.indent(alloc, depth);
+                push_msl_place_expr(alloc, out, eir_prog, fn_id, env, slot_param_map, param_map, pl);
+                out.ps(alloc, " = _v");
+                out.pu(alloc, inst.v0.widen.[u64]());
+                out.ps(alloc, ";\n");
+            }
+        }
+        .FieldExtract => {
+            if inst.dst == eir.EIR_NONE { return; }
+            out.indent(alloc, depth);
+            out.ps(alloc, "_v");
+            out.pu(alloc, inst.dst.widen.[u64]());
+            out.ps(alloc, " = _v");
+            out.pu(alloc, inst.v0.widen.[u64]());
+            let sn = env.get(eir_prog.fn_val_ty(fn_id, inst.v0));
+            if sn.kind == .Vec {
+                if inst.aux0 == 0_u32 { out.ps(alloc, ".x"); }
+                else if inst.aux0 == 1_u32 { out.ps(alloc, ".y"); }
+                else if inst.aux0 == 2_u32 { out.ps(alloc, ".z"); }
+                else { out.ps(alloc, ".w"); }
+            } else {
+                out.ps(alloc, ".f");
+                out.pu(alloc, inst.aux0.widen.[u64]());
+            }
+            out.ps(alloc, ";\n");
+        }
+        .Aggregate => {
+            if inst.dst == eir.EIR_NONE { return; }
+            let dn = env.get(inst.ty0);
+            if dn.kind == .Array { return; }
+            let evs = eir_prog.vals_slice(inst.range);
+            out.indent(alloc, depth);
+            out.ps(alloc, "_v");
+            out.pu(alloc, inst.dst.widen.[u64]());
+            out.ps(alloc, " = ");
+            push_msl_ty(alloc, out, env, interner, inst.ty0);
+            if dn.kind == .Struct { out.ps(alloc, "{"); } else { out.ps(alloc, "("); }
+            var ei: usize = 0_usize;
+            while ei < evs.len {
+                if ei > 0_usize { out.ps(alloc, ", "); }
+                out.ps(alloc, "_v");
+                out.pu(alloc, evs[ei].widen.[u64]());
+                ei = ei +% 1_usize;
+            }
+            if dn.kind == .Struct { out.ps(alloc, "};\n"); } else { out.ps(alloc, ");\n"); }
+        }
+        .Unary => {
+            if inst.dst == eir.EIR_NONE { return; }
+            out.indent(alloc, depth);
+            out.ps(alloc, "_v");
+            out.pu(alloc, inst.dst.widen.[u64]());
+            out.ps(alloc, " = ");
+            if inst.unary_op == .Neg { out.ps(alloc, "-"); }
+            else if inst.unary_op == .Not { out.ps(alloc, "!"); }
+            else { out.ps(alloc, "~"); }
+            out.ps(alloc, "_v");
+            out.pu(alloc, inst.v0.widen.[u64]());
+            out.ps(alloc, ";\n");
+        }
+        .Binary => {
+            if inst.dst == eir.EIR_NONE { return; }
+            out.indent(alloc, depth);
+            out.ps(alloc, "_v");
+            out.pu(alloc, inst.dst.widen.[u64]());
+            out.ps(alloc, " = (_v");
+            out.pu(alloc, inst.v0.widen.[u64]());
+            push_msl_binop(alloc, out, inst.bin_op);
+            out.ps(alloc, "_v");
+            out.pu(alloc, inst.v1.widen.[u64]());
+            out.ps(alloc, ");\n");
+        }
+        .Cast => {
+            if inst.dst == eir.EIR_NONE { return; }
+            out.indent(alloc, depth);
+            out.ps(alloc, "_v");
+            out.pu(alloc, inst.dst.widen.[u64]());
+            out.ps(alloc, " = ");
+            if inst.cast_kind == .Bitcast {
+                out.ps(alloc, "as_type<");
+                push_msl_ty(alloc, out, env, interner, inst.ty0);
+                out.ps(alloc, ">(_v");
+                out.pu(alloc, inst.v0.widen.[u64]());
+                out.ps(alloc, ");\n");
+            } else {
+                out.ps(alloc, "static_cast<");
+                push_msl_ty(alloc, out, env, interner, inst.ty0);
+                out.ps(alloc, ">(_v");
+                out.pu(alloc, inst.v0.widen.[u64]());
+                out.ps(alloc, ");\n");
+            }
+        }
+        .Call => {
+            if let cd = eir_prog.get_call(inst.aux0) {
+                var target: u32 = eir.EIR_NONE;
+                if cd.callee.kind == .DirectFn {
+                    if let f = eir_prog.find_fn_by_key(cfg_ir.fn_key_top_def(cd.callee.a)) { target = f; }
+                } else if cd.callee.kind == .Method {
+                    if let f = eir_prog.find_fn_by_key(cfg_ir.fn_key_impl_method(cd.callee.a, cd.callee.b)) { target = f; }
+                } else if cd.callee.kind == .GenericInst {
+                    if let f = eir_prog.find_fn_by_key(cfg_ir.fn_key_generic_inst(cd.callee.a)) { target = f; }
+                }
+                if target != eir.EIR_NONE {
+                    out.indent(alloc, depth);
+                    if inst.dst != eir.EIR_NONE && cd.ret_ty != types.TY_VOID && cd.ret_ty != types.TY_NEVER {
+                        out.ps(alloc, "_v");
+                        out.pu(alloc, inst.dst.widen.[u64]());
+                        out.ps(alloc, " = ");
+                    }
+                    out.ps(alloc, "eon_fn_");
+                    out.pu(alloc, target.widen.[u64]());
+                    out.ps(alloc, "(");
+                    let cargs = eir_prog.vals_slice(cd.args);
+                    var ci: usize = 0_usize;
+                    while ci < cargs.len {
+                        if ci > 0_usize { out.ps(alloc, ", "); }
+                        out.ps(alloc, "_v");
+                        out.pu(alloc, cargs[ci].widen.[u64]());
+                        ci = ci +% 1_usize;
+                    }
+                    out.ps(alloc, ");\n");
+                }
+            }
+        }
+        .BuiltinCall => {
+            if let bc = eir_prog.get_builtin_call(inst.aux0) {
+                emit_msl_builtin(alloc, out, eir_prog, fn_id, env, interner, slot_param_map, param_map, inst, bc, depth);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn emit_phi_copies_on_edge(
+    alloc: *mut AllocCap,
+    out: *mut MslBuf,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    from_bb: u32,
+    to_bb: u32,
+    depth: u32,
+) {
+    let phis = eir_prog.block_phis(fn_id, to_bb);
+    var pi: usize = 0_usize;
+    while pi < phis.len {
+        let incs = eir_prog.phi_incoming(phis[pi].incoming);
+        var k: usize = 0_usize;
+        while k < incs.len {
+            if incs[k].pred_bb == from_bb {
+                out.indent(alloc, depth);
+                out.ps(alloc, "_v");
+                out.pu(alloc, phis[pi].dst.widen.[u64]());
+                out.ps(alloc, " = _v");
+                out.pu(alloc, incs[k].val.widen.[u64]());
+                out.ps(alloc, ";\n");
+                break;
+            }
+            k = k +% 1_usize;
+        }
+        pi = pi +% 1_usize;
+    }
+}
+
+fn emit_msl_return(
+    alloc: *mut AllocCap,
+    out: *mut MslBuf,
+    env: *types.TypeEnv,
+    fctx: *MslFnCtx,
+    term: *eir.EirTerm,
+    depth: u32,
+) {
+    out.indent(alloc, depth);
+    if !term.flag || fctx.ret_ty == types.TY_VOID || fctx.ret_ty == types.TY_NEVER {
+        out.ps(alloc, "return;\n");
+        return;
+    }
+    if fctx.is_entry && fctx.stage == .Vertex && env.get(fctx.ret_ty).kind == .Struct {
+        out.ps(alloc, "EonVsOut _out;\n");
+        if let sm = env.get_struct(env.get(fctx.ret_ty).primary) {
+            let fs = env.struct_fields_range(sm.fields);
+            var fi: usize = 0_usize;
+            while fi < fs.len {
+                if fs[fi].is_gpu_position || fs[fi].has_gpu_location {
+                    out.indent(alloc, depth);
+                    out.ps(alloc, "_out.f");
+                    out.pu(alloc, fi.widen.[u64]());
+                    out.ps(alloc, " = _v");
+                    out.pu(alloc, term.val.widen.[u64]());
+                    out.ps(alloc, ".f");
+                    out.pu(alloc, fi.widen.[u64]());
+                    out.ps(alloc, ";\n");
+                }
+                fi = fi +% 1_usize;
+            }
+        }
+        out.indent(alloc, depth);
+        out.ps(alloc, "return _out;\n");
+        return;
+    }
+    out.ps(alloc, "return _v");
+    out.pu(alloc, term.val.widen.[u64]());
+    out.ps(alloc, ";\n");
+}
+
+fn emit_msl_state_machine(
+    alloc: *mut AllocCap,
+    out: *mut MslBuf,
+    eir_prog: *eir.EirProgram,
+    fctx: *MslFnCtx,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    slot_param_map: *[MslParamMap],
+    param_map: *[MslParamMap],
+) {
+    let rpo = eir_prog.fn_rpo(fctx.fn_id);
+    if rpo.len == 0_usize {
+        return;
+    }
+    if rpo.len == 1_usize {
+        // Single-block fast path: emit straight-line MSL with zero switch overhead!
+        let bb = rpo[0_usize];
+        if let blk = eir_prog.fn_block(fctx.fn_id, bb) {
+            let insts = eir_prog.insts_slice(blk.insts);
+            var ii: usize = 0_usize;
+            while ii < insts.len {
+                emit_msl_inst(alloc, out, eir_prog, fctx.fn_id, env, interner, slot_param_map, param_map, &insts[ii], 1_u32);
+                ii = ii +% 1_usize;
+            }
+            if blk.term.kind == .Return {
+                emit_msl_return(alloc, out, env, fctx, &blk.term, 1_u32);
+            }
+        }
+        return;
+    }
+
+    // Zero-goto structured state machine (100% valid Metal 2.4 for arbitrary branches, loops, phis, and early returns).
+    out.ps(alloc, "    uint _bb = ");
+    out.pu(alloc, rpo[0_usize].widen.[u64]());
+    out.ps(alloc, "u;\n    while (true) {\n        switch (_bb) {\n");
+    var ri: usize = 0_usize;
+    while ri < rpo.len {
+        let bb = rpo[ri];
+        out.ps(alloc, "            case ");
+        out.pu(alloc, bb.widen.[u64]());
+        out.ps(alloc, "u: {\n");
+        if let blk = eir_prog.fn_block(fctx.fn_id, bb) {
+            let insts = eir_prog.insts_slice(blk.insts);
+            var ii: usize = 0_usize;
+            while ii < insts.len {
+                emit_msl_inst(alloc, out, eir_prog, fctx.fn_id, env, interner, slot_param_map, param_map, &insts[ii], 4_u32);
+                ii = ii +% 1_usize;
+            }
+            let term = blk.term;
+            if term.kind == .Goto {
+                emit_phi_copies_on_edge(alloc, out, eir_prog, fctx.fn_id, bb, term.bb0, 4_u32);
+                out.ps(alloc, "                _bb = ");
+                out.pu(alloc, term.bb0.widen.[u64]());
+                out.ps(alloc, "u;\n                break;\n");
+            } else if term.kind == .Branch {
+                out.ps(alloc, "                if (_v");
+                out.pu(alloc, term.val.widen.[u64]());
+                out.ps(alloc, ") {\n");
+                emit_phi_copies_on_edge(alloc, out, eir_prog, fctx.fn_id, bb, term.bb0, 5_u32);
+                out.ps(alloc, "                    _bb = ");
+                out.pu(alloc, term.bb0.widen.[u64]());
+                out.ps(alloc, "u;\n                } else {\n");
+                emit_phi_copies_on_edge(alloc, out, eir_prog, fctx.fn_id, bb, term.bb1, 5_u32);
+                out.ps(alloc, "                    _bb = ");
+                out.pu(alloc, term.bb1.widen.[u64]());
+                out.ps(alloc, "u;\n                }\n                break;\n");
+            } else if term.kind == .SwitchInt {
+                let ts = eir_prog.switch_targets_slice(term.targets);
+                out.ps(alloc, "                switch (_v");
+                out.pu(alloc, term.val.widen.[u64]());
+                out.ps(alloc, ") {\n");
+                var ti: usize = 0_usize;
+                while ti < ts.len {
+                    out.ps(alloc, "                    case ");
+                    out.pu(alloc, ts[ti].val.lo.trunc.[u32]().widen.[u64]());
+                    out.ps(alloc, "u: {\n");
+                    emit_phi_copies_on_edge(alloc, out, eir_prog, fctx.fn_id, bb, ts[ti].target, 6_u32);
+                    out.ps(alloc, "                        _bb = ");
+                    out.pu(alloc, ts[ti].target.widen.[u64]());
+                    out.ps(alloc, "u; break;\n                    }\n");
+                    ti = ti +% 1_usize;
+                }
+                out.ps(alloc, "                    default: {\n");
+                emit_phi_copies_on_edge(alloc, out, eir_prog, fctx.fn_id, bb, term.bb0, 6_u32);
+                out.ps(alloc, "                        _bb = ");
+                out.pu(alloc, term.bb0.widen.[u64]());
+                out.ps(alloc, "u; break;\n                    }\n                }\n                break;\n");
+            } else if term.kind == .Return {
+                emit_msl_return(alloc, out, env, fctx, &term, 4_u32);
+            } else {
+                out.ps(alloc, "                return");
+                if fctx.ret_ty != types.TY_VOID && fctx.ret_ty != types.TY_NEVER {
+                    out.ps(alloc, " ");
+                    if fctx.is_entry && fctx.stage == .Vertex && env.get(fctx.ret_ty).kind == .Struct {
+                        out.ps(alloc, "EonVsOut{}");
+                    } else {
+                        push_msl_ty(alloc, out, env, interner, fctx.ret_ty);
+                        out.ps(alloc, "(0)");
+                    }
+                }
+                out.ps(alloc, ";\n");
+            }
+        }
+        out.ps(alloc, "            }\n");
+        ri = ri +% 1_usize;
+    }
+    out.ps(alloc, "        }\n    }\n");
+}
+
+fn emit_msl_locals_and_body(
+    alloc: *mut AllocCap,
+    out: *mut MslBuf,
+    eir_prog: *eir.EirProgram,
+    fctx: *MslFnCtx,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    slot_param_map: *[MslParamMap],
+    param_map: *[MslParamMap],
+) {
+    let vtys = eir_prog.fn_value_tys(fctx.fn_id);
+    var vi: usize = 0_usize;
+    while vi < vtys.len {
+        let vt = vtys[vi];
+        let vn = env.get(vt);
+        let skip = vt == types.TY_VOID || vt == types.TY_NEVER || vn.kind == .Array
+            || (vn.kind == .Builtin && (vn.builtin_kind == .GpuBuf || vn.builtin_kind == .GpuImage2D));
+        if !skip {
+            out.ps(alloc, "    ");
+            push_msl_var_decl(alloc, out, env, interner, vt, "_v", vi.trunc.[u32]());
+            out.ps(alloc, ";\n");
+        }
+        vi = vi +% 1_usize;
+    }
+
+    let slots = eir_prog.fn_slots(fctx.fn_id);
+    var si: usize = 0_usize;
+    while si < slots.len {
+        let skip = si < slot_param_map.len && slot_param_map[si].kind != 0_u8;
+        let st = slots[si].ty;
+        let sn = env.get(st);
+        let is_res = sn.kind == .Builtin && (sn.builtin_kind == .GpuBuf || sn.builtin_kind == .GpuImage2D);
+        if !skip && !is_res && st != types.TY_VOID && st != types.TY_NEVER {
+            out.ps(alloc, "    ");
+            if slots[si].is_gpu_shared {
+                out.ps(alloc, "threadgroup ");
+            }
+            push_msl_var_decl(alloc, out, env, interner, st, "_s", si.trunc.[u32]());
+            out.ps(alloc, ";\n");
+        }
+        si = si +% 1_usize;
+    }
+
+    // Bind non-resource parameters into their SSA value variables.
+    let pvals = eir_prog.fn_params(fctx.fn_id);
+    var pi: usize = 0_usize;
+    while pi < pvals.len && pi < param_map.len {
+        let pm = param_map[pi];
+        if pm.kind == 0_u8 {
+            out.ps(alloc, "    _v");
+            out.pu(alloc, pvals[pi].widen.[u64]());
+            out.ps(alloc, " = _p");
+            out.pu(alloc, pi.widen.[u64]());
+            out.ps(alloc, ";\n");
+        } else if pm.kind == 4_u8 {
+            out.ps(alloc, "    _v");
+            out.pu(alloc, pvals[pi].widen.[u64]());
+            out.ps(alloc, " = _pc.m");
+            out.pu(alloc, pm.param_idx.widen.[u64]());
+            out.ps(alloc, ";\n");
+        } else if pm.kind == 5_u8 {
+            out.ps(alloc, "    _v");
+            out.pu(alloc, pvals[pi].widen.[u64]());
+            out.ps(alloc, " = _in.in");
+            out.pu(alloc, pi.widen.[u64]());
+            out.ps(alloc, ";\n");
+        }
+        pi = pi +% 1_usize;
+    }
+
+    emit_msl_state_machine(alloc, out, eir_prog, fctx, env, interner, slot_param_map, param_map);
+}
+
+pub fn emit_msl(
+    alloc: *mut AllocCap,
+    eir_prog: *eir.EirProgram,
+    fn_id: u32,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+) -> MslOut ! OutOfMemory {
+    var out = try MslBuf.init(alloc, 1024_usize);
+    errdefer out.destroy(alloc);
+    var err_msg = try str.StrBuf.init(alloc, 32_usize);
+    errdefer err_msg.destroy(alloc);
+
+    let f = eir_prog.get_fn(fn_id) orelse {
+        try err_msg.push_str_grow(alloc, "invalid GPU function id");
+        let MslBuf.{ sb, oom: _ } = out;
+        return MslOut.{ ok: false, text: sb, err_msg: err_msg };
+    };
+    let stage = f.sig.effects.gpu_stage;
+
+    out.ps(alloc, "#include <metal_stdlib>\nusing namespace metal;\n\n");
+
+    // 1. Collect helper callees & all referenced std430 structs.
+    if !out.oom {
+        var callees = try col.DynBuf.[u32].init(alloc, 8_usize);
+        errdefer callees.destroy(alloc);
+        try gpu_check.collect_gpu_callees(alloc, eir_prog, fn_id, &mut callees);
+
+        if !out.oom {
+            var seen_structs = try col.HashMap.[u32].init(alloc, 16_usize);
+            errdefer seen_structs.destroy(alloc);
+            var struct_order = try col.DynBuf.[u32].init(alloc, 16_usize);
+            errdefer struct_order.destroy(alloc);
+            let cs = callees.as_slice();
+            var ci: usize = 0_usize;
+            while ci < cs.len {
+                try collect_fn_structs(alloc, eir_prog, cs[ci], env, &mut seen_structs, &mut struct_order);
+                ci = ci +% 1_usize;
+            }
+            try collect_fn_structs(alloc, eir_prog, fn_id, env, &mut seen_structs, &mut struct_order);
+            emit_struct_defs(alloc, &mut out, env, interner, struct_order.as_slice());
+            struct_order.destroy(alloc);
+            seen_structs.destroy(alloc);
+        }
+
+        // 2. Emit pure helper functions.
+        let cs2 = callees.as_slice();
+        var hi: usize = 0_usize;
+        while hi < cs2.len {
+            let hfid = cs2[hi];
+            if let hf = eir_prog.get_fn(hfid) {
+                out.ps(alloc, "static inline ");
+                push_msl_ty(alloc, &mut out, env, interner, hf.sig.ret);
+                out.ps(alloc, " eon_fn_");
+                out.pu(alloc, hfid.widen.[u64]());
+                out.ps(alloc, "(");
+                let hps = env.params_range(hf.sig.params);
+                var hpm = try col.DynBuf.[MslParamMap].init(alloc, hps.len +% 1_usize);
+                errdefer hpm.destroy(alloc);
+                var hpi: usize = 0_usize;
+                while hpi < hps.len {
+                    if hpi > 0_usize { out.ps(alloc, ", "); }
+                    push_msl_ty(alloc, &mut out, env, interner, hps[hpi].ty);
+                    out.ps(alloc, " _p");
+                    out.pu(alloc, hpi.widen.[u64]());
+                    try hpm.push(alloc, MslParamMap.{ kind: 0_u8, param_idx: hpi.trunc.[u32]() });
+                    hpi = hpi +% 1_usize;
+                }
+                out.ps(alloc, ") {\n");
+                let empty_spm: [1]MslParamMap = [MslParamMap.{ kind: 0_u8, param_idx: 0_u32 }];
+                let hfctx = MslFnCtx.{ fn_id: hfid, is_entry: false, stage: stage, ret_ty: hf.sig.ret };
+                emit_msl_locals_and_body(alloc, &mut out, eir_prog, &hfctx, env, interner, empty_spm[0_usize..0_usize], hpm.as_slice());
+                out.ps(alloc, "}\n\n");
+                hpm.destroy(alloc);
+            }
+            hi = hi +% 1_usize;
+        }
+        callees.destroy(alloc);
+    }
+
+    // 3. Emit PushConstant struct / Fragment stage_in struct / Vertex output struct if needed.
+    let ps = env.params_range(f.sig.params);
+    var param_map = try col.DynBuf.[MslParamMap].init(alloc, ps.len +% 1_usize);
+    errdefer param_map.destroy(alloc);
+    var has_pc = false;
+    var pc_cnt: u32 = 0_u32;
+    var has_stage_in = false;
+    var has_sampled_img = false;
+
+    var pi0: usize = 0_usize;
+    while pi0 < ps.len {
+        let p = ps[pi0];
+        let pn = env.get(p.ty);
+        if pn.kind == .Builtin && pn.builtin_kind == .GpuBuf {
+            try param_map.push(alloc, MslParamMap.{ kind: 1_u8, param_idx: pi0.trunc.[u32]() });
+        } else if pn.kind == .Builtin && pn.builtin_kind == .GpuImage2D {
+            if p.access == .Write {
+                try param_map.push(alloc, MslParamMap.{ kind: 3_u8, param_idx: pi0.trunc.[u32]() });
+            } else {
+                has_sampled_img = true;
+                try param_map.push(alloc, MslParamMap.{ kind: 2_u8, param_idx: pi0.trunc.[u32]() });
+            }
+        } else if p.is_push_const {
+            has_pc = true;
+            try param_map.push(alloc, MslParamMap.{ kind: 4_u8, param_idx: pc_cnt });
+            pc_cnt = pc_cnt +% 1_u32;
+        } else if p.has_gpu_location {
+            has_stage_in = true;
+            try param_map.push(alloc, MslParamMap.{ kind: 5_u8, param_idx: p.gpu_location });
+        } else {
+            try param_map.push(alloc, MslParamMap.{ kind: 0_u8, param_idx: pi0.trunc.[u32]() });
+        }
+        pi0 = pi0 +% 1_usize;
+    }
+
+    if has_pc {
+        out.ps(alloc, "struct EonPushConst {\n");
+        var pci: usize = 0_usize;
+        var mi: u32 = 0_u32;
+        while pci < ps.len {
+            if ps[pci].is_push_const {
+                out.ps(alloc, "    ");
+                push_msl_ty(alloc, &mut out, env, interner, ps[pci].ty);
+                out.ps(alloc, " m");
+                out.pu(alloc, mi.widen.[u64]());
+                out.ps(alloc, ";\n");
+                mi = mi +% 1_u32;
+            }
+            pci = pci +% 1_usize;
+        }
+        out.ps(alloc, "};\n\n");
+    }
+
+    if has_stage_in {
+        out.ps(alloc, "struct EonStageIn {\n");
+        var si: usize = 0_usize;
+        while si < ps.len {
+            if ps[si].has_gpu_location {
+                out.ps(alloc, "    ");
+                push_msl_ty(alloc, &mut out, env, interner, ps[si].ty);
+                out.ps(alloc, " in");
+                out.pu(alloc, si.widen.[u64]());
+                out.ps(alloc, " [[user(locn");
+                out.pu(alloc, ps[si].gpu_location.widen.[u64]());
+                out.ps(alloc, ")]]");
+                if stage == .Fragment && is_msl_int_or_vec(env, ps[si].ty) {
+                    out.ps(alloc, " [[flat]]");
+                }
+                out.ps(alloc, ";\n");
+            }
+            si = si +% 1_usize;
+        }
+        out.ps(alloc, "};\n\n");
+    }
+
+    let is_vs_struct_out = stage == .Vertex && env.get(f.sig.ret).kind == .Struct;
+    if is_vs_struct_out {
+        out.ps(alloc, "struct EonVsOut {\n");
+        if let sm = env.get_struct(env.get(f.sig.ret).primary) {
+            let fs = env.struct_fields_range(sm.fields);
+            var fi: usize = 0_usize;
+            while fi < fs.len {
+                if fs[fi].is_gpu_position || fs[fi].has_gpu_location {
+                    out.ps(alloc, "    ");
+                    push_msl_ty(alloc, &mut out, env, interner, fs[fi].ty);
+                    out.ps(alloc, " f");
+                    out.pu(alloc, fi.widen.[u64]());
+                    if fs[fi].is_gpu_position {
+                        out.ps(alloc, " [[position]]");
+                    } else {
+                        out.ps(alloc, " [[user(locn");
+                        out.pu(alloc, fs[fi].gpu_location.widen.[u64]());
+                        out.ps(alloc, ")]]");
+                        if is_msl_int_or_vec(env, fs[fi].ty) {
+                            out.ps(alloc, " [[flat]]");
+                        }
+                    }
+                    out.ps(alloc, ";\n");
+                }
+                fi = fi +% 1_usize;
+            }
+        }
+        out.ps(alloc, "};\n\n");
+    }
+
+    // 4. Emit entry point signature.
+    if stage == .Vertex {
+        out.ps(alloc, "vertex ");
+        if is_vs_struct_out {
+            out.ps(alloc, "EonVsOut");
+        } else {
+            push_msl_ty(alloc, &mut out, env, interner, f.sig.ret);
+        }
+    } else if stage == .Fragment {
+        out.ps(alloc, "fragment ");
+        push_msl_ty(alloc, &mut out, env, interner, f.sig.ret);
+    } else {
+        out.ps(alloc, "kernel void");
+    }
+    out.ps(alloc, " ");
+    out.pb(alloc, interner.get(f.name));
+    out.ps(alloc, "(\n");
+
+    var first_arg = true;
+    if has_stage_in {
+        out.ps(alloc, "    EonStageIn _in [[stage_in]]");
+        first_arg = false;
+    }
+    var pi: usize = 0_usize;
+    while pi < ps.len {
+        let p = ps[pi];
+        let pn = env.get(p.ty);
+        if pn.kind == .Builtin && pn.builtin_kind == .GpuBuf {
+            if !first_arg { out.ps(alloc, ",\n"); }
+            first_arg = false;
+            let gs = env.node_gval_list(&pn);
+            let elem_ty = if gs.len > 0_usize && gs[0_usize].kind == .Ty { gs[0_usize].id } else { types.TY_U32 };
+            out.ps(alloc, if p.access == .Read { "    device const " } else { "    device " });
+            push_msl_ty(alloc, &mut out, env, interner, elem_ty);
+            out.ps(alloc, "* _p");
+            out.pu(alloc, pi.widen.[u64]());
+            out.ps(alloc, " [[buffer(");
+            out.pu(alloc, if p.has_gpu_binding { p.gpu_binding.widen.[u64]() } else { pi.widen.[u64]() });
+            out.ps(alloc, ")]]");
+        } else if pn.kind == .Builtin && pn.builtin_kind == .GpuImage2D {
+            if !first_arg { out.ps(alloc, ",\n"); }
+            first_arg = false;
+            let gs = env.node_gval_list(&pn);
+            let elem_ty = if gs.len > 0_usize && gs[0_usize].kind == .Ty { gs[0_usize].id } else { types.TY_F32 };
+            let is_uint = is_msl_int_or_vec(env, elem_ty);
+            if p.access == .Write {
+                out.ps(alloc, if is_uint { "    texture2d<uint, access::write> _p" } else { "    texture2d<float, access::write> _p" });
+            } else {
+                out.ps(alloc, "    texture2d<float, access::sample> _p");
+            }
+            out.pu(alloc, pi.widen.[u64]());
+            out.ps(alloc, " [[texture(");
+            out.pu(alloc, if p.has_gpu_binding { p.gpu_binding.widen.[u64]() } else { pi.widen.[u64]() });
+            out.ps(alloc, ")]]");
+        }
+        pi = pi +% 1_usize;
+    }
+    if has_pc {
+        if !first_arg { out.ps(alloc, ",\n"); }
+        first_arg = false;
+        out.ps(alloc, "    constant EonPushConst& _pc [[buffer(30)]]");
+    }
+    if stage == .Compute {
+        if !first_arg { out.ps(alloc, ",\n"); }
+        out.ps(alloc, "    uint3 _gid [[thread_position_in_grid]],\n");
+        out.ps(alloc, "    uint3 _lid [[thread_position_in_threadgroup]],\n");
+        out.ps(alloc, "    uint3 _wid [[threadgroup_position_in_grid]]");
+    } else if stage == .Vertex {
+        if !first_arg { out.ps(alloc, ",\n"); }
+        out.ps(alloc, "    uint _vid [[vertex_id]],\n");
+        out.ps(alloc, "    uint _iid [[instance_id]]");
+    } else if stage == .Fragment {
+        if !first_arg { out.ps(alloc, ",\n"); }
+        out.ps(alloc, "    float4 _fcoord [[position]]");
+    }
+    out.ps(alloc, "\n) {\n");
+    if has_sampled_img {
+        out.ps(alloc, "    constexpr sampler _smp(mag_filter::linear, min_filter::linear, address::clamp_to_edge);\n");
+    }
+
+    // Map slots holding GpuBuf / GpuImage2D parameters.
+    let nslots = eir_prog.fn_slots(fn_id).len;
+    var slot_param_map = try col.DynBuf.[MslParamMap].init(alloc, nslots +% 1_usize);
+    errdefer slot_param_map.destroy(alloc);
+    var si0: usize = 0_usize;
+    while si0 < nslots {
+        try slot_param_map.push(alloc, MslParamMap.{ kind: 0_u8, param_idx: 0_u32 });
+        si0 = si0 +% 1_usize;
+    }
+    let pvals = eir_prog.fn_params(fn_id);
+    let blks = eir_prog.fn_blocks(fn_id);
+    var bi: usize = 0_usize;
+    while bi < blks.len {
+        let insts = eir_prog.insts_slice(blks[bi].insts);
+        var ii: usize = 0_usize;
+        while ii < insts.len {
+            if insts[ii].kind == .StoreSlot {
+                var pk: usize = 0_usize;
+                while pk < pvals.len && pk < param_map.len() {
+                    if pvals[pk] == insts[ii].v0 {
+                        if let pmp = param_map.get(pk) {
+                            if pmp.kind == 1_u8 || pmp.kind == 2_u8 || pmp.kind == 3_u8 {
+                                let su = insts[ii].aux0.widen.[usize]();
+                                let spm_mut = slot_param_map.as_mut_slice();
+                                if su < spm_mut.len {
+                                    spm_mut[su] = pmp.*;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    pk = pk +% 1_usize;
+                }
+            }
+            ii = ii +% 1_usize;
+        }
+        bi = bi +% 1_usize;
+    }
+
+    let fctx = MslFnCtx.{ fn_id: fn_id, is_entry: true, stage: stage, ret_ty: f.sig.ret };
+    emit_msl_locals_and_body(alloc, &mut out, eir_prog, &fctx, env, interner, slot_param_map.as_slice(), param_map.as_slice());
+    out.ps(alloc, "}\n");
+
+    slot_param_map.destroy(alloc);
+    param_map.destroy(alloc);
+
+    if out.oom {
+        out.destroy(alloc);
+        err_msg.destroy(alloc);
+        return OutOfMemory;
+    }
+    let MslBuf.{ sb, oom: _ } = out;
+    return MslOut.{ ok: true, text: sb, err_msg: err_msg };
+}
