@@ -13,11 +13,15 @@ pub fn iouring_nop_batch(io_cap: *IoCap, count: usize) -> usize ! IoError {
     return try io_cap.nop_roundtrip(count);
 }
 
-/// Emit a CPU spin-wait hint (`pause` on x86_64, `yield` on AArch64) inside spin-wait loops.
+/// Emit a CPU spin-wait hint (`pause` on x86_64/RISC-V, `yield` on AArch64) inside spin-wait loops.
 pub fn cpu_pause() {
     comptime if @target_arch() == .AArch64 {
         raw {
             asm("yield");
+        }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw {
+            asm("pause");
         }
     } else {
         raw {

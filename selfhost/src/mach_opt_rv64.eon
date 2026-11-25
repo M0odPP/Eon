@@ -1,0 +1,936 @@
+module eonc.mach_opt_rv64;
+
+import core.col;
+import eonc.span;
+import eonc.ast;
+import eonc.x64_asm;
+import eonc.rv64_asm;
+import eonc.elf64;
+import eonc.mach_ir;
+
+// ============================================================================
+// Post-RA RISC-V 64 Peephole Optimizer & `MachFunc` -> `Rv64Buf` Emitter
+// ============================================================================
+
+pub linear struct Rv64EmitOut {
+    pub ok: bool;
+    pub own_stack_bytes: u64;
+    pub code: col.DynBuf[u8];
+    pub relocs: col.DynBuf[rv64_asm.Rv64Reloc];
+    pub rodata_items: col.DynBuf[mach_ir.MachRodataItem];
+    pub rodata_bytes: col.DynBuf[u8];
+    pub rodata_relocs: col.DynBuf[mach_ir.MachRodataReloc];
+    pub used_helpers: col.DynBuf[u32];
+    pub line_entries: col.DynBuf[elf64.LineEntry];
+}
+
+impl Rv64EmitOut {
+    pub fn init(alloc: *mut AllocCap) -> Rv64EmitOut ! OutOfMemory {
+        let code = try col.DynBuf.[u8].init(alloc, 128_usize);
+        errdefer code.destroy(alloc);
+        let relocs = try col.DynBuf.[rv64_asm.Rv64Reloc].init(alloc, 8_usize);
+        errdefer relocs.destroy(alloc);
+        let rodata_items = try col.DynBuf.[mach_ir.MachRodataItem].init(alloc, 4_usize);
+        errdefer rodata_items.destroy(alloc);
+        let rodata_bytes = try col.DynBuf.[u8].init(alloc, 32_usize);
+        errdefer rodata_bytes.destroy(alloc);
+        let rodata_relocs = try col.DynBuf.[mach_ir.MachRodataReloc].init(alloc, 4_usize);
+        errdefer rodata_relocs.destroy(alloc);
+        let used_helpers = try col.DynBuf.[u32].init(alloc, 4_usize);
+        errdefer used_helpers.destroy(alloc);
+        let line_entries = try col.DynBuf.[elf64.LineEntry].init(alloc, 16_usize);
+        errdefer line_entries.destroy(alloc);
+        return Rv64EmitOut.{
+            ok: false,
+            own_stack_bytes: 0_u64,
+            code: code,
+            relocs: relocs,
+            rodata_items: rodata_items,
+            rodata_bytes: rodata_bytes,
+            rodata_relocs: rodata_relocs,
+            used_helpers: used_helpers,
+            line_entries: line_entries,
+        };
+    }
+
+    pub fn destroy(self: Rv64EmitOut, alloc: *mut AllocCap) {
+        let Rv64EmitOut.{
+            ok: _, own_stack_bytes: _, code, relocs, rodata_items, rodata_bytes, rodata_relocs, used_helpers, line_entries,
+        } = self;
+        code.destroy(alloc);
+        relocs.destroy(alloc);
+        rodata_items.destroy(alloc);
+        rodata_bytes.destroy(alloc);
+        rodata_relocs.destroy(alloc);
+        used_helpers.destroy(alloc);
+        line_entries.destroy(alloc);
+    }
+}
+
+fn align_up_usize(val: usize, align: usize) -> usize {
+    if align <= 1_usize { return val; }
+    let mask = align -% 1_usize;
+    return (val +% mask) & (~mask);
+}
+
+fn invert_x64_cond(cc: x64_asm.Cond) -> x64_asm.Cond {
+    match cc {
+        .O => { return .No; }
+        .No => { return .O; }
+        .B => { return .Ae; }
+        .Ae => { return .B; }
+        .E => { return .Ne; }
+        .Ne => { return .E; }
+        .Be => { return .A; }
+        .A => { return .Be; }
+        .S => { return .Ns; }
+        .Ns => { return .S; }
+        .P => { return .Np; }
+        .Np => { return .P; }
+        .L => { return .Ge; }
+        .Ge => { return .L; }
+        .Le => { return .G; }
+        .G => { return .Le; }
+    }
+    return .E;
+}
+
+fn build_emit_order(alloc: *mut AllocCap, mf: *mach_ir.MachFunc, out: *mut col.DynBuf[u32]) -> !OutOfMemory {
+    out.clear();
+    let n_blocks = mf.blocks.len();
+    if n_blocks == 0_usize { return; }
+    let rpo = mf.rpo.as_slice();
+    if rpo.len > 0_usize {
+        var seen = try col.BitSet.init(alloc, n_blocks);
+        errdefer seen.destroy(alloc);
+        let eb = mf.entry_block;
+        let eb_idx = eb.widen.[usize]();
+        if eb_idx < n_blocks {
+            seen.set(eb_idx);
+            try out.push(alloc, eb);
+        }
+        var ri: usize = 0_usize;
+        while ri < rpo.len {
+            let bb = rpo[ri];
+            let bidx = bb.widen.[usize]();
+            if bidx < n_blocks && !seen.test(bidx) {
+                seen.set(bidx);
+                try out.push(alloc, bb);
+            }
+            ri = ri +% 1_usize;
+        }
+        seen.destroy(alloc);
+        return;
+    }
+    var bi: usize = 0_usize;
+    while bi < n_blocks {
+        try out.push(alloc, bi.trunc.[u32]());
+        bi = bi +% 1_usize;
+    }
+    return;
+}
+
+pub fn peephole_rv64(alloc: *mut AllocCap, mf: *mut mach_ir.MachFunc) -> !OutOfMemory {
+    let n_blocks = mf.blocks.len();
+    if n_blocks == 0_usize { return; }
+    var order = try col.DynBuf.[u32].init(alloc, n_blocks);
+    errdefer order.destroy(alloc);
+    try build_emit_order(alloc, mf, &mut order);
+
+    var new_insts = try col.DynBuf.[mach_ir.MachInst].init(alloc, mf.insts.len());
+    errdefer new_insts.destroy(alloc);
+    var new_ranges = try col.DynBuf.[ast.IdRange].init(alloc, n_blocks);
+    errdefer new_ranges.destroy(alloc);
+    var bi0: usize = 0_usize;
+    while bi0 < n_blocks {
+        try new_ranges.push(alloc, ast.range_empty());
+        bi0 = bi0 +% 1_usize;
+    }
+
+    let ord_s = order.as_slice();
+    let bs_ro = mf.blocks.as_slice();
+    var oi: usize = 0_usize;
+    while oi < ord_s.len {
+        let bb = ord_s[oi];
+        let bidx = bb.widen.[usize]();
+        let next_lbl: u32 = if oi +% 1_usize < ord_s.len {
+            let nidx = ord_s[oi +% 1_usize].widen.[usize]();
+            if nidx < bs_ro.len { bs_ro[nidx].label } else { mach_ir.LABEL_NONE }
+        } else {
+            mach_ir.LABEL_NONE
+        };
+        let start = new_insts.len().trunc.[u32]();
+        let blk_insts = mf.block_insts(bb);
+        var ki: usize = 0_usize;
+        while ki < blk_insts.len {
+            let cur = blk_insts[ki];
+            if (cur.op == .Mov || cur.op == .Copy || cur.op == .VMovVecReg)
+                && cur.dst_phys < 32_u8 && cur.dst_phys == cur.src0_phys
+            {
+                ki = ki +% 1_usize;
+                continue;
+            }
+            if cur.op == .Jmp && cur.mem.label == next_lbl && ki +% 1_usize == blk_insts.len {
+                ki = ki +% 1_usize;
+                continue;
+            }
+            if cur.op == .Jcc && cur.mem.label == next_lbl && ki +% 2_usize == blk_insts.len {
+                let nxt = blk_insts[ki +% 1_usize];
+                if nxt.op == .Jmp {
+                    var inv = cur;
+                    inv.cc = invert_x64_cond(inv.cc);
+                    inv.mem.label = nxt.mem.label;
+                    try new_insts.push(alloc, inv);
+                    ki = ki +% 2_usize;
+                    continue;
+                }
+            }
+            if cur.op == .Load && cur.mem.kind == .StackSlot && cur.size_bytes == 8_u8 {
+                let ns = new_insts.as_slice();
+                if ns.len > start.widen.[usize]() && ns.len > 0_usize {
+                    let prev = ns[ns.len - 1_usize];
+                    if prev.op == .Store && prev.mem.kind == .StackSlot && prev.size_bytes == 8_u8
+                        && prev.mem.disp == cur.mem.disp && prev.src0_phys == cur.dst_phys
+                    {
+                        ki = ki +% 1_usize;
+                        continue;
+                    }
+                }
+            }
+            try new_insts.push(alloc, cur);
+            ki = ki +% 1_usize;
+        }
+        let end = new_insts.len().trunc.[u32]();
+        let nr_m = new_ranges.as_mut_slice();
+        if bidx < nr_m.len { nr_m[bidx] = ast.range_new(start, end -% start); }
+        oi = oi +% 1_usize;
+    }
+
+    let nr_ro = new_ranges.as_slice();
+    let bs_m = mf.blocks.as_mut_slice();
+    var bi1: usize = 0_usize;
+    while bi1 < bs_m.len && bi1 < nr_ro.len {
+        bs_m[bi1].insts = nr_ro[bi1];
+        bi1 = bi1 +% 1_usize;
+    }
+    mf.replace_insts(alloc, new_insts);
+    new_ranges.destroy(alloc);
+    order.destroy(alloc);
+    return;
+}
+
+// ============================================================================
+// LP64D Frame Layout, Prologue & Flag/Error-Channel-Preserving Epilogue
+// ============================================================================
+//   [fp + 16 ..]             : caller overflow args
+//   [fp + 0  .. fp + 16)     : saved fp (x8), ra (x1)
+//   [fp - local .. fp)       : local & spill StackSlots
+//   [sp .. sp + saved_bytes) : callee-saved GPRs (s1, s2..s11) & FPRs (fs0..fs1, fs2..fs11)
+
+struct Rv64FrameLayout {
+    is_naked: bool;
+    needs_frame: bool;
+    local_bytes: usize;
+    saved_gpr_count: usize;
+    saved_gprs: [12]u8;
+    saved_vec_count: usize;
+    saved_vecs: [12]u8;
+    body_sub: usize;
+    total_sub: usize;
+}
+
+fn plan_rv64_frame(mf: *mach_ir.MachFunc) -> Rv64FrameLayout {
+    var fl = Rv64FrameLayout.{
+        is_naked: mf.is_naked,
+        needs_frame: false,
+        local_bytes: 0_usize,
+        saved_gpr_count: 0_usize,
+        saved_gprs: [0_u8; 12],
+        saved_vec_count: 0_usize,
+        saved_vecs: [0_u8; 12],
+        body_sub: 0_usize,
+        total_sub: 0_usize,
+    };
+    if mf.is_naked { return fl; }
+    if (mf.used_callee_gprs & mach_ir.phys_bit(rv64_asm.S1)) != 0_u32 {
+        fl.saved_gprs[0_usize] = rv64_asm.S1;
+        fl.saved_gpr_count = 1_usize;
+    }
+    var r: u8 = 18_u8;
+    while r <= 27_u8 {
+        if (mf.used_callee_gprs & mach_ir.phys_bit(r)) != 0_u32 && fl.saved_gpr_count < 12_usize {
+            fl.saved_gprs[fl.saved_gpr_count] = r;
+            fl.saved_gpr_count = fl.saved_gpr_count +% 1_usize;
+        }
+        r = r +% 1_u8;
+    }
+    if (mf.used_callee_vecs & mach_ir.phys_bit(8_u8)) != 0_u32 {
+        fl.saved_vecs[0_usize] = 8_u8;
+        fl.saved_vec_count = 1_usize;
+    }
+    if (mf.used_callee_vecs & mach_ir.phys_bit(9_u8)) != 0_u32 && fl.saved_vec_count < 12_usize {
+        fl.saved_vecs[fl.saved_vec_count] = 9_u8;
+        fl.saved_vec_count = fl.saved_vec_count +% 1_usize;
+    }
+    r = 18_u8;
+    while r <= 27_u8 {
+        if (mf.used_callee_vecs & mach_ir.phys_bit(r)) != 0_u32 && fl.saved_vec_count < 12_usize {
+            fl.saved_vecs[fl.saved_vec_count] = r;
+            fl.saved_vec_count = fl.saved_vec_count +% 1_usize;
+        }
+        r = r +% 1_u8;
+    }
+    let locals = align_up_usize(mf.frame_cursor, 16_usize);
+    let saved_b = align_up_usize((fl.saved_gpr_count +% fl.saved_vec_count) *% 8_usize, 16_usize);
+    fl.local_bytes = locals;
+    fl.needs_frame = !mf.is_leaf || mf.has_calls || locals > 0_usize || saved_b > 0_usize;
+    if fl.needs_frame {
+        fl.body_sub = align_up_usize(locals +% saved_b, 16_usize);
+        fl.total_sub = 16_usize +% fl.body_sub;
+    }
+    return fl;
+}
+
+fn emit_rv64_prologue(alloc: *mut AllocCap, b: *mut rv64_asm.Rv64Buf, fl: *Rv64FrameLayout) {
+    if fl.is_naked || !fl.needs_frame { return; }
+    b.addi(alloc, rv64_asm.SP, rv64_asm.SP, -16_i32);
+    b.store_mem(alloc, rv64_asm.SP, 0_i32, rv64_asm.FP, 8_u8, rv64_asm.T5);
+    b.store_mem(alloc, rv64_asm.SP, 8_i32, rv64_asm.RA, 8_u8, rv64_asm.T5);
+    b.mv(alloc, rv64_asm.FP, rv64_asm.SP);
+    if fl.body_sub > 0_usize {
+        b.add_imm_large(alloc, rv64_asm.SP, rv64_asm.SP, 0_i64 -% fl.body_sub.widen.[u64]().bitcast.[i64](), rv64_asm.T5);
+    }
+    var off: i32 = 0_i32;
+    var i: usize = 0_usize;
+    while i < fl.saved_gpr_count && i < 12_usize {
+        b.store_mem(alloc, rv64_asm.SP, off, fl.saved_gprs[i], 8_u8, rv64_asm.T5);
+        off = off +% 8_i32;
+        i = i +% 1_usize;
+    }
+    i = 0_usize;
+    while i < fl.saved_vec_count && i < 12_usize {
+        b.fstore(alloc, true, rv64_asm.SP, off, fl.saved_vecs[i], rv64_asm.T5);
+        off = off +% 8_i32;
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+fn emit_rv64_epilogue(alloc: *mut AllocCap, b: *mut rv64_asm.Rv64Buf, fl: *Rv64FrameLayout) {
+    if fl.is_naked { return; }
+    if fl.needs_frame {
+        var off: i32 = 0_i32;
+        var i: usize = 0_usize;
+        while i < fl.saved_gpr_count && i < 12_usize {
+            b.load_mem(alloc, fl.saved_gprs[i], rv64_asm.SP, off, 8_u8, false, rv64_asm.T5);
+            off = off +% 8_i32;
+            i = i +% 1_usize;
+        }
+        i = 0_usize;
+        while i < fl.saved_vec_count && i < 12_usize {
+            b.fload(alloc, true, fl.saved_vecs[i], rv64_asm.SP, off, rv64_asm.T5);
+            off = off +% 8_i32;
+            i = i +% 1_usize;
+        }
+        b.mv(alloc, rv64_asm.SP, rv64_asm.FP);
+        b.load_mem(alloc, rv64_asm.FP, rv64_asm.SP, 0_i32, 8_u8, false, rv64_asm.T5);
+        b.load_mem(alloc, rv64_asm.RA, rv64_asm.SP, 8_i32, 8_u8, false, rv64_asm.T5);
+        b.addi(alloc, rv64_asm.SP, rv64_asm.SP, 16_i32);
+    }
+    b.ret(alloc);
+    return;
+}
+
+// ============================================================================
+// Compare State & Condition Emitter (Int + IEEE-754 FP)
+// ============================================================================
+
+struct RvCmpState {
+    is_fp: bool;
+    fp64: bool;
+    fs1: u8;
+    fs2: u8;
+    is32: bool;
+    rs1: u8;
+    rs2: u8;
+}
+
+fn save_int_cmp_regs(alloc: *mut AllocCap, b: *mut rv64_asm.Rv64Buf, s0: u8, s1: u8, is32: bool, cs: *mut RvCmpState) {
+    let sc0 = rv64_asm.T5;
+    let sc1 = rv64_asm.T6;
+    if s0 == sc1 && s1 == sc0 {
+        cs.rs1 = sc1;
+        cs.rs2 = sc0;
+    } else if s1 == sc0 {
+        b.mv(alloc, sc1, sc0);
+        b.mv(alloc, sc0, s0);
+        cs.rs1 = sc0;
+        cs.rs2 = sc1;
+    } else {
+        b.mv(alloc, sc0, s0);
+        b.mv(alloc, sc1, s1);
+        cs.rs1 = sc0;
+        cs.rs2 = sc1;
+    }
+    cs.is_fp = false;
+    cs.is32 = is32;
+    return;
+}
+
+fn emit_fp_cond_to_reg(alloc: *mut AllocCap, b: *mut rv64_asm.Rv64Buf, cc: x64_asm.Cond, cs: RvCmpState, rd: u8) {
+    let f1 = cs.fs1;
+    let f2 = cs.fs2;
+    let d = cs.fp64;
+    match cc {
+        .E  => { b.feq(alloc, d, rd, f1, f2); }
+        .Ne => { b.feq(alloc, d, rd, f1, f2); b.xori(alloc, rd, rd, 1_i32); }
+        .B  => { b.flt(alloc, d, rd, f1, f2); }
+        .L  => { b.flt(alloc, d, rd, f1, f2); }
+        .Be => { b.fle(alloc, d, rd, f1, f2); }
+        .Le => { b.fle(alloc, d, rd, f1, f2); }
+        .A  => { b.flt(alloc, d, rd, f2, f1); }
+        .G  => { b.flt(alloc, d, rd, f2, f1); }
+        .Ae => { b.fle(alloc, d, rd, f2, f1); }
+        .Ge => { b.fle(alloc, d, rd, f2, f1); }
+        _   => { b.mv(alloc, rd, rv64_asm.ZERO); }
+    }
+    return;
+}
+
+fn prep_int_cmp_width(alloc: *mut AllocCap, b: *mut rv64_asm.Rv64Buf, cc: x64_asm.Cond, cs: RvCmpState) {
+    if !cs.is32 { return; }
+    let is_signed = cc == .L || cc == .Ge || cc == .Le || cc == .G;
+    if is_signed {
+        b.addiw(alloc, cs.rs1, cs.rs1, 0_i32);
+        b.addiw(alloc, cs.rs2, cs.rs2, 0_i32);
+    } else {
+        b.slli(alloc, cs.rs1, cs.rs1, 32_u8);
+        b.srli(alloc, cs.rs1, cs.rs1, 32_u8);
+        b.slli(alloc, cs.rs2, cs.rs2, 32_u8);
+        b.srli(alloc, cs.rs2, cs.rs2, 32_u8);
+    }
+    return;
+}
+
+fn emit_rv_setcc(alloc: *mut AllocCap, b: *mut rv64_asm.Rv64Buf, cc: x64_asm.Cond, cs: RvCmpState, rd: u8) {
+    if cs.is_fp {
+        emit_fp_cond_to_reg(alloc, b, cc, cs, rd);
+        return;
+    }
+    prep_int_cmp_width(alloc, b, cc, cs);
+    let a = cs.rs1;
+    let c = cs.rs2;
+    match cc {
+        .E  => { b.xor(alloc, rd, a, c); b.sltiu(alloc, rd, rd, 1_i32); }
+        .Ne => { b.xor(alloc, rd, a, c); b.sltu(alloc, rd, rv64_asm.ZERO, rd); }
+        .L  => { b.slt(alloc, rd, a, c); }
+        .Ge => { b.slt(alloc, rd, a, c); b.xori(alloc, rd, rd, 1_i32); }
+        .Le => { b.slt(alloc, rd, c, a); b.xori(alloc, rd, rd, 1_i32); }
+        .G  => { b.slt(alloc, rd, c, a); }
+        .B  => { b.sltu(alloc, rd, a, c); }
+        .Ae => { b.sltu(alloc, rd, a, c); b.xori(alloc, rd, rd, 1_i32); }
+        .Be => { b.sltu(alloc, rd, c, a); b.xori(alloc, rd, rd, 1_i32); }
+        .A  => { b.sltu(alloc, rd, c, a); }
+        _   => { b.mv(alloc, rd, rv64_asm.ZERO); }
+    }
+    return;
+}
+
+fn emit_rv_jcc(alloc: *mut AllocCap, b: *mut rv64_asm.Rv64Buf, cc: x64_asm.Cond, cs: RvCmpState, lbl: u32) {
+    if cs.is_fp {
+        emit_fp_cond_to_reg(alloc, b, cc, cs, rv64_asm.T5);
+        b.br_cond_label(alloc, .Ne, rv64_asm.T5, rv64_asm.ZERO, lbl);
+        return;
+    }
+    prep_int_cmp_width(alloc, b, cc, cs);
+    let a = cs.rs1;
+    let c = cs.rs2;
+    match cc {
+        .E  => { b.br_cond_label(alloc, .Eq, a, c, lbl); }
+        .Ne => { b.br_cond_label(alloc, .Ne, a, c, lbl); }
+        .L  => { b.br_cond_label(alloc, .Lt, a, c, lbl); }
+        .Ge => { b.br_cond_label(alloc, .Ge, a, c, lbl); }
+        .Le => { b.br_cond_label(alloc, .Ge, c, a, lbl); }
+        .G  => { b.br_cond_label(alloc, .Lt, c, a, lbl); }
+        .B  => { b.br_cond_label(alloc, .Ltu, a, c, lbl); }
+        .Ae => { b.br_cond_label(alloc, .Geu, a, c, lbl); }
+        .Be => { b.br_cond_label(alloc, .Geu, c, a, lbl); }
+        .A  => { b.br_cond_label(alloc, .Ltu, c, a, lbl); }
+        _   => {}
+    }
+    return;
+}
+
+// ============================================================================
+// Memory Addressing & Single MachInst -> RV64 Machine Code Emitter
+// ============================================================================
+
+fn mem_base_rv64(m: *mach_ir.MemAddr) -> u8 {
+    if m.kind == .StackSlot {
+        return rv64_asm.FP;
+    }
+    return m.base_phys;
+}
+
+fn emit_addr_rv64(alloc: *mut AllocCap, b: *mut rv64_asm.Rv64Buf, m: *mach_ir.MemAddr, dst: u8, sc: u8) {
+    match m.kind {
+        .StackSlot => { b.add_imm_large(alloc, dst, rv64_asm.FP, m.disp.widen.[i64](), sc); }
+        .BaseDisp => { b.add_imm_large(alloc, dst, m.base_phys, m.disp.widen.[i64](), sc); }
+        .Sib => {
+            b.mv(alloc, sc, m.idx_phys);
+            if m.scale == 2_u8 { b.slli(alloc, sc, sc, 1_u8); }
+            else if m.scale == 4_u8 { b.slli(alloc, sc, sc, 2_u8); }
+            else if m.scale == 8_u8 { b.slli(alloc, sc, sc, 3_u8); }
+            b.add(alloc, dst, m.base_phys, sc);
+            if m.disp != 0_i32 { b.add_imm_large(alloc, dst, dst, m.disp.widen.[i64](), sc); }
+        }
+        .RipSym => { b.lea_sym(alloc, dst, m.sym, m.disp.widen.[i64]()); }
+        _ => { b.mv(alloc, dst, rv64_asm.ZERO); }
+    }
+    return;
+}
+
+fn emit_rv_load(alloc: *mut AllocCap, b: *mut rv64_asm.Rv64Buf, rd: u8, m: *mach_ir.MemAddr, sz: u8, signed_ext: bool) {
+    let sc0 = rv64_asm.T5;
+    let sc1 = rv64_asm.T6;
+    if m.kind == .StackSlot || m.kind == .BaseDisp {
+        let base = mem_base_rv64(m);
+        let sc = if base == sc0 { sc1 } else { sc0 };
+        b.load_mem(alloc, rd, base, m.disp, sz, signed_ext, sc);
+        return;
+    }
+    emit_addr_rv64(alloc, b, m, sc0, sc1);
+    b.load_mem(alloc, rd, sc0, 0_i32, sz, signed_ext, sc1);
+    return;
+}
+
+fn emit_rv_store(alloc: *mut AllocCap, b: *mut rv64_asm.Rv64Buf, m: *mach_ir.MemAddr, rs: u8, sz: u8) {
+    let sc0 = rv64_asm.T5;
+    let sc1 = rv64_asm.T6;
+    if m.kind == .StackSlot || m.kind == .BaseDisp {
+        let base = mem_base_rv64(m);
+        let sc = if rs == sc0 || base == sc0 { sc1 } else { sc0 };
+        b.store_mem(alloc, base, m.disp, rs, sz, sc);
+        return;
+    }
+    let addr_r = if rs == sc0 { sc1 } else { sc0 };
+    let tmp_r = if addr_r == sc0 { sc1 } else { sc0 };
+    emit_addr_rv64(alloc, b, m, addr_r, tmp_r);
+    b.store_mem(alloc, addr_r, 0_i32, rs, sz, tmp_r);
+    return;
+}
+
+fn emit_rv_fload(alloc: *mut AllocCap, b: *mut rv64_asm.Rv64Buf, is64: bool, fd: u8, m: *mach_ir.MemAddr) {
+    let sc0 = rv64_asm.T5;
+    let sc1 = rv64_asm.T6;
+    if m.kind == .StackSlot || m.kind == .BaseDisp {
+        let base = mem_base_rv64(m);
+        let sc = if base == sc0 { sc1 } else { sc0 };
+        b.fload(alloc, is64, fd, base, m.disp, sc);
+        return;
+    }
+    emit_addr_rv64(alloc, b, m, sc0, sc1);
+    b.fload(alloc, is64, fd, sc0, 0_i32, sc1);
+    return;
+}
+
+fn emit_rv_fstore(alloc: *mut AllocCap, b: *mut rv64_asm.Rv64Buf, is64: bool, m: *mach_ir.MemAddr, fs: u8) {
+    let sc0 = rv64_asm.T5;
+    let sc1 = rv64_asm.T6;
+    if m.kind == .StackSlot || m.kind == .BaseDisp {
+        let base = mem_base_rv64(m);
+        let sc = if base == sc0 { sc1 } else { sc0 };
+        b.fstore(alloc, is64, base, m.disp, fs, sc);
+        return;
+    }
+    emit_addr_rv64(alloc, b, m, sc0, sc1);
+    b.fstore(alloc, is64, sc0, 0_i32, fs, sc1);
+    return;
+}
+
+fn emit_rv_alu_imm_op(alloc: *mut AllocCap, b: *mut rv64_asm.Rv64Buf, op: mach_ir.MachOp, d: u8, s0: u8, imm: i64) {
+    let sc = if s0 == rv64_asm.T5 { rv64_asm.T6 } else { rv64_asm.T5 };
+    match op {
+        .AddImm => { b.add_imm_large(alloc, d, s0, imm, sc); }
+        .Add32Imm => {
+            if imm >= -2048_i64 && imm <= 2047_i64 {
+                b.addiw(alloc, d, s0, imm.trunc.[i32]());
+            } else {
+                b.li64(alloc, sc, imm.bitcast.[u64]());
+                b.addw(alloc, d, s0, sc);
+            }
+        }
+        .SubImm => { b.add_imm_large(alloc, d, s0, 0_i64 -% imm, sc); }
+        .Sub32Imm => {
+            b.li64(alloc, sc, imm.bitcast.[u64]());
+            b.subw(alloc, d, s0, sc);
+        }
+        .MulImm => { b.li64(alloc, sc, imm.bitcast.[u64]()); b.mul(alloc, d, s0, sc); }
+        .Mul32Imm => { b.li64(alloc, sc, imm.bitcast.[u64]()); b.mulw(alloc, d, s0, sc); }
+        .AndImm => {
+            if imm >= -2048_i64 && imm <= 2047_i64 { b.andi(alloc, d, s0, imm.trunc.[i32]()); }
+            else { b.li64(alloc, sc, imm.bitcast.[u64]()); b.and_r(alloc, d, s0, sc); }
+        }
+        .And32Imm => {
+            b.li64(alloc, sc, imm.bitcast.[u64]() & 0xFFFFFFFF_u64);
+            b.and_r(alloc, d, s0, sc);
+        }
+        .OrImm => {
+            if imm >= -2048_i64 && imm <= 2047_i64 { b.ori(alloc, d, s0, imm.trunc.[i32]()); }
+            else { b.li64(alloc, sc, imm.bitcast.[u64]()); b.or_r(alloc, d, s0, sc); }
+        }
+        .Or32Imm => {
+            b.li64(alloc, sc, imm.bitcast.[u64]() & 0xFFFFFFFF_u64);
+            b.or_r(alloc, d, s0, sc);
+        }
+        .XorImm => {
+            if imm >= -2048_i64 && imm <= 2047_i64 { b.xori(alloc, d, s0, imm.trunc.[i32]()); }
+            else { b.li64(alloc, sc, imm.bitcast.[u64]()); b.xor(alloc, d, s0, sc); }
+        }
+        .Xor32Imm => {
+            b.li64(alloc, sc, imm.bitcast.[u64]() & 0xFFFFFFFF_u64);
+            b.xor(alloc, d, s0, sc);
+        }
+        _ => {}
+    }
+    return;
+}
+
+fn emit_rv_div_op(alloc: *mut AllocCap, b: *mut rv64_asm.Rv64Buf, op: mach_ir.MachOp, d: u8, d2: u8, s0: u8, s1: u8) {
+    let sc = if s0 != rv64_asm.T5 && s1 != rv64_asm.T5 { rv64_asm.T5 }
+        else if s0 != rv64_asm.T6 && s1 != rv64_asm.T6 { rv64_asm.T6 }
+        else { rv64_asm.T5 };
+    match op {
+        .Div => {
+            if d2 < 32_u8 && d >= 32_u8 { b.remu(alloc, d2, s0, s1); return; }
+            if d2 < 32_u8 { b.remu(alloc, sc, s0, s1); }
+            if d < 32_u8 { b.divu(alloc, d, s0, s1); }
+            if d2 < 32_u8 { b.mv(alloc, d2, sc); }
+        }
+        .Idiv => {
+            if d2 < 32_u8 && d >= 32_u8 { b.rem(alloc, d2, s0, s1); return; }
+            if d2 < 32_u8 { b.rem(alloc, sc, s0, s1); }
+            if d < 32_u8 { b.div(alloc, d, s0, s1); }
+            if d2 < 32_u8 { b.mv(alloc, d2, sc); }
+        }
+        .Div32 => {
+            if d2 < 32_u8 && d >= 32_u8 { b.remuw(alloc, d2, s0, s1); return; }
+            if d2 < 32_u8 { b.remuw(alloc, sc, s0, s1); }
+            if d < 32_u8 { b.divuw(alloc, d, s0, s1); }
+            if d2 < 32_u8 { b.mv(alloc, d2, sc); }
+        }
+        .Idiv32 => {
+            if d2 < 32_u8 && d >= 32_u8 { b.remw(alloc, d2, s0, s1); return; }
+            if d2 < 32_u8 { b.remw(alloc, sc, s0, s1); }
+            if d < 32_u8 { b.divw(alloc, d, s0, s1); }
+            if d2 < 32_u8 { b.mv(alloc, d2, sc); }
+        }
+        .Mul128 => {
+            if d2 < 32_u8 { b.mulhu(alloc, sc, s0, s1); }
+            if d < 32_u8 { b.mul(alloc, d, s0, s1); }
+            if d2 < 32_u8 { b.mv(alloc, d2, sc); }
+        }
+        .Imul128 => {
+            if d2 < 32_u8 { b.mulh(alloc, sc, s0, s1); }
+            if d < 32_u8 { b.mul(alloc, d, s0, s1); }
+            if d2 < 32_u8 { b.mv(alloc, d2, sc); }
+        }
+        _ => {}
+    }
+    return;
+}
+
+fn emit_mach_inst_rv64_fp(alloc: *mut AllocCap, b: *mut rv64_asm.Rv64Buf, mi: *mach_ir.MachInst, d: u8, s0: u8, s1: u8, s2: u8, sz: u8, cs: *mut RvCmpState) -> bool {
+    match mi.op {
+        .VMovSSLoad => { emit_rv_fload(alloc, b, false, d, &mi.mem); return true; }
+        .VMovSDLoad => { emit_rv_fload(alloc, b, true, d, &mi.mem); return true; }
+        .VMovSSStore => { emit_rv_fstore(alloc, b, false, &mi.mem, s0); return true; }
+        .VMovSDStore => { emit_rv_fstore(alloc, b, true, &mi.mem, s0); return true; }
+        .VMovUpsLoad => { emit_rv_fload(alloc, b, true, d, &mi.mem); return true; }
+        .VMovUpsStore => { emit_rv_fstore(alloc, b, true, &mi.mem, s0); return true; }
+        .VMovVecReg => { b.fmv(alloc, true, d, s0); return true; }
+        .VAddSS => { b.fadd(alloc, false, d, s0, s1); return true; }
+        .VSubSS => { b.fsub(alloc, false, d, s0, s1); return true; }
+        .VMulSS => { b.fmul(alloc, false, d, s0, s1); return true; }
+        .VDivSS => { b.fdiv(alloc, false, d, s0, s1); return true; }
+        .VMinSS => { b.fmin(alloc, false, d, s0, s1); return true; }
+        .VMaxSS => { b.fmax(alloc, false, d, s0, s1); return true; }
+        .VSqrtSS => { b.fsqrt(alloc, false, d, s0); return true; }
+        .VFmadd231SS => { b.fmadd(alloc, false, d, s1, s2, s0); return true; }
+        .VAddSD => { b.fadd(alloc, true, d, s0, s1); return true; }
+        .VSubSD => { b.fsub(alloc, true, d, s0, s1); return true; }
+        .VMulSD => { b.fmul(alloc, true, d, s0, s1); return true; }
+        .VDivSD => { b.fdiv(alloc, true, d, s0, s1); return true; }
+        .VMinSD => { b.fmin(alloc, true, d, s0, s1); return true; }
+        .VMaxSD => { b.fmax(alloc, true, d, s0, s1); return true; }
+        .VSqrtSD => { b.fsqrt(alloc, true, d, s0); return true; }
+        .VFmadd231SD => { b.fmadd(alloc, true, d, s1, s2, s0); return true; }
+        .VUcomiSS => { cs.is_fp = true; cs.fp64 = false; cs.fs1 = s0; cs.fs2 = s1; return true; }
+        .VUcomiSD => { cs.is_fp = true; cs.fp64 = true; cs.fs1 = s0; cs.fs2 = s1; return true; }
+        .VCvtSI2SS => { b.fcvt_int_to_fp(alloc, false, sz == 8_u8, false, d, s0); return true; }
+        .VCvtSI2SD => { b.fcvt_int_to_fp(alloc, true, sz == 8_u8, false, d, s0); return true; }
+        .VCvtTTSS2SI => { b.fcvt_fp_to_int(alloc, false, sz == 8_u8, false, d, s0); return true; }
+        .VCvtTTSD2SI => { b.fcvt_fp_to_int(alloc, true, sz == 8_u8, false, d, s0); return true; }
+        .VCvtSS2SD => { b.fcvt_d_s(alloc, d, s0); return true; }
+        .VCvtSD2SS => { b.fcvt_s_d(alloc, d, s0); return true; }
+        .VMovDToXmm => { b.fmv_fp_x(alloc, false, d, s0); return true; }
+        .VMovDFromXmm => {
+            b.fmv_x_fp(alloc, false, d, s0);
+            b.extend_bits(alloc, d, d, 32_u8, false);
+            return true;
+        }
+        .VMovQToXmm => { b.fmv_fp_x(alloc, true, d, s0); return true; }
+        .VMovQFromXmm => { b.fmv_x_fp(alloc, true, d, s0); return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+fn emit_mach_inst_rv64(
+    alloc: *mut AllocCap,
+    b: *mut rv64_asm.Rv64Buf,
+    mi: *mach_ir.MachInst,
+    fl: *Rv64FrameLayout,
+    lbl_map: *[u32],
+    cs: *mut RvCmpState,
+) -> bool {
+    let d = mi.dst_phys;
+    let d2 = mi.dst2_phys;
+    let s0 = if mi.tied_src0 && d < 32_u8 { d } else { mi.src0_phys };
+    let s1 = mi.src1_phys;
+    let s2 = mi.src2_phys;
+    let sz = if mi.size_bytes == 0_u8 { 8_u8 } else { mi.size_bytes };
+    let sh8 = (mi.imm & 63_i64).trunc.[u8]();
+    let sc0 = rv64_asm.T5;
+    let sc1 = rv64_asm.T6;
+
+    match mi.op {
+        .Nop => { return true; }
+        .Mov => { b.mv(alloc, d, s0); return true; }
+        .Copy => { b.mv(alloc, d, s0); return true; }
+        .Mov32 => { b.extend_bits(alloc, d, s0, 32_u8, false); return true; }
+        .MovImm => { b.li64(alloc, d, mi.imm.bitcast.[u64]()); return true; }
+        .MovImm32 => { b.li64(alloc, d, mi.imm.bitcast.[u64]() & 0xFFFFFFFF_u64); return true; }
+        .Lea => { emit_addr_rv64(alloc, b, &mi.mem, d, sc0); return true; }
+        .Load => { emit_rv_load(alloc, b, d, &mi.mem, sz, false); return true; }
+        .LoadSX => { emit_rv_load(alloc, b, d, &mi.mem, sz, true); return true; }
+        .Store => { emit_rv_store(alloc, b, &mi.mem, s0, sz); return true; }
+        .StoreImm => {
+            if mi.imm == 0_i64 {
+                emit_rv_store(alloc, b, &mi.mem, rv64_asm.ZERO, sz);
+            } else {
+                b.li64(alloc, sc1, mi.imm.bitcast.[u64]());
+                emit_rv_store(alloc, b, &mi.mem, sc1, sz);
+            }
+            return true;
+        }
+        .Extend => { b.extend_bits(alloc, d, s0, sz *% 8_u8, mi.flag0); return true; }
+        .Add => { b.add(alloc, d, s0, s1); return true; }
+        .Add32 => { b.addw(alloc, d, s0, s1); return true; }
+        .AddImm => { emit_rv_alu_imm_op(alloc, b, .AddImm, d, s0, mi.imm); return true; }
+        .Add32Imm => { emit_rv_alu_imm_op(alloc, b, .Add32Imm, d, s0, mi.imm); return true; }
+        .AddMem => { emit_rv_load(alloc, b, sc1, &mi.mem, 8_u8, false); b.add(alloc, d, s0, sc1); return true; }
+        .Sub => { b.sub(alloc, d, s0, s1); return true; }
+        .Sub32 => { b.subw(alloc, d, s0, s1); return true; }
+        .SubImm => { emit_rv_alu_imm_op(alloc, b, .SubImm, d, s0, mi.imm); return true; }
+        .Sub32Imm => { emit_rv_alu_imm_op(alloc, b, .Sub32Imm, d, s0, mi.imm); return true; }
+        .SubMem => { emit_rv_load(alloc, b, sc1, &mi.mem, 8_u8, false); b.sub(alloc, d, s0, sc1); return true; }
+        .Mul => { b.mul(alloc, d, s0, s1); return true; }
+        .Mul32 => { b.mulw(alloc, d, s0, s1); return true; }
+        .MulImm => { emit_rv_alu_imm_op(alloc, b, .MulImm, d, s0, mi.imm); return true; }
+        .Mul32Imm => { emit_rv_alu_imm_op(alloc, b, .Mul32Imm, d, s0, mi.imm); return true; }
+        .MulMem => { emit_rv_load(alloc, b, sc1, &mi.mem, 8_u8, false); b.mul(alloc, d, s0, sc1); return true; }
+        .Div => { emit_rv_div_op(alloc, b, .Div, d, d2, s0, s1); return true; }
+        .Idiv => { emit_rv_div_op(alloc, b, .Idiv, d, d2, s0, s1); return true; }
+        .Div32 => { emit_rv_div_op(alloc, b, .Div32, d, d2, s0, s1); return true; }
+        .Idiv32 => { emit_rv_div_op(alloc, b, .Idiv32, d, d2, s0, s1); return true; }
+        .Mul128 => { emit_rv_div_op(alloc, b, .Mul128, d, d2, s0, s1); return true; }
+        .Imul128 => { emit_rv_div_op(alloc, b, .Imul128, d, d2, s0, s1); return true; }
+        .And => { b.and_r(alloc, d, s0, s1); return true; }
+        .And32 => { b.and_r(alloc, d, s0, s1); b.extend_bits(alloc, d, d, 32_u8, false); return true; }
+        .AndImm => { emit_rv_alu_imm_op(alloc, b, .AndImm, d, s0, mi.imm); return true; }
+        .And32Imm => { emit_rv_alu_imm_op(alloc, b, .And32Imm, d, s0, mi.imm); return true; }
+        .AndMem => { emit_rv_load(alloc, b, sc1, &mi.mem, 8_u8, false); b.and_r(alloc, d, s0, sc1); return true; }
+        .Or => { b.or_r(alloc, d, s0, s1); return true; }
+        .Or32 => { b.or_r(alloc, d, s0, s1); b.extend_bits(alloc, d, d, 32_u8, false); return true; }
+        .OrImm => { emit_rv_alu_imm_op(alloc, b, .OrImm, d, s0, mi.imm); return true; }
+        .Or32Imm => { emit_rv_alu_imm_op(alloc, b, .Or32Imm, d, s0, mi.imm); return true; }
+        .OrMem => { emit_rv_load(alloc, b, sc1, &mi.mem, 8_u8, false); b.or_r(alloc, d, s0, sc1); return true; }
+        .Xor => { b.xor(alloc, d, s0, s1); return true; }
+        .Xor32 => { b.xor(alloc, d, s0, s1); b.extend_bits(alloc, d, d, 32_u8, false); return true; }
+        .XorImm => { emit_rv_alu_imm_op(alloc, b, .XorImm, d, s0, mi.imm); return true; }
+        .Xor32Imm => { emit_rv_alu_imm_op(alloc, b, .Xor32Imm, d, s0, mi.imm); return true; }
+        .XorMem => { emit_rv_load(alloc, b, sc1, &mi.mem, 8_u8, false); b.xor(alloc, d, s0, sc1); return true; }
+        .Shl => { b.sll(alloc, d, s0, s1); return true; }
+        .ShlImm => { b.slli(alloc, d, s0, sh8); return true; }
+        .Shr => { b.srl(alloc, d, s0, s1); return true; }
+        .ShrImm => { b.srli(alloc, d, s0, sh8); return true; }
+        .Sar => { b.sra(alloc, d, s0, s1); return true; }
+        .SarImm => { b.srai(alloc, d, s0, sh8); return true; }
+        .Shl32 => { b.sllw(alloc, d, s0, s1); return true; }
+        .Shl32Imm => { b.slliw(alloc, d, s0, sh8); return true; }
+        .Shr32 => { b.srlw(alloc, d, s0, s1); return true; }
+        .Shr32Imm => { b.srliw(alloc, d, s0, sh8); return true; }
+        .Sar32 => { b.sraw(alloc, d, s0, s1); return true; }
+        .Sar32Imm => { b.sraiw(alloc, d, s0, sh8); return true; }
+        .Neg => { b.sub(alloc, d, rv64_asm.ZERO, s0); return true; }
+        .Neg32 => { b.subw(alloc, d, rv64_asm.ZERO, s0); return true; }
+        .Not => { b.xori(alloc, d, s0, -1_i32); return true; }
+        .Not32 => { b.xori(alloc, d, s0, -1_i32); b.extend_bits(alloc, d, d, 32_u8, false); return true; }
+        .Cmp => { save_int_cmp_regs(alloc, b, s0, s1, false, cs); return true; }
+        .Cmp32 => { save_int_cmp_regs(alloc, b, s0, s1, true, cs); return true; }
+        .CmpImm => {
+            b.mv(alloc, sc0, s0);
+            b.li64(alloc, sc1, mi.imm.bitcast.[u64]());
+            cs.is_fp = false; cs.is32 = false; cs.rs1 = sc0; cs.rs2 = sc1;
+            return true;
+        }
+        .Cmp32Imm => {
+            b.mv(alloc, sc0, s0);
+            b.li64(alloc, sc1, mi.imm.bitcast.[u64]());
+            cs.is_fp = false; cs.is32 = true; cs.rs1 = sc0; cs.rs2 = sc1;
+            return true;
+        }
+        .Test => {
+            b.and_r(alloc, sc0, s0, s1);
+            b.mv(alloc, sc1, rv64_asm.ZERO);
+            cs.is_fp = false; cs.is32 = false; cs.rs1 = sc0; cs.rs2 = sc1;
+            return true;
+        }
+        .Test32 => {
+            b.and_r(alloc, sc0, s0, s1);
+            b.mv(alloc, sc1, rv64_asm.ZERO);
+            cs.is_fp = false; cs.is32 = true; cs.rs1 = sc0; cs.rs2 = sc1;
+            return true;
+        }
+        .Setcc => { emit_rv_setcc(alloc, b, mi.cc, cs.*, d); return true; }
+        .Cmov => {
+            let l_t = b.new_label(alloc);
+            let l_d = b.new_label(alloc);
+            emit_rv_jcc(alloc, b, mi.cc, cs.*, l_t);
+            b.mv(alloc, d, s0);
+            b.j_label(alloc, l_d);
+            b.bind_label(l_t);
+            b.mv(alloc, d, s1);
+            b.bind_label(l_d);
+            return true;
+        }
+        .Jmp => {
+            let li = mi.mem.label.widen.[usize]();
+            if li >= lbl_map.len { return false; }
+            b.j_label(alloc, lbl_map[li]);
+            return true;
+        }
+        .Jcc => {
+            let li = mi.mem.label.widen.[usize]();
+            if li >= lbl_map.len { return false; }
+            emit_rv_jcc(alloc, b, mi.cc, cs.*, lbl_map[li]);
+            return true;
+        }
+        .JmpReg => { b.jalr(alloc, rv64_asm.ZERO, s0, 0_i32); return true; }
+        .JmpSym => { b.tail_call_sym(alloc, mi.mem.sym); return true; }
+        .CallSym => { b.call_sym(alloc, mi.mem.sym); return true; }
+        .CallReg => { b.call_reg(alloc, s0); return true; }
+        .Ret => { emit_rv64_epilogue(alloc, b, fl); return true; }
+        .Ud2 => { b.trap(alloc); return true; }
+        .LabelDef => {
+            let li = mi.mem.label.widen.[usize]();
+            if li < lbl_map.len { b.bind_label(lbl_map[li]); }
+            return true;
+        }
+        _ => { return emit_mach_inst_rv64_fp(alloc, b, mi, d, s0, s1, s2, sz, cs); }
+    }
+    return false;
+}
+
+pub fn emit_mach_func_rv64(
+    alloc: *mut AllocCap,
+    mf: *mach_ir.MachFunc,
+    sm: *span.SourceMap,
+    emit_debug_line: bool,
+) -> Rv64EmitOut ! OutOfMemory {
+    var out = try Rv64EmitOut.init(alloc);
+    errdefer out.destroy(alloc);
+    var buf = try rv64_asm.Rv64Buf.init(alloc);
+    errdefer buf.destroy(alloc);
+
+    let fl = plan_rv64_frame(mf);
+    out.own_stack_bytes = fl.total_sub.widen.[u64]();
+
+    var order = try col.DynBuf.[u32].init(alloc, mf.blocks.len() +% 1_usize);
+    errdefer order.destroy(alloc);
+    try build_emit_order(alloc, mf, &mut order);
+
+    var lbl_map = try col.DynBuf.[u32].init(alloc, mf.blocks.len() +% 1_usize);
+    errdefer lbl_map.destroy(alloc);
+    var max_lbl: usize = mf.blocks.len();
+    let bs_ro = mf.blocks.as_slice();
+    var bi: usize = 0_usize;
+    while bi < bs_ro.len {
+        let l = bs_ro[bi].label.widen.[usize]();
+        if l < 65536_usize && l >= max_lbl { max_lbl = l +% 1_usize; }
+        bi = bi +% 1_usize;
+    }
+    var li: usize = 0_usize;
+    while li < max_lbl {
+        let nl = buf.new_label(alloc);
+        try lbl_map.push(alloc, nl);
+        li = li +% 1_usize;
+    }
+
+    emit_rv64_prologue(alloc, &mut buf, &fl);
+    var cs = RvCmpState.{ is_fp: false, fp64: false, fs1: 0_u8, fs2: 0_u8, is32: false, rs1: rv64_asm.T5, rs2: rv64_asm.T6 };
+    var ok = true;
+    var last_file: u32 = span.FILE_DUMMY;
+    var last_line: u32 = 0_u32;
+    let ord_s = order.as_slice();
+    let lms = lbl_map.as_slice();
+    var oi: usize = 0_usize;
+    while oi < ord_s.len && ok {
+        let bb = ord_s[oi];
+        let bidx = bb.widen.[usize]();
+        if bidx < bs_ro.len {
+            let bl = bs_ro[bidx].label.widen.[usize]();
+            if bl < lms.len { buf.bind_label(lms[bl]); }
+        }
+        let insts = mf.block_insts(bb);
+        var ki: usize = 0_usize;
+        while ki < insts.len && ok {
+            let mi = insts[ki];
+            if emit_debug_line && mi.span.file != span.FILE_DUMMY {
+                let lc = sm.line_col(mi.span.file, mi.span.start);
+                if lc.line > 0_u32 && (mi.span.file != last_file || lc.line != last_line) {
+                    last_file = mi.span.file;
+                    last_line = lc.line;
+                    try out.line_entries.push(alloc, elf64.LineEntry.{
+                        code_offset: buf.pos(),
+                        file_idx: mi.span.file +% 1_u32,
+                        line: lc.line,
+                        col: lc.col,
+                    });
+                }
+            }
+            ok = emit_mach_inst_rv64(alloc, &mut buf, &mi, &fl, lms, &mut cs);
+            ki = ki +% 1_usize;
+        }
+        oi = oi +% 1_usize;
+    }
+
+    try buf.check_oom();
+    if ok {
+        ok = buf.finish();
+    }
+    if ok {
+        out.ok = true;
+        try out.code.push_slice(alloc, buf.code.as_slice());
+        try out.relocs.push_slice(alloc, buf.relocs.as_slice());
+        try out.rodata_items.push_slice(alloc, mf.rodata_items.as_slice());
+        try out.rodata_bytes.push_slice(alloc, mf.rodata_bytes.as_slice());
+        try out.rodata_relocs.push_slice(alloc, mf.rodata_relocs.as_slice());
+        try out.used_helpers.push_slice(alloc, mf.used_helpers.as_slice());
+    }
+    lbl_map.destroy(alloc);
+    order.destroy(alloc);
+    buf.destroy(alloc);
+    return out;
+}

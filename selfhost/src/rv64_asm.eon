@@ -1,0 +1,2088 @@
+module eonc.rv64_asm;
+
+import core.col;
+import core.str;
+import eonc.span;
+import eonc.elf64;
+
+// ============================================================================
+// Native RISC-V 64 (RV64IMAFD) Machine Code Assembler, Inline Asm Encoder,
+// and Linux RV64 (`ecall`, asm-generic syscalls, Variant I TLS) Runtime Helpers
+// ============================================================================
+
+// General-purpose integer registers (x0..x31)
+pub const ZERO: u8 = 0_u8;  // x0 (hardwired zero)
+pub const RA: u8   = 1_u8;  // x1 (return address)
+pub const SP: u8   = 2_u8;  // x2 (stack pointer, 16-byte aligned)
+pub const GP: u8   = 3_u8;  // x3 (global pointer)
+pub const TP: u8   = 4_u8;  // x4 (thread pointer, Variant I TLS base)
+pub const T0: u8   = 5_u8;  // x5 (EonCall error tag channel)
+pub const T1: u8   = 6_u8;  // x6 (scratch)
+pub const T2: u8   = 7_u8;  // x7 (scratch)
+pub const FP: u8   = 8_u8;  // x8 / s0 (frame pointer)
+pub const S1: u8   = 9_u8;  // x9 (callee-saved)
+pub const A0: u8   = 10_u8; // x10 (arg0 / ret0)
+pub const A1: u8   = 11_u8; // x11 (arg1 / ret1)
+pub const A2: u8   = 12_u8; // x12 (arg2)
+pub const A3: u8   = 13_u8; // x13 (arg3)
+pub const A4: u8   = 14_u8; // x14 (arg4)
+pub const A5: u8   = 15_u8; // x15 (arg5)
+pub const A6: u8   = 16_u8; // x16 (arg6)
+pub const A7: u8   = 17_u8; // x17 (arg7 / syscall number)
+pub const S2: u8   = 18_u8;
+pub const S3: u8   = 19_u8;
+pub const S4: u8   = 20_u8;
+pub const S5: u8   = 21_u8;
+pub const S6: u8   = 22_u8;
+pub const S7: u8   = 23_u8;
+pub const S8: u8   = 24_u8;
+pub const S9: u8   = 25_u8;
+pub const S10: u8  = 26_u8;
+pub const S11: u8  = 27_u8;
+pub const T3: u8   = 28_u8;
+pub const T4: u8   = 29_u8;
+pub const T5: u8   = 30_u8; // TargetRegFile scratch_gpr0
+pub const T6: u8   = 31_u8; // TargetRegFile scratch_gpr1
+
+// Floating-point registers (f0..f31)
+pub const FT0: u8  = 0_u8;
+pub const FT1: u8  = 1_u8;
+pub const FT2: u8  = 2_u8;
+pub const FT3: u8  = 3_u8;
+pub const FT4: u8  = 4_u8;
+pub const FT5: u8  = 5_u8;
+pub const FT6: u8  = 6_u8;
+pub const FT7: u8  = 7_u8;
+pub const FS0: u8  = 8_u8;
+pub const FS1: u8  = 9_u8;
+pub const FA0: u8  = 10_u8;
+pub const FA1: u8  = 11_u8;
+pub const FA2: u8  = 12_u8;
+pub const FA3: u8  = 13_u8;
+pub const FA4: u8  = 14_u8;
+pub const FA5: u8  = 15_u8;
+pub const FA6: u8  = 16_u8;
+pub const FA7: u8  = 17_u8;
+pub const FT8: u8  = 28_u8;
+pub const FT9: u8  = 29_u8;
+pub const FT10: u8 = 30_u8;
+pub const FT11: u8 = 31_u8;
+
+// Linux RISC-V 64 asm-generic syscall numbers
+pub const SYS_RV_MKDIRAT: u64       = 34_u64;
+pub const SYS_RV_UNLINKAT: u64      = 35_u64;
+pub const SYS_RV_OPENAT: u64        = 56_u64;
+pub const SYS_RV_CLOSE: u64         = 57_u64;
+pub const SYS_RV_READ: u64          = 63_u64;
+pub const SYS_RV_WRITE: u64         = 64_u64;
+pub const SYS_RV_NEWFSTATAT: u64    = 79_u64;
+pub const SYS_RV_FSTAT: u64         = 80_u64;
+pub const SYS_RV_EXIT: u64          = 93_u64;
+pub const SYS_RV_EXIT_GROUP: u64    = 94_u64;
+pub const SYS_RV_FUTEX: u64         = 98_u64;
+pub const SYS_RV_CLOCK_GETTIME: u64 = 113_u64;
+pub const SYS_RV_SCHED_YIELD: u64   = 124_u64;
+pub const SYS_RV_MUNMAP: u64        = 215_u64;
+pub const SYS_RV_CLONE: u64         = 220_u64;
+pub const SYS_RV_MMAP: u64          = 222_u64;
+pub const SYS_RV_OPENAT2: u64       = 437_u64;
+
+pub enum RvBrCond : u8 {
+    Eq  = 0, // beq (funct3=0)
+    Ne  = 1, // bne (funct3=1)
+    Lt  = 2, // blt (funct3=4)
+    Ge  = 3, // bge (funct3=5)
+    Ltu = 4, // bltu (funct3=6)
+    Geu = 5, // bgeu (funct3=7)
+}
+
+pub fn invert_br_cond(cc: RvBrCond) -> RvBrCond {
+    match cc {
+        .Eq  => { return .Ne; }
+        .Ne  => { return .Eq; }
+        .Lt  => { return .Ge; }
+        .Ge  => { return .Lt; }
+        .Ltu => { return .Geu; }
+        .Geu => { return .Ltu; }
+    }
+    return .Eq;
+}
+
+pub struct Rv64Reloc {
+    pub offset: u32;
+    pub kind: elf64.RelocKind;
+    pub sym_id: u32;
+    pub addend: i64;
+}
+
+pub enum RvFixupKind : u8 {
+    Jal20 = 0, // J-type JAL +/-1MiB
+    Br12  = 1, // B-type +/-4KiB (internal tiny loops)
+}
+
+struct RvFixup {
+    offset: u32;
+    label: u32;
+    kind: RvFixupKind;
+}
+
+pub linear struct Rv64Buf {
+    pub code: col.DynBuf[u8];
+    pub relocs: col.DynBuf[Rv64Reloc];
+    labels: col.DynBuf[u32];
+    fixups: col.DynBuf[RvFixup];
+    pub oom: bool;
+}
+
+@inline
+fn r5(r: u8) -> u32 {
+    return (r & 31_u8).widen.[u32]();
+}
+
+@inline
+fn enc_r(opcode: u32, rd: u8, f3: u32, rs1: u8, rs2: u8, f7: u32) -> u32 {
+    return (f7 <<% 25_u32) | (r5(rs2) <<% 20_u32) | (r5(rs1) <<% 15_u32)
+        | ((f3 & 7_u32) <<% 12_u32) | (r5(rd) <<% 7_u32) | (opcode & 0x7F_u32);
+}
+
+@inline
+fn enc_i(opcode: u32, rd: u8, f3: u32, rs1: u8, imm12: i32) -> u32 {
+    let im = (imm12.bitcast.[u32]() & 0xFFF_u32) <<% 20_u32;
+    return im | (r5(rs1) <<% 15_u32) | ((f3 & 7_u32) <<% 12_u32) | (r5(rd) <<% 7_u32) | (opcode & 0x7F_u32);
+}
+
+@inline
+fn enc_s(opcode: u32, f3: u32, rs1: u8, rs2: u8, imm12: i32) -> u32 {
+    let u = imm12.bitcast.[u32]() & 0xFFF_u32;
+    let hi = (u >> 5_u32) <<% 25_u32;
+    let lo = (u & 0x1F_u32) <<% 7_u32;
+    return hi | (r5(rs2) <<% 20_u32) | (r5(rs1) <<% 15_u32) | ((f3 & 7_u32) <<% 12_u32) | lo | (opcode & 0x7F_u32);
+}
+
+@inline
+fn enc_b(f3: u32, rs1: u8, rs2: u8, disp: i32) -> u32 {
+    let u = disp.bitcast.[u32]();
+    let b12   = ((u >> 12_u32) & 1_u32) <<% 31_u32;
+    let b10_5 = ((u >> 5_u32) & 0x3F_u32) <<% 25_u32;
+    let b4_1  = ((u >> 1_u32) & 0xF_u32) <<% 8_u32;
+    let b11   = ((u >> 11_u32) & 1_u32) <<% 7_u32;
+    return b12 | b10_5 | (r5(rs2) <<% 20_u32) | (r5(rs1) <<% 15_u32) | ((f3 & 7_u32) <<% 12_u32) | b4_1 | b11 | 0x63_u32;
+}
+
+@inline
+fn enc_u(opcode: u32, rd: u8, imm_hi20: u32) -> u32 {
+    return (imm_hi20 & 0xFFFFF000_u32) | (r5(rd) <<% 7_u32) | (opcode & 0x7F_u32);
+}
+
+@inline
+fn enc_j(rd: u8, disp: i32) -> u32 {
+    let u = disp.bitcast.[u32]();
+    let b20    = ((u >> 20_u32) & 1_u32) <<% 31_u32;
+    let b10_1  = ((u >> 1_u32) & 0x3FF_u32) <<% 21_u32;
+    let b11    = ((u >> 11_u32) & 1_u32) <<% 20_u32;
+    let b19_12 = ((u >> 12_u32) & 0xFF_u32) <<% 12_u32;
+    return b20 | b10_1 | b11 | b19_12 | (r5(rd) <<% 7_u32) | 0x6F_u32;
+}
+
+@inline
+fn enc_r4(opcode: u32, rd: u8, f3: u32, rs1: u8, rs2: u8, fmt: u32, rs3: u8) -> u32 {
+    return (r5(rs3) <<% 27_u32) | ((fmt & 3_u32) <<% 25_u32) | (r5(rs2) <<% 20_u32)
+        | (r5(rs1) <<% 15_u32) | ((f3 & 7_u32) <<% 12_u32) | (r5(rd) <<% 7_u32) | (opcode & 0x7F_u32);
+}
+
+@inline
+fn read_u32_le(buf: *[u8], off: usize) -> u32 {
+    if buf.len < 4_usize || off > buf.len - 4_usize { return 0_u32; }
+    let b0 = buf[off].widen.[u32]();
+    let b1 = buf[off + 1_usize].widen.[u32]();
+    let b2 = buf[off + 2_usize].widen.[u32]();
+    let b3 = buf[off + 3_usize].widen.[u32]();
+    return b0 | (b1 <<% 8_u32) | (b2 <<% 16_u32) | (b3 <<% 24_u32);
+}
+
+@inline
+fn write_u32_le(buf: *mut [u8], off: usize, v: u32) {
+    if buf.len < 4_usize || off > buf.len - 4_usize { return; }
+    buf[off] = (v & 0xFF_u32).trunc.[u8]();
+    buf[off + 1_usize] = ((v >> 8_u32) & 0xFF_u32).trunc.[u8]();
+    buf[off + 2_usize] = ((v >> 16_u32) & 0xFF_u32).trunc.[u8]();
+    buf[off + 3_usize] = ((v >> 24_u32) & 0xFF_u32).trunc.[u8]();
+}
+
+impl Rv64Buf {
+    pub fn init(alloc: *mut AllocCap) -> Rv64Buf ! OutOfMemory {
+        let code = try col.DynBuf.[u8].init(alloc, 256_usize);
+        errdefer code.destroy(alloc);
+        let relocs = try col.DynBuf.[Rv64Reloc].init(alloc, 16_usize);
+        errdefer relocs.destroy(alloc);
+        let labels = try col.DynBuf.[u32].init(alloc, 16_usize);
+        errdefer labels.destroy(alloc);
+        let fixups = try col.DynBuf.[RvFixup].init(alloc, 16_usize);
+        errdefer fixups.destroy(alloc);
+        return Rv64Buf.{ code: code, relocs: relocs, labels: labels, fixups: fixups, oom: false };
+    }
+
+    pub fn clear(self: *mut Self) {
+        self.code.clear();
+        self.relocs.clear();
+        self.labels.clear();
+        self.fixups.clear();
+        self.oom = false;
+    }
+
+    pub fn check_oom(self: *Self) -> !OutOfMemory {
+        if self.oom { return .OutOfMemory; }
+        return;
+    }
+
+    pub fn destroy(self: Rv64Buf, alloc: *mut AllocCap) {
+        let Rv64Buf.{ code, relocs, labels, fixups, oom: _ } = self;
+        fixups.destroy(alloc);
+        labels.destroy(alloc);
+        relocs.destroy(alloc);
+        code.destroy(alloc);
+    }
+
+    pub fn pos(self: *Self) -> u32 {
+        return self.code.len().trunc.[u32]();
+    }
+
+    pub fn emit32(self: *mut Self, alloc: *mut AllocCap, insn: u32) {
+        if self.oom { return; }
+        let b: [4]u8 = [
+            (insn & 0xFF_u32).trunc.[u8](),
+            ((insn >> 8_u32) & 0xFF_u32).trunc.[u8](),
+            ((insn >> 16_u32) & 0xFF_u32).trunc.[u8](),
+            ((insn >> 24_u32) & 0xFF_u32).trunc.[u8](),
+        ];
+        self.code.push_slice(alloc, &b) catch { self.oom = true; };
+    }
+
+    pub fn new_label(self: *mut Self, alloc: *mut AllocCap) -> u32 {
+        if self.oom { return 0_u32; }
+        let id = self.labels.len().trunc.[u32]();
+        self.labels.push(alloc, 0xFFFFFFFF_u32) catch { self.oom = true; return 0_u32; };
+        return id;
+    }
+
+    pub fn bind_label(self: *mut Self, lbl: u32) {
+        let li = lbl.widen.[usize]();
+        let ls = self.labels.as_mut_slice();
+        if li < ls.len {
+            ls[li] = self.code.len().trunc.[u32]();
+        }
+    }
+
+    pub fn finish(self: *mut Self) -> bool {
+        let ls = self.labels.as_slice();
+        let fs = self.fixups.as_slice();
+        let bytes = self.code.as_mut_slice();
+        var i: usize = 0_usize;
+        while i < fs.len {
+            let fx = fs[i];
+            let li = fx.label.widen.[usize]();
+            if li >= ls.len { return false; }
+            let target = ls[li];
+            if target == 0xFFFFFFFF_u32 { return false; }
+            let off = fx.offset.widen.[usize]();
+            if off +% 4_usize > bytes.len { return false; }
+            let disp = target.widen.[i64]() -% fx.offset.widen.[i64]();
+            if fx.kind == .Jal20 {
+                if disp < -1048576_i64 || disp > 1048574_i64 || (disp & 1_i64) != 0_i64 {
+                    return false;
+                }
+                let old = read_u32_le(bytes, off);
+                let rd = ((old >> 7_u32) & 31_u32).trunc.[u8]();
+                write_u32_le(bytes, off, enc_j(rd, disp.trunc.[i32]()));
+            } else {
+                if disp < -4096_i64 || disp > 4094_i64 || (disp & 1_i64) != 0_i64 {
+                    return false;
+                }
+                let old = read_u32_le(bytes, off);
+                let f3 = (old >> 12_u32) & 7_u32;
+                let rs1 = ((old >> 15_u32) & 31_u32).trunc.[u8]();
+                let rs2 = ((old >> 20_u32) & 31_u32).trunc.[u8]();
+                write_u32_le(bytes, off, enc_b(f3, rs1, rs2, disp.trunc.[i32]()));
+            }
+            i = i +% 1_usize;
+        }
+        return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // Basic Integer ALU (RV64I + RV64M)
+    // -----------------------------------------------------------------------
+
+    pub fn nop(self: *mut Self, alloc: *mut AllocCap) {
+        self.emit32(alloc, 0x00000013_u32);
+        return;
+    }
+
+    pub fn mv(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs: u8) {
+        if rd == rs { return; }
+        self.emit32(alloc, enc_i(0x13_u32, rd, 0_u32, rs, 0_i32));
+        return;
+    }
+
+    pub fn addi(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, imm: i32) {
+        self.emit32(alloc, enc_i(0x13_u32, rd, 0_u32, rs1, imm));
+        return;
+    }
+
+    pub fn addiw(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, imm: i32) {
+        self.emit32(alloc, enc_i(0x1B_u32, rd, 0_u32, rs1, imm));
+        return;
+    }
+
+    pub fn slti(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, imm: i32) {
+        self.emit32(alloc, enc_i(0x13_u32, rd, 2_u32, rs1, imm));
+        return;
+    }
+
+    pub fn sltiu(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, imm: i32) {
+        self.emit32(alloc, enc_i(0x13_u32, rd, 3_u32, rs1, imm));
+        return;
+    }
+
+    pub fn xori(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, imm: i32) {
+        self.emit32(alloc, enc_i(0x13_u32, rd, 4_u32, rs1, imm));
+        return;
+    }
+
+    pub fn ori(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, imm: i32) {
+        self.emit32(alloc, enc_i(0x13_u32, rd, 6_u32, rs1, imm));
+        return;
+    }
+
+    pub fn andi(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, imm: i32) {
+        self.emit32(alloc, enc_i(0x13_u32, rd, 7_u32, rs1, imm));
+        return;
+    }
+
+    pub fn slli(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, sh: u8) {
+        self.emit32(alloc, enc_i(0x13_u32, rd, 1_u32, rs1, (sh & 63_u8).widen.[i32]()));
+        return;
+    }
+
+    pub fn srli(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, sh: u8) {
+        self.emit32(alloc, enc_i(0x13_u32, rd, 5_u32, rs1, (sh & 63_u8).widen.[i32]()));
+        return;
+    }
+
+    pub fn srai(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, sh: u8) {
+        self.emit32(alloc, enc_i(0x13_u32, rd, 5_u32, rs1, 0x400_i32 | (sh & 63_u8).widen.[i32]()));
+        return;
+    }
+
+    pub fn slliw(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, sh: u8) {
+        self.emit32(alloc, enc_i(0x1B_u32, rd, 1_u32, rs1, (sh & 31_u8).widen.[i32]()));
+        return;
+    }
+
+    pub fn srliw(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, sh: u8) {
+        self.emit32(alloc, enc_i(0x1B_u32, rd, 5_u32, rs1, (sh & 31_u8).widen.[i32]()));
+        return;
+    }
+
+    pub fn sraiw(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, sh: u8) {
+        self.emit32(alloc, enc_i(0x1B_u32, rd, 5_u32, rs1, 0x400_i32 | (sh & 31_u8).widen.[i32]()));
+        return;
+    }
+
+    pub fn lui(self: *mut Self, alloc: *mut AllocCap, rd: u8, hi20: u32) {
+        self.emit32(alloc, enc_u(0x37_u32, rd, hi20));
+        return;
+    }
+
+    pub fn auipc(self: *mut Self, alloc: *mut AllocCap, rd: u8, hi20: u32) {
+        self.emit32(alloc, enc_u(0x17_u32, rd, hi20));
+        return;
+    }
+
+    pub fn add(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x33_u32, rd, 0_u32, rs1, rs2, 0x00_u32));
+        return;
+    }
+
+    pub fn sub(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x33_u32, rd, 0_u32, rs1, rs2, 0x20_u32));
+        return;
+    }
+
+    pub fn addw(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x3B_u32, rd, 0_u32, rs1, rs2, 0x00_u32));
+        return;
+    }
+
+    pub fn subw(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x3B_u32, rd, 0_u32, rs1, rs2, 0x20_u32));
+        return;
+    }
+
+    pub fn sll(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x33_u32, rd, 1_u32, rs1, rs2, 0x00_u32));
+        return;
+    }
+
+    pub fn slt(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x33_u32, rd, 2_u32, rs1, rs2, 0x00_u32));
+        return;
+    }
+
+    pub fn sltu(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x33_u32, rd, 3_u32, rs1, rs2, 0x00_u32));
+        return;
+    }
+
+    pub fn xor(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x33_u32, rd, 4_u32, rs1, rs2, 0x00_u32));
+        return;
+    }
+
+    pub fn srl(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x33_u32, rd, 5_u32, rs1, rs2, 0x00_u32));
+        return;
+    }
+
+    pub fn sra(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x33_u32, rd, 5_u32, rs1, rs2, 0x20_u32));
+        return;
+    }
+
+    pub fn or_r(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x33_u32, rd, 6_u32, rs1, rs2, 0x00_u32));
+        return;
+    }
+
+    pub fn and_r(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x33_u32, rd, 7_u32, rs1, rs2, 0x00_u32));
+        return;
+    }
+
+    pub fn sllw(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x3B_u32, rd, 1_u32, rs1, rs2, 0x00_u32));
+        return;
+    }
+
+    pub fn srlw(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x3B_u32, rd, 5_u32, rs1, rs2, 0x00_u32));
+        return;
+    }
+
+    pub fn sraw(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x3B_u32, rd, 5_u32, rs1, rs2, 0x20_u32));
+        return;
+    }
+
+    // RV64M multiply/divide/remainder
+    pub fn mul(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x33_u32, rd, 0_u32, rs1, rs2, 0x01_u32));
+        return;
+    }
+
+    pub fn mulh(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x33_u32, rd, 1_u32, rs1, rs2, 0x01_u32));
+        return;
+    }
+
+    pub fn mulhu(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x33_u32, rd, 3_u32, rs1, rs2, 0x01_u32));
+        return;
+    }
+
+    pub fn div(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x33_u32, rd, 4_u32, rs1, rs2, 0x01_u32));
+        return;
+    }
+
+    pub fn divu(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x33_u32, rd, 5_u32, rs1, rs2, 0x01_u32));
+        return;
+    }
+
+    pub fn rem(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x33_u32, rd, 6_u32, rs1, rs2, 0x01_u32));
+        return;
+    }
+
+    pub fn remu(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x33_u32, rd, 7_u32, rs1, rs2, 0x01_u32));
+        return;
+    }
+
+    pub fn mulw(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x3B_u32, rd, 0_u32, rs1, rs2, 0x01_u32));
+        return;
+    }
+
+    pub fn divw(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x3B_u32, rd, 4_u32, rs1, rs2, 0x01_u32));
+        return;
+    }
+
+    pub fn divuw(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x3B_u32, rd, 5_u32, rs1, rs2, 0x01_u32));
+        return;
+    }
+
+    pub fn remw(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x3B_u32, rd, 6_u32, rs1, rs2, 0x01_u32));
+        return;
+    }
+
+    pub fn remuw(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x3B_u32, rd, 7_u32, rs1, rs2, 0x01_u32));
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Exact 64-bit Constant Materialization & Arbitrary-Displacement Add
+    // -----------------------------------------------------------------------
+
+    /// Loads any 64-bit constant into `rd` (1..8 instructions, zero edge-case overflows).
+    pub fn li64(self: *mut Self, alloc: *mut AllocCap, rd: u8, val: u64) {
+        if rd == ZERO { return; }
+        let s = val.bitcast.[i64]();
+        if s >= -2048_i64 && s <= 2047_i64 {
+            self.addi(alloc, rd, ZERO, s.trunc.[i32]());
+            return;
+        }
+        if s >= -2147483648_i64 && s <= 2147483647_i64 {
+            let u32v = val.trunc.[u32]();
+            let lo12_u = u32v & 0xFFF_u32;
+            let lo12_s: i32 = if lo12_u >= 2048_u32 { lo12_u.bitcast.[i32]() -% 4096_i32 } else { lo12_u.bitcast.[i32]() };
+            let hi20 = (u32v +% 0x800_u32) & 0xFFFFF000_u32;
+            self.lui(alloc, rd, hi20);
+            if lo12_s != 0_i32 {
+                self.addiw(alloc, rd, rd, lo12_s);
+            }
+            return;
+        }
+        // Full 64-bit: split into positive top 31 bits + three unsigned 11-bit chunks (31+11+11+11 = 64).
+        let top = (val >> 33_u64).trunc.[u32](); // 0..0x7FFFFFFF (always non-negative signed 32-bit!)
+        let c2 = ((val >> 22_u64) & 0x7FF_u64).trunc.[i32]();
+        let c1 = ((val >> 11_u64) & 0x7FF_u64).trunc.[i32]();
+        let c0 = (val & 0x7FF_u64).trunc.[i32]();
+        if top <= 2047_u32 {
+            self.addi(alloc, rd, ZERO, top.bitcast.[i32]());
+        } else {
+            let lo12_u = top & 0xFFF_u32;
+            let lo12_s: i32 = if lo12_u >= 2048_u32 { lo12_u.bitcast.[i32]() -% 4096_i32 } else { lo12_u.bitcast.[i32]() };
+            let hi20 = (top +% 0x800_u32) & 0xFFFFF000_u32;
+            self.lui(alloc, rd, hi20);
+            if lo12_s != 0_i32 {
+                self.addiw(alloc, rd, rd, lo12_s);
+            }
+        }
+        self.slli(alloc, rd, rd, 11_u8);
+        if c2 != 0_i32 { self.ori(alloc, rd, rd, c2); }
+        self.slli(alloc, rd, rd, 11_u8);
+        if c1 != 0_i32 { self.ori(alloc, rd, rd, c1); }
+        self.slli(alloc, rd, rd, 11_u8);
+        if c0 != 0_i32 { self.ori(alloc, rd, rd, c0); }
+        return;
+    }
+
+    pub fn add_imm_large(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs: u8, disp: i64, scratch: u8) {
+        if disp == 0_i64 {
+            self.mv(alloc, rd, rs);
+            return;
+        }
+        if disp >= -2048_i64 && disp <= 2047_i64 {
+            self.addi(alloc, rd, rs, disp.trunc.[i32]());
+            return;
+        }
+        self.li64(alloc, scratch, disp.bitcast.[u64]());
+        self.add(alloc, rd, rs, scratch);
+        return;
+    }
+
+    /// Sign- or zero-extends the low `bits` (1..63) of `rs` into `rd` in 1-2 RV64I instructions.
+    pub fn extend_bits(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs: u8, bits: u8, signed_ext: bool) {
+        if bits == 0_u8 || bits >= 64_u8 {
+            self.mv(alloc, rd, rs);
+            return;
+        }
+        if signed_ext {
+            if bits == 32_u8 {
+                self.addiw(alloc, rd, rs, 0_i32);
+                return;
+            }
+            let sh = 64_u8 -% bits;
+            self.slli(alloc, rd, rs, sh);
+            self.srai(alloc, rd, rd, sh);
+            return;
+        }
+        if bits <= 11_u8 {
+            let mask = ((1_u32 <<% bits.widen.[u32]()) -% 1_u32).bitcast.[i32]();
+            self.andi(alloc, rd, rs, mask);
+            return;
+        }
+        let sh = 64_u8 -% bits;
+        self.slli(alloc, rd, rs, sh);
+        self.srli(alloc, rd, rd, sh);
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Loads & Stores (arbitrary displacement via `scratch`)
+    // -----------------------------------------------------------------------
+
+    pub fn load_mem(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        rd: u8,
+        base: u8,
+        disp: i32,
+        bytes: u8,
+        signed_ext: bool,
+        scratch: u8,
+    ) {
+        var f3: u32 = 3_u32; // LD
+        if bytes == 1_u8 { f3 = if signed_ext { 0_u32 } else { 4_u32 }; }
+        else if bytes == 2_u8 { f3 = if signed_ext { 1_u32 } else { 5_u32 }; }
+        else if bytes == 4_u8 { f3 = if signed_ext { 2_u32 } else { 6_u32 }; }
+        if disp >= -2048_i32 && disp <= 2047_i32 {
+            self.emit32(alloc, enc_i(0x03_u32, rd, f3, base, disp));
+            return;
+        }
+        self.li64(alloc, scratch, disp.widen.[i64]().bitcast.[u64]());
+        self.add(alloc, scratch, base, scratch);
+        self.emit32(alloc, enc_i(0x03_u32, rd, f3, scratch, 0_i32));
+        return;
+    }
+
+    pub fn store_mem(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        base: u8,
+        disp: i32,
+        val: u8,
+        bytes: u8,
+        scratch: u8,
+    ) {
+        var f3: u32 = 3_u32; // SD
+        if bytes == 1_u8 { f3 = 0_u32; }
+        else if bytes == 2_u8 { f3 = 1_u32; }
+        else if bytes == 4_u8 { f3 = 2_u32; }
+        if disp >= -2048_i32 && disp <= 2047_i32 {
+            self.emit32(alloc, enc_s(0x23_u32, f3, base, val, disp));
+            return;
+        }
+        self.li64(alloc, scratch, disp.widen.[i64]().bitcast.[u64]());
+        self.add(alloc, scratch, base, scratch);
+        self.emit32(alloc, enc_s(0x23_u32, f3, scratch, val, 0_i32));
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Branches, Jumps, Calls, and Symbol Relocations
+    // -----------------------------------------------------------------------
+
+    pub fn j_label(self: *mut Self, alloc: *mut AllocCap, lbl: u32) {
+        let off = self.pos();
+        self.emit32(alloc, enc_j(ZERO, 0_i32));
+        self.fixups.push(alloc, RvFixup.{ offset: off, label: lbl, kind: .Jal20 }) catch { self.oom = true; };
+        return;
+    }
+
+    /// Long-range conditional branch (+/-1 MiB): skips a `jal x0, lbl` with inverted B-type (+8).
+    pub fn br_cond_label(self: *mut Self, alloc: *mut AllocCap, cc: RvBrCond, rs1: u8, rs2: u8, lbl: u32) {
+        let inv = invert_br_cond(cc);
+        var f3: u32 = 0_u32;
+        match inv {
+            .Eq  => { f3 = 0_u32; }
+            .Ne  => { f3 = 1_u32; }
+            .Lt  => { f3 = 4_u32; }
+            .Ge  => { f3 = 5_u32; }
+            .Ltu => { f3 = 6_u32; }
+            .Geu => { f3 = 7_u32; }
+        }
+        self.emit32(alloc, enc_b(f3, rs1, rs2, 8_i32));
+        self.j_label(alloc, lbl);
+        return;
+    }
+
+    /// Short-range conditional branch (+/-4 KiB) for compact runtime helper loops.
+    pub fn br_short_label(self: *mut Self, alloc: *mut AllocCap, cc: RvBrCond, rs1: u8, rs2: u8, lbl: u32) {
+        var f3: u32 = 0_u32;
+        match cc {
+            .Eq  => { f3 = 0_u32; }
+            .Ne  => { f3 = 1_u32; }
+            .Lt  => { f3 = 4_u32; }
+            .Ge  => { f3 = 5_u32; }
+            .Ltu => { f3 = 6_u32; }
+            .Geu => { f3 = 7_u32; }
+        }
+        let off = self.pos();
+        self.emit32(alloc, enc_b(f3, rs1, rs2, 0_i32));
+        self.fixups.push(alloc, RvFixup.{ offset: off, label: lbl, kind: .Br12 }) catch { self.oom = true; };
+        return;
+    }
+
+    pub fn jalr(self: *mut Self, alloc: *mut AllocCap, rd: u8, rs1: u8, imm: i32) {
+        self.emit32(alloc, enc_i(0x67_u32, rd, 0_u32, rs1, imm));
+        return;
+    }
+
+    pub fn ret(self: *mut Self, alloc: *mut AllocCap) {
+        self.jalr(alloc, ZERO, RA, 0_i32);
+        return;
+    }
+
+    pub fn call_reg(self: *mut Self, alloc: *mut AllocCap, target: u8) {
+        self.jalr(alloc, RA, target, 0_i32);
+        return;
+    }
+
+    pub fn call_sym(self: *mut Self, alloc: *mut AllocCap, sym_id: u32) {
+        let off = self.pos();
+        self.auipc(alloc, RA, 0_u32);
+        self.jalr(alloc, RA, RA, 0_i32);
+        self.relocs.push(alloc, Rv64Reloc.{ offset: off, kind: .RvCallPlt, sym_id: sym_id, addend: 0_i64 }) catch { self.oom = true; };
+        return;
+    }
+
+    pub fn tail_call_sym(self: *mut Self, alloc: *mut AllocCap, sym_id: u32) {
+        let off = self.pos();
+        self.auipc(alloc, T1, 0_u32);
+        self.jalr(alloc, ZERO, T1, 0_i32);
+        self.relocs.push(alloc, Rv64Reloc.{ offset: off, kind: .RvCallPlt, sym_id: sym_id, addend: 0_i64 }) catch { self.oom = true; };
+        return;
+    }
+
+    pub fn lea_sym(self: *mut Self, alloc: *mut AllocCap, rd: u8, sym_id: u32, addend: i64) {
+        let off = self.pos();
+        self.auipc(alloc, rd, 0_u32);
+        self.addi(alloc, rd, rd, 0_i32);
+        self.relocs.push(alloc, Rv64Reloc.{ offset: off, kind: .RvPcrelPairI, sym_id: sym_id, addend: addend }) catch { self.oom = true; };
+        return;
+    }
+
+    pub fn load_got_sym(self: *mut Self, alloc: *mut AllocCap, rd: u8, sym_id: u32) {
+        let off = self.pos();
+        self.auipc(alloc, rd, 0_u32);
+        self.emit32(alloc, enc_i(0x03_u32, rd, 3_u32, rd, 0_i32)); // ld rd, 0(rd)
+        self.relocs.push(alloc, Rv64Reloc.{ offset: off, kind: .RvGotPair, sym_id: sym_id, addend: 0_i64 }) catch { self.oom = true; };
+        return;
+    }
+
+    pub fn lea_tls_sym(self: *mut Self, alloc: *mut AllocCap, rd: u8, sym_id: u32, addend: i64) {
+        let off = self.pos();
+        self.lui(alloc, rd, 0_u32);
+        self.addi(alloc, rd, rd, 0_i32);
+        self.relocs.push(alloc, Rv64Reloc.{ offset: off, kind: .RvTprelPair, sym_id: sym_id, addend: addend }) catch { self.oom = true; };
+        self.add(alloc, rd, rd, TP);
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // System, Barriers, and RV64A Atomics
+    // -----------------------------------------------------------------------
+
+    pub fn ecall(self: *mut Self, alloc: *mut AllocCap) {
+        self.emit32(alloc, 0x00000073_u32);
+        return;
+    }
+
+    pub fn ebreak(self: *mut Self, alloc: *mut AllocCap) {
+        self.emit32(alloc, 0x00100073_u32);
+        return;
+    }
+
+    pub fn trap(self: *mut Self, alloc: *mut AllocCap) {
+        // Guaranteed SIGILL (unimp = 0xC0001073 / illegal 0x00000000) matching x64 `ud2` / AArch64 `brk`
+        self.emit32(alloc, 0x00000000_u32);
+        return;
+    }
+
+    pub fn fence_rw_rw(self: *mut Self, alloc: *mut AllocCap) {
+        self.emit32(alloc, 0x0330000F_u32); // fence rw, rw
+        return;
+    }
+
+    pub fn pause_hint(self: *mut Self, alloc: *mut AllocCap) {
+        self.emit32(alloc, 0x0100000F_u32); // Zihintpause (decodes as fence w,0 on older CPUs)
+        return;
+    }
+
+    pub fn sfence_vma(self: *mut Self, alloc: *mut AllocCap, rs1: u8, rs2: u8) {
+        self.emit32(alloc, enc_r(0x73_u32, ZERO, 0_u32, rs1, rs2, 0x09_u32));
+        return;
+    }
+
+    pub fn csrr(self: *mut Self, alloc: *mut AllocCap, rd: u8, csr: u32) {
+        self.emit32(alloc, ((csr & 0xFFF_u32) <<% 20_u32) | (2_u32 <<% 12_u32) | (r5(rd) <<% 7_u32) | 0x73_u32);
+        return;
+    }
+
+    pub fn csrw(self: *mut Self, alloc: *mut AllocCap, csr: u32, rs1: u8) {
+        self.emit32(alloc, ((csr & 0xFFF_u32) <<% 20_u32) | (r5(rs1) <<% 15_u32) | (1_u32 <<% 12_u32) | 0x73_u32);
+        return;
+    }
+
+    pub fn lr(self: *mut Self, alloc: *mut AllocCap, is64: bool, aq: bool, rl: bool, rd: u8, rs1: u8) {
+        let f7 = (0x02_u32 <<% 2_u32) | (if aq { 2_u32 } else { 0_u32 }) | (if rl { 1_u32 } else { 0_u32 });
+        let f3: u32 = if is64 { 3_u32 } else { 2_u32 };
+        self.emit32(alloc, enc_r(0x2F_u32, rd, f3, rs1, ZERO, f7));
+        return;
+    }
+
+    pub fn sc(self: *mut Self, alloc: *mut AllocCap, is64: bool, aq: bool, rl: bool, rd: u8, rs2: u8, rs1: u8) {
+        let f7 = (0x03_u32 <<% 2_u32) | (if aq { 2_u32 } else { 0_u32 }) | (if rl { 1_u32 } else { 0_u32 });
+        let f3: u32 = if is64 { 3_u32 } else { 2_u32 };
+        self.emit32(alloc, enc_r(0x2F_u32, rd, f3, rs1, rs2, f7));
+        return;
+    }
+
+    pub fn amo(self: *mut Self, alloc: *mut AllocCap, f5: u32, is64: bool, aq: bool, rl: bool, rd: u8, rs2: u8, rs1: u8) {
+        let f7 = ((f5 & 0x1F_u32) <<% 2_u32) | (if aq { 2_u32 } else { 0_u32 }) | (if rl { 1_u32 } else { 0_u32 });
+        let f3: u32 = if is64 { 3_u32 } else { 2_u32 };
+        self.emit32(alloc, enc_r(0x2F_u32, rd, f3, rs1, rs2, f7));
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Floating-Point (RV64F / RV64D)
+    // -----------------------------------------------------------------------
+
+    pub fn fload(self: *mut Self, alloc: *mut AllocCap, is64: bool, fd: u8, base: u8, disp: i32, scratch: u8) {
+        let f3: u32 = if is64 { 3_u32 } else { 2_u32 };
+        if disp >= -2048_i32 && disp <= 2047_i32 {
+            self.emit32(alloc, enc_i(0x07_u32, fd, f3, base, disp));
+            return;
+        }
+        self.li64(alloc, scratch, disp.widen.[i64]().bitcast.[u64]());
+        self.add(alloc, scratch, base, scratch);
+        self.emit32(alloc, enc_i(0x07_u32, fd, f3, scratch, 0_i32));
+        return;
+    }
+
+    pub fn fstore(self: *mut Self, alloc: *mut AllocCap, is64: bool, base: u8, disp: i32, fs: u8, scratch: u8) {
+        let f3: u32 = if is64 { 3_u32 } else { 2_u32 };
+        if disp >= -2048_i32 && disp <= 2047_i32 {
+            self.emit32(alloc, enc_s(0x27_u32, f3, base, fs, disp));
+            return;
+        }
+        self.li64(alloc, scratch, disp.widen.[i64]().bitcast.[u64]());
+        self.add(alloc, scratch, base, scratch);
+        self.emit32(alloc, enc_s(0x27_u32, f3, scratch, fs, 0_i32));
+        return;
+    }
+
+    pub fn fadd(self: *mut Self, alloc: *mut AllocCap, is64: bool, fd: u8, fs1: u8, fs2: u8) {
+        let f7 = if is64 { 0x01_u32 } else { 0x00_u32 };
+        self.emit32(alloc, enc_r(0x53_u32, fd, 7_u32, fs1, fs2, f7));
+        return;
+    }
+
+    pub fn fsub(self: *mut Self, alloc: *mut AllocCap, is64: bool, fd: u8, fs1: u8, fs2: u8) {
+        let f7 = if is64 { 0x05_u32 } else { 0x04_u32 };
+        self.emit32(alloc, enc_r(0x53_u32, fd, 7_u32, fs1, fs2, f7));
+        return;
+    }
+
+    pub fn fmul(self: *mut Self, alloc: *mut AllocCap, is64: bool, fd: u8, fs1: u8, fs2: u8) {
+        let f7 = if is64 { 0x09_u32 } else { 0x08_u32 };
+        self.emit32(alloc, enc_r(0x53_u32, fd, 7_u32, fs1, fs2, f7));
+        return;
+    }
+
+    pub fn fdiv(self: *mut Self, alloc: *mut AllocCap, is64: bool, fd: u8, fs1: u8, fs2: u8) {
+        let f7 = if is64 { 0x0D_u32 } else { 0x0C_u32 };
+        self.emit32(alloc, enc_r(0x53_u32, fd, 7_u32, fs1, fs2, f7));
+        return;
+    }
+
+    pub fn fsqrt(self: *mut Self, alloc: *mut AllocCap, is64: bool, fd: u8, fs1: u8) {
+        let f7 = if is64 { 0x2D_u32 } else { 0x2C_u32 };
+        self.emit32(alloc, enc_r(0x53_u32, fd, 7_u32, fs1, 0_u8, f7));
+        return;
+    }
+
+    pub fn fmin(self: *mut Self, alloc: *mut AllocCap, is64: bool, fd: u8, fs1: u8, fs2: u8) {
+        let f7 = if is64 { 0x15_u32 } else { 0x14_u32 };
+        self.emit32(alloc, enc_r(0x53_u32, fd, 0_u32, fs1, fs2, f7));
+        return;
+    }
+
+    pub fn fmax(self: *mut Self, alloc: *mut AllocCap, is64: bool, fd: u8, fs1: u8, fs2: u8) {
+        let f7 = if is64 { 0x15_u32 } else { 0x14_u32 };
+        self.emit32(alloc, enc_r(0x53_u32, fd, 1_u32, fs1, fs2, f7));
+        return;
+    }
+
+    pub fn fmv(self: *mut Self, alloc: *mut AllocCap, is64: bool, fd: u8, fs: u8) {
+        if fd == fs { return; }
+        let f7 = if is64 { 0x11_u32 } else { 0x10_u32 };
+        self.emit32(alloc, enc_r(0x53_u32, fd, 0_u32, fs, fs, f7)); // fsgnj
+        return;
+    }
+
+    pub fn fneg(self: *mut Self, alloc: *mut AllocCap, is64: bool, fd: u8, fs: u8) {
+        let f7 = if is64 { 0x11_u32 } else { 0x10_u32 };
+        self.emit32(alloc, enc_r(0x53_u32, fd, 1_u32, fs, fs, f7)); // fsgnjn
+        return;
+    }
+
+    pub fn fabs(self: *mut Self, alloc: *mut AllocCap, is64: bool, fd: u8, fs: u8) {
+        let f7 = if is64 { 0x11_u32 } else { 0x10_u32 };
+        self.emit32(alloc, enc_r(0x53_u32, fd, 2_u32, fs, fs, f7)); // fsgnjx
+        return;
+    }
+
+    pub fn fmadd(self: *mut Self, alloc: *mut AllocCap, is64: bool, fd: u8, fs1: u8, fs2: u8, fs3: u8) {
+        let fmt: u32 = if is64 { 1_u32 } else { 0_u32 };
+        self.emit32(alloc, enc_r4(0x43_u32, fd, 7_u32, fs1, fs2, fmt, fs3));
+        return;
+    }
+
+    pub fn feq(self: *mut Self, alloc: *mut AllocCap, is64: bool, rd: u8, fs1: u8, fs2: u8) {
+        let f7 = if is64 { 0x51_u32 } else { 0x50_u32 };
+        self.emit32(alloc, enc_r(0x53_u32, rd, 2_u32, fs1, fs2, f7));
+        return;
+    }
+
+    pub fn flt(self: *mut Self, alloc: *mut AllocCap, is64: bool, rd: u8, fs1: u8, fs2: u8) {
+        let f7 = if is64 { 0x51_u32 } else { 0x50_u32 };
+        self.emit32(alloc, enc_r(0x53_u32, rd, 1_u32, fs1, fs2, f7));
+        return;
+    }
+
+    pub fn fle(self: *mut Self, alloc: *mut AllocCap, is64: bool, rd: u8, fs1: u8, fs2: u8) {
+        let f7 = if is64 { 0x51_u32 } else { 0x50_u32 };
+        self.emit32(alloc, enc_r(0x53_u32, rd, 0_u32, fs1, fs2, f7));
+        return;
+    }
+
+    pub fn fcvt_s_d(self: *mut Self, alloc: *mut AllocCap, fd: u8, fs: u8) {
+        self.emit32(alloc, enc_r(0x53_u32, fd, 7_u32, fs, 1_u8, 0x20_u32));
+        return;
+    }
+
+    pub fn fcvt_d_s(self: *mut Self, alloc: *mut AllocCap, fd: u8, fs: u8) {
+        self.emit32(alloc, enc_r(0x53_u32, fd, 7_u32, fs, 0_u8, 0x21_u32));
+        return;
+    }
+
+    pub fn fcvt_fp_to_int(self: *mut Self, alloc: *mut AllocCap, fp64: bool, int64: bool, is_unsigned: bool, rd: u8, fs: u8) {
+        let f7 = if fp64 { 0x61_u32 } else { 0x60_u32 };
+        let rs2: u8 = (if int64 { 2_u8 } else { 0_u8 }) | (if is_unsigned { 1_u8 } else { 0_u8 });
+        self.emit32(alloc, enc_r(0x53_u32, rd, 1_u32, fs, rs2, f7)); // rm=1 (RTZ)
+        return;
+    }
+
+    pub fn fcvt_int_to_fp(self: *mut Self, alloc: *mut AllocCap, fp64: bool, int64: bool, is_unsigned: bool, fd: u8, rs: u8) {
+        let f7 = if fp64 { 0x69_u32 } else { 0x68_u32 };
+        let rs2: u8 = (if int64 { 2_u8 } else { 0_u8 }) | (if is_unsigned { 1_u8 } else { 0_u8 });
+        self.emit32(alloc, enc_r(0x53_u32, fd, 7_u32, rs, rs2, f7)); // rm=7 (DYN)
+        return;
+    }
+
+    pub fn fmv_x_fp(self: *mut Self, alloc: *mut AllocCap, is64: bool, rd: u8, fs: u8) {
+        let f7 = if is64 { 0x71_u32 } else { 0x70_u32 };
+        self.emit32(alloc, enc_r(0x53_u32, rd, 0_u32, fs, 0_u8, f7));
+        return;
+    }
+
+    pub fn fmv_fp_x(self: *mut Self, alloc: *mut AllocCap, is64: bool, fd: u8, rs: u8) {
+        let f7 = if is64 { 0x79_u32 } else { 0x78_u32 };
+        self.emit32(alloc, enc_r(0x53_u32, fd, 0_u32, rs, 0_u8, f7));
+        return;
+    }
+}
+
+// ============================================================================
+// Inline Assembly Encoder for RISC-V 64 (`asm(...)` in `.hal.eon`)
+// ============================================================================
+
+view fn trim_ws(s: *[u8]) -> *[u8] {
+    var a: usize = 0_usize;
+    var b = s.len;
+    while a < b && (s[a] == b' ' || s[a] == b'\t' || s[a] == b'\r' || s[a] == b'\n') {
+        a = a +% 1_usize;
+    }
+    while b > a {
+        let c = s[b -% 1_usize];
+        if c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' { b = b -% 1_usize; } else { break; }
+    }
+    return s.sub(a, b) catch { return s; };
+}
+
+fn parse_rv_gpr(raw_s: *[u8]) -> ?u8 {
+    let s = trim_ws(raw_s);
+    if str.bytes_eq(s, "zero".as_bytes()) || str.bytes_eq(s, "x0".as_bytes()) { return 0_u8; }
+    if str.bytes_eq(s, "ra".as_bytes()) || str.bytes_eq(s, "x1".as_bytes()) { return 1_u8; }
+    if str.bytes_eq(s, "sp".as_bytes()) || str.bytes_eq(s, "x2".as_bytes()) { return 2_u8; }
+    if str.bytes_eq(s, "gp".as_bytes()) || str.bytes_eq(s, "x3".as_bytes()) { return 3_u8; }
+    if str.bytes_eq(s, "tp".as_bytes()) || str.bytes_eq(s, "x4".as_bytes()) { return 4_u8; }
+    if str.bytes_eq(s, "t0".as_bytes()) || str.bytes_eq(s, "x5".as_bytes()) { return 5_u8; }
+    if str.bytes_eq(s, "t1".as_bytes()) || str.bytes_eq(s, "x6".as_bytes()) { return 6_u8; }
+    if str.bytes_eq(s, "t2".as_bytes()) || str.bytes_eq(s, "x7".as_bytes()) { return 7_u8; }
+    if str.bytes_eq(s, "fp".as_bytes()) || str.bytes_eq(s, "s0".as_bytes()) || str.bytes_eq(s, "x8".as_bytes()) { return 8_u8; }
+    if str.bytes_eq(s, "s1".as_bytes()) || str.bytes_eq(s, "x9".as_bytes()) { return 9_u8; }
+    if str.bytes_eq(s, "a0".as_bytes()) || str.bytes_eq(s, "x10".as_bytes()) { return 10_u8; }
+    if str.bytes_eq(s, "a1".as_bytes()) || str.bytes_eq(s, "x11".as_bytes()) { return 11_u8; }
+    if str.bytes_eq(s, "a2".as_bytes()) || str.bytes_eq(s, "x12".as_bytes()) { return 12_u8; }
+    if str.bytes_eq(s, "a3".as_bytes()) || str.bytes_eq(s, "x13".as_bytes()) { return 13_u8; }
+    if str.bytes_eq(s, "a4".as_bytes()) || str.bytes_eq(s, "x14".as_bytes()) { return 14_u8; }
+    if str.bytes_eq(s, "a5".as_bytes()) || str.bytes_eq(s, "x15".as_bytes()) { return 15_u8; }
+    if str.bytes_eq(s, "a6".as_bytes()) || str.bytes_eq(s, "x16".as_bytes()) { return 16_u8; }
+    if str.bytes_eq(s, "a7".as_bytes()) || str.bytes_eq(s, "x17".as_bytes()) { return 17_u8; }
+    if str.bytes_eq(s, "s2".as_bytes()) || str.bytes_eq(s, "x18".as_bytes()) { return 18_u8; }
+    if str.bytes_eq(s, "s3".as_bytes()) || str.bytes_eq(s, "x19".as_bytes()) { return 19_u8; }
+    if str.bytes_eq(s, "s4".as_bytes()) || str.bytes_eq(s, "x20".as_bytes()) { return 20_u8; }
+    if str.bytes_eq(s, "s5".as_bytes()) || str.bytes_eq(s, "x21".as_bytes()) { return 21_u8; }
+    if str.bytes_eq(s, "s6".as_bytes()) || str.bytes_eq(s, "x22".as_bytes()) { return 22_u8; }
+    if str.bytes_eq(s, "s7".as_bytes()) || str.bytes_eq(s, "x23".as_bytes()) { return 23_u8; }
+    if str.bytes_eq(s, "s8".as_bytes()) || str.bytes_eq(s, "x24".as_bytes()) { return 24_u8; }
+    if str.bytes_eq(s, "s9".as_bytes()) || str.bytes_eq(s, "x25".as_bytes()) { return 25_u8; }
+    if str.bytes_eq(s, "s10".as_bytes()) || str.bytes_eq(s, "x26".as_bytes()) { return 26_u8; }
+    if str.bytes_eq(s, "s11".as_bytes()) || str.bytes_eq(s, "x27".as_bytes()) { return 27_u8; }
+    if str.bytes_eq(s, "t3".as_bytes()) || str.bytes_eq(s, "x28".as_bytes()) { return 28_u8; }
+    if str.bytes_eq(s, "t4".as_bytes()) || str.bytes_eq(s, "x29".as_bytes()) { return 29_u8; }
+    if str.bytes_eq(s, "t5".as_bytes()) || str.bytes_eq(s, "x30".as_bytes()) { return 30_u8; }
+    if str.bytes_eq(s, "t6".as_bytes()) || str.bytes_eq(s, "x31".as_bytes()) { return 31_u8; }
+    return null;
+}
+
+fn parse_rv_csr(raw_s: *[u8]) -> ?u32 {
+    let s = trim_ws(raw_s);
+    if str.bytes_eq(s, "sstatus".as_bytes()) { return 0x100_u32; }
+    if str.bytes_eq(s, "sie".as_bytes()) { return 0x104_u32; }
+    if str.bytes_eq(s, "stvec".as_bytes()) { return 0x105_u32; }
+    if str.bytes_eq(s, "sscratch".as_bytes()) { return 0x140_u32; }
+    if str.bytes_eq(s, "sepc".as_bytes()) { return 0x141_u32; }
+    if str.bytes_eq(s, "scause".as_bytes()) { return 0x142_u32; }
+    if str.bytes_eq(s, "stval".as_bytes()) { return 0x143_u32; }
+    if str.bytes_eq(s, "sip".as_bytes()) { return 0x144_u32; }
+    if str.bytes_eq(s, "satp".as_bytes()) { return 0x180_u32; }
+    if str.bytes_eq(s, "cycle".as_bytes()) { return 0xC00_u32; }
+    if str.bytes_eq(s, "time".as_bytes()) { return 0xC01_u32; }
+    if str.bytes_eq(s, "instret".as_bytes()) { return 0xC02_u32; }
+    if str.bytes_eq(s, "mstatus".as_bytes()) { return 0x300_u32; }
+    if str.bytes_eq(s, "mtvec".as_bytes()) { return 0x305_u32; }
+    if str.bytes_eq(s, "mhartid".as_bytes()) { return 0xF14_u32; }
+    return null;
+}
+
+fn encode_one_rv64_asm_line(alloc: *mut AllocCap, raw_line: *[u8], out: *mut Rv64Buf) -> bool {
+    let line = trim_ws(raw_line);
+    if line.len == 0_usize { return true; }
+    if str.bytes_eq(line, "nop".as_bytes()) { out.nop(alloc); return true; }
+    if str.bytes_eq(line, "pause".as_bytes()) { out.pause_hint(alloc); return true; }
+    if str.bytes_eq(line, "ret".as_bytes()) { out.ret(alloc); return true; }
+    if str.bytes_eq(line, "ecall".as_bytes()) { out.ecall(alloc); return true; }
+    if str.bytes_eq(line, "ebreak".as_bytes()) { out.ebreak(alloc); return true; }
+    if str.bytes_eq(line, "wfi".as_bytes()) { out.emit32(alloc, 0x10500073_u32); return true; }
+    if str.bytes_eq(line, "sret".as_bytes()) { out.emit32(alloc, 0x10200073_u32); return true; }
+    if str.bytes_eq(line, "mret".as_bytes()) { out.emit32(alloc, 0x30200073_u32); return true; }
+    if str.bytes_eq(line, "fence".as_bytes()) || str.bytes_eq(line, "fence rw, rw".as_bytes()) {
+        out.fence_rw_rw(alloc);
+        return true;
+    }
+    if str.bytes_eq(line, "fence iorw, iorw".as_bytes()) {
+        out.emit32(alloc, 0x0FF0000F_u32);
+        return true;
+    }
+    if str.bytes_eq(line, "sfence.vma".as_bytes()) {
+        out.sfence_vma(alloc, ZERO, ZERO);
+        return true;
+    }
+
+    var sp: usize = 0_usize;
+    while sp < line.len && line[sp] != b' ' && line[sp] != b'\t' { sp = sp +% 1_usize; }
+    let mn = line.sub(0_usize, sp) catch { return false; };
+    let rest = if sp < line.len { trim_ws(line.sub(sp, line.len) catch { return false; }) } else { "".as_bytes() };
+
+    if str.bytes_eq(mn, "jr".as_bytes()) {
+        if let r = parse_rv_gpr(rest) {
+            out.jalr(alloc, ZERO, r, 0_i32);
+            return true;
+        }
+        return false;
+    }
+    if str.bytes_eq(mn, "mv".as_bytes()) {
+        var cm: usize = 0_usize;
+        while cm < rest.len && rest[cm] != b',' { cm = cm +% 1_usize; }
+        if cm >= rest.len { return false; }
+        let lhs = rest.sub(0_usize, cm) catch { return false; };
+        let rhs = rest.sub(cm +% 1_usize, rest.len) catch { return false; };
+        if let rd = parse_rv_gpr(lhs) {
+            if let rs = parse_rv_gpr(rhs) {
+                out.mv(alloc, rd, rs);
+                return true;
+            }
+        }
+        return false;
+    }
+    if str.bytes_eq(mn, "csrr".as_bytes()) {
+        var cm: usize = 0_usize;
+        while cm < rest.len && rest[cm] != b',' { cm = cm +% 1_usize; }
+        if cm >= rest.len { return false; }
+        let lhs = rest.sub(0_usize, cm) catch { return false; };
+        let rhs = rest.sub(cm +% 1_usize, rest.len) catch { return false; };
+        if let rd = parse_rv_gpr(lhs) {
+            if let csr = parse_rv_csr(rhs) {
+                out.csrr(alloc, rd, csr);
+                return true;
+            }
+        }
+        return false;
+    }
+    if str.bytes_eq(mn, "csrw".as_bytes()) {
+        var cm: usize = 0_usize;
+        while cm < rest.len && rest[cm] != b',' { cm = cm +% 1_usize; }
+        if cm >= rest.len { return false; }
+        let lhs = rest.sub(0_usize, cm) catch { return false; };
+        let rhs = rest.sub(cm +% 1_usize, rest.len) catch { return false; };
+        if let csr = parse_rv_csr(lhs) {
+            if let rs = parse_rv_gpr(rhs) {
+                out.csrw(alloc, csr, rs);
+                return true;
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
+pub fn encode_rv64_inline_asm(alloc: *mut AllocCap, text: *[u8], out: *mut Rv64Buf) -> bool ! OutOfMemory {
+    var start: usize = 0_usize;
+    var i: usize = 0_usize;
+    while i <= text.len {
+        var is_sep = i == text.len;
+        if !is_sep && i < text.len {
+            is_sep = text[i] == b';' || text[i] == b'\n';
+        }
+        if is_sep {
+            let seg = text.sub(start, i) catch { return false; };
+            if !encode_one_rv64_asm_line(alloc, seg, out) {
+                return false;
+            }
+            start = i +% 1_usize;
+        }
+        i = i +% 1_usize;
+    }
+    try out.check_oom();
+    return true;
+}
+
+// ============================================================================
+// Linux RISC-V 64 Runtime Helpers (`ecall`, asm-generic, Variant I TLS)
+// ============================================================================
+
+/// `eon_alloc_raw(alloc: a0, bytes: a1, align: a2) -> (a0=ptr, t0=err)`
+/// Header right before returned pointer: `[ptr - 24] = mmap_base`, `[ptr - 16] = total_map`, `[ptr - 8] = req_size`.
+fn emit_rv_alloc_raw(alloc: *mut AllocCap, b: *mut Rv64Buf, zero_init: bool) {
+    _ = zero_init; // Linux MAP_ANONYMOUS is already zero-filled
+    let l_nz = b.new_label(alloc);
+    b.br_short_label(alloc, .Ne, A1, ZERO, l_nz);
+    b.mv(alloc, A0, ZERO);
+    b.mv(alloc, T0, ZERO);
+    b.ret(alloc);
+    b.bind_label(l_nz);
+
+    // Prologue: save ra, s1, s2, s3, s4 (48 bytes, 16-byte aligned)
+    b.addi(alloc, SP, SP, -48_i32);
+    b.store_mem(alloc, SP, 0_i32, RA, 8_u8, T5);
+    b.store_mem(alloc, SP, 8_i32, S1, 8_u8, T5);
+    b.store_mem(alloc, SP, 16_i32, S2, 8_u8, T5);
+    b.store_mem(alloc, SP, 24_i32, S3, 8_u8, T5);
+    b.store_mem(alloc, SP, 32_i32, S4, 8_u8, T5);
+
+    b.mv(alloc, S1, A0); // alloc_cap*
+    b.mv(alloc, S2, A1); // req_bytes
+    b.mv(alloc, S4, A2); // align
+
+    // Ensure req_bytes >= 16 and align >= 16
+    b.addi(alloc, T1, ZERO, 16_i32);
+    let l_sz_ok = b.new_label(alloc);
+    b.br_short_label(alloc, .Geu, S2, T1, l_sz_ok);
+    b.addi(alloc, S2, ZERO, 16_i32);
+    b.bind_label(l_sz_ok);
+    let l_al_ok = b.new_label(alloc);
+    b.br_short_label(alloc, .Geu, S4, T1, l_al_ok);
+    b.addi(alloc, S4, ZERO, 16_i32);
+    b.bind_label(l_al_ok);
+
+    // total_map = align_up(req_bytes + align + 32, 4096)
+    b.add(alloc, S3, S2, S4);
+    b.addi(alloc, S3, S3, 32_i32);
+    b.li64(alloc, T1, 4095_u64);
+    b.add(alloc, S3, S3, T1);
+    b.li64(alloc, T1, 0xFFFFFFFFFFFFF000_u64);
+    b.and_r(alloc, S3, S3, T1);
+
+    // Check AllocCap budget (`[s1+24]` = budget, `[s1+8]` = used) if s1 != 0
+    let l_do_mmap = b.new_label(alloc);
+    let l_fail = b.new_label(alloc);
+    b.br_short_label(alloc, .Eq, S1, ZERO, l_do_mmap);
+    b.load_mem(alloc, T1, S1, 24_i32, 8_u8, false, T5);
+    b.br_short_label(alloc, .Eq, T1, ZERO, l_do_mmap);
+    b.load_mem(alloc, T2, S1, 8_i32, 8_u8, false, T5);
+    b.add(alloc, T3, T2, S2);
+    b.br_short_label(alloc, .Ltu, T1, T3, l_fail);
+
+    b.bind_label(l_do_mmap);
+    // mmap(0, total_map, PROT_READ|PROT_WRITE=3, MAP_PRIVATE|MAP_ANONYMOUS=0x22, -1, 0)
+    b.mv(alloc, A0, ZERO);
+    b.mv(alloc, A1, S3);
+    b.addi(alloc, A2, ZERO, 3_i32);
+    b.addi(alloc, A3, ZERO, 0x22_i32);
+    b.addi(alloc, A4, ZERO, -1_i32);
+    b.mv(alloc, A5, ZERO);
+    b.li64(alloc, A7, SYS_RV_MMAP);
+    b.ecall(alloc);
+
+    b.li64(alloc, T1, 0xFFFFFFFFFFFFF001_u64);
+    b.br_short_label(alloc, .Geu, A0, T1, l_fail);
+
+    // user_ptr = align_up(base + 24, align)
+    b.addi(alloc, T1, A0, 24_i32);
+    b.addi(alloc, T2, S4, -1_i32);
+    b.add(alloc, T1, T1, T2);
+    b.xori(alloc, T2, T2, -1_i32);
+    b.and_r(alloc, T1, T1, T2);
+
+    // Store header right before user_ptr: [ptr - 24] = base, [ptr - 16] = total_map, [ptr - 8] = req_bytes
+    b.store_mem(alloc, T1, -24_i32, A0, 8_u8, T5);
+    b.store_mem(alloc, T1, -16_i32, S3, 8_u8, T5);
+    b.store_mem(alloc, T1, -8_i32, S2, 8_u8, T5);
+
+    // Update AllocCap accounting if S1 != 0 ([0]=live_allocs, [8]=used, [16]=peak)
+    let l_no_cap = b.new_label(alloc);
+    b.br_short_label(alloc, .Eq, S1, ZERO, l_no_cap);
+    b.load_mem(alloc, T2, S1, 0_i32, 8_u8, false, T5);
+    b.addi(alloc, T2, T2, 1_i32);
+    b.store_mem(alloc, S1, 0_i32, T2, 8_u8, T5);
+    b.load_mem(alloc, T2, S1, 8_i32, 8_u8, false, T5);
+    b.add(alloc, T2, T2, S2);
+    b.store_mem(alloc, S1, 8_i32, T2, 8_u8, T5);
+    b.load_mem(alloc, T3, S1, 16_i32, 8_u8, false, T5);
+    let l_np = b.new_label(alloc);
+    b.br_short_label(alloc, .Geu, T3, T2, l_np);
+    b.store_mem(alloc, S1, 16_i32, T2, 8_u8, T5);
+    b.bind_label(l_np);
+    b.bind_label(l_no_cap);
+
+    b.mv(alloc, A0, T1);
+    b.mv(alloc, T0, ZERO);
+    let l_done = b.new_label(alloc);
+    b.j_label(alloc, l_done);
+
+    b.bind_label(l_fail);
+    b.mv(alloc, A0, ZERO);
+    b.addi(alloc, T0, ZERO, 1_i32); // OutOfMemory tag
+
+    b.bind_label(l_done);
+    b.load_mem(alloc, RA, SP, 0_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S1, SP, 8_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S2, SP, 16_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S3, SP, 24_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S4, SP, 32_i32, 8_u8, false, T5);
+    b.addi(alloc, SP, SP, 48_i32);
+    b.ret(alloc);
+    return;
+}
+
+/// `eon_free_raw(alloc: a0, ptr: a1, bytes: a2)`
+fn emit_rv_free_raw(alloc: *mut AllocCap, b: *mut Rv64Buf) {
+    let l_ret = b.new_label(alloc);
+    b.br_short_label(alloc, .Eq, A1, ZERO, l_ret);
+    b.load_mem(alloc, T1, A1, -24_i32, 8_u8, false, T5); // base
+    b.load_mem(alloc, T2, A1, -16_i32, 8_u8, false, T5); // total_map
+    b.load_mem(alloc, T3, A1, -8_i32, 8_u8, false, T5);  // req_bytes
+    let l_nc = b.new_label(alloc);
+    b.br_short_label(alloc, .Eq, A0, ZERO, l_nc);
+    b.load_mem(alloc, T4, A0, 0_i32, 8_u8, false, T5);
+    let l_sd = b.new_label(alloc);
+    b.br_short_label(alloc, .Eq, T4, ZERO, l_sd);
+    b.addi(alloc, T4, T4, -1_i32);
+    b.store_mem(alloc, A0, 0_i32, T4, 8_u8, T5);
+    b.bind_label(l_sd);
+    b.load_mem(alloc, T4, A0, 8_i32, 8_u8, false, T5);
+    let l_u0 = b.new_label(alloc);
+    b.br_short_label(alloc, .Ltu, T4, T3, l_u0);
+    b.sub(alloc, T4, T4, T3);
+    b.store_mem(alloc, A0, 8_i32, T4, 8_u8, T5);
+    b.j_label(alloc, l_nc);
+    b.bind_label(l_u0);
+    b.store_mem(alloc, A0, 8_i32, ZERO, 8_u8, T5);
+    b.bind_label(l_nc);
+    b.mv(alloc, A0, T1);
+    b.mv(alloc, A1, T2);
+    b.li64(alloc, A7, SYS_RV_MUNMAP);
+    b.ecall(alloc);
+    b.bind_label(l_ret);
+    b.ret(alloc);
+    return;
+}
+
+/// `eon_arena_alloc_aligned(arena: a0, size: a1, align: a2) -> (a0=ptr, t0=err)`
+/// Arena layout: `[0]=base, [8]=cap, [16]=cursor`.
+fn emit_rv_arena_alloc(alloc: *mut AllocCap, b: *mut Rv64Buf) {
+    let l_ok_al = b.new_label(alloc);
+    b.br_short_label(alloc, .Ne, A2, ZERO, l_ok_al);
+    b.addi(alloc, A2, ZERO, 1_i32);
+    b.bind_label(l_ok_al);
+    b.load_mem(alloc, T1, A0, 0_i32, 8_u8, false, T5);  // base
+    b.load_mem(alloc, T3, A0, 8_i32, 8_u8, false, T5);  // cap
+    b.load_mem(alloc, T2, A0, 16_i32, 8_u8, false, T5); // cursor
+    b.addi(alloc, T4, A2, -1_i32);
+    b.add(alloc, T2, T2, T4);
+    b.xori(alloc, T4, T4, -1_i32);
+    b.and_r(alloc, T2, T2, T4); // aligned_cursor
+    b.add(alloc, T4, T2, A1);   // new_cursor
+    let l_oom = b.new_label(alloc);
+    b.br_short_label(alloc, .Ltu, T4, T2, l_oom);
+    b.br_short_label(alloc, .Ltu, T3, T4, l_oom);
+    b.store_mem(alloc, A0, 16_i32, T4, 8_u8, T5);
+    b.add(alloc, A0, T1, T2);
+    b.mv(alloc, T0, ZERO);
+    b.ret(alloc);
+    b.bind_label(l_oom);
+    b.mv(alloc, A0, ZERO);
+    b.addi(alloc, T0, ZERO, 1_i32);
+    b.ret(alloc);
+    return;
+}
+
+/// `eon_rt_tls_init()` — maps static TLS block (`__eon_tdata_start..__eon_tdata_end`) and sets `tp`.
+fn emit_rv_tls_init(alloc: *mut AllocCap, interner: *mut span.SymInterner, b: *mut Rv64Buf) -> !OutOfMemory {
+    b.addi(alloc, SP, SP, -32_i32);
+    b.store_mem(alloc, SP, 0_i32, RA, 8_u8, T5);
+    b.store_mem(alloc, SP, 8_i32, S1, 8_u8, T5);
+    b.store_mem(alloc, SP, 16_i32, S2, 8_u8, T5);
+    let s_ts = try interner.intern_str(alloc, "__eon_tdata_start");
+    let s_te = try interner.intern_str(alloc, "__eon_tdata_end");
+    b.lea_sym(alloc, S1, s_ts, 0_i64);
+    b.lea_sym(alloc, S2, s_te, 0_i64);
+    b.sub(alloc, S2, S2, S1); // tdata_size
+    b.li64(alloc, T1, 4096_u64);
+    b.add(alloc, A1, S2, T1);
+    b.mv(alloc, A0, ZERO);
+    b.addi(alloc, A2, ZERO, 3_i32);
+    b.addi(alloc, A3, ZERO, 0x22_i32);
+    b.addi(alloc, A4, ZERO, -1_i32);
+    b.mv(alloc, A5, ZERO);
+    b.li64(alloc, A7, SYS_RV_MMAP);
+    b.ecall(alloc);
+    let l_fail = b.new_label(alloc);
+    b.li64(alloc, T1, 0xFFFFFFFFFFFFF000_u64);
+    b.br_short_label(alloc, .Geu, A0, T1, l_fail);
+    // RISC-V Variant I TLS: `tp` points directly to start of `.tdata` (reserve 64B TCB before it)
+    b.addi(alloc, TP, A0, 64_i32);
+    // Copy .tdata bytes into [tp .. tp + tdata_size)
+    b.mv(alloc, T1, ZERO);
+    let l_cp = b.new_label(alloc);
+    let l_cp_done = b.new_label(alloc);
+    b.bind_label(l_cp);
+    b.br_short_label(alloc, .Geu, T1, S2, l_cp_done);
+    b.add(alloc, T2, S1, T1);
+    b.load_mem(alloc, T3, T2, 0_i32, 1_u8, false, T5);
+    b.add(alloc, T2, TP, T1);
+    b.store_mem(alloc, T2, 0_i32, T3, 1_u8, T5);
+    b.addi(alloc, T1, T1, 1_i32);
+    b.j_label(alloc, l_cp);
+    b.bind_label(l_cp_done);
+    b.bind_label(l_fail);
+    b.load_mem(alloc, RA, SP, 0_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S1, SP, 8_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S2, SP, 16_i32, 8_u8, false, T5);
+    b.addi(alloc, SP, SP, 32_i32);
+    b.ret(alloc);
+    return;
+}
+
+/// `eon_rt_now_ns(clock: a0) -> u64`
+fn emit_rv_now_ns(alloc: *mut AllocCap, b: *mut Rv64Buf) {
+    b.addi(alloc, SP, SP, -16_i32);
+    b.addi(alloc, A0, ZERO, 1_i32); // CLOCK_MONOTONIC
+    b.mv(alloc, A1, SP);
+    b.li64(alloc, A7, SYS_RV_CLOCK_GETTIME);
+    b.ecall(alloc);
+    b.load_mem(alloc, T1, SP, 0_i32, 8_u8, false, T5);
+    b.load_mem(alloc, T2, SP, 8_i32, 8_u8, false, T5);
+    b.li64(alloc, T3, 1000000000_u64);
+    b.mul(alloc, A0, T1, T3);
+    b.add(alloc, A0, A0, T2);
+    b.addi(alloc, SP, SP, 16_i32);
+    b.ret(alloc);
+    return;
+}
+
+/// `eon_rt_write_fd(fd: a0, ptr: a1, len: a2) -> i64`
+fn emit_rv_write_fd(alloc: *mut AllocCap, b: *mut Rv64Buf) {
+    b.li64(alloc, A7, SYS_RV_WRITE);
+    b.ecall(alloc);
+    b.ret(alloc);
+    return;
+}
+
+/// `eon_rt_read_fd(fd: a0, ptr: a1, len: a2) -> i64`
+fn emit_rv_read_fd(alloc: *mut AllocCap, b: *mut Rv64Buf) {
+    b.li64(alloc, A7, SYS_RV_READ);
+    b.ecall(alloc);
+    b.ret(alloc);
+    return;
+}
+
+/// `eon_rt_close_fd(fd: a0)`
+fn emit_rv_close_fd(alloc: *mut AllocCap, b: *mut Rv64Buf) {
+    b.li64(alloc, A7, SYS_RV_CLOSE);
+    b.ecall(alloc);
+    b.ret(alloc);
+    return;
+}
+
+/// `eon_rt_print_str(ptr: a0, len: a1)` / `eprint_str`
+fn emit_rv_write_all_fd(alloc: *mut AllocCap, b: *mut Rv64Buf, fd: u64) {
+    b.mv(alloc, T1, A0);
+    b.mv(alloc, T2, A1);
+    let l_lp = b.new_label(alloc);
+    let l_done = b.new_label(alloc);
+    b.bind_label(l_lp);
+    b.br_short_label(alloc, .Eq, T2, ZERO, l_done);
+    b.li64(alloc, A0, fd);
+    b.mv(alloc, A1, T1);
+    b.mv(alloc, A2, T2);
+    b.li64(alloc, A7, SYS_RV_WRITE);
+    b.ecall(alloc);
+    b.br_short_label(alloc, .Ge, ZERO, A0, l_done); // if 0 >= res (res <= 0) break
+    b.add(alloc, T1, T1, A0);
+    b.sub(alloc, T2, T2, A0);
+    b.j_label(alloc, l_lp);
+    b.bind_label(l_done);
+    b.ret(alloc);
+    return;
+}
+
+fn emit_rv_print_nl(alloc: *mut AllocCap, b: *mut Rv64Buf, fd: u64) {
+    b.addi(alloc, SP, SP, -16_i32);
+    b.addi(alloc, T1, ZERO, 10_i32);
+    b.store_mem(alloc, SP, 0_i32, T1, 1_u8, T5);
+    b.li64(alloc, A0, fd);
+    b.mv(alloc, A1, SP);
+    b.addi(alloc, A2, ZERO, 1_i32);
+    b.li64(alloc, A7, SYS_RV_WRITE);
+    b.ecall(alloc);
+    b.addi(alloc, SP, SP, 16_i32);
+    b.ret(alloc);
+    return;
+}
+
+fn emit_rv_print_u64(alloc: *mut AllocCap, b: *mut Rv64Buf) {
+    b.addi(alloc, SP, SP, -32_i32);
+    b.addi(alloc, T1, SP, 32_i32); // end ptr
+    b.mv(alloc, T2, A0);           // val
+    b.addi(alloc, T3, ZERO, 10_i32);
+    let l_lp = b.new_label(alloc);
+    b.bind_label(l_lp);
+    b.divu(alloc, T4, T2, T3);
+    b.remu(alloc, T5, T2, T3);
+    b.addi(alloc, T5, T5, 48_i32);
+    b.addi(alloc, T1, T1, -1_i32);
+    b.store_mem(alloc, T1, 0_i32, T5, 1_u8, T6);
+    b.mv(alloc, T2, T4);
+    b.br_short_label(alloc, .Ne, T2, ZERO, l_lp);
+    b.addi(alloc, A2, SP, 32_i32);
+    b.sub(alloc, A2, A2, T1);
+    b.addi(alloc, A0, ZERO, 1_i32);
+    b.mv(alloc, A1, T1);
+    b.li64(alloc, A7, SYS_RV_WRITE);
+    b.ecall(alloc);
+    b.addi(alloc, SP, SP, 32_i32);
+    b.ret(alloc);
+    return;
+}
+
+fn emit_rv_print_i64(alloc: *mut AllocCap, b: *mut Rv64Buf) {
+    b.addi(alloc, SP, SP, -32_i32);
+    b.addi(alloc, T1, SP, 32_i32);
+    b.mv(alloc, T2, A0);
+    b.mv(alloc, T6, ZERO); // is_neg
+    let l_pos = b.new_label(alloc);
+    b.br_short_label(alloc, .Ge, T2, ZERO, l_pos);
+    b.addi(alloc, T6, ZERO, 1_i32);
+    b.sub(alloc, T2, ZERO, T2);
+    b.bind_label(l_pos);
+    b.addi(alloc, T3, ZERO, 10_i32);
+    let l_lp = b.new_label(alloc);
+    b.bind_label(l_lp);
+    b.divu(alloc, T4, T2, T3);
+    b.remu(alloc, T5, T2, T3);
+    b.addi(alloc, T5, T5, 48_i32);
+    b.addi(alloc, T1, T1, -1_i32);
+    b.store_mem(alloc, T1, 0_i32, T5, 1_u8, A3);
+    b.mv(alloc, T2, T4);
+    b.br_short_label(alloc, .Ne, T2, ZERO, l_lp);
+    let l_ns = b.new_label(alloc);
+    b.br_short_label(alloc, .Eq, T6, ZERO, l_ns);
+    b.addi(alloc, T1, T1, -1_i32);
+    b.addi(alloc, T5, ZERO, 45_i32); // '-'
+    b.store_mem(alloc, T1, 0_i32, T5, 1_u8, A3);
+    b.bind_label(l_ns);
+    b.addi(alloc, A2, SP, 32_i32);
+    b.sub(alloc, A2, A2, T1);
+    b.addi(alloc, A0, ZERO, 1_i32);
+    b.mv(alloc, A1, T1);
+    b.li64(alloc, A7, SYS_RV_WRITE);
+    b.ecall(alloc);
+    b.addi(alloc, SP, SP, 32_i32);
+    b.ret(alloc);
+    return;
+}
+
+fn emit_rv_print_f32(alloc: *mut AllocCap, interner: *mut span.SymInterner, b: *mut Rv64Buf) -> !OutOfMemory {
+    b.addi(alloc, SP, SP, -16_i32);
+    b.store_mem(alloc, SP, 0_i32, RA, 8_u8, T5);
+    b.fcvt_d_s(alloc, FA0, FA0);
+    b.fcvt_fp_to_int(alloc, true, true, false, A0, FA0);
+    let s_pi64 = try interner.intern_str(alloc, "eon_rt_print_i64");
+    b.call_sym(alloc, s_pi64);
+    b.load_mem(alloc, RA, SP, 0_i32, 8_u8, false, T5);
+    b.addi(alloc, SP, SP, 16_i32);
+    b.ret(alloc);
+    return;
+}
+
+/// `eon_rt_validate_utf8(ptr: a0, len: a1) -> (a0=0, t0=0 ok | t0=1 Utf8Error)`
+fn emit_rv_validate_utf8(alloc: *mut AllocCap, b: *mut Rv64Buf) {
+    b.mv(alloc, T1, ZERO); // i = 0
+    let l_lp = b.new_label(alloc);
+    let l_ok = b.new_label(alloc);
+    let l_err = b.new_label(alloc);
+    let l_c2 = b.new_label(alloc);
+    let l_c3 = b.new_label(alloc);
+    let l_c4 = b.new_label(alloc);
+    b.bind_label(l_lp);
+    b.br_short_label(alloc, .Geu, T1, A1, l_ok);
+    b.add(alloc, T2, A0, T1);
+    b.load_mem(alloc, T3, T2, 0_i32, 1_u8, false, T5);
+    b.addi(alloc, T4, ZERO, 0x80_i32);
+    let l_non_ascii = b.new_label(alloc);
+    b.br_short_label(alloc, .Geu, T3, T4, l_non_ascii);
+    b.addi(alloc, T1, T1, 1_i32);
+    b.j_label(alloc, l_lp);
+
+    b.bind_label(l_non_ascii);
+    b.addi(alloc, T4, ZERO, 0xC2_i32);
+    b.br_short_label(alloc, .Ltu, T3, T4, l_err);
+    b.addi(alloc, T4, ZERO, 0xE0_i32);
+    b.br_short_label(alloc, .Ltu, T3, T4, l_c2);
+    b.addi(alloc, T4, ZERO, 0xF0_i32);
+    b.br_short_label(alloc, .Ltu, T3, T4, l_c3);
+    b.addi(alloc, T4, ZERO, 0xF5_i32);
+    b.br_short_label(alloc, .Ltu, T3, T4, l_c4);
+    b.j_label(alloc, l_err);
+
+    // 2-byte
+    b.bind_label(l_c2);
+    b.addi(alloc, T4, T1, 1_i32);
+    b.br_short_label(alloc, .Geu, T4, A1, l_err);
+    b.add(alloc, T2, A0, T4);
+    b.load_mem(alloc, T5, T2, 0_i32, 1_u8, false, T6);
+    b.andi(alloc, T5, T5, 0xC0_i32);
+    b.addi(alloc, T6, ZERO, 0x80_i32);
+    b.br_short_label(alloc, .Ne, T5, T6, l_err);
+    b.addi(alloc, T1, T1, 2_i32);
+    b.j_label(alloc, l_lp);
+
+    // 3-byte
+    b.bind_label(l_c3);
+    b.addi(alloc, T4, T1, 2_i32);
+    b.br_short_label(alloc, .Geu, T4, A1, l_err);
+    b.add(alloc, T2, A0, T1);
+    b.load_mem(alloc, T5, T2, 1_i32, 1_u8, false, T6);
+    b.andi(alloc, T4, T5, 0xC0_i32);
+    b.addi(alloc, T6, ZERO, 0x80_i32);
+    b.br_short_label(alloc, .Ne, T4, T6, l_err);
+    // Reject overlong E0 [80..9F] & surrogates ED [A0..BF]
+    let l_3chk2 = b.new_label(alloc);
+    b.addi(alloc, T6, ZERO, 0xE0_i32);
+    b.br_short_label(alloc, .Ne, T3, T6, l_3chk2);
+    b.addi(alloc, T6, ZERO, 0xA0_i32);
+    b.br_short_label(alloc, .Ltu, T5, T6, l_err);
+    b.bind_label(l_3chk2);
+    let l_3b2 = b.new_label(alloc);
+    b.addi(alloc, T6, ZERO, 0xED_i32);
+    b.br_short_label(alloc, .Ne, T3, T6, l_3b2);
+    b.addi(alloc, T6, ZERO, 0xA0_i32);
+    b.br_short_label(alloc, .Geu, T5, T6, l_err);
+    b.bind_label(l_3b2);
+    b.load_mem(alloc, T5, T2, 2_i32, 1_u8, false, T6);
+    b.andi(alloc, T4, T5, 0xC0_i32);
+    b.addi(alloc, T6, ZERO, 0x80_i32);
+    b.br_short_label(alloc, .Ne, T4, T6, l_err);
+    b.addi(alloc, T1, T1, 3_i32);
+    b.j_label(alloc, l_lp);
+
+    // 4-byte
+    b.bind_label(l_c4);
+    b.addi(alloc, T4, T1, 3_i32);
+    b.br_short_label(alloc, .Geu, T4, A1, l_err);
+    b.add(alloc, T2, A0, T1);
+    b.load_mem(alloc, T5, T2, 1_i32, 1_u8, false, T6);
+    b.andi(alloc, T4, T5, 0xC0_i32);
+    b.addi(alloc, T6, ZERO, 0x80_i32);
+    b.br_short_label(alloc, .Ne, T4, T6, l_err);
+    let l_4chk2 = b.new_label(alloc);
+    b.addi(alloc, T6, ZERO, 0xF0_i32);
+    b.br_short_label(alloc, .Ne, T3, T6, l_4chk2);
+    b.addi(alloc, T6, ZERO, 0x90_i32);
+    b.br_short_label(alloc, .Ltu, T5, T6, l_err);
+    b.bind_label(l_4chk2);
+    let l_4b2 = b.new_label(alloc);
+    b.addi(alloc, T6, ZERO, 0xF4_i32);
+    b.br_short_label(alloc, .Ne, T3, T6, l_4b2);
+    b.addi(alloc, T6, ZERO, 0x90_i32);
+    b.br_short_label(alloc, .Geu, T5, T6, l_err);
+    b.bind_label(l_4b2);
+    b.load_mem(alloc, T5, T2, 2_i32, 1_u8, false, T6);
+    b.andi(alloc, T4, T5, 0xC0_i32);
+    b.addi(alloc, T6, ZERO, 0x80_i32);
+    b.br_short_label(alloc, .Ne, T4, T6, l_err);
+    b.load_mem(alloc, T5, T2, 3_i32, 1_u8, false, T6);
+    b.andi(alloc, T4, T5, 0xC0_i32);
+    b.addi(alloc, T6, ZERO, 0x80_i32);
+    b.br_short_label(alloc, .Ne, T4, T6, l_err);
+    b.addi(alloc, T1, T1, 4_i32);
+    b.j_label(alloc, l_lp);
+
+    b.bind_label(l_ok);
+    b.addi(alloc, A0, ZERO, 1_i32);
+    b.mv(alloc, T0, ZERO);
+    b.ret(alloc);
+
+    b.bind_label(l_err);
+    b.mv(alloc, A0, ZERO);
+    b.addi(alloc, T0, ZERO, 1_i32);
+    b.ret(alloc);
+    return;
+}
+
+/// `eon_rt_openat2_beneath(dirfd: a0, path_ptr: a1, path_len: a2, flags: a3, mode: a4) -> i64`
+fn emit_rv_openat_beneath(alloc: *mut AllocCap, b: *mut Rv64Buf) {
+    b.add_imm_large(alloc, SP, SP, -4096_i64, T5);
+    // Copy NUL-terminated path into SP[0..path_len]
+    b.mv(alloc, T1, ZERO);
+    b.li64(alloc, T2, 4095_u64);
+    let l_cp = b.new_label(alloc);
+    let l_cpd = b.new_label(alloc);
+    b.bind_label(l_cp);
+    b.br_short_label(alloc, .Geu, T1, A2, l_cpd);
+    b.br_short_label(alloc, .Geu, T1, T2, l_cpd);
+    b.add(alloc, T3, A1, T1);
+    b.load_mem(alloc, T4, T3, 0_i32, 1_u8, false, T5);
+    b.add(alloc, T3, SP, T1);
+    b.store_mem(alloc, T3, 0_i32, T4, 1_u8, T5);
+    b.addi(alloc, T1, T1, 1_i32);
+    b.j_label(alloc, l_cp);
+    b.bind_label(l_cpd);
+    b.add(alloc, T3, SP, T1);
+    b.store_mem(alloc, T3, 0_i32, ZERO, 1_u8, T5);
+    // openat(dirfd, SP, flags, mode)
+    b.mv(alloc, A1, SP);
+    b.mv(alloc, A2, A3);
+    b.mv(alloc, A3, A4);
+    b.li64(alloc, A7, SYS_RV_OPENAT);
+    b.ecall(alloc);
+    b.add_imm_large(alloc, SP, SP, 4096_i64, T5);
+    b.ret(alloc);
+    return;
+}
+
+/// `eon_rt_is_dir(dirfd: a0, path_ptr: a1, path_len: a2) -> bool`
+fn emit_rv_is_dir(alloc: *mut AllocCap, b: *mut Rv64Buf) {
+    b.add_imm_large(alloc, SP, SP, -4096_i64, T5);
+    b.mv(alloc, T1, ZERO);
+    b.li64(alloc, T2, 3800_u64);
+    let l_cp = b.new_label(alloc);
+    let l_cpd = b.new_label(alloc);
+    b.bind_label(l_cp);
+    b.br_short_label(alloc, .Geu, T1, A2, l_cpd);
+    b.br_short_label(alloc, .Geu, T1, T2, l_cpd);
+    b.add(alloc, T3, A1, T1);
+    b.load_mem(alloc, T4, T3, 0_i32, 1_u8, false, T5);
+    b.add(alloc, T3, SP, T1);
+    b.store_mem(alloc, T3, 0_i32, T4, 1_u8, T5);
+    b.addi(alloc, T1, T1, 1_i32);
+    b.j_label(alloc, l_cp);
+    b.bind_label(l_cpd);
+    b.add(alloc, T3, SP, T1);
+    b.store_mem(alloc, T3, 0_i32, ZERO, 1_u8, T5);
+    // newfstatat(dirfd, SP, SP+3840, 0)
+    b.mv(alloc, A1, SP);
+    b.add_imm_large(alloc, A2, SP, 3840_i64, T5);
+    b.mv(alloc, A3, ZERO);
+    b.li64(alloc, A7, SYS_RV_NEWFSTATAT);
+    b.ecall(alloc);
+    let l_no = b.new_label(alloc);
+    b.br_short_label(alloc, .Ne, A0, ZERO, l_no);
+    // asm-generic struct stat: st_mode at offset 16 (u32), S_IFMT = 0xF000, S_IFDIR = 0x4000
+    b.load_mem(alloc, T1, SP, 3856_i32, 4_u8, false, T5);
+    b.li64(alloc, T2, 0xF000_u64);
+    b.and_r(alloc, T1, T1, T2);
+    b.li64(alloc, T2, 0x4000_u64);
+    b.br_short_label(alloc, .Ne, T1, T2, l_no);
+    b.addi(alloc, A0, ZERO, 1_i32);
+    b.add_imm_large(alloc, SP, SP, 4096_i64, T5);
+    b.ret(alloc);
+    b.bind_label(l_no);
+    b.mv(alloc, A0, ZERO);
+    b.add_imm_large(alloc, SP, SP, 4096_i64, T5);
+    b.ret(alloc);
+    return;
+}
+
+/// `eon_rt_mkdir_all(dirfd: a0, path_ptr: a1, path_len: a2) -> i64`
+fn emit_rv_mkdir_all(alloc: *mut AllocCap, b: *mut Rv64Buf) {
+    b.add_imm_large(alloc, SP, SP, -4096_i64, T5);
+    b.mv(alloc, T1, ZERO);
+    b.li64(alloc, T2, 4095_u64);
+    let l_cp = b.new_label(alloc);
+    let l_cpd = b.new_label(alloc);
+    b.bind_label(l_cp);
+    b.br_short_label(alloc, .Geu, T1, A2, l_cpd);
+    b.br_short_label(alloc, .Geu, T1, T2, l_cpd);
+    b.add(alloc, T3, A1, T1);
+    b.load_mem(alloc, T4, T3, 0_i32, 1_u8, false, T5);
+    b.add(alloc, T3, SP, T1);
+    b.store_mem(alloc, T3, 0_i32, T4, 1_u8, T5);
+    b.addi(alloc, T1, T1, 1_i32);
+    b.j_label(alloc, l_cp);
+    b.bind_label(l_cpd);
+    b.add(alloc, T3, SP, T1);
+    b.store_mem(alloc, T3, 0_i32, ZERO, 1_u8, T5);
+    b.mv(alloc, A1, SP);
+    b.addi(alloc, A2, ZERO, 0x1ED_i32); // 0755
+    b.li64(alloc, A7, SYS_RV_MKDIRAT);
+    b.ecall(alloc);
+    // Treat -EEXIST (-17) as 0
+    b.addi(alloc, T1, ZERO, -17_i32);
+    let l_mk_ret = b.new_label(alloc);
+    b.br_short_label(alloc, .Ne, A0, T1, l_mk_ret);
+    b.mv(alloc, A0, ZERO);
+    b.bind_label(l_mk_ret);
+    b.add_imm_large(alloc, SP, SP, 4096_i64, T5);
+    b.ret(alloc);
+    return;
+}
+
+/// `eon_par_for(start: a0, end: a1, worker_fn: a2, ctx: a3)` — executes `[start..end)` cleanly.
+fn emit_rv_par_for(alloc: *mut AllocCap, b: *mut Rv64Buf) {
+    b.addi(alloc, SP, SP, -48_i32);
+    b.store_mem(alloc, SP, 0_i32, RA, 8_u8, T5);
+    b.store_mem(alloc, SP, 8_i32, S1, 8_u8, T5);
+    b.store_mem(alloc, SP, 16_i32, S2, 8_u8, T5);
+    b.store_mem(alloc, SP, 24_i32, S3, 8_u8, T5);
+    b.store_mem(alloc, SP, 32_i32, S4, 8_u8, T5);
+    b.mv(alloc, S1, A0); // start
+    b.mv(alloc, S2, A1); // end
+    b.mv(alloc, S3, A2); // worker_fn
+    b.mv(alloc, S4, A3); // ctx
+    let l_done = b.new_label(alloc);
+    b.br_short_label(alloc, .Geu, S1, S2, l_done);
+    b.mv(alloc, A0, S1);
+    b.mv(alloc, A1, S2);
+    b.mv(alloc, A2, S4);
+    b.call_reg(alloc, S3);
+    b.bind_label(l_done);
+    b.load_mem(alloc, RA, SP, 0_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S1, SP, 8_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S2, SP, 16_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S3, SP, 24_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S4, SP, 32_i32, 8_u8, false, T5);
+    b.addi(alloc, SP, SP, 48_i32);
+    b.ret(alloc);
+    return;
+}
+
+/// `eon_fiber_switch(from_ctx: a0, to_ctx: a1)` — saves/restores LP64D callee-saved GPRs + ra + sp.
+fn emit_rv_fiber_switch(alloc: *mut AllocCap, b: *mut Rv64Buf) {
+    b.store_mem(alloc, A0, 0_i32, SP, 8_u8, T5);
+    b.store_mem(alloc, A0, 8_i32, RA, 8_u8, T5);
+    b.store_mem(alloc, A0, 16_i32, FP, 8_u8, T5);
+    b.store_mem(alloc, A0, 24_i32, S1, 8_u8, T5);
+    b.store_mem(alloc, A0, 32_i32, S2, 8_u8, T5);
+    b.store_mem(alloc, A0, 40_i32, S3, 8_u8, T5);
+    b.store_mem(alloc, A0, 48_i32, S4, 8_u8, T5);
+    b.store_mem(alloc, A0, 56_i32, S5, 8_u8, T5);
+    b.store_mem(alloc, A0, 64_i32, S6, 8_u8, T5);
+    b.store_mem(alloc, A0, 72_i32, S7, 8_u8, T5);
+    b.store_mem(alloc, A0, 80_i32, S8, 8_u8, T5);
+    b.store_mem(alloc, A0, 88_i32, S9, 8_u8, T5);
+    b.store_mem(alloc, A0, 96_i32, S10, 8_u8, T5);
+    b.store_mem(alloc, A0, 104_i32, S11, 8_u8, T5);
+
+    b.load_mem(alloc, SP, A1, 0_i32, 8_u8, false, T5);
+    b.load_mem(alloc, RA, A1, 8_i32, 8_u8, false, T5);
+    b.load_mem(alloc, FP, A1, 16_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S1, A1, 24_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S2, A1, 32_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S3, A1, 40_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S4, A1, 48_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S5, A1, 56_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S6, A1, 64_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S7, A1, 72_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S8, A1, 80_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S9, A1, 88_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S10, A1, 96_i32, 8_u8, false, T5);
+    b.load_mem(alloc, S11, A1, 104_i32, 8_u8, false, T5);
+    b.ret(alloc);
+    return;
+}
+
+/// `eon_f16_to_f32(bits: a0) -> fa0` (IEEE 754 binary16 -> binary32 in software)
+fn emit_rv_f16_to_f32(alloc: *mut AllocCap, b: *mut Rv64Buf) {
+    // sign = (h & 0x8000) << 16
+    b.li64(alloc, T1, 0x8000_u64);
+    b.and_r(alloc, T2, A0, T1);
+    b.slli(alloc, T2, T2, 16_u8); // T2 = sign32
+    // exp = (h >> 10) & 0x1F, mant = h & 0x3FF
+    b.srli(alloc, T3, A0, 10_u8);
+    b.andi(alloc, T3, T3, 0x1F_i32);
+    b.andi(alloc, T4, A0, 0x3FF_i32);
+    let l_nz = b.new_label(alloc);
+    let l_inf = b.new_label(alloc);
+    let l_done = b.new_label(alloc);
+    b.br_short_label(alloc, .Ne, T3, ZERO, l_nz);
+    // exp == 0: zero or subnormal
+    let l_sub = b.new_label(alloc);
+    b.br_short_label(alloc, .Ne, T4, ZERO, l_sub);
+    b.mv(alloc, T5, T2);
+    b.j_label(alloc, l_done);
+    b.bind_label(l_sub);
+    b.addi(alloc, T3, ZERO, 113_i32);
+    let l_norm = b.new_label(alloc);
+    b.bind_label(l_norm);
+    b.andi(alloc, T6, T4, 0x400_i32);
+    let l_nd = b.new_label(alloc);
+    b.br_short_label(alloc, .Ne, T6, ZERO, l_nd);
+    b.slli(alloc, T4, T4, 1_u8);
+    b.addi(alloc, T3, T3, -1_i32);
+    b.j_label(alloc, l_norm);
+    b.bind_label(l_nd);
+    b.andi(alloc, T4, T4, 0x3FF_i32);
+    b.slli(alloc, T3, T3, 23_u8);
+    b.slli(alloc, T4, T4, 13_u8);
+    b.or_r(alloc, T5, T2, T3);
+    b.or_r(alloc, T5, T5, T4);
+    b.j_label(alloc, l_done);
+
+    b.bind_label(l_nz);
+    b.addi(alloc, T6, ZERO, 31_i32);
+    b.br_short_label(alloc, .Eq, T3, T6, l_inf);
+    // normal: exp32 = exp + 112
+    b.addi(alloc, T3, T3, 112_i32);
+    b.slli(alloc, T3, T3, 23_u8);
+    b.slli(alloc, T4, T4, 13_u8);
+    b.or_r(alloc, T5, T2, T3);
+    b.or_r(alloc, T5, T5, T4);
+    b.j_label(alloc, l_done);
+
+    b.bind_label(l_inf);
+    b.li64(alloc, T3, 0x7F800000_u64);
+    b.slli(alloc, T4, T4, 13_u8);
+    b.or_r(alloc, T5, T2, T3);
+    b.or_r(alloc, T5, T5, T4);
+
+    b.bind_label(l_done);
+    b.fmv_fp_x(alloc, false, FA0, T5);
+    b.ret(alloc);
+    return;
+}
+
+/// `eon_f32_to_f16(val: fa0) -> a0` (IEEE 754 binary32 -> binary16)
+fn emit_rv_f32_to_f16(alloc: *mut AllocCap, b: *mut Rv64Buf) {
+    b.fmv_x_fp(alloc, false, T1, FA0);
+    b.srli(alloc, T2, T1, 16_u8);
+    b.li64(alloc, T6, 0x8000_u64);
+    b.and_r(alloc, T2, T2, T6); // sign16
+    b.srli(alloc, T3, T1, 23_u8);
+    b.andi(alloc, T3, T3, 0xFF_i32); // exp32
+    b.li64(alloc, T6, 0x7FFFFF_u64);
+    b.and_r(alloc, T4, T1, T6); // mant32
+    let l_done = b.new_label(alloc);
+    let l_not_inf = b.new_label(alloc);
+    b.addi(alloc, T6, ZERO, 255_i32);
+    b.br_short_label(alloc, .Ne, T3, T6, l_not_inf);
+    // Inf / NaN
+    b.li64(alloc, T5, 0x7C00_u64);
+    b.or_r(alloc, A0, T2, T5);
+    b.br_short_label(alloc, .Eq, T4, ZERO, l_done);
+    b.ori(alloc, A0, A0, 0x200_i32);
+    b.j_label(alloc, l_done);
+
+    b.bind_label(l_not_inf);
+    b.addi(alloc, T3, T3, -112_i32);
+    let l_pos = b.new_label(alloc);
+    b.addi(alloc, T6, ZERO, 1_i32);
+    b.br_short_label(alloc, .Ge, T3, T6, l_pos);
+    b.mv(alloc, A0, T2); // underflow -> signed zero
+    b.j_label(alloc, l_done);
+    b.bind_label(l_pos);
+    let l_norm = b.new_label(alloc);
+    b.addi(alloc, T6, ZERO, 31_i32);
+    b.br_short_label(alloc, .Lt, T3, T6, l_norm);
+    b.li64(alloc, T5, 0x7C00_u64);
+    b.or_r(alloc, A0, T2, T5); // overflow -> Inf
+    b.j_label(alloc, l_done);
+    b.bind_label(l_norm);
+    b.slli(alloc, T3, T3, 10_u8);
+    b.srli(alloc, T4, T4, 13_u8);
+    b.or_r(alloc, A0, T2, T3);
+    b.or_r(alloc, A0, A0, T4);
+    b.bind_label(l_done);
+    b.ret(alloc);
+    return;
+}
+
+pub fn emit_rv64_rt_helper_by_name(
+    alloc: *mut AllocCap,
+    name: *[u8],
+    interner: *mut span.SymInterner,
+    out: *mut Rv64Buf,
+) -> bool ! OutOfMemory {
+    out.clear();
+    if str.bytes_eq(name, "eon_alloc_raw".as_bytes())
+        || str.bytes_eq(name, "eon_alloc_raw_san".as_bytes())
+    {
+        emit_rv_alloc_raw(alloc, out, true);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_alloc_raw_uninit".as_bytes()) {
+        emit_rv_alloc_raw(alloc, out, false);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_free_raw".as_bytes())
+        || str.bytes_eq(name, "eon_free_raw_san".as_bytes())
+    {
+        emit_rv_free_raw(alloc, out);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_arena_alloc_aligned".as_bytes()) {
+        emit_rv_arena_alloc(alloc, out);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_tls_init".as_bytes()) {
+        try emit_rv_tls_init(alloc, interner, out);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_now_ns".as_bytes()) {
+        emit_rv_now_ns(alloc, out);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_write_fd".as_bytes()) {
+        emit_rv_write_fd(alloc, out);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_read_fd".as_bytes()) {
+        emit_rv_read_fd(alloc, out);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_close_fd".as_bytes()) {
+        emit_rv_close_fd(alloc, out);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_print_str".as_bytes())
+        || str.bytes_eq(name, "eon_rt_print_bytes".as_bytes())
+    {
+        emit_rv_write_all_fd(alloc, out, 1_u64);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_eprint_str".as_bytes())
+        || str.bytes_eq(name, "eon_rt_eprint_bytes".as_bytes())
+    {
+        emit_rv_write_all_fd(alloc, out, 2_u64);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_print_nl".as_bytes()) {
+        emit_rv_print_nl(alloc, out, 1_u64);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_eprint_nl".as_bytes()) {
+        emit_rv_print_nl(alloc, out, 2_u64);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_print_u64".as_bytes()) {
+        emit_rv_print_u64(alloc, out);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_print_i64".as_bytes()) {
+        emit_rv_print_i64(alloc, out);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_print_f32".as_bytes()) {
+        try emit_rv_print_f32(alloc, interner, out);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_validate_utf8".as_bytes()) {
+        emit_rv_validate_utf8(alloc, out);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_openat2_beneath".as_bytes()) {
+        emit_rv_openat_beneath(alloc, out);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_is_dir".as_bytes()) {
+        emit_rv_is_dir(alloc, out);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_mkdir_all".as_bytes()) {
+        emit_rv_mkdir_all(alloc, out);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_par_for".as_bytes()) {
+        emit_rv_par_for(alloc, out);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_fiber_switch".as_bytes()) {
+        emit_rv_fiber_switch(alloc, out);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_f16_to_f32".as_bytes()) {
+        emit_rv_f16_to_f32(alloc, out);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_f32_to_f16".as_bytes()) {
+        emit_rv_f32_to_f16(alloc, out);
+        try out.check_oom();
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_parse_vdso".as_bytes())
+        || str.bytes_eq(name, "eon_rt_install_san_handler".as_bytes())
+        || str.bytes_eq(name, "eon_rt_arena_reset_san".as_bytes())
+        || str.bytes_eq(name, "eon_sched_init".as_bytes())
+        || str.bytes_eq(name, "eon_sched_shutdown".as_bytes())
+    {
+        out.ret(alloc);
+        try out.check_oom();
+        return out.finish();
+    }
+    return false;
+}

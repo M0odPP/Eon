@@ -4,20 +4,20 @@ module std.net @hal;
 // Capability-gated TCP/UDP IPv4 networking over direct Linux syscalls (`std.net`)
 // ---------------------------------------------------------------------------
 
-@inline fn sys_nr_read() -> u64 { comptime if @target_arch() == .AArch64 { return 63_u64; } else { return 0_u64; } }
-@inline fn sys_nr_write() -> u64 { comptime if @target_arch() == .AArch64 { return 64_u64; } else { return 1_u64; } }
-@inline fn sys_nr_close() -> u64 { comptime if @target_arch() == .AArch64 { return 57_u64; } else { return 3_u64; } }
-@inline fn sys_nr_socket() -> u64 { comptime if @target_arch() == .AArch64 { return 198_u64; } else { return 41_u64; } }
-@inline fn sys_nr_connect() -> u64 { comptime if @target_arch() == .AArch64 { return 203_u64; } else { return 42_u64; } }
-@inline fn sys_nr_sendto() -> u64 { comptime if @target_arch() == .AArch64 { return 206_u64; } else { return 44_u64; } }
-@inline fn sys_nr_recvfrom() -> u64 { comptime if @target_arch() == .AArch64 { return 207_u64; } else { return 45_u64; } }
-@inline fn sys_nr_shutdown() -> u64 { comptime if @target_arch() == .AArch64 { return 210_u64; } else { return 48_u64; } }
-@inline fn sys_nr_bind() -> u64 { comptime if @target_arch() == .AArch64 { return 200_u64; } else { return 49_u64; } }
-@inline fn sys_nr_listen() -> u64 { comptime if @target_arch() == .AArch64 { return 201_u64; } else { return 50_u64; } }
-@inline fn sys_nr_getsockname() -> u64 { comptime if @target_arch() == .AArch64 { return 204_u64; } else { return 51_u64; } }
-@inline fn sys_nr_setsockopt() -> u64 { comptime if @target_arch() == .AArch64 { return 208_u64; } else { return 54_u64; } }
-@inline fn sys_nr_fcntl() -> u64 { comptime if @target_arch() == .AArch64 { return 25_u64; } else { return 72_u64; } }
-@inline fn sys_nr_accept4() -> u64 { comptime if @target_arch() == .AArch64 { return 242_u64; } else { return 288_u64; } }
+@inline fn sys_nr_read() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 63_u64; } else { return 0_u64; } }
+@inline fn sys_nr_write() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 64_u64; } else { return 1_u64; } }
+@inline fn sys_nr_close() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 57_u64; } else { return 3_u64; } }
+@inline fn sys_nr_socket() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 198_u64; } else { return 41_u64; } }
+@inline fn sys_nr_connect() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 203_u64; } else { return 42_u64; } }
+@inline fn sys_nr_sendto() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 206_u64; } else { return 44_u64; } }
+@inline fn sys_nr_recvfrom() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 207_u64; } else { return 45_u64; } }
+@inline fn sys_nr_shutdown() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 210_u64; } else { return 48_u64; } }
+@inline fn sys_nr_bind() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 200_u64; } else { return 49_u64; } }
+@inline fn sys_nr_listen() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 201_u64; } else { return 50_u64; } }
+@inline fn sys_nr_getsockname() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 204_u64; } else { return 51_u64; } }
+@inline fn sys_nr_setsockopt() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 208_u64; } else { return 54_u64; } }
+@inline fn sys_nr_fcntl() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 25_u64; } else { return 72_u64; } }
+@inline fn sys_nr_accept4() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 242_u64; } else { return 288_u64; } }
 
 const AF_INET: u64 = 2_u64;
 const SOCK_STREAM: u64 = 1_u64;
@@ -35,6 +35,8 @@ const EINTR: i64 = -4_i64;
 fn syscall1(_nr: u64, _a1: u64) -> i64 {
     comptime if @target_arch() == .AArch64 {
         raw { asm("mov x8, x0; mov x0, x1; svc #0; ret", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv a7, a0; mv a0, a1; ecall; ret", options(noreturn)); }
     } else {
         raw { asm("mov rax, rdi; mov rdi, rsi; syscall; ret", options(noreturn)); }
     }
@@ -45,6 +47,8 @@ fn syscall1(_nr: u64, _a1: u64) -> i64 {
 fn syscall2(_nr: u64, _a1: u64, _a2: u64) -> i64 {
     comptime if @target_arch() == .AArch64 {
         raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; svc #0; ret", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv a7, a0; mv a0, a1; mv a1, a2; ecall; ret", options(noreturn)); }
     } else {
         raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; syscall; ret", options(noreturn)); }
     }
@@ -55,6 +59,8 @@ fn syscall2(_nr: u64, _a1: u64, _a2: u64) -> i64 {
 fn syscall3(_nr: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
     comptime if @target_arch() == .AArch64 {
         raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; svc #0; ret", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv a7, a0; mv a0, a1; mv a1, a2; mv a2, a3; ecall; ret", options(noreturn)); }
     } else {
         raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; syscall; ret", options(noreturn)); }
     }
@@ -65,6 +71,8 @@ fn syscall3(_nr: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
 fn syscall4(_nr: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64) -> i64 {
     comptime if @target_arch() == .AArch64 {
         raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; svc #0; ret", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv a7, a0; mv a0, a1; mv a1, a2; mv a2, a3; mv a3, a4; ecall; ret", options(noreturn)); }
     } else {
         raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r10, r8; syscall; ret", options(noreturn)); }
     }
@@ -75,6 +83,8 @@ fn syscall4(_nr: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64) -> i64 {
 fn syscall5(_nr: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> i64 {
     comptime if @target_arch() == .AArch64 {
         raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; mov x4, x5; svc #0; ret", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv a7, a0; mv a0, a1; mv a1, a2; mv a2, a3; mv a3, a4; mv a4, a5; ecall; ret", options(noreturn)); }
     } else {
         raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r10, r8; mov r8, r9; syscall; ret", options(noreturn)); }
     }
@@ -93,6 +103,8 @@ fn syscall6(
 ) -> i64 {
     comptime if @target_arch() == .AArch64 {
         raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; mov x4, x5; mov x5, x6; svc #0; ret", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv a7, a0; mv a0, a1; mv a1, a2; mv a2, a3; mv a3, a4; mv a4, a5; mv a5, a6; ecall; ret", options(noreturn)); }
     } else {
         raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r11, r10; mov r10, r8; mov r8, r9; mov r9, r11; syscall; ret", options(noreturn)); }
     }
@@ -101,28 +113,28 @@ fn syscall6(
 
 @naked
 fn slice_ptr(_s: *[u8]) -> u64 {
-    comptime if @target_arch() == .AArch64 { raw { asm("ret", options(noreturn)); } }
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { raw { asm("ret", options(noreturn)); } }
     else { raw { asm("mov rax, rdi; ret", options(noreturn)); } }
     return 0_u64;
 }
 
 @naked
 fn slice_mut_ptr(_s: *mut [u8]) -> u64 {
-    comptime if @target_arch() == .AArch64 { raw { asm("ret", options(noreturn)); } }
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { raw { asm("ret", options(noreturn)); } }
     else { raw { asm("mov rax, rdi; ret", options(noreturn)); } }
     return 0_u64;
 }
 
 @naked
 fn u32_mut_addr(_p: *mut u32) -> u64 {
-    comptime if @target_arch() == .AArch64 { raw { asm("ret", options(noreturn)); } }
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { raw { asm("ret", options(noreturn)); } }
     else { raw { asm("mov rax, rdi; ret", options(noreturn)); } }
     return 0_u64;
 }
 
 @naked
 fn u32_addr(_p: *u32) -> u64 {
-    comptime if @target_arch() == .AArch64 { raw { asm("ret", options(noreturn)); } }
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { raw { asm("ret", options(noreturn)); } }
     else { raw { asm("mov rax, rdi; ret", options(noreturn)); } }
     return 0_u64;
 }

@@ -29,6 +29,7 @@ import eonc.emi;
 import eonc.build_sys;
 import eonc.mach_x64;
 import eonc.mach_a64;
+import eonc.mach_rv64;
 import eonc.ui_test;
 import eonc.fmt;
 import eonc.lsp;
@@ -5065,6 +5066,10 @@ fn compile_loaded_to_elf_file(
 
             let res = if copts.target_spec.arch == .AArch64 {
                 try mach_a64.compile_and_link_a64(
+                    alloc, sm, &mut eir_prog, &resolved, &tenv, &ct, interner, copts, lib_syms.as_slice(),
+                )
+            } else if copts.target_spec.arch == .RiscV64 {
+                try mach_rv64.compile_and_link_rv64(
                     alloc, sm, &mut eir_prog, &resolved, &tenv, &ct, interner, copts, lib_syms.as_slice(),
                 )
             } else if copts.has_emi_cache && emi_cache_dir.len > 0_usize && user_file_count > 0_usize {

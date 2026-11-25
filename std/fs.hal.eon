@@ -4,16 +4,16 @@ module std.fs @hal;
 // Capability-first + linear-FD OS filesystem layer (`std.fs`)
 // ---------------------------------------------------------------------------
 
-@inline fn sys_nr_read() -> u64 { comptime if @target_arch() == .AArch64 { return 63_u64; } else { return 0_u64; } }
-@inline fn sys_nr_write() -> u64 { comptime if @target_arch() == .AArch64 { return 64_u64; } else { return 1_u64; } }
-@inline fn sys_nr_close() -> u64 { comptime if @target_arch() == .AArch64 { return 57_u64; } else { return 3_u64; } }
-@inline fn sys_nr_fstat() -> u64 { comptime if @target_arch() == .AArch64 { return 80_u64; } else { return 5_u64; } }
-@inline fn sys_nr_lseek() -> u64 { comptime if @target_arch() == .AArch64 { return 62_u64; } else { return 8_u64; } }
-@inline fn sys_nr_fsync() -> u64 { comptime if @target_arch() == .AArch64 { return 82_u64; } else { return 74_u64; } }
-@inline fn sys_nr_openat() -> u64 { comptime if @target_arch() == .AArch64 { return 56_u64; } else { return 257_u64; } }
-@inline fn sys_nr_newfstatat() -> u64 { comptime if @target_arch() == .AArch64 { return 79_u64; } else { return 262_u64; } }
-@inline fn sys_nr_unlinkat() -> u64 { comptime if @target_arch() == .AArch64 { return 35_u64; } else { return 263_u64; } }
-@inline fn sys_nr_renameat() -> u64 { comptime if @target_arch() == .AArch64 { return 38_u64; } else { return 264_u64; } }
+@inline fn sys_nr_read() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 63_u64; } else { return 0_u64; } }
+@inline fn sys_nr_write() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 64_u64; } else { return 1_u64; } }
+@inline fn sys_nr_close() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 57_u64; } else { return 3_u64; } }
+@inline fn sys_nr_fstat() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 80_u64; } else { return 5_u64; } }
+@inline fn sys_nr_lseek() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 62_u64; } else { return 8_u64; } }
+@inline fn sys_nr_fsync() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 82_u64; } else { return 74_u64; } }
+@inline fn sys_nr_openat() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 56_u64; } else { return 257_u64; } }
+@inline fn sys_nr_newfstatat() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 79_u64; } else { return 262_u64; } }
+@inline fn sys_nr_unlinkat() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 35_u64; } else { return 263_u64; } }
+@inline fn sys_nr_renameat() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 38_u64; } else { return 264_u64; } }
 
 const AT_FDCWD: u64 = 0xFFFFFFFFFFFFFF9C_u64; // -100
 const AT_REMOVEDIR: u64 = 0x200_u64;
@@ -39,6 +39,8 @@ pub const SEEK_END: i32 = 2_i32;
 fn syscall1(_nr: u64, _a1: u64) -> i64 {
     comptime if @target_arch() == .AArch64 {
         raw { asm("mov x8, x0; mov x0, x1; svc #0; ret", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv a7, a0; mv a0, a1; ecall; ret", options(noreturn)); }
     } else {
         raw { asm("mov rax, rdi; mov rdi, rsi; syscall; ret", options(noreturn)); }
     }
@@ -49,6 +51,8 @@ fn syscall1(_nr: u64, _a1: u64) -> i64 {
 fn syscall2(_nr: u64, _a1: u64, _a2: u64) -> i64 {
     comptime if @target_arch() == .AArch64 {
         raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; svc #0; ret", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv a7, a0; mv a0, a1; mv a1, a2; ecall; ret", options(noreturn)); }
     } else {
         raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; syscall; ret", options(noreturn)); }
     }
@@ -59,6 +63,8 @@ fn syscall2(_nr: u64, _a1: u64, _a2: u64) -> i64 {
 fn syscall3(_nr: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
     comptime if @target_arch() == .AArch64 {
         raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; svc #0; ret", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv a7, a0; mv a0, a1; mv a1, a2; mv a2, a3; ecall; ret", options(noreturn)); }
     } else {
         raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; syscall; ret", options(noreturn)); }
     }
@@ -69,6 +75,8 @@ fn syscall3(_nr: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
 fn syscall4(_nr: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64) -> i64 {
     comptime if @target_arch() == .AArch64 {
         raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; svc #0; ret", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv a7, a0; mv a0, a1; mv a1, a2; mv a2, a3; mv a3, a4; ecall; ret", options(noreturn)); }
     } else {
         raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r10, r8; syscall; ret", options(noreturn)); }
     }
@@ -77,7 +85,7 @@ fn syscall4(_nr: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64) -> i64 {
 
 @naked
 fn slice_ptr(_s: *[u8]) -> u64 {
-    comptime if @target_arch() == .AArch64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
         raw { asm("ret", options(noreturn)); }
     } else {
         raw { asm("mov rax, rdi; ret", options(noreturn)); }
@@ -87,7 +95,7 @@ fn slice_ptr(_s: *[u8]) -> u64 {
 
 @naked
 fn slice_mut_ptr(_s: *mut [u8]) -> u64 {
-    comptime if @target_arch() == .AArch64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
         raw { asm("ret", options(noreturn)); }
     } else {
         raw { asm("mov rax, rdi; ret", options(noreturn)); }

@@ -6,7 +6,7 @@ module std.time @hal;
 
 @inline
 fn sys_nr_nanosleep() -> u64 {
-    comptime if @target_arch() == .AArch64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
         return 101_u64;
     } else {
         return 35_u64;
@@ -15,7 +15,7 @@ fn sys_nr_nanosleep() -> u64 {
 
 @inline
 fn sys_nr_clock_gettime() -> u64 {
-    comptime if @target_arch() == .AArch64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
         return 113_u64;
     } else {
         return 228_u64;
@@ -37,6 +37,10 @@ fn syscall2(_nr: u64, _a1: u64, _a2: u64) -> i64 {
         raw {
             asm("mov x8, x0; mov x0, x1; mov x1, x2; svc #0; ret", options(noreturn));
         }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw {
+            asm("mv a7, a0; mv a0, a1; mv a1, a2; ecall; ret", options(noreturn));
+        }
     } else {
         raw {
             asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; syscall; ret", options(noreturn));
@@ -47,7 +51,7 @@ fn syscall2(_nr: u64, _a1: u64, _a2: u64) -> i64 {
 
 @naked
 fn timespec_mut_addr(_p: *mut Timespec) -> u64 {
-    comptime if @target_arch() == .AArch64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
         raw {
             asm("ret", options(noreturn));
         }
@@ -61,7 +65,7 @@ fn timespec_mut_addr(_p: *mut Timespec) -> u64 {
 
 @naked
 fn timespec_addr(_p: *Timespec) -> u64 {
-    comptime if @target_arch() == .AArch64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
         raw {
             asm("ret", options(noreturn));
         }

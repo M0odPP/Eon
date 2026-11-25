@@ -12,7 +12,7 @@ import core.sync;
 
 @inline
 fn sys_nr_futex() -> u64 {
-    comptime if @target_arch() == .AArch64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
         return 98_u64;
     } else {
         return 202_u64;
@@ -35,6 +35,10 @@ fn syscall6(
         raw {
             asm("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; mov x4, x5; mov x5, x6; svc #0; ret", options(noreturn));
         }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw {
+            asm("mv a7, a0; mv a0, a1; mv a1, a2; mv a2, a3; mv a3, a4; mv a4, a5; mv a5, a6; ecall; ret", options(noreturn));
+        }
     } else {
         raw {
             asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r11, r10; mov r10, r8; mov r8, r9; mov r9, r11; syscall; ret", options(noreturn));
@@ -45,7 +49,7 @@ fn syscall6(
 
 @naked
 fn atomic_u32_addr(_a: *Atomic[u32]) -> u64 {
-    comptime if @target_arch() == .AArch64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
         raw {
             asm("ret", options(noreturn));
         }

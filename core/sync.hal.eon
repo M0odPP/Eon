@@ -1,10 +1,14 @@
 module core.sync @hal;
 
-/// Emit a CPU spin-wait hint (`pause` on x86_64, `yield` on AArch64) inside spin loops.
+/// Emit a CPU spin-wait hint (`pause` on x86_64/RISC-V, `yield` on AArch64) inside spin loops.
 pub fn cpu_relax() {
     comptime if @target_arch() == .AArch64 {
         raw {
             asm("yield");
+        }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw {
+            asm("pause");
         }
     } else {
         raw {
