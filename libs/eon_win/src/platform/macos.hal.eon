@@ -1,0 +1,281 @@
+module eon_win.platform.macos @hal;
+
+import eon_win.events;
+
+// ============================================================================
+// macOS AppKit / Cocoa + CAMetalLayer Window Adapter via libobjc (`objc_msgSend`)
+// Zero C Toolchain — links cleanly to Foundation / AppKit / QuartzCore!
+// ============================================================================
+
+extern "C" fn objc_getClass(name: u64) -> u64;
+extern "C" fn sel_registerName(name: u64) -> u64;
+extern "C" fn objc_msgSend(obj: u64, sel: u64) -> u64;
+
+@naked
+pub fn slice_ptr(_s: *[u8]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn msg_send1(_fp: u64, _obj: u64, _sel: u64, _a0: u64) -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x9, x0; mov x0, x1; mov x1, x2; mov x2, x3; br x9", options(noreturn)); }
+    } else comptime if @target_arch() == .X86_64 {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; jmp rax", options(noreturn)); }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn msg_send2(_fp: u64, _obj: u64, _sel: u64, _a0: u64, _a1: u64) -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x9, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; br x9", options(noreturn)); }
+    } else comptime if @target_arch() == .X86_64 {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; jmp rax", options(noreturn)); }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn fn_ptr_u64(_f: fn(u64, u64) -> u64) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+pub fn objc_cls(name_z: *[u8]) -> u64 {
+    comptime if @target_os() == .MacOS {
+        raw { return objc_getClass(slice_ptr(name_z)); }
+    } else {
+        _ = name_z;
+        return 0_u64;
+    }
+}
+
+pub fn objc_sel(name_z: *[u8]) -> u64 {
+    comptime if @target_os() == .MacOS {
+        raw { return sel_registerName(slice_ptr(name_z)); }
+    } else {
+        _ = name_z;
+        return 0_u64;
+    }
+}
+
+pub fn objc_call0(obj: u64, sel: u64) -> u64 {
+    comptime if @target_os() == .MacOS {
+        if obj == 0_u64 || sel == 0_u64 { return 0_u64; }
+        raw { return objc_msgSend(obj, sel); }
+    } else {
+        _ = obj;
+        _ = sel;
+        return 0_u64;
+    }
+}
+
+pub fn objc_call1(obj: u64, sel: u64, a0: u64) -> u64 {
+    comptime if @target_os() == .MacOS {
+        if obj == 0_u64 || sel == 0_u64 { return 0_u64; }
+        raw {
+            let fp = fn_ptr_u64(objc_msgSend);
+            return msg_send1(fp, obj, sel, a0);
+        }
+    } else {
+        _ = obj; _ = sel; _ = a0;
+        return 0_u64;
+    }
+}
+
+pub fn objc_call2(obj: u64, sel: u64, a0: u64, a1: u64) -> u64 {
+    comptime if @target_os() == .MacOS {
+        if obj == 0_u64 || sel == 0_u64 { return 0_u64; }
+        raw {
+            let fp = fn_ptr_u64(objc_msgSend);
+            return msg_send2(fp, obj, sel, a0, a1);
+        }
+    } else {
+        _ = obj; _ = sel; _ = a0; _ = a1;
+        return 0_u64;
+    }
+}
+
+pub struct MacOsWindow {
+    pub ns_app: u64;
+    pub ns_window: u64;
+    pub ns_view: u64;
+    pub metal_layer: u64;
+    pub width: u32;
+    pub height: u32;
+    pub scale_factor: f32;
+    pub should_close: bool;
+    pub opened: bool;
+    pub clipboard: events.ClipboardBuf;
+}
+
+impl MacOsWindow {
+    pub fn empty() -> MacOsWindow {
+        return MacOsWindow.{
+            ns_app: 0_u64,
+            ns_window: 0_u64,
+            ns_view: 0_u64,
+            metal_layer: 0_u64,
+            width: 0_u32,
+            height: 0_u32,
+            scale_factor: 2.0_f32,
+            should_close: false,
+            opened: false,
+            clipboard: events.ClipboardBuf.new(),
+        };
+    }
+
+    pub fn open_into(self: *mut Self, opts: *events.WindowOptions) -> bool {
+        self.width = opts.width;
+        self.height = opts.height;
+        self.scale_factor = 2.0_f32;
+        self.should_close = false;
+        comptime if @target_os() == .MacOS {
+            let cls_app = objc_cls("NSApplication\0".as_bytes());
+            let app = objc_call0(cls_app, objc_sel("sharedApplication\0".as_bytes()));
+            _ = objc_call1(app, objc_sel("setActivationPolicy:\0".as_bytes()), 0_u64);
+            let cls_win = objc_cls("NSWindow\0".as_bytes());
+            let win = objc_call0(objc_call0(cls_win, objc_sel("alloc\0".as_bytes())), objc_sel("init\0".as_bytes()));
+            let ns_v = objc_call0(win, objc_sel("contentView\0".as_bytes()));
+            let cls_layer = objc_cls("CAMetalLayer\0".as_bytes());
+            let layer = objc_call0(cls_layer, objc_sel("layer\0".as_bytes()));
+            if ns_v != 0_u64 && layer != 0_u64 {
+                _ = objc_call1(ns_v, objc_sel("setWantsLayer:\0".as_bytes()), 1_u64);
+                _ = objc_call1(ns_v, objc_sel("setLayer:\0".as_bytes()), layer);
+            }
+            _ = objc_call1(win, objc_sel("makeKeyAndOrderFront:\0".as_bytes()), 0_u64);
+            _ = objc_call1(app, objc_sel("activateIgnoringOtherApps:\0".as_bytes()), 1_u64);
+            self.ns_app = app;
+            self.ns_window = win;
+            self.ns_view = ns_v;
+            self.metal_layer = layer;
+            self.set_title_bytes(opts.title_bytes());
+            self.opened = win != 0_u64;
+            return self.opened;
+        } else {
+            return false;
+        }
+    }
+
+    pub fn surface_info(self: *Self) -> events.SurfaceInfo {
+        return events.SurfaceInfo.{
+            kind: .Metal,
+            display_handle: self.ns_app,
+            window_handle: self.metal_layer,
+            extra_handle: self.ns_view,
+            width: self.width,
+            height: self.height,
+            scale_factor: self.scale_factor,
+            fb_base_addr: 0_u64,
+            fb_pitch_bytes: 0_u32,
+            fb_is_bgr: true,
+        };
+    }
+
+    pub fn poll_events(self: *mut Self, q: *mut events.EventQueue) {
+        comptime if @target_os() == .MacOS {
+            if !self.opened || self.ns_window == 0_u64 { return; }
+            let vis = objc_call0(self.ns_window, objc_sel("isVisible\0".as_bytes()));
+            if vis == 0_u64 {
+                self.should_close = true;
+                q.push(.CloseRequested);
+            }
+        } else {
+            _ = self;
+            _ = q;
+        }
+    }
+
+    pub fn set_title_bytes(self: *mut Self, src: *[u8]) {
+        comptime if @target_os() == .MacOS {
+            if self.ns_window == 0_u64 { return; }
+            var cbuf: [256]u8 = [0_u8; 256];
+            let n: usize = if src.len < 255_usize { src.len } else { 255_usize };
+            var i: usize = 0_usize;
+            while i < n {
+                cbuf[i] = src[i];
+                i = i +% 1_usize;
+            }
+            let cls_str = objc_cls("NSString\0".as_bytes());
+            let ns_str = objc_call1(cls_str, objc_sel("stringWithUTF8String:\0".as_bytes()), slice_ptr(&cbuf));
+            if ns_str != 0_u64 {
+                _ = objc_call1(self.ns_window, objc_sel("setTitle:\0".as_bytes()), ns_str);
+            }
+        } else {
+            _ = self;
+            _ = src;
+        }
+    }
+
+    pub fn set_title(self: *mut Self, title: *str) {
+        self.set_title_bytes(title.as_bytes());
+    }
+
+    pub fn set_cursor(self: *mut Self, shape: events.CursorShape) {
+        _ = self;
+        comptime if @target_os() == .MacOS {
+            let cls_cur = objc_cls("NSCursor\0".as_bytes());
+            let sel = match shape {
+                .Pointer => objc_sel("pointingHandCursor\0".as_bytes()),
+                .Text => objc_sel("IBeamCursor\0".as_bytes()),
+                .Grab => objc_sel("openHandCursor\0".as_bytes()),
+                .Grabbing => objc_sel("closedHandCursor\0".as_bytes()),
+                .ResizeEW => objc_sel("resizeLeftRightCursor\0".as_bytes()),
+                .ResizeNS => objc_sel("resizeUpDownCursor\0".as_bytes()),
+                _ => objc_sel("arrowCursor\0".as_bytes()),
+            };
+            let cur = objc_call0(cls_cur, sel);
+            if cur != 0_u64 {
+                _ = objc_call0(cur, objc_sel("set\0".as_bytes()));
+            }
+        } else {
+            _ = shape;
+        }
+    }
+
+    pub fn clipboard_set(self: *mut Self, text: *[u8]) -> bool {
+        self.clipboard.set_bytes(text);
+        comptime if @target_os() == .MacOS {
+            let cls_pb = objc_cls("NSPasteboard\0".as_bytes());
+            let pb = objc_call0(cls_pb, objc_sel("generalPasteboard\0".as_bytes()));
+            if pb == 0_u64 { return false; }
+            _ = objc_call0(pb, objc_sel("clearContents\0".as_bytes()));
+            let cls_str = objc_cls("NSString\0".as_bytes());
+            let ns_str = objc_call1(cls_str, objc_sel("stringWithUTF8String:\0".as_bytes()), slice_ptr(&self.clipboard.data));
+            let ns_ty = objc_call1(cls_str, objc_sel("stringWithUTF8String:\0".as_bytes()), slice_ptr("public.utf8-plain-text\0".as_bytes()));
+            _ = objc_call2(pb, objc_sel("setString:forType:\0".as_bytes()), ns_str, ns_ty);
+            return true;
+        } else {
+            return true;
+        }
+    }
+
+    pub fn clipboard_get(self: *mut Self, dst: *mut events.ClipboardBuf) -> bool {
+        dst.set_bytes(self.clipboard.as_bytes());
+        return dst.len > 0_usize;
+    }
+
+    pub fn close(self: *mut Self) {
+        comptime if @target_os() == .MacOS {
+            if self.ns_window != 0_u64 {
+                _ = objc_call0(self.ns_window, objc_sel("close\0".as_bytes()));
+                self.ns_window = 0_u64;
+            }
+        }
+        self.opened = false;
+    }
+}

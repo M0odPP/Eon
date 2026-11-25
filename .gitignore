@@ -2,6 +2,8 @@
 /selfhost/out/
 /kernel/out/
 /utils/out/
+/libs/*/out/
+/apps/*/out/
 /utils/results/ci_*.json
 *.emi
 *.eobj

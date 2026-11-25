@@ -1,0 +1,587 @@
+module eon_win.platform.nostd_fb @hal;
+
+import eon_win.events;
+
+// ============================================================================
+// Bare-Metal `nostd` Linear Framebuffer + Input Bridge (x86_64 / AArch64 /
+// RISC-V 64) & Portable Headless Test Window Backend (Zero C Toolchain)
+// ============================================================================
+
+const VBE_DISPI_IOPORT_INDEX: u16 = 0x01CE_u16;
+const VBE_DISPI_IOPORT_DATA: u16 = 0x01CF_u16;
+const VBE_DISPI_INDEX_XRES: u16 = 1_u16;
+const VBE_DISPI_INDEX_YRES: u16 = 2_u16;
+const VBE_DISPI_INDEX_BPP: u16 = 3_u16;
+const VBE_DISPI_INDEX_ENABLE: u16 = 4_u16;
+const VBE_DISPI_DISABLED: u16 = 0x00_u16;
+const VBE_DISPI_ENABLED: u16 = 0x01_u16;
+const VBE_DISPI_LFB_ENABLED: u16 = 0x40_u16;
+const PCI_CONFIG_ADDR: u16 = 0x0CF8_u16;
+const PCI_CONFIG_DATA: u16 = 0x0CFC_u16;
+
+const A64_PL011_UART_BASE: u64 = 0x09000000_u64;
+const A64_FW_CFG_BASE: u64 = 0x09020000_u64;
+const A64_RAMFB_PHYS: u64 = 0x44000000_u64;
+const A64_DMA_SCRATCH: u64 = 0x43F00000_u64;
+const A64_FW_DIR_BUF: u64 = 0x43F01000_u64;
+
+const RV64_NS16550_UART_BASE: u64 = 0x10000000_u64;
+const RV64_SIFIVE_TEST_ADDR: u64 = 0x00100000_u64;
+const RV64_FW_CFG_BASE: u64 = 0x10100000_u64;
+const RV64_RAMFB_PHYS: u64 = 0x84000000_u64;
+const RV64_DMA_SCRATCH: u64 = 0x83F00000_u64;
+const RV64_FW_DIR_BUF: u64 = 0x83F01000_u64;
+
+const FW_CFG_DMA_CTL_READ: u32 = 0x02_u32;
+const FW_CFG_DMA_CTL_SELECT: u32 = 0x08_u32;
+const FW_CFG_DMA_CTL_WRITE: u32 = 0x10_u32;
+const FW_CFG_FILE_DIR_SEL: u32 = 0x0019_u32;
+
+@inline
+pub fn bswap16(v: u16) -> u16 {
+    return ((v & 0xFF_u16) << 8_u16) | ((v >> 8_u16) & 0xFF_u16);
+}
+
+@inline
+pub fn bswap32(v: u32) -> u32 {
+    return ((v & 0x000000FF_u32) << 24_u32)
+        | ((v & 0x0000FF00_u32) << 8_u32)
+        | ((v & 0x00FF0000_u32) >> 8_u32)
+        | ((v & 0xFF000000_u32) >> 24_u32);
+}
+
+@inline
+pub fn bswap64(v: u64) -> u64 {
+    let lo = bswap32((v & 0xFFFFFFFF_u64).trunc.[u32]()).widen.[u64]();
+    let hi = bswap32(((v >> 32_u64) & 0xFFFFFFFF_u64).trunc.[u32]()).widen.[u64]();
+    return (lo << 32_u64) | hi;
+}
+
+@naked
+pub fn x64_outw(_port: u16, _val: u16) {
+    comptime if @target_os() == .NoStd && @target_arch() == .X86_64 {
+        raw { asm("mov rdx, rdi; mov rax, rsi; outw; ret", options(noreturn)); }
+    } else {
+        comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+            raw { asm("ret", options(noreturn)); }
+        } else {
+            raw { asm("ret", options(noreturn)); }
+        }
+    }
+}
+
+@naked
+pub fn x64_outl(_port: u16, _val: u32) {
+    comptime if @target_os() == .NoStd && @target_arch() == .X86_64 {
+        raw { asm("mov rdx, rdi; mov rax, rsi; outl; ret", options(noreturn)); }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+}
+
+@naked
+pub fn x64_inl(_port: u16) -> u32 {
+    comptime if @target_os() == .NoStd && @target_arch() == .X86_64 {
+        raw { asm("mov rdx, rdi; xor rax, rax; inl; ret", options(noreturn)); }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+    return 0_u32;
+}
+
+@naked
+pub fn x64_outb(_port: u16, _val: u8) {
+    comptime if @target_os() == .NoStd && @target_arch() == .X86_64 {
+        raw { asm("mov rdx, rdi; mov rax, rsi; outb; ret", options(noreturn)); }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+}
+
+@naked
+pub fn x64_inb(_port: u16) -> u8 {
+    comptime if @target_os() == .NoStd && @target_arch() == .X86_64 {
+        raw { asm("mov rdx, rdi; xor rax, rax; inb; ret", options(noreturn)); }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+    return 0_u8;
+}
+
+@naked
+pub fn a64_psci_hvc0(_fn_id: u64) {
+    comptime if @target_os() == .NoStd && @target_arch() == .AArch64 {
+        raw { asm("hvc #0; ret", options(noreturn)); }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+}
+
+pub fn mmio_barrier() {
+    comptime if @target_os() == .NoStd && @target_arch() == .AArch64 {
+        raw { asm("dmb sy"); }
+    } else comptime if @target_os() == .NoStd && @target_arch() == .RiscV64 {
+        raw { asm("fence iorw, iorw"); }
+    }
+}
+
+pub fn mmio_w8(addr: u64, val: u8) {
+    comptime if @target_os() == .NoStd {
+        raw {
+            let p = rawptr_mut.[u8].from_usize(addr.trunc.[usize]());
+            p.* = val;
+        }
+        mmio_barrier();
+    } else {
+        _ = addr;
+        _ = val;
+    }
+}
+
+pub fn mmio_r8(addr: u64) -> u8 {
+    comptime if @target_os() == .NoStd {
+        raw {
+            let v = rawptr.[u8].from_usize(addr.trunc.[usize]()).*;
+            mmio_barrier();
+            return v;
+        }
+    } else {
+        _ = addr;
+        return 0_u8;
+    }
+}
+
+pub fn mmio_r16(addr: u64) -> u16 {
+    comptime if @target_os() == .NoStd {
+        raw {
+            let v = rawptr.[u16].from_usize(addr.trunc.[usize]()).*;
+            mmio_barrier();
+            return v;
+        }
+    } else {
+        _ = addr;
+        return 0_u16;
+    }
+}
+
+pub fn mmio_w32(addr: u64, val: u32) {
+    comptime if @target_os() == .NoStd {
+        raw {
+            let p = rawptr_mut.[u32].from_usize(addr.trunc.[usize]());
+            p.* = val;
+        }
+        mmio_barrier();
+    } else {
+        _ = addr;
+        _ = val;
+    }
+}
+
+pub fn mmio_r32(addr: u64) -> u32 {
+    comptime if @target_os() == .NoStd {
+        raw {
+            let v = rawptr.[u32].from_usize(addr.trunc.[usize]()).*;
+            mmio_barrier();
+            return v;
+        }
+    } else {
+        _ = addr;
+        return 0_u32;
+    }
+}
+
+pub fn mmio_w64(addr: u64, val: u64) {
+    comptime if @target_os() == .NoStd {
+        raw {
+            let p = rawptr_mut.[u64].from_usize(addr.trunc.[usize]());
+            p.* = val;
+        }
+        mmio_barrier();
+    } else {
+        _ = addr;
+        _ = val;
+    }
+}
+
+pub fn fw_cfg_dma(fw_base: u64, scratch: u64, control: u32, length: u32, data_phys: u64) {
+    mmio_w32(scratch, bswap32(control));
+    mmio_w32(scratch +% 4_u64, bswap32(length));
+    mmio_w64(scratch +% 8_u64, bswap64(data_phys));
+    mmio_w64(fw_base +% 0x10_u64, bswap64(scratch));
+    var spin: u32 = 0_u32;
+    while mmio_r32(scratch) != 0_u32 && spin < 1000000_u32 {
+        spin = spin +% 1_u32;
+    }
+}
+
+pub fn find_ramfb_selector(fw_base: u64, scratch: u64, dir_buf: u64) -> u16 {
+    fw_cfg_dma(fw_base, scratch, FW_CFG_DMA_CTL_SELECT | FW_CFG_DMA_CTL_READ | (FW_CFG_FILE_DIR_SEL << 16_u32), 4_u32, dir_buf);
+    let count = bswap32(mmio_r32(dir_buf));
+    if count == 0_u32 || count > 128_u32 {
+        return 0_u16;
+    }
+    let total_bytes = 4_u32 +% count *% 64_u32;
+    fw_cfg_dma(fw_base, scratch, FW_CFG_DMA_CTL_SELECT | FW_CFG_DMA_CTL_READ | (FW_CFG_FILE_DIR_SEL << 16_u32), total_bytes, dir_buf);
+    let target = "etc/ramfb".as_bytes();
+    var i: u32 = 0_u32;
+    while i < count {
+        let entry = dir_buf +% 4_u64 +% i.widen.[u64]() *% 64_u64;
+        var ok = true;
+        var k: usize = 0_usize;
+        while k < target.len {
+            if mmio_r8(entry +% 8_u64 +% k.widen.[u64]()) != target[k] {
+                ok = false;
+                break;
+            }
+            k = k +% 1_usize;
+        }
+        if ok && mmio_r8(entry +% 8_u64 +% target.len.widen.[u64]()) == 0_u8 {
+            return bswap16(mmio_r16(entry +% 4_u64));
+        }
+        i = i +% 1_u32;
+    }
+    return 0_u16;
+}
+
+pub fn init_ramfb(fw_base: u64, scratch: u64, dir_buf: u64, fb_phys: u64, width: u32, height: u32) -> u64 {
+    let sel = find_ramfb_selector(fw_base, scratch, dir_buf);
+    let cfg_addr = scratch +% 64_u64;
+    let pitch = width *% 4_u32;
+    if sel != 0_u16 {
+        mmio_w64(cfg_addr, bswap64(fb_phys));
+        mmio_w32(cfg_addr +% 8_u64, bswap32(0x34325258_u32)); // XR24
+        mmio_w32(cfg_addr +% 12_u64, 0_u32);
+        mmio_w32(cfg_addr +% 16_u64, bswap32(width));
+        mmio_w32(cfg_addr +% 20_u64, bswap32(height));
+        mmio_w32(cfg_addr +% 24_u64, bswap32(pitch));
+        fw_cfg_dma(fw_base, scratch, FW_CFG_DMA_CTL_SELECT | FW_CFG_DMA_CTL_WRITE | (sel.widen.[u32]() << 16_u32), 28_u32, cfg_addr);
+    }
+    return fb_phys;
+}
+
+pub fn init_x64_vbe(width: u32, height: u32) -> u64 {
+    comptime if @target_os() == .NoStd && @target_arch() == .X86_64 {
+        var lfb: u64 = 0xFD000000_u64;
+        var slot: u32 = 0_u32;
+        while slot < 32_u32 {
+            x64_outl(PCI_CONFIG_ADDR, 0x80000000_u32 | (slot << 11_u32));
+            let id = x64_inl(PCI_CONFIG_DATA);
+            if id == 0x11111234_u32 {
+                x64_outl(PCI_CONFIG_ADDR, 0x80000000_u32 | (slot << 11_u32) | 0x10_u32);
+                let phys = (x64_inl(PCI_CONFIG_DATA) & 0xFFFFFFF0_u32).widen.[u64]();
+                if phys != 0_u64 {
+                    lfb = phys;
+                    break;
+                }
+            }
+            slot = slot +% 1_u32;
+        }
+        x64_outw(VBE_DISPI_IOPORT_INDEX, VBE_DISPI_INDEX_ENABLE);
+        x64_outw(VBE_DISPI_IOPORT_DATA, VBE_DISPI_DISABLED);
+        x64_outw(VBE_DISPI_IOPORT_INDEX, VBE_DISPI_INDEX_XRES);
+        x64_outw(VBE_DISPI_IOPORT_DATA, width.trunc.[u16]());
+        x64_outw(VBE_DISPI_IOPORT_INDEX, VBE_DISPI_INDEX_YRES);
+        x64_outw(VBE_DISPI_IOPORT_DATA, height.trunc.[u16]());
+        x64_outw(VBE_DISPI_IOPORT_INDEX, VBE_DISPI_INDEX_BPP);
+        x64_outw(VBE_DISPI_IOPORT_DATA, 32_u16);
+        x64_outw(VBE_DISPI_IOPORT_INDEX, VBE_DISPI_INDEX_ENABLE);
+        x64_outw(VBE_DISPI_IOPORT_DATA, VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED);
+        return lfb;
+    } else {
+        _ = width;
+        _ = height;
+        return 0_u64;
+    }
+}
+
+pub fn serial_init() {
+    comptime if @target_os() == .NoStd && @target_arch() == .X86_64 {
+        x64_outb(0x03F8_u16 +% 1_u16, 0x00_u8);
+        x64_outb(0x03F8_u16 +% 3_u16, 0x80_u8);
+        x64_outb(0x03F8_u16, 0x01_u8);
+        x64_outb(0x03F8_u16 +% 1_u16, 0x00_u8);
+        x64_outb(0x03F8_u16 +% 3_u16, 0x03_u8);
+        x64_outb(0x03F8_u16 +% 2_u16, 0xC7_u8);
+        x64_outb(0x03F8_u16 +% 4_u16, 0x0B_u8);
+    }
+}
+
+pub fn serial_write(s: *str) {
+    comptime if @target_os() == .NoStd {
+        let bs = s.as_bytes();
+        var i: usize = 0_usize;
+        while i < bs.len {
+            comptime if @target_arch() == .X86_64 {
+                var spin: u32 = 0_u32;
+                while (x64_inb(0x03F8_u16 +% 5_u16) & 0x20_u8) == 0_u8 && spin < 100000_u32 {
+                    spin = spin +% 1_u32;
+                }
+                x64_outb(0x03F8_u16, bs[i]);
+            } else comptime if @target_arch() == .AArch64 {
+                var spin: u32 = 0_u32;
+                while (mmio_r32(A64_PL011_UART_BASE +% 0x18_u64) & 0x20_u32) != 0_u32 && spin < 100000_u32 {
+                    spin = spin +% 1_u32;
+                }
+                mmio_w32(A64_PL011_UART_BASE, bs[i].widen.[u32]());
+            } else comptime if @target_arch() == .RiscV64 {
+                var spin: u32 = 0_u32;
+                while (mmio_r8(RV64_NS16550_UART_BASE +% 5_u64) & 0x20_u8) == 0_u8 && spin < 100000_u32 {
+                    spin = spin +% 1_u32;
+                }
+                mmio_w8(RV64_NS16550_UART_BASE, bs[i]);
+            }
+            i = i +% 1_usize;
+        }
+    } else {
+        _ = s;
+    }
+}
+
+pub fn qemu_exit(ok: bool) {
+    comptime if @target_os() == .NoStd {
+        comptime if @target_arch() == .X86_64 {
+            let code: u8 = if ok { 0x10_u8 } else { 0x20_u8 };
+            x64_outb(0x00F4_u16, code);
+            loop { raw { asm("hlt"); } }
+        } else comptime if @target_arch() == .AArch64 {
+            _ = ok;
+            a64_psci_hvc0(0x84000008_u64);
+            loop { raw { asm("wfe"); } }
+        } else comptime if @target_arch() == .RiscV64 {
+            let code: u32 = if ok { 0x5555_u32 } else { 0x3333_u32 };
+            mmio_w32(RV64_SIFIVE_TEST_ADDR, code);
+            loop { raw { asm("wfi"); } }
+        }
+    } else {
+        _ = ok;
+    }
+}
+
+pub fn init_hw_fb(width: u32, height: u32) -> u64 {
+    comptime if @target_os() == .NoStd {
+        serial_init();
+        comptime if @target_arch() == .X86_64 {
+            return init_x64_vbe(width, height);
+        } else comptime if @target_arch() == .AArch64 {
+            return init_ramfb(A64_FW_CFG_BASE, A64_DMA_SCRATCH, A64_FW_DIR_BUF, A64_RAMFB_PHYS, width, height);
+        } else comptime if @target_arch() == .RiscV64 {
+            return init_ramfb(RV64_FW_CFG_BASE, RV64_DMA_SCRATCH, RV64_FW_DIR_BUF, RV64_RAMFB_PHYS, width, height);
+        } else {
+            return 0_u64;
+        }
+    } else {
+        _ = width; _ = height;
+        return 0_u64;
+    }
+}
+
+/// Hardware bare-metal framebuffer + headless window state.
+pub struct NoStdWindow {
+    pub width: u32;
+    pub height: u32;
+    pub fb_base: u64;
+    pub fb_pitch: u32;
+    pub is_headless: bool;
+    pub should_close: bool;
+    pub mods: u8;
+    pub frame_count: u64;
+    pub last_presented_crc: u32;
+    pub cursor: events.CursorShape;
+}
+
+impl NoStdWindow {
+    pub fn open_headless(width: u32, height: u32) -> NoStdWindow {
+        return NoStdWindow.{
+            width: width,
+            height: height,
+            fb_base: 0_u64,
+            fb_pitch: width *% 4_u32,
+            is_headless: true,
+            should_close: false,
+            mods: 0_u8,
+            frame_count: 0_u64,
+            last_presented_crc: 0_u32,
+            cursor: .Default,
+        };
+    }
+
+    pub fn open_hardware(width: u32, height: u32) -> NoStdWindow {
+        let fb_base: u64 = comptime if @target_os() == .NoStd {
+            init_hw_fb(width, height)
+        } else {
+            0_u64
+        };
+        return NoStdWindow.{
+            width: width,
+            height: height,
+            fb_base: fb_base,
+            fb_pitch: width *% 4_u32,
+            is_headless: false,
+            should_close: false,
+            mods: 0_u8,
+            frame_count: 0_u64,
+            last_presented_crc: 0_u32,
+            cursor: .Default,
+        };
+    }
+
+    pub fn surface_info(self: *Self) -> events.SurfaceInfo {
+        return events.SurfaceInfo.{
+            kind: if self.is_headless { .Headless } else { .NoStdFb },
+            display_handle: 0_u64,
+            window_handle: self.fb_base,
+            extra_handle: 0_u64,
+            width: self.width,
+            height: self.height,
+            scale_factor: 1.0_f32,
+            fb_base_addr: self.fb_base,
+            fb_pitch_bytes: self.fb_pitch,
+            fb_is_bgr: true,
+        };
+    }
+
+    pub fn poll_events(self: *mut Self, q: *mut events.EventQueue) {
+        if self.is_headless {
+            return;
+        }
+        comptime if @target_os() == .NoStd && @target_arch() == .X86_64 {
+            var count: u32 = 0_u32;
+            while (x64_inb(0x64_u16) & 1_u8) != 0_u8 && count < 16_u32 {
+                let raw_sc = x64_inb(0x60_u16);
+                let is_release = (raw_sc & 0x80_u8) != 0_u8;
+                let sc = (raw_sc & 0x7F_u8).widen.[u32]();
+                let key = events.key_from_evdev(sc);
+                if key == .Shift {
+                    if is_release { self.mods = self.mods & (~events.MOD_SHIFT); }
+                    else { self.mods = self.mods | events.MOD_SHIFT; }
+                } else if key == .Control {
+                    if is_release { self.mods = self.mods & (~events.MOD_CTRL); }
+                    else { self.mods = self.mods | events.MOD_CTRL; }
+                } else if key == .Alt {
+                    if is_release { self.mods = self.mods & (~events.MOD_ALT); }
+                    else { self.mods = self.mods | events.MOD_ALT; }
+                }
+                let mods = events.Modifiers.from_bits(self.mods);
+                if is_release {
+                    q.push(.KeyUp(events.KeyEvent.{ key: key, scancode: sc, repeat: false, mods: mods }));
+                } else {
+                    q.push(.KeyDown(events.KeyEvent.{ key: key, scancode: sc, repeat: false, mods: mods }));
+                    let ch = ps2_scancode_to_ascii(sc, mods.has_shift());
+                    if ch != 0_u32 {
+                        q.push(.TextInput(ch));
+                    }
+                }
+                count = count +% 1_u32;
+            }
+        } else {
+            _ = q;
+        }
+    }
+
+    /// Blit RGBA8 software buffer to the bare-metal BGRX8888 linear framebuffer (and compute frame hash).
+    pub fn present_rgba8(self: *mut Self, rgba: *[u8], w: u32, h: u32) {
+        var hash: u32 = 2166136261_u32;
+        if !self.is_headless && self.fb_base != 0_u64 {
+            comptime if @target_os() == .NoStd {
+                let cw: u32 = if w < self.width { w } else { self.width };
+                let ch: u32 = if h < self.height { h } else { self.height };
+                var y: u32 = 0_u32;
+                while y < ch {
+                    let row_dst = self.fb_base +% y.widen.[u64]() *% self.fb_pitch.widen.[u64]();
+                    let row_src = (y *% w).widen.[usize]() *% 4_usize;
+                    var x: u32 = 0_u32;
+                    while x < cw {
+                        let si = row_src +% x.widen.[usize]() *% 4_usize;
+                        if rgba.len >= 4_usize && si <= rgba.len - 4_usize {
+                            let r = rgba[si].widen.[u32]();
+                            let g = rgba[si + 1_usize].widen.[u32]();
+                            let b = rgba[si + 2_usize].widen.[u32]();
+                            let a = rgba[si + 3_usize].widen.[u32]();
+                            let bgrx = b | (g << 8_u32) | (r << 16_u32) | (a << 24_u32);
+                            raw {
+                                let p = rawptr_mut.[u32].from_usize((row_dst +% x.widen.[u64]() *% 4_u64).trunc.[usize]());
+                                p.* = bgrx;
+                            }
+                            if (x & 31_u32) == 0_u32 && (y & 31_u32) == 0_u32 {
+                                hash = (hash ^ bgrx) *% 16777619_u32;
+                            }
+                        }
+                        x = x +% 1_u32;
+                    }
+                    y = y +% 1_u32;
+                }
+            } else {
+                _ = w;
+                _ = h;
+            }
+        } else {
+            _ = w;
+            _ = h;
+            if rgba.len >= 4_usize {
+                let lim = rgba.len - 4_usize;
+                var i: usize = 0_usize;
+                while i <= lim {
+                    let px = rgba[i].widen.[u32]()
+                        | (rgba[i + 1_usize].widen.[u32]() << 8_u32)
+                        | (rgba[i + 2_usize].widen.[u32]() << 16_u32)
+                        | (rgba[i + 3_usize].widen.[u32]() << 24_u32);
+                    hash = (hash ^ px) *% 16777619_u32;
+                    i = i +% 64_usize;
+                }
+            }
+        }
+        self.last_presented_crc = hash;
+        self.frame_count = self.frame_count +% 1_u64;
+    }
+
+    pub fn read_hw_pixel(self: *Self, x: u32, y: u32) -> u32 {
+        comptime if @target_os() == .NoStd {
+            if self.fb_base == 0_u64 || x >= self.width || y >= self.height {
+                return 0_u32;
+            }
+            let off = y.widen.[u64]() *% self.fb_pitch.widen.[u64]() +% x.widen.[u64]() *% 4_u64;
+            raw {
+                return rawptr.[u32].from_usize((self.fb_base +% off).trunc.[usize]()).*;
+            }
+        } else {
+            _ = self;
+            _ = x;
+            _ = y;
+            return 0_u32;
+        }
+    }
+}
+
+pub fn ps2_scancode_to_ascii(sc: u32, shift: bool) -> u32 {
+    if !shift {
+        match sc {
+            2_u32 => { return b'1'.widen.[u32](); }
+            3_u32 => { return b'2'.widen.[u32](); }
+            4_u32 => { return b'3'.widen.[u32](); }
+            5_u32 => { return b'4'.widen.[u32](); }
+            6_u32 => { return b'5'.widen.[u32](); }
+            7_u32 => { return b'6'.widen.[u32](); }
+            8_u32 => { return b'7'.widen.[u32](); }
+            9_u32 => { return b'8'.widen.[u32](); }
+            10_u32 => { return b'9'.widen.[u32](); }
+            11_u32 => { return b'0'.widen.[u32](); }
+            12_u32 => { return b'-'.widen.[u32](); }
+            13_u32 => { return b'='.widen.[u32](); }
+            52_u32 => { return b'.'.widen.[u32](); }
+            53_u32 => { return b'/'.widen.[u32](); }
+            55_u32 => { return b'*'.widen.[u32](); }
+            78_u32 => { return b'+'.widen.[u32](); }
+            _ => { return 0_u32; }
+        }
+    } else {
+        match sc {
+            6_u32 => { return b'%'.widen.[u32](); }
+            7_u32 => { return b'^'.widen.[u32](); }
+            9_u32 => { return b'*'.widen.[u32](); }
+            10_u32 => { return b'('.widen.[u32](); }
+            11_u32 => { return b')'.widen.[u32](); }
+            13_u32 => { return b'+'.widen.[u32](); }
+            _ => { return 0_u32; }
+        }
+    }
+}

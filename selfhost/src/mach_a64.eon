@@ -342,8 +342,10 @@ fn emit_a64_fnref_thunks(
         let target_sym = try mach_isel_a64.a64_fn_sym_name_id(alloc, cfg_ir.fn_key_top_def(req.target_def), eir_prog, interner);
         var start_idx: usize = 0_usize;
         var user_gp: usize = 0_usize;
+        var is_c_abi = false;
         if let fid = eir_prog.find_fn_by_key(cfg_ir.fn_key_top_def(req.target_def)) {
             if let f = eir_prog.get_fn(fid) {
+                is_c_abi = f.sig.effects.is_export_c;
                 let rc = mach_isel_a64.a64_classify_ret(f.sig.ret, env);
                 if mach_isel_a64.a64_ret_uses_sret(rc) { start_idx = 1_usize; }
                 let ps = env.params_range(f.sig.params);
@@ -355,19 +357,31 @@ fn emit_a64_fnref_thunks(
                     pi = pi +% 1_usize;
                 }
             }
+        } else {
+            let ext_fns = eir_prog.extern_fns_slice();
+            var ei: usize = 0_usize;
+            while ei < ext_fns.len {
+                if ext_fns[ei] == req.target_def {
+                    is_c_abi = true;
+                    break;
+                }
+                ei = ei +% 1_usize;
+            }
         }
 
         var tb = try a64_asm.A64Buf.init(alloc);
         errdefer tb.destroy(alloc);
-        // Shift X(start_idx+1)..X7 down to X(start_idx)..X6 to discard hidden closure env pointer!
-        var gi = start_idx;
-        while gi < 7_usize {
-            try tb.mov_rr(alloc, gi.trunc.[u8](), (gi +% 1_usize).trunc.[u8]());
-            gi = gi +% 1_usize;
-        }
-        if start_idx +% user_gp == 8_usize {
-            // 8th GP arg spilled to [SP + 0] by caller
-            try tb.load_mem(alloc, a64_asm.X7, a64_asm.SP, 0_i32, 8_u8, false, a64_asm.X16);
+        if !is_c_abi {
+            // Shift X(start_idx+1)..X7 down to X(start_idx)..X6 to discard hidden closure env pointer!
+            var gi = start_idx;
+            while gi < 7_usize {
+                try tb.mov_rr(alloc, gi.trunc.[u8](), (gi +% 1_usize).trunc.[u8]());
+                gi = gi +% 1_usize;
+            }
+            if start_idx +% user_gp == 8_usize {
+                // 8th GP arg spilled to [SP + 0] by caller
+                try tb.load_mem(alloc, a64_asm.X7, a64_asm.SP, 0_i32, 8_u8, false, a64_asm.X16);
+            }
         }
         try tb.b_sym(alloc, target_sym);
         _ = tb.finish();

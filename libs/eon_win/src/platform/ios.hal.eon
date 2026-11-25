@@ -1,0 +1,173 @@
+module eon_win.platform.ios @hal;
+
+import eon_win.events;
+
+// ============================================================================
+// iOS UIKit + CAMetalLayer Window Adapter via libobjc (`objc_msgSend`)
+// Zero C Toolchain — links cleanly to UIKit / QuartzCore / Foundation!
+// ============================================================================
+
+extern "C" fn objc_getClass(name: u64) -> u64;
+extern "C" fn sel_registerName(name: u64) -> u64;
+extern "C" fn objc_msgSend(obj: u64, sel: u64) -> u64;
+
+@naked
+pub fn slice_ptr(_s: *[u8]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn msg_send1(_fp: u64, _obj: u64, _sel: u64, _a0: u64) -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x9, x0; mov x0, x1; mov x1, x2; mov x2, x3; br x9", options(noreturn)); }
+    } else comptime if @target_arch() == .X86_64 {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; jmp rax", options(noreturn)); }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn fn_ptr_u64(_f: fn(u64, u64) -> u64) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+pub fn objc_cls(name_z: *[u8]) -> u64 {
+    comptime if @target_os() == .IOS {
+        raw { return objc_getClass(slice_ptr(name_z)); }
+    } else {
+        _ = name_z;
+        return 0_u64;
+    }
+}
+
+pub fn objc_sel(name_z: *[u8]) -> u64 {
+    comptime if @target_os() == .IOS {
+        raw { return sel_registerName(slice_ptr(name_z)); }
+    } else {
+        _ = name_z;
+        return 0_u64;
+    }
+}
+
+pub fn objc_call0(obj: u64, sel: u64) -> u64 {
+    comptime if @target_os() == .IOS {
+        if obj == 0_u64 || sel == 0_u64 { return 0_u64; }
+        raw { return objc_msgSend(obj, sel); }
+    } else {
+        _ = obj; _ = sel;
+        return 0_u64;
+    }
+}
+
+pub fn objc_call1(obj: u64, sel: u64, a0: u64) -> u64 {
+    comptime if @target_os() == .IOS {
+        if obj == 0_u64 || sel == 0_u64 { return 0_u64; }
+        raw {
+            let fp = fn_ptr_u64(objc_msgSend);
+            return msg_send1(fp, obj, sel, a0);
+        }
+    } else {
+        _ = obj; _ = sel; _ = a0;
+        return 0_u64;
+    }
+}
+
+pub struct IosWindow {
+    pub ui_window: u64;
+    pub metal_layer: u64;
+    pub width: u32;
+    pub height: u32;
+    pub scale_factor: f32;
+    pub should_close: bool;
+    pub opened: bool;
+    pub clipboard: events.ClipboardBuf;
+}
+
+impl IosWindow {
+    pub fn empty() -> IosWindow {
+        return IosWindow.{
+            ui_window: 0_u64,
+            metal_layer: 0_u64,
+            width: 390_u32,
+            height: 844_u32,
+            scale_factor: 3.0_f32,
+            should_close: false,
+            opened: false,
+            clipboard: events.ClipboardBuf.new(),
+        };
+    }
+
+    pub fn open_into(self: *mut Self, opts: *events.WindowOptions) -> bool {
+        self.width = opts.width;
+        self.height = opts.height;
+        self.scale_factor = 3.0_f32;
+        self.should_close = false;
+        comptime if @target_os() == .IOS {
+            let cls_win = objc_cls("UIWindow\0".as_bytes());
+            let win = objc_call0(objc_call0(cls_win, objc_sel("alloc\0".as_bytes())), objc_sel("init\0".as_bytes()));
+            let cls_layer = objc_cls("CAMetalLayer\0".as_bytes());
+            let layer = objc_call0(cls_layer, objc_sel("layer\0".as_bytes()));
+            let root_layer = objc_call0(win, objc_sel("layer\0".as_bytes()));
+            if root_layer != 0_u64 && layer != 0_u64 {
+                _ = objc_call1(root_layer, objc_sel("addSublayer:\0".as_bytes()), layer);
+            }
+            _ = objc_call0(win, objc_sel("makeKeyAndVisible\0".as_bytes()));
+            self.ui_window = win;
+            self.metal_layer = layer;
+            self.opened = win != 0_u64;
+            return self.opened;
+        } else {
+            return false;
+        }
+    }
+
+    pub fn surface_info(self: *Self) -> events.SurfaceInfo {
+        return events.SurfaceInfo.{
+            kind: .Metal,
+            display_handle: 0_u64,
+            window_handle: self.metal_layer,
+            extra_handle: self.ui_window,
+            width: self.width,
+            height: self.height,
+            scale_factor: self.scale_factor,
+            fb_base_addr: 0_u64,
+            fb_pitch_bytes: 0_u32,
+            fb_is_bgr: true,
+        };
+    }
+
+    pub fn clipboard_set(self: *mut Self, text: *[u8]) -> bool {
+        self.clipboard.set_bytes(text);
+        comptime if @target_os() == .IOS {
+            let cls_pb = objc_cls("UIPasteboard\0".as_bytes());
+            let pb = objc_call0(cls_pb, objc_sel("generalPasteboard\0".as_bytes()));
+            let cls_str = objc_cls("NSString\0".as_bytes());
+            let ns_str = objc_call1(cls_str, objc_sel("stringWithUTF8String:\0".as_bytes()), slice_ptr(&self.clipboard.data));
+            if pb != 0_u64 && ns_str != 0_u64 {
+                _ = objc_call1(pb, objc_sel("setString:\0".as_bytes()), ns_str);
+            }
+        }
+        return true;
+    }
+
+    pub fn clipboard_get(self: *mut Self, dst: *mut events.ClipboardBuf) -> bool {
+        dst.set_bytes(self.clipboard.as_bytes());
+        return dst.len > 0_usize;
+    }
+
+    pub fn close(self: *mut Self) {
+        self.opened = false;
+    }
+}

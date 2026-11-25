@@ -1,0 +1,212 @@
+module eon_win.platform.android @hal;
+
+import eon_win.events;
+
+// ============================================================================
+// Android NativeActivity / ANativeWindow / AInputQueue Window Adapter
+// Zero NDK / C / Gradle — links cleanly to `libandroid.so` & `liblog.so`!
+// ============================================================================
+
+const WINDOW_FORMAT_RGBA_8888: i32 = 1_i32;
+const AINPUT_EVENT_TYPE_KEY: i32 = 1_i32;
+const AINPUT_EVENT_TYPE_MOTION: i32 = 2_i32;
+const AMOTION_EVENT_ACTION_DOWN: i32 = 0_i32;
+const AMOTION_EVENT_ACTION_UP: i32 = 1_i32;
+const AMOTION_EVENT_ACTION_MOVE: i32 = 2_i32;
+const AMOTION_EVENT_ACTION_CANCEL: i32 = 3_i32;
+const AKEY_EVENT_ACTION_DOWN: i32 = 0_i32;
+
+@layout(c)
+struct ANativeWindowBuffer {
+    width: i32;
+    height: i32;
+    stride: i32;
+    format: i32;
+    bits: u64;
+    reserved: [6]u32;
+}
+
+extern "C" fn ANativeWindow_getWidth(window: u64) -> i32;
+extern "C" fn ANativeWindow_getHeight(window: u64) -> i32;
+extern "C" fn ANativeWindow_setBuffersGeometry(window: u64, w: i32, h: i32, fmt: i32) -> i32;
+extern "C" fn ANativeWindow_lock(window: u64, out_buf: *mut ANativeWindowBuffer, dirty: u64) -> i32;
+extern "C" fn ANativeWindow_unlockAndPost(window: u64) -> i32;
+extern "C" fn ALooper_pollOnce(timeout_ms: i32, out_fd: u64, out_ev: u64, out_data: u64) -> i32;
+extern "C" fn AInputQueue_getEvent(queue: u64, out_event: *mut u64) -> i32;
+extern "C" fn AInputQueue_finishEvent(queue: u64, event: u64, handled: i32);
+extern "C" fn AInputEvent_getType(event: u64) -> i32;
+extern "C" fn AKeyEvent_getKeyCode(event: u64) -> i32;
+extern "C" fn AKeyEvent_getAction(event: u64) -> i32;
+extern "C" fn AMotionEvent_getAction(event: u64) -> i32;
+extern "C" fn AMotionEvent_getX(event: u64, idx: usize) -> f32;
+extern "C" fn AMotionEvent_getY(event: u64, idx: usize) -> f32;
+
+pub struct AndroidWindow {
+    pub native_window: u64;
+    pub input_queue: u64;
+    pub width: u32;
+    pub height: u32;
+    pub scale_factor: f32;
+    pub should_close: bool;
+    pub opened: bool;
+    pub clipboard: events.ClipboardBuf;
+}
+
+impl AndroidWindow {
+    pub fn empty() -> AndroidWindow {
+        return AndroidWindow.{
+            native_window: 0_u64,
+            input_queue: 0_u64,
+            width: 390_u32,
+            height: 844_u32,
+            scale_factor: 2.0_f32,
+            should_close: false,
+            opened: false,
+            clipboard: events.ClipboardBuf.new(),
+        };
+    }
+
+    pub fn open_into(self: *mut Self, opts: *events.WindowOptions) -> bool {
+        self.width = opts.width;
+        self.height = opts.height;
+        self.scale_factor = 2.0_f32;
+        self.should_close = false;
+        comptime if @target_os() == .Android {
+            if self.native_window != 0_u64 {
+                raw {
+                    let w = ANativeWindow_getWidth(self.native_window);
+                    let h = ANativeWindow_getHeight(self.native_window);
+                    if w > 0_i32 && h > 0_i32 {
+                        self.width = w.bitcast.[u32]();
+                        self.height = h.bitcast.[u32]();
+                    }
+                    _ = ANativeWindow_setBuffersGeometry(self.native_window, self.width.bitcast.[i32](), self.height.bitcast.[i32](), WINDOW_FORMAT_RGBA_8888);
+                }
+            }
+            self.opened = true;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    pub fn bind_native_handles(self: *mut Self, native_window: u64, input_queue: u64) {
+        self.native_window = native_window;
+        self.input_queue = input_queue;
+        comptime if @target_os() == .Android {
+            if native_window != 0_u64 {
+                raw {
+                    let w = ANativeWindow_getWidth(native_window);
+                    let h = ANativeWindow_getHeight(native_window);
+                    if w > 0_i32 && h > 0_i32 {
+                        self.width = w.bitcast.[u32]();
+                        self.height = h.bitcast.[u32]();
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn surface_info(self: *Self) -> events.SurfaceInfo {
+        return events.SurfaceInfo.{
+            kind: .Android,
+            display_handle: 0_u64,
+            window_handle: self.native_window,
+            extra_handle: self.input_queue,
+            width: self.width,
+            height: self.height,
+            scale_factor: self.scale_factor,
+            fb_base_addr: 0_u64,
+            fb_pitch_bytes: 0_u32,
+            fb_is_bgr: false,
+        };
+    }
+
+    pub fn poll_events(self: *mut Self, q: *mut events.EventQueue) {
+        comptime if @target_os() == .Android {
+            raw { _ = ALooper_pollOnce(0_i32, 0_u64, 0_u64, 0_u64); }
+            if self.input_queue == 0_u64 { return; }
+            var guard: u32 = 0_u32;
+            while guard < 64_u32 {
+                var ev: u64 = 0_u64;
+                var rc: i32 = -1_i32;
+                raw { rc = AInputQueue_getEvent(self.input_queue, &mut ev); }
+                if rc < 0_i32 || ev == 0_u64 { break; }
+                raw {
+                    let ety = AInputEvent_getType(ev);
+                    if ety == AINPUT_EVENT_TYPE_MOTION {
+                        let act = AMotionEvent_getAction(ev) & 0xFF_i32;
+                        let x = AMotionEvent_getX(ev, 0_usize);
+                        let y = AMotionEvent_getY(ev, 0_usize);
+                        let phase: events.TouchPhase = if act == AMOTION_EVENT_ACTION_DOWN { .Started }
+                            else if act == AMOTION_EVENT_ACTION_MOVE { .Moved }
+                            else if act == AMOTION_EVENT_ACTION_UP { .Ended }
+                            else { .Cancelled };
+                        q.push(.Touch(events.TouchEvent.{ id: 0_u32, phase: phase, x: x, y: y }));
+                        if act == AMOTION_EVENT_ACTION_DOWN {
+                            q.push(.MouseDown(events.MouseButtonEvent.{ button: .Left, x: x, y: y, click_count: 1_u8, mods: events.Modifiers.none() }));
+                        } else if act == AMOTION_EVENT_ACTION_MOVE {
+                            q.push(.MouseMove(events.MouseMoveEvent.{ x: x, y: y, mods: events.Modifiers.none() }));
+                        } else if act == AMOTION_EVENT_ACTION_UP {
+                            q.push(.MouseUp(events.MouseButtonEvent.{ button: .Left, x: x, y: y, click_count: 0_u8, mods: events.Modifiers.none() }));
+                        }
+                    } else if ety == AINPUT_EVENT_TYPE_KEY {
+                        let code = AKeyEvent_getKeyCode(ev);
+                        let act = AKeyEvent_getAction(ev);
+                        let key = events.key_from_android(code);
+                        if act == AKEY_EVENT_ACTION_DOWN {
+                            q.push(.KeyDown(events.KeyEvent.{ key: key, scancode: code.bitcast.[u32](), repeat: false, mods: events.Modifiers.none() }));
+                        } else {
+                            q.push(.KeyUp(events.KeyEvent.{ key: key, scancode: code.bitcast.[u32](), repeat: false, mods: events.Modifiers.none() }));
+                        }
+                    }
+                    AInputQueue_finishEvent(self.input_queue, ev, 1_i32);
+                }
+                guard = guard +% 1_u32;
+            }
+        } else {
+            _ = self;
+            _ = q;
+        }
+    }
+
+    pub fn present_rgba8(self: *mut Self, rgba: *[u8], w: u32, h: u32) {
+        comptime if @target_os() == .Android {
+            if self.native_window == 0_u64 { return; }
+            var buf = ANativeWindowBuffer.{
+                width: 0_i32, height: 0_i32, stride: 0_i32, format: 0_i32, bits: 0_u64, reserved: [0_u32; 6],
+            };
+            raw {
+                if ANativeWindow_lock(self.native_window, &mut buf, 0_u64) == 0_i32 && buf.bits != 0_u64 {
+                    let cw: u32 = if w < buf.width.bitcast.[u32]() { w } else { buf.width.bitcast.[u32]() };
+                    let ch: u32 = if h < buf.height.bitcast.[u32]() { h } else { buf.height.bitcast.[u32]() };
+                    var y: u32 = 0_u32;
+                    while y < ch {
+                        let dst_row = buf.bits +% y.widen.[u64]() *% buf.stride.bitcast.[u32]().widen.[u64]() *% 4_u64;
+                        let src_row = (y *% w).widen.[usize]() *% 4_usize;
+                        var x: u32 = 0_u32;
+                        while x < cw {
+                            let si = src_row +% x.widen.[usize]() *% 4_usize;
+                            if rgba.len >= 4_usize && si <= rgba.len - 4_usize {
+                                let px = rgba[si].widen.[u32]()
+                                    | (rgba[si + 1_usize].widen.[u32]() << 8_u32)
+                                    | (rgba[si + 2_usize].widen.[u32]() << 16_u32)
+                                    | (rgba[si + 3_usize].widen.[u32]() << 24_u32);
+                                rawptr_mut.[u32].from_usize((dst_row +% x.widen.[u64]() *% 4_u64).trunc.[usize]()).* = px;
+                            }
+                            x = x +% 1_u32;
+                        }
+                        y = y +% 1_u32;
+                    }
+                    _ = ANativeWindow_unlockAndPost(self.native_window);
+                }
+            }
+        } else {
+            _ = self; _ = rgba; _ = w; _ = h;
+        }
+    }
+
+    pub fn close(self: *mut Self) {
+        self.opened = false;
+    }
+}

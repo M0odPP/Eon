@@ -1,0 +1,746 @@
+module eon_win.events;
+
+// ============================================================================
+// Cross-platform Windowing, Surface, Input, Cursor & Event Types (100% safe,
+// 100% core/-only, zero heap allocations — works identically on hosted OSes
+// and bare-metal nostd targets).
+// ============================================================================
+
+pub struct WindowSize {
+    pub width: u32;
+    pub height: u32;
+}
+
+impl WindowSize {
+    @inline
+    pub fn new(width: u32, height: u32) -> WindowSize {
+        return WindowSize.{ width: width, height: height };
+    }
+}
+
+pub struct WindowOptions {
+    pub title: [128]u8;
+    pub title_len: usize;
+    pub width: u32;
+    pub height: u32;
+    pub min_width: u32;
+    pub min_height: u32;
+    pub resizable: bool;
+    pub headless: bool;
+}
+
+impl WindowOptions {
+    pub fn new(title: *str, width: u32, height: u32) -> WindowOptions {
+        var buf: [128]u8 = [0_u8; 128];
+        let src = title.as_bytes();
+        let n: usize = if src.len < 127_usize { src.len } else { 127_usize };
+        var i: usize = 0_usize;
+        while i < n {
+            buf[i] = src[i];
+            i = i +% 1_usize;
+        }
+        return WindowOptions.{
+            title: buf,
+            title_len: n,
+            width: width,
+            height: height,
+            min_width: 320_u32,
+            min_height: 240_u32,
+            resizable: true,
+            headless: false,
+        };
+    }
+
+    pub fn headless(title: *str, width: u32, height: u32) -> WindowOptions {
+        var o = WindowOptions.new(title, width, height);
+        o.min_width = 64_u32;
+        o.min_height = 64_u32;
+        o.headless = true;
+        return o;
+    }
+
+    pub view fn title_bytes(self: *Self) -> *[u8] {
+        let n: usize = if self.title_len <= 128_usize { self.title_len } else { 128_usize };
+        return self.title[0_usize..n];
+    }
+}
+
+pub enum SurfaceKind : u8 {
+    None = 0,
+    Wayland = 1,
+    Xcb = 2,
+    Xlib = 3,
+    Win32 = 4,
+    Metal = 5,
+    Android = 6,
+    NoStdFb = 7,
+    Headless = 8,
+}
+
+/// Safe opaque platform surface descriptor passed to `eon_gpu` backends.
+pub struct SurfaceInfo {
+    pub kind: SurfaceKind;
+    pub display_handle: u64;
+    pub window_handle: u64;
+    pub extra_handle: u64;
+    pub width: u32;
+    pub height: u32;
+    pub scale_factor: f32;
+    pub fb_base_addr: u64;
+    pub fb_pitch_bytes: u32;
+    pub fb_is_bgr: bool;
+}
+
+impl SurfaceInfo {
+    pub fn empty() -> SurfaceInfo {
+        return SurfaceInfo.{
+            kind: .None,
+            display_handle: 0_u64,
+            window_handle: 0_u64,
+            extra_handle: 0_u64,
+            width: 0_u32,
+            height: 0_u32,
+            scale_factor: 1.0_f32,
+            fb_base_addr: 0_u64,
+            fb_pitch_bytes: 0_u32,
+            fb_is_bgr: false,
+        };
+    }
+}
+
+pub enum MouseButton : u8 {
+    Left = 0,
+    Right = 1,
+    Middle = 2,
+    Back = 3,
+    Forward = 4,
+}
+
+pub struct Modifiers {
+    pub bits: u8;
+}
+
+pub const MOD_SHIFT: u8 = 1_u8;
+pub const MOD_CTRL: u8 = 2_u8;
+pub const MOD_ALT: u8 = 4_u8;
+pub const MOD_META: u8 = 8_u8;
+
+impl Modifiers {
+    @inline
+    pub fn none() -> Modifiers {
+        return Modifiers.{ bits: 0_u8 };
+    }
+
+    @inline
+    pub fn from_bits(bits: u8) -> Modifiers {
+        return Modifiers.{ bits: bits };
+    }
+
+    @inline
+    pub fn has_shift(self: Self) -> bool {
+        return (self.bits & MOD_SHIFT) != 0_u8;
+    }
+
+    @inline
+    pub fn has_ctrl(self: Self) -> bool {
+        return (self.bits & MOD_CTRL) != 0_u8;
+    }
+
+    @inline
+    pub fn has_alt(self: Self) -> bool {
+        return (self.bits & MOD_ALT) != 0_u8;
+    }
+
+    @inline
+    pub fn has_meta(self: Self) -> bool {
+        return (self.bits & MOD_META) != 0_u8;
+    }
+
+    @inline
+    pub fn has_primary(self: Self) -> bool {
+        comptime if @target_os() == .MacOS || @target_os() == .IOS {
+            return self.has_meta() || self.has_ctrl();
+        } else {
+            return self.has_ctrl();
+        }
+    }
+}
+
+pub enum Key : u16 {
+    Unknown = 0,
+    Digit0 = 1,
+    Digit1 = 2,
+    Digit2 = 3,
+    Digit3 = 4,
+    Digit4 = 5,
+    Digit5 = 6,
+    Digit6 = 7,
+    Digit7 = 8,
+    Digit8 = 9,
+    Digit9 = 10,
+    A = 11,
+    B = 12,
+    C = 13,
+    D = 14,
+    E = 15,
+    F = 16,
+    G = 17,
+    H = 18,
+    I = 19,
+    J = 20,
+    K = 21,
+    L = 22,
+    M = 23,
+    N = 24,
+    O = 25,
+    P = 26,
+    Q = 27,
+    R = 28,
+    S = 29,
+    T = 30,
+    U = 31,
+    V = 32,
+    W = 33,
+    X = 34,
+    Y = 35,
+    Z = 36,
+    Enter = 37,
+    Escape = 38,
+    Backspace = 39,
+    Delete = 40,
+    Tab = 41,
+    Space = 42,
+    Left = 43,
+    Right = 44,
+    Up = 45,
+    Down = 46,
+    Home = 47,
+    End = 48,
+    PageUp = 49,
+    PageDown = 50,
+    Plus = 51,
+    Minus = 52,
+    Multiply = 53,
+    Divide = 54,
+    Period = 55,
+    Comma = 56,
+    LParen = 57,
+    RParen = 58,
+    Percent = 59,
+    Caret = 60,
+    Equal = 61,
+    Slash = 62,
+    Backslash = 63,
+    Semicolon = 64,
+    Quote = 65,
+    LBracket = 66,
+    RBracket = 67,
+    Grave = 68,
+    F1 = 69,
+    F2 = 70,
+    F3 = 71,
+    F4 = 72,
+    F5 = 73,
+    F6 = 74,
+    F7 = 75,
+    F8 = 76,
+    F9 = 77,
+    F10 = 78,
+    F11 = 79,
+    F12 = 80,
+    Shift = 81,
+    Control = 82,
+    Alt = 83,
+    Meta = 84,
+}
+
+pub enum TouchPhase : u8 {
+    Started = 0,
+    Moved = 1,
+    Ended = 2,
+    Cancelled = 3,
+}
+
+pub enum CursorShape : u8 {
+    Default = 0,
+    Pointer = 1,
+    Text = 2,
+    Grab = 3,
+    Grabbing = 4,
+    NotAllowed = 5,
+    ResizeEW = 6,
+    ResizeNS = 7,
+}
+
+pub struct MouseMoveEvent {
+    pub x: f32;
+    pub y: f32;
+    pub mods: Modifiers;
+}
+
+pub struct MouseButtonEvent {
+    pub button: MouseButton;
+    pub x: f32;
+    pub y: f32;
+    pub click_count: u8;
+    pub mods: Modifiers;
+}
+
+pub struct MouseWheelEvent {
+    pub dx: f32;
+    pub dy: f32;
+    pub x: f32;
+    pub y: f32;
+    pub mods: Modifiers;
+}
+
+pub struct KeyEvent {
+    pub key: Key;
+    pub scancode: u32;
+    pub repeat: bool;
+    pub mods: Modifiers;
+}
+
+pub struct TouchEvent {
+    pub id: u32;
+    pub phase: TouchPhase;
+    pub x: f32;
+    pub y: f32;
+}
+
+pub union PlatformEvent {
+    MouseMove: MouseMoveEvent,
+    MouseDown: MouseButtonEvent,
+    MouseUp: MouseButtonEvent,
+    MouseWheel: MouseWheelEvent,
+    KeyDown: KeyEvent,
+    KeyUp: KeyEvent,
+    TextInput: u32,
+    Touch: TouchEvent,
+    Resized: WindowSize,
+    ScaleFactorChanged: f32,
+    FocusChanged: bool,
+    CloseRequested,
+    RedrawRequested,
+}
+
+/// Fixed-capacity allocation-free circular event queue (works in both hosted & nostd).
+pub struct EventQueue {
+    items: [32]PlatformEvent;
+    head: usize;
+    tail: usize;
+    count: usize;
+}
+
+impl EventQueue {
+    pub fn new() -> EventQueue {
+        let init_ev: PlatformEvent = .RedrawRequested;
+        return EventQueue.{
+            items: [init_ev; 32],
+            head: 0_usize,
+            tail: 0_usize,
+            count: 0_usize,
+        };
+    }
+
+    pub fn len(self: *Self) -> usize {
+        return self.count;
+    }
+
+    pub fn is_empty(self: *Self) -> bool {
+        return self.count == 0_usize;
+    }
+
+    pub fn clear(self: *mut Self) {
+        self.head = 0_usize;
+        self.tail = 0_usize;
+        self.count = 0_usize;
+    }
+
+    pub fn push(self: *mut Self, ev: PlatformEvent) {
+        if self.count >= 32_usize {
+            self.head = (self.head +% 1_usize) & 31_usize;
+            self.count = 31_usize;
+        }
+        let idx = self.tail & 31_usize;
+        self.items[idx] = ev;
+        self.tail = (self.tail +% 1_usize) & 31_usize;
+        self.count = self.count +% 1_usize;
+    }
+
+    pub fn pop(self: *mut Self) -> ?PlatformEvent {
+        if self.count == 0_usize {
+            return null;
+        }
+        let idx = self.head & 31_usize;
+        let ev = self.items[idx];
+        self.head = (self.head +% 1_usize) & 31_usize;
+        self.count = self.count - 1_usize;
+        return ev;
+    }
+}
+
+/// Fixed-capacity UTF-8 clipboard buffer (512 B, zero heap allocations, nostd stack-safe).
+pub struct ClipboardBuf {
+    pub data: [512]u8;
+    pub len: usize;
+}
+
+impl ClipboardBuf {
+    pub fn new() -> ClipboardBuf {
+        return ClipboardBuf.{ data: [0_u8; 512], len: 0_usize };
+    }
+
+    pub fn clear(self: *mut Self) {
+        self.len = 0_usize;
+    }
+
+    pub fn set_bytes(self: *mut Self, src: *[u8]) {
+        let n: usize = if src.len < 511_usize { src.len } else { 511_usize };
+        var i: usize = 0_usize;
+        while i < n {
+            self.data[i] = src[i];
+            i = i +% 1_usize;
+        }
+        self.data[n] = 0_u8;
+        self.len = n;
+    }
+
+    pub fn set_str(self: *mut Self, s: *str) {
+        self.set_bytes(s.as_bytes());
+    }
+
+    pub view fn as_bytes(self: *Self) -> *[u8] {
+        let n: usize = if self.len <= 512_usize { self.len } else { 512_usize };
+        return self.data[0_usize..n];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Portable Key Translation Helpers (ASCII, Linux evdev / XKB, Win32 VK, Android)
+// ---------------------------------------------------------------------------
+
+pub fn key_from_ascii(ch: u8) -> Key {
+    if ch >= 48_u8 && ch <= 57_u8 {
+        match ch - 48_u8 {
+            0_u8 => { return .Digit0; }
+            1_u8 => { return .Digit1; }
+            2_u8 => { return .Digit2; }
+            3_u8 => { return .Digit3; }
+            4_u8 => { return .Digit4; }
+            5_u8 => { return .Digit5; }
+            6_u8 => { return .Digit6; }
+            7_u8 => { return .Digit7; }
+            8_u8 => { return .Digit8; }
+            _ => { return .Digit9; }
+        }
+    }
+    let lo: u8 = if ch >= 65_u8 && ch <= 90_u8 { ch +% 32_u8 } else { ch };
+    match lo {
+        97_u8 => { return .A; }
+        98_u8 => { return .B; }
+        99_u8 => { return .C; }
+        100_u8 => { return .D; }
+        101_u8 => { return .E; }
+        102_u8 => { return .F; }
+        103_u8 => { return .G; }
+        104_u8 => { return .H; }
+        105_u8 => { return .I; }
+        106_u8 => { return .J; }
+        107_u8 => { return .K; }
+        108_u8 => { return .L; }
+        109_u8 => { return .M; }
+        110_u8 => { return .N; }
+        111_u8 => { return .O; }
+        112_u8 => { return .P; }
+        113_u8 => { return .Q; }
+        114_u8 => { return .R; }
+        115_u8 => { return .S; }
+        116_u8 => { return .T; }
+        117_u8 => { return .U; }
+        118_u8 => { return .V; }
+        119_u8 => { return .W; }
+        120_u8 => { return .X; }
+        121_u8 => { return .Y; }
+        122_u8 => { return .Z; }
+        43_u8 => { return .Plus; }
+        45_u8 => { return .Minus; }
+        42_u8 => { return .Multiply; }
+        47_u8 => { return .Divide; }
+        46_u8 => { return .Period; }
+        44_u8 => { return .Comma; }
+        40_u8 => { return .LParen; }
+        41_u8 => { return .RParen; }
+        37_u8 => { return .Percent; }
+        94_u8 => { return .Caret; }
+        61_u8 => { return .Equal; }
+        32_u8 => { return .Space; }
+        10_u8 => { return .Enter; }
+        13_u8 => { return .Enter; }
+        9_u8 => { return .Tab; }
+        27_u8 => { return .Escape; }
+        8_u8 => { return .Backspace; }
+        127_u8 => { return .Delete; }
+        _ => { return .Unknown; }
+    }
+}
+
+/// Map Linux input-event / Wayland / PS2 set-1 scancode to logical `Key`.
+pub fn key_from_evdev(sc: u32) -> Key {
+    match sc {
+        1_u32 => { return .Escape; }
+        2_u32 => { return .Digit1; }
+        3_u32 => { return .Digit2; }
+        4_u32 => { return .Digit3; }
+        5_u32 => { return .Digit4; }
+        6_u32 => { return .Digit5; }
+        7_u32 => { return .Digit6; }
+        8_u32 => { return .Digit7; }
+        9_u32 => { return .Digit8; }
+        10_u32 => { return .Digit9; }
+        11_u32 => { return .Digit0; }
+        12_u32 => { return .Minus; }
+        13_u32 => { return .Equal; }
+        14_u32 => { return .Backspace; }
+        15_u32 => { return .Tab; }
+        16_u32 => { return .Q; }
+        17_u32 => { return .W; }
+        18_u32 => { return .E; }
+        19_u32 => { return .R; }
+        20_u32 => { return .T; }
+        21_u32 => { return .Y; }
+        22_u32 => { return .U; }
+        23_u32 => { return .I; }
+        24_u32 => { return .O; }
+        25_u32 => { return .P; }
+        26_u32 => { return .LBracket; }
+        27_u32 => { return .RBracket; }
+        28_u32 => { return .Enter; }
+        29_u32 => { return .Control; }
+        30_u32 => { return .A; }
+        31_u32 => { return .S; }
+        32_u32 => { return .D; }
+        33_u32 => { return .F; }
+        34_u32 => { return .G; }
+        35_u32 => { return .H; }
+        36_u32 => { return .J; }
+        37_u32 => { return .K; }
+        38_u32 => { return .L; }
+        39_u32 => { return .Semicolon; }
+        40_u32 => { return .Quote; }
+        41_u32 => { return .Grave; }
+        42_u32 => { return .Shift; }
+        43_u32 => { return .Backslash; }
+        44_u32 => { return .Z; }
+        45_u32 => { return .X; }
+        46_u32 => { return .C; }
+        47_u32 => { return .V; }
+        48_u32 => { return .B; }
+        49_u32 => { return .N; }
+        50_u32 => { return .M; }
+        51_u32 => { return .Comma; }
+        52_u32 => { return .Period; }
+        53_u32 => { return .Slash; }
+        54_u32 => { return .Shift; }
+        55_u32 => { return .Multiply; }
+        56_u32 => { return .Alt; }
+        57_u32 => { return .Space; }
+        59_u32 => { return .F1; }
+        60_u32 => { return .F2; }
+        61_u32 => { return .F3; }
+        62_u32 => { return .F4; }
+        63_u32 => { return .F5; }
+        64_u32 => { return .F6; }
+        65_u32 => { return .F7; }
+        66_u32 => { return .F8; }
+        67_u32 => { return .F9; }
+        68_u32 => { return .F10; }
+        71_u32 => { return .Digit7; }
+        72_u32 => { return .Digit8; }
+        73_u32 => { return .Digit9; }
+        74_u32 => { return .Minus; }
+        75_u32 => { return .Digit4; }
+        76_u32 => { return .Digit5; }
+        77_u32 => { return .Digit6; }
+        78_u32 => { return .Plus; }
+        79_u32 => { return .Digit1; }
+        80_u32 => { return .Digit2; }
+        81_u32 => { return .Digit3; }
+        82_u32 => { return .Digit0; }
+        83_u32 => { return .Period; }
+        87_u32 => { return .F11; }
+        88_u32 => { return .F12; }
+        96_u32 => { return .Enter; }
+        97_u32 => { return .Control; }
+        98_u32 => { return .Divide; }
+        100_u32 => { return .Alt; }
+        102_u32 => { return .Home; }
+        103_u32 => { return .Up; }
+        104_u32 => { return .PageUp; }
+        105_u32 => { return .Left; }
+        106_u32 => { return .Right; }
+        107_u32 => { return .End; }
+        108_u32 => { return .Down; }
+        109_u32 => { return .PageDown; }
+        111_u32 => { return .Delete; }
+        125_u32 => { return .Meta; }
+        126_u32 => { return .Meta; }
+        _ => { return .Unknown; }
+    }
+}
+
+/// Map Win32 Virtual-Key code (`VK_*`) to logical `Key`.
+pub fn key_from_vk(vk: u32) -> Key {
+    if vk >= 0x30_u32 && vk <= 0x39_u32 {
+        return key_from_ascii(vk.trunc.[u8]());
+    }
+    if vk >= 0x41_u32 && vk <= 0x5A_u32 {
+        return key_from_ascii(vk.trunc.[u8]());
+    }
+    if vk >= 0x60_u32 && vk <= 0x69_u32 {
+        return key_from_ascii(48_u8 +% (vk - 0x60_u32).trunc.[u8]());
+    }
+    match vk {
+        0x08_u32 => { return .Backspace; }
+        0x09_u32 => { return .Tab; }
+        0x0D_u32 => { return .Enter; }
+        0x10_u32 => { return .Shift; }
+        0x11_u32 => { return .Control; }
+        0x12_u32 => { return .Alt; }
+        0x1B_u32 => { return .Escape; }
+        0x20_u32 => { return .Space; }
+        0x21_u32 => { return .PageUp; }
+        0x22_u32 => { return .PageDown; }
+        0x23_u32 => { return .End; }
+        0x24_u32 => { return .Home; }
+        0x25_u32 => { return .Left; }
+        0x26_u32 => { return .Up; }
+        0x27_u32 => { return .Right; }
+        0x28_u32 => { return .Down; }
+        0x2E_u32 => { return .Delete; }
+        0x6A_u32 => { return .Multiply; }
+        0x6B_u32 => { return .Plus; }
+        0x6D_u32 => { return .Minus; }
+        0x6E_u32 => { return .Period; }
+        0x6F_u32 => { return .Divide; }
+        0x70_u32 => { return .F1; }
+        0x71_u32 => { return .F2; }
+        0x72_u32 => { return .F3; }
+        0x73_u32 => { return .F4; }
+        0x74_u32 => { return .F5; }
+        0x75_u32 => { return .F6; }
+        0x76_u32 => { return .F7; }
+        0x77_u32 => { return .F8; }
+        0x78_u32 => { return .F9; }
+        0x79_u32 => { return .F10; }
+        0x7A_u32 => { return .F11; }
+        0x7B_u32 => { return .F12; }
+        0xBB_u32 => { return .Equal; }
+        0xBC_u32 => { return .Comma; }
+        0xBD_u32 => { return .Minus; }
+        0xBE_u32 => { return .Period; }
+        0xBF_u32 => { return .Slash; }
+        _ => { return .Unknown; }
+    }
+}
+
+/// Map XKB keysym to logical `Key`.
+pub fn key_from_xkb_sym(sym: u32) -> Key {
+    if sym >= 0x20_u32 && sym <= 0x7E_u32 {
+        return key_from_ascii(sym.trunc.[u8]());
+    }
+    match sym {
+        0xFF08_u32 => { return .Backspace; }
+        0xFF09_u32 => { return .Tab; }
+        0xFF0D_u32 => { return .Enter; }
+        0xFF1B_u32 => { return .Escape; }
+        0xFF50_u32 => { return .Home; }
+        0xFF51_u32 => { return .Left; }
+        0xFF52_u32 => { return .Up; }
+        0xFF53_u32 => { return .Right; }
+        0xFF54_u32 => { return .Down; }
+        0xFF55_u32 => { return .PageUp; }
+        0xFF56_u32 => { return .PageDown; }
+        0xFF57_u32 => { return .End; }
+        0xFFFF_u32 => { return .Delete; }
+        0xFF8D_u32 => { return .Enter; }
+        0xFFAA_u32 => { return .Multiply; }
+        0xFFAB_u32 => { return .Plus; }
+        0xFFAD_u32 => { return .Minus; }
+        0xFFAE_u32 => { return .Period; }
+        0xFFAF_u32 => { return .Divide; }
+        0xFFB0_u32 => { return .Digit0; }
+        0xFFB1_u32 => { return .Digit1; }
+        0xFFB2_u32 => { return .Digit2; }
+        0xFFB3_u32 => { return .Digit3; }
+        0xFFB4_u32 => { return .Digit4; }
+        0xFFB5_u32 => { return .Digit5; }
+        0xFFB6_u32 => { return .Digit6; }
+        0xFFB7_u32 => { return .Digit7; }
+        0xFFB8_u32 => { return .Digit8; }
+        0xFFB9_u32 => { return .Digit9; }
+        0xFFBE_u32 => { return .F1; }
+        0xFFBF_u32 => { return .F2; }
+        0xFFC0_u32 => { return .F3; }
+        0xFFC1_u32 => { return .F4; }
+        0xFFC2_u32 => { return .F5; }
+        0xFFC3_u32 => { return .F6; }
+        0xFFC4_u32 => { return .F7; }
+        0xFFC5_u32 => { return .F8; }
+        0xFFC6_u32 => { return .F9; }
+        0xFFC7_u32 => { return .F10; }
+        0xFFC8_u32 => { return .F11; }
+        0xFFC9_u32 => { return .F12; }
+        0xFFE1_u32 => { return .Shift; }
+        0xFFE2_u32 => { return .Shift; }
+        0xFFE3_u32 => { return .Control; }
+        0xFFE4_u32 => { return .Control; }
+        0xFFE9_u32 => { return .Alt; }
+        0xFFEA_u32 => { return .Alt; }
+        0xFFEB_u32 => { return .Meta; }
+        0xFFEC_u32 => { return .Meta; }
+        _ => { return .Unknown; }
+    }
+}
+
+/// Map Android `AKEYCODE_*` to logical `Key`.
+pub fn key_from_android(code: i32) -> Key {
+    if code >= 7_i32 && code <= 16_i32 {
+        return key_from_ascii(48_u8 +% (code - 7_i32).trunc.[u8]());
+    }
+    if code >= 29_i32 && code <= 54_i32 {
+        return key_from_ascii(97_u8 +% (code - 29_i32).trunc.[u8]());
+    }
+    match code {
+        4_i32 => { return .Escape; }
+        19_i32 => { return .Up; }
+        20_i32 => { return .Down; }
+        21_i32 => { return .Left; }
+        22_i32 => { return .Right; }
+        55_i32 => { return .Comma; }
+        56_i32 => { return .Period; }
+        57_i32 => { return .Alt; }
+        58_i32 => { return .Alt; }
+        59_i32 => { return .Shift; }
+        60_i32 => { return .Shift; }
+        61_i32 => { return .Tab; }
+        62_i32 => { return .Space; }
+        66_i32 => { return .Enter; }
+        67_i32 => { return .Backspace; }
+        69_i32 => { return .Minus; }
+        70_i32 => { return .Equal; }
+        76_i32 => { return .Slash; }
+        81_i32 => { return .Plus; }
+        111_i32 => { return .Escape; }
+        112_i32 => { return .Delete; }
+        113_i32 => { return .Control; }
+        114_i32 => { return .Control; }
+        155_i32 => { return .Multiply; }
+        156_i32 => { return .Minus; }
+        157_i32 => { return .Plus; }
+        160_i32 => { return .Enter; }
+        162_i32 => { return .LParen; }
+        163_i32 => { return .RParen; }
+        _ => { return .Unknown; }
+    }
+}

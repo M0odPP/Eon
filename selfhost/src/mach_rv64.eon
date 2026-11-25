@@ -336,8 +336,10 @@ fn emit_rv64_fnref_thunks(
         let target_sym = try mach_isel_a64.a64_fn_sym_name_id(alloc, cfg_ir.fn_key_top_def(req.target_def), eir_prog, interner);
         var start_idx: usize = 0_usize;
         var user_gp: usize = 0_usize;
+        var is_c_abi = false;
         if let fid = eir_prog.find_fn_by_key(cfg_ir.fn_key_top_def(req.target_def)) {
             if let f = eir_prog.get_fn(fid) {
+                is_c_abi = f.sig.effects.is_export_c;
                 let rc = mach_isel_a64.a64_classify_ret(f.sig.ret, env);
                 if mach_isel_a64.a64_ret_uses_sret(rc) { start_idx = 1_usize; }
                 let ps = env.params_range(f.sig.params);
@@ -349,16 +351,28 @@ fn emit_rv64_fnref_thunks(
                     pi = pi +% 1_usize;
                 }
             }
+        } else {
+            let ext_fns = eir_prog.extern_fns_slice();
+            var ei: usize = 0_usize;
+            while ei < ext_fns.len {
+                if ext_fns[ei] == req.target_def {
+                    is_c_abi = true;
+                    break;
+                }
+                ei = ei +% 1_usize;
+            }
         }
         var tb = try rv64_asm.Rv64Buf.init(alloc);
         errdefer tb.destroy(alloc);
-        // Drop hidden env_ptr in arg reg `start_idx` by shifting a(start_idx+1..7) down by 1
-        var k: usize = 0_usize;
-        while k < user_gp && (start_idx +% k +% 1_usize) < 8_usize {
-            let dst_r = (rv64_asm.A0.widen.[usize]() +% start_idx +% k).trunc.[u8]();
-            let src_r = (dst_r +% 1_u8);
-            tb.mv(alloc, dst_r, src_r);
-            k = k +% 1_usize;
+        if !is_c_abi {
+            // Drop hidden env_ptr in arg reg `start_idx` by shifting a(start_idx+1..7) down by 1
+            var k: usize = 0_usize;
+            while k < user_gp && (start_idx +% k +% 1_usize) < 8_usize {
+                let dst_r = (rv64_asm.A0.widen.[usize]() +% start_idx +% k).trunc.[u8]();
+                let src_r = (dst_r +% 1_u8);
+                tb.mv(alloc, dst_r, src_r);
+                k = k +% 1_usize;
+            }
         }
         tb.tail_call_sym(alloc, target_sym);
         try tb.check_oom();

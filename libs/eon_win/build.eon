@@ -1,0 +1,13 @@
+module eon_win.build;
+
+pub fn build(b: *mut BuildCap) {
+    b.set_out_dir("out");
+    b.allow_hal("eon_win.platform.wayland");
+    b.allow_hal("eon_win.platform.x11");
+    b.allow_hal("eon_win.platform.win32");
+    b.allow_hal("eon_win.platform.macos");
+    b.allow_hal("eon_win.platform.android");
+    b.allow_hal("eon_win.platform.ios");
+    b.allow_hal("eon_win.platform.nostd_fb");
+    b.add_lib("eon_win", "src");
+}

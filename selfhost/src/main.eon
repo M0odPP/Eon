@@ -6306,6 +6306,10 @@ fn build_plan_target(
         elf64.ElfMode.linux_pie()
     };
     let mode = mode_base.with_arch(eff_target.arch);
+    var opt_cfg = args.opt;
+    if is_nostd || !eff_target.has_avx2 {
+        opt_cfg.target_avx2 = false;
+    }
     let copts = mach_x64.CompileOptions.{
         mode: mode,
         target_spec: eff_target,
@@ -6313,7 +6317,7 @@ fn build_plan_target(
         emit_debug_line: true,
         has_emi_cache: args.has_emi_cache && eff_target.arch == .X86_64 && eff_target.os == .Linux,
         win_gui: args.win_gui,
-        opt: args.opt,
+        opt: opt_cfg,
         jobs: args.jobs,
     };
 

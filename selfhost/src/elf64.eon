@@ -1075,7 +1075,7 @@ fn build_multiboot2_pvh_boot(
         0x8E_u8, 0xD0_u8,                               // mov ss, ax
         0x8E_u8, 0xE0_u8,                               // mov fs, ax
         0x8E_u8, 0xE8_u8,                               // mov gs, ax
-        0x48_u8, 0xC7_u8, 0xC4_u8, 0x00_u8, 0xC0_u8, 0x07_u8, 0x00_u8, // mov rsp, 0x7C000
+        0x48_u8, 0xC7_u8, 0xC4_u8, 0x00_u8, 0xF0_u8, 0x3F_u8, 0x00_u8, // mov rsp, 0x3F0000 (2.5 MiB kernel stack below 4 MiB heap)
         0x48_u8, 0xB8_u8,                               // movabs rax, entry_vaddr
     ];
     try v.push_slice(alloc, &p64);

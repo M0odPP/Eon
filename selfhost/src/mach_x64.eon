@@ -11223,8 +11223,10 @@ fn emit_fnref_thunks_x64(
         let target_sym = try fn_sym_name_id(alloc, cfg_ir.fn_key_top_def(req.target_def), eir_prog, interner);
         var start_idx: usize = 0_usize;
         var user_gp: usize = 0_usize;
+        var is_c_abi = false;
         if let fid = eir_prog.find_fn_by_key(cfg_ir.fn_key_top_def(req.target_def)) {
             if let f = eir_prog.get_fn(fid) {
+                is_c_abi = f.sig.effects.is_export_c;
                 let rc = classify_ret(f.sig.ret, env);
                 if ret_uses_sret(rc) { start_idx = 1_usize; }
                 let ps = env.params_range(f.sig.params);
@@ -11249,20 +11251,6 @@ fn emit_fnref_thunks_x64(
             }
         }
 
-        var tb = try x64_asm.X64Buf.init(alloc);
-        errdefer tb.destroy(alloc);
-        var gi = start_idx;
-        while gi < 7_usize {
-            if let r0 = gp_arg_reg(false, gi) {
-                if let r1 = gp_arg_reg(false, gi +% 1_usize) {
-                    try tb.mov_rr(alloc, r0, r1);
-                }
-            }
-            gi = gi +% 1_usize;
-        }
-        if start_idx +% user_gp == 8_usize {
-            try tb.load_mem(alloc, .R11, .Rsp, 8_i32, 8_usize, false);
-        }
         var is_ext_only = false;
         if eir_prog.find_fn_by_key(cfg_ir.fn_key_top_def(req.target_def)) == null {
             var ei: usize = 0_usize;
@@ -11272,6 +11260,24 @@ fn emit_fnref_thunks_x64(
                     break;
                 }
                 ei = ei +% 1_usize;
+            }
+        }
+        if is_ext_only { is_c_abi = true; }
+
+        var tb = try x64_asm.X64Buf.init(alloc);
+        errdefer tb.destroy(alloc);
+        if !is_c_abi {
+            var gi = start_idx;
+            while gi < 7_usize {
+                if let r0 = gp_arg_reg(false, gi) {
+                    if let r1 = gp_arg_reg(false, gi +% 1_usize) {
+                        try tb.mov_rr(alloc, r0, r1);
+                    }
+                }
+                gi = gi +% 1_usize;
+            }
+            if start_idx +% user_gp == 8_usize {
+                try tb.load_mem(alloc, .R11, .Rsp, 8_i32, 8_usize, false);
             }
         }
         if is_ext_only && is_linux && !is_builtin_rt_helper(interner.get(target_sym)) {

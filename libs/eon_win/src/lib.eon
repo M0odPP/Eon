@@ -1,0 +1,349 @@
+module eon_win.lib;
+
+import eon_win.events;
+import eon_win.platform.wayland;
+import eon_win.platform.x11;
+import eon_win.platform.win32;
+import eon_win.platform.macos;
+import eon_win.platform.android;
+import eon_win.platform.ios;
+import eon_win.platform.nostd_fb;
+
+// ============================================================================
+// Safe Cross-Platform Windowing & EventLoop Facade (`libs/eon_win`)
+// ZERO `@hal` / `raw` in this module — dispatches cleanly via `comptime if`.
+// ============================================================================
+
+pub enum BackendKind : u8 {
+    Headless = 0,
+    Wayland = 1,
+    X11 = 2,
+    Win32 = 3,
+    MacOS = 4,
+    Android = 5,
+    IOS = 6,
+    NoStdFb = 7,
+}
+
+/// Safe unified cross-platform window handle (call `.init_in_place(&opts)` and `.close()`).
+pub struct PlatformWindow {
+    pub backend: BackendKind;
+    pub width: u32;
+    pub height: u32;
+    pub scale_factor: f32;
+    pub should_close: bool;
+    pub cursor: events.CursorShape;
+    pub queue: events.EventQueue;
+    pub clipboard: events.ClipboardBuf;
+
+    // Platform backend slots (pinned inside caller storage so OS callbacks stay valid)
+    wl: wayland.WaylandWindow;
+    x11_win: x11.X11Window;
+    w32: win32.Win32Window;
+    mac: macos.MacOsWindow;
+    and: android.AndroidWindow;
+    ios_win: ios.IosWindow;
+    fb: nostd_fb.NoStdWindow;
+}
+
+impl PlatformWindow {
+    pub fn uninit() -> PlatformWindow {
+        return PlatformWindow.{
+            backend: .Headless,
+            width: 800_u32,
+            height: 600_u32,
+            scale_factor: 1.0_f32,
+            should_close: false,
+            cursor: .Default,
+            queue: events.EventQueue.new(),
+            clipboard: events.ClipboardBuf.new(),
+            wl: wayland.WaylandWindow.empty(),
+            x11_win: x11.X11Window.empty(),
+            w32: win32.Win32Window.empty(),
+            mac: macos.MacOsWindow.empty(),
+            and: android.AndroidWindow.empty(),
+            ios_win: ios.IosWindow.empty(),
+            fb: nostd_fb.NoStdWindow.open_headless(800_u32, 600_u32),
+        };
+    }
+
+    /// Initialize the window in-place (keeps callback pointers pinned inside `self`).
+    pub fn open_in_place(self: *mut Self, opts: *events.WindowOptions) -> bool {
+        self.width = opts.width;
+        self.height = opts.height;
+        self.scale_factor = 1.0_f32;
+        self.should_close = false;
+        self.queue.clear();
+
+        if opts.headless {
+            self.backend = .Headless;
+            self.fb = nostd_fb.NoStdWindow.open_headless(opts.width, opts.height);
+            self.queue.push(.RedrawRequested);
+            return true;
+        }
+
+        comptime if @target_os() == .Linux {
+            if self.wl.open_into(opts) {
+                self.backend = .Wayland;
+                self.width = self.wl.st.width;
+                self.height = self.wl.st.height;
+                self.scale_factor = self.wl.st.scale_factor;
+                return true;
+            }
+            if self.x11_win.open_into(opts) {
+                self.backend = .X11;
+                self.width = self.x11_win.width;
+                self.height = self.x11_win.height;
+                self.scale_factor = 1.0_f32;
+                return true;
+            }
+            // Graceful fallback to headless when no display server is active
+            self.backend = .Headless;
+            self.fb = nostd_fb.NoStdWindow.open_headless(opts.width, opts.height);
+            return true;
+        } else comptime if @target_os() == .Windows {
+            if self.w32.open_into(opts) {
+                self.backend = .Win32;
+                self.width = self.w32.state.width;
+                self.height = self.w32.state.height;
+                self.scale_factor = self.w32.state.scale_factor;
+                return true;
+            }
+            self.backend = .Headless;
+            self.fb = nostd_fb.NoStdWindow.open_headless(opts.width, opts.height);
+            return true;
+        } else comptime if @target_os() == .MacOS {
+            if self.mac.open_into(opts) {
+                self.backend = .MacOS;
+                self.width = self.mac.width;
+                self.height = self.mac.height;
+                self.scale_factor = self.mac.scale_factor;
+                return true;
+            }
+            self.backend = .Headless;
+            self.fb = nostd_fb.NoStdWindow.open_headless(opts.width, opts.height);
+            return true;
+        } else comptime if @target_os() == .Android {
+            if self.and.open_into(opts) {
+                self.backend = .Android;
+                self.width = self.and.width;
+                self.height = self.and.height;
+                self.scale_factor = self.and.scale_factor;
+                return true;
+            }
+            self.backend = .Headless;
+            self.fb = nostd_fb.NoStdWindow.open_headless(opts.width, opts.height);
+            return true;
+        } else comptime if @target_os() == .IOS {
+            if self.ios_win.open_into(opts) {
+                self.backend = .IOS;
+                self.width = self.ios_win.width;
+                self.height = self.ios_win.height;
+                self.scale_factor = self.ios_win.scale_factor;
+                return true;
+            }
+            self.backend = .Headless;
+            self.fb = nostd_fb.NoStdWindow.open_headless(opts.width, opts.height);
+            return true;
+        } else {
+            self.backend = .NoStdFb;
+            self.fb = nostd_fb.NoStdWindow.open_hardware(opts.width, opts.height);
+            self.queue.push(.RedrawRequested);
+            return true;
+        }
+    }
+
+    pub fn size(self: *Self) -> events.WindowSize {
+        return events.WindowSize.{ width: self.width, height: self.height };
+    }
+
+    pub fn surface_info(self: *Self) -> events.SurfaceInfo {
+        match self.backend {
+            .Wayland => { return self.wl.surface_info(); }
+            .X11 => { return self.x11_win.surface_info(); }
+            .Win32 => { return self.w32.surface_info(); }
+            .MacOS => { return self.mac.surface_info(); }
+            .Android => { return self.and.surface_info(); }
+            .IOS => { return self.ios_win.surface_info(); }
+            _ => { return self.fb.surface_info(); }
+        }
+    }
+
+    pub fn poll_events(self: *mut Self) {
+        match self.backend {
+            .Wayland => {
+                self.wl.poll_events(&mut self.queue);
+                self.width = self.wl.st.width;
+                self.height = self.wl.st.height;
+                if self.wl.st.should_close { self.should_close = true; }
+            }
+            .X11 => {
+                self.x11_win.poll_events(&mut self.queue);
+                self.width = self.x11_win.width;
+                self.height = self.x11_win.height;
+                if self.x11_win.should_close { self.should_close = true; }
+            }
+            .Win32 => {
+                self.w32.poll_events(&mut self.queue);
+                self.width = self.w32.state.width;
+                self.height = self.w32.state.height;
+                self.scale_factor = self.w32.state.scale_factor;
+                if self.w32.state.should_close { self.should_close = true; }
+            }
+            .MacOS => {
+                self.mac.poll_events(&mut self.queue);
+                if self.mac.should_close { self.should_close = true; }
+            }
+            .Android => {
+                self.and.poll_events(&mut self.queue);
+                if self.and.should_close { self.should_close = true; }
+            }
+            .NoStdFb => {
+                self.fb.poll_events(&mut self.queue);
+                if self.fb.should_close { self.should_close = true; }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn next_event(self: *mut Self) -> ?events.PlatformEvent {
+        return self.queue.pop();
+    }
+
+    /// Programmatic event injection for deterministic headless/golden UI tests.
+    pub fn inject_event(self: *mut Self, ev: events.PlatformEvent) {
+        match ev {
+            .Resized(sz) => {
+                self.width = sz.width;
+                self.height = sz.height;
+                self.fb.width = sz.width;
+                self.fb.height = sz.height;
+            }
+            .CloseRequested => {
+                self.should_close = true;
+            }
+            _ => {}
+        }
+        self.queue.push(ev);
+    }
+
+    pub fn inject_click(self: *mut Self, x: f32, y: f32) {
+        let m = events.Modifiers.none();
+        self.inject_event(.MouseMove(events.MouseMoveEvent.{ x: x, y: y, mods: m }));
+        self.inject_event(.MouseDown(events.MouseButtonEvent.{ button: .Left, x: x, y: y, click_count: 1_u8, mods: m }));
+        self.inject_event(.MouseUp(events.MouseButtonEvent.{ button: .Left, x: x, y: y, click_count: 0_u8, mods: m }));
+    }
+
+    pub fn inject_key(self: *mut Self, key: events.Key, mods: events.Modifiers) {
+        self.inject_event(.KeyDown(events.KeyEvent.{ key: key, scancode: 0_u32, repeat: false, mods: mods }));
+        self.inject_event(.KeyUp(events.KeyEvent.{ key: key, scancode: 0_u32, repeat: false, mods: mods }));
+    }
+
+    pub fn inject_text(self: *mut Self, text: *str) {
+        let bs = text.as_bytes();
+        var i: usize = 0_usize;
+        while i < bs.len {
+            let b = bs[i];
+            let k = events.key_from_ascii(b);
+            self.inject_event(.KeyDown(events.KeyEvent.{ key: k, scancode: 0_u32, repeat: false, mods: events.Modifiers.none() }));
+            if b >= 0x20_u8 && b <= 0x7E_u8 {
+                self.inject_event(.TextInput(b.widen.[u32]()));
+            }
+            self.inject_event(.KeyUp(events.KeyEvent.{ key: k, scancode: 0_u32, repeat: false, mods: events.Modifiers.none() }));
+            i = i +% 1_usize;
+        }
+    }
+
+    pub fn set_title(self: *mut Self, title: *str) {
+        match self.backend {
+            .Wayland => { self.wl.set_title(title); }
+            .X11 => { self.x11_win.set_title(title); }
+            .Win32 => { self.w32.set_title(title); }
+            .MacOS => { self.mac.set_title(title); }
+            _ => {}
+        }
+    }
+
+    pub fn set_cursor(self: *mut Self, shape: events.CursorShape) {
+        self.cursor = shape;
+        match self.backend {
+            .Win32 => { self.w32.set_cursor(shape); }
+            .MacOS => { self.mac.set_cursor(shape); }
+            _ => {}
+        }
+    }
+
+    pub fn request_redraw(self: *mut Self) {
+        match self.backend {
+            .Win32 => { self.w32.request_redraw(); }
+            _ => {}
+        }
+        self.queue.push(.RedrawRequested);
+    }
+
+    pub fn clipboard_set(self: *mut Self, text: *[u8]) -> bool {
+        self.clipboard.set_bytes(text);
+        match self.backend {
+            .Win32 => { return self.w32.clipboard_set(text); }
+            .MacOS => { return self.mac.clipboard_set(text); }
+            .IOS => { return self.ios_win.clipboard_set(text); }
+            _ => { return true; }
+        }
+    }
+
+    pub fn clipboard_get(self: *mut Self, dst: *mut events.ClipboardBuf) -> bool {
+        match self.backend {
+            .Win32 => {
+                if self.w32.clipboard_get(dst) { return true; }
+            }
+            .MacOS => {
+                if self.mac.clipboard_get(dst) { return true; }
+            }
+            .IOS => {
+                if self.ios_win.clipboard_get(dst) { return true; }
+            }
+            _ => {}
+        }
+        dst.set_bytes(self.clipboard.as_bytes());
+        return dst.len > 0_usize;
+    }
+
+    /// Present a software RGBA8 framebuffer directly via the active OS window (wl_shm / GDI StretchDIBits / Android / nostd LFB).
+    pub fn present_rgba8(self: *mut Self, rgba: *[u8], w: u32, h: u32) {
+        match self.backend {
+            .Wayland => { self.wl.present_rgba8(rgba, w, h); }
+            .Win32 => { self.w32.present_rgba8(rgba, w, h); }
+            .Android => { self.and.present_rgba8(rgba, w, h); }
+            _ => { self.fb.present_rgba8(rgba, w, h); }
+        }
+    }
+
+    pub fn frame_count(self: *Self) -> u64 {
+        return self.fb.frame_count;
+    }
+
+    pub fn last_presented_crc(self: *Self) -> u32 {
+        return self.fb.last_presented_crc;
+    }
+
+    pub fn close(self: *mut Self) {
+        match self.backend {
+            .Wayland => { self.wl.close(); }
+            .X11 => { self.x11_win.close(); }
+            .Win32 => { self.w32.close(); }
+            .MacOS => { self.mac.close(); }
+            .Android => { self.and.close(); }
+            .IOS => { self.ios_win.close(); }
+            _ => {}
+        }
+        self.should_close = true;
+    }
+}
+
+pub fn nostd_log(msg: *str) {
+    nostd_fb.serial_write(msg);
+}
+
+pub fn nostd_exit(ok: bool) {
+    nostd_fb.qemu_exit(ok);
+}

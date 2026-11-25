@@ -1,0 +1,438 @@
+module eon_win.platform.x11 @hal;
+
+import eon_win.events;
+
+// ============================================================================
+// Linux X11 Fallback Window Adapter (Dynamic `libX11.so.6` + `libX11-xcb.so.1`)
+// Zero static X11 link dependency — cleanly coexists with Wayland & nostd!
+// ============================================================================
+
+const RTLD_LAZY: i32 = 1_i32;
+
+const KeyPressMask: u64 = 1_u64;
+const KeyReleaseMask: u64 = 2_u64;
+const ButtonPressMask: u64 = 4_u64;
+const ButtonReleaseMask: u64 = 8_u64;
+const PointerMotionMask: u64 = 64_u64;
+const ExposureMask: u64 = 32768_u64;
+const StructureNotifyMask: u64 = 131072_u64;
+const FocusChangeMask: u64 = 2097152_u64;
+
+const EV_KEY_PRESS: i32 = 2_i32;
+const EV_KEY_RELEASE: i32 = 3_i32;
+const EV_BUTTON_PRESS: i32 = 4_i32;
+const EV_BUTTON_RELEASE: i32 = 5_i32;
+const EV_MOTION_NOTIFY: i32 = 6_i32;
+const EV_FOCUS_IN: i32 = 9_i32;
+const EV_FOCUS_OUT: i32 = 10_i32;
+const EV_EXPOSE: i32 = 12_i32;
+const EV_CONFIGURE_NOTIFY: i32 = 22_i32;
+const EV_CLIENT_MESSAGE: i32 = 33_i32;
+
+extern "C" fn dlopen(path: u64, flags: i32) -> u64;
+extern "C" fn dlsym(handle: u64, sym: u64) -> u64;
+extern "C" fn dlclose(handle: u64) -> i32;
+
+@naked
+pub fn slice_ptr(_s: *[u8]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn slice_mut_ptr(_s: *mut [u8]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call1(_fp: u64, _a0: u64) -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x9, x0; mov x0, x1; br x9", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t1, a0; mv a0, a1; jr t1", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; jmp rax", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call2(_fp: u64, _a0: u64, _a1: u64) -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x9, x0; mov x0, x1; mov x1, x2; br x9", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t1, a0; mv a0, a1; mv a1, a2; jr t1", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; jmp rax", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call3(_fp: u64, _a0: u64, _a1: u64, _a2: u64) -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x9, x0; mov x0, x1; mov x1, x2; mov x2, x3; br x9", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t1, a0; mv a0, a1; mv a1, a2; mv a2, a3; jr t1", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; jmp rax", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call4(_fp: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64) -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x9, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; br x9", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t1, a0; mv a0, a1; mv a1, a2; mv a2, a3; mv a3, a4; jr t1", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; jmp rax", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+pub fn call9(fp: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64, a7: u64, a8: u64) -> u64 {
+    comptime if @target_os() == .Linux && @target_arch() == .X86_64 {
+        return call9_x64_inner(a0, a1, a2, a3, a4, a5, fp, 0_u64, a6, a7, a8);
+    } else {
+        _ = fp; _ = a0; _ = a1; _ = a2; _ = a3; _ = a4; _ = a5; _ = a6; _ = a7; _ = a8;
+        return 0_u64;
+    }
+}
+
+@naked
+pub fn call9_x64_inner(
+    _a0: u64,
+    _a1: u64,
+    _a2: u64,
+    _a3: u64,
+    _a4: u64,
+    _a5: u64,
+    _fp: u64,
+    _pad: u64,
+    _a6: u64,
+    _a7: u64,
+    _a8: u64,
+) -> u64 {
+    comptime if @target_os() == .Linux && @target_arch() == .X86_64 {
+        raw { asm("jmp r10", options(noreturn)); }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+pub fn dl_open(name_z: *[u8]) -> u64 {
+    comptime if @target_os() == .Linux {
+        raw { return dlopen(slice_ptr(name_z), RTLD_LAZY); }
+    } else {
+        _ = name_z;
+        return 0_u64;
+    }
+}
+
+pub fn dl_sym(h: u64, name_z: *[u8]) -> u64 {
+    comptime if @target_os() == .Linux {
+        if h == 0_u64 { return 0_u64; }
+        raw { return dlsym(h, slice_ptr(name_z)); }
+    } else {
+        _ = h; _ = name_z;
+        return 0_u64;
+    }
+}
+
+pub fn read_i32_le(buf: *[u8], off: usize) -> i32 {
+    if buf.len < 4_usize || off > buf.len - 4_usize { return 0_i32; }
+    let v = buf[off].widen.[u32]()
+        | (buf[off +% 1_usize].widen.[u32]() << 8_u32)
+        | (buf[off +% 2_usize].widen.[u32]() << 16_u32)
+        | (buf[off +% 3_usize].widen.[u32]() << 24_u32);
+    return v.bitcast.[i32]();
+}
+
+pub fn read_u64_le(buf: *[u8], off: usize) -> u64 {
+    if buf.len < 8_usize || off > buf.len - 8_usize { return 0_u64; }
+    let lo = read_i32_le(buf, off).bitcast.[u32]().widen.[u64]();
+    let hi = read_i32_le(buf, off +% 4_usize).bitcast.[u32]().widen.[u64]();
+    return lo | (hi << 32_u64);
+}
+
+pub struct X11Window {
+    pub lib_x11: u64;
+    pub lib_x11_xcb: u64;
+    pub display: u64;
+    pub xcb_conn: u64;
+    pub window: u64;
+    pub wm_delete: u64;
+    pub width: u32;
+    pub height: u32;
+    pub should_close: bool;
+    pub opened: bool;
+    pub fn_pending: u64;
+    pub fn_next_event: u64;
+    pub fn_store_name: u64;
+    pub fn_lookup_keysym: u64;
+    pub fn_flush: u64;
+    pub fn_destroy_window: u64;
+    pub fn_close_display: u64;
+    pub clipboard: events.ClipboardBuf;
+}
+
+impl X11Window {
+    pub fn empty() -> X11Window {
+        return X11Window.{
+            lib_x11: 0_u64,
+            lib_x11_xcb: 0_u64,
+            display: 0_u64,
+            xcb_conn: 0_u64,
+            window: 0_u64,
+            wm_delete: 0_u64,
+            width: 0_u32,
+            height: 0_u32,
+            should_close: false,
+            opened: false,
+            fn_pending: 0_u64,
+            fn_next_event: 0_u64,
+            fn_store_name: 0_u64,
+            fn_lookup_keysym: 0_u64,
+            fn_flush: 0_u64,
+            fn_destroy_window: 0_u64,
+            fn_close_display: 0_u64,
+            clipboard: events.ClipboardBuf.new(),
+        };
+    }
+
+    pub fn open_into(self: *mut Self, opts: *events.WindowOptions) -> bool {
+        self.width = opts.width;
+        self.height = opts.height;
+        self.should_close = false;
+        comptime if @target_os() == .Linux {
+            let lib = dl_open("libX11.so.6\0".as_bytes());
+            if lib == 0_u64 { return false; }
+            let f_open = dl_sym(lib, "XOpenDisplay\0".as_bytes());
+            let f_def_scr = dl_sym(lib, "XDefaultScreen\0".as_bytes());
+            let f_root = dl_sym(lib, "XRootWindow\0".as_bytes());
+            let f_create = dl_sym(lib, "XCreateSimpleWindow\0".as_bytes());
+            let f_select = dl_sym(lib, "XSelectInput\0".as_bytes());
+            let f_map = dl_sym(lib, "XMapWindow\0".as_bytes());
+            let f_atom = dl_sym(lib, "XInternAtom\0".as_bytes());
+            let f_proto = dl_sym(lib, "XSetWMProtocols\0".as_bytes());
+            self.fn_pending = dl_sym(lib, "XPending\0".as_bytes());
+            self.fn_next_event = dl_sym(lib, "XNextEvent\0".as_bytes());
+            self.fn_store_name = dl_sym(lib, "XStoreName\0".as_bytes());
+            self.fn_lookup_keysym = dl_sym(lib, "XLookupKeysym\0".as_bytes());
+            self.fn_flush = dl_sym(lib, "XFlush\0".as_bytes());
+            self.fn_destroy_window = dl_sym(lib, "XDestroyWindow\0".as_bytes());
+            self.fn_close_display = dl_sym(lib, "XCloseDisplay\0".as_bytes());
+            if f_open == 0_u64 || f_create == 0_u64 || f_map == 0_u64 {
+                raw { _ = dlclose(lib); }
+                return false;
+            }
+            let dpy = call1(f_open, 0_u64);
+            if dpy == 0_u64 {
+                raw { _ = dlclose(lib); }
+                return false;
+            }
+            let scr = call1(f_def_scr, dpy);
+            let root = call2(f_root, dpy, scr);
+            let win = call9(f_create, dpy, root, 0_u64, 0_u64, opts.width.widen.[u64](), opts.height.widen.[u64](), 0_u64, 0_u64, 0x1E1E2E_u64);
+            if win == 0_u64 {
+                _ = call1(self.fn_close_display, dpy);
+                raw { _ = dlclose(lib); }
+                return false;
+            }
+            let mask = KeyPressMask | KeyReleaseMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask | ExposureMask | StructureNotifyMask | FocusChangeMask;
+            if f_select != 0_u64 { _ = call3(f_select, dpy, win, mask); }
+            if f_atom != 0_u64 && f_proto != 0_u64 {
+                let wm_del = call3(f_atom, dpy, slice_ptr("WM_DELETE_WINDOW\0".as_bytes()), 0_u64);
+                self.wm_delete = wm_del;
+                let atom_bytes: [8]u8 = [
+                    (wm_del & 0xFF_u64).trunc.[u8](),
+                    ((wm_del >> 8_u64) & 0xFF_u64).trunc.[u8](),
+                    ((wm_del >> 16_u64) & 0xFF_u64).trunc.[u8](),
+                    ((wm_del >> 24_u64) & 0xFF_u64).trunc.[u8](),
+                    ((wm_del >> 32_u64) & 0xFF_u64).trunc.[u8](),
+                    ((wm_del >> 40_u64) & 0xFF_u64).trunc.[u8](),
+                    ((wm_del >> 48_u64) & 0xFF_u64).trunc.[u8](),
+                    ((wm_del >> 56_u64) & 0xFF_u64).trunc.[u8](),
+                ];
+                _ = call4(f_proto, dpy, win, slice_ptr(&atom_bytes), 1_u64);
+            }
+            self.lib_x11 = lib;
+            self.display = dpy;
+            self.window = win;
+            self.set_title_bytes(opts.title_bytes());
+            _ = call2(f_map, dpy, win);
+            if self.fn_flush != 0_u64 { _ = call1(self.fn_flush, dpy); }
+            let lib_xcb = dl_open("libX11-xcb.so.1\0".as_bytes());
+            if lib_xcb != 0_u64 {
+                self.lib_x11_xcb = lib_xcb;
+                let f_get_xcb = dl_sym(lib_xcb, "XGetXCBConnection\0".as_bytes());
+                if f_get_xcb != 0_u64 {
+                    self.xcb_conn = call1(f_get_xcb, dpy);
+                }
+            }
+            self.opened = true;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    pub fn surface_info(self: *Self) -> events.SurfaceInfo {
+        let use_xcb = self.xcb_conn != 0_u64;
+        return events.SurfaceInfo.{
+            kind: if use_xcb { .Xcb } else { .Xlib },
+            display_handle: if use_xcb { self.xcb_conn } else { self.display },
+            window_handle: self.window,
+            extra_handle: self.display,
+            width: self.width,
+            height: self.height,
+            scale_factor: 1.0_f32,
+            fb_base_addr: 0_u64,
+            fb_pitch_bytes: 0_u32,
+            fb_is_bgr: true,
+        };
+    }
+
+    pub fn poll_events(self: *mut Self, q: *mut events.EventQueue) {
+        comptime if @target_os() == .Linux {
+            if !self.opened || self.display == 0_u64 || self.fn_pending == 0_u64 || self.fn_next_event == 0_u64 {
+                return;
+            }
+            var ev_buf: [192]u8 = [0_u8; 192];
+            var guard: u32 = 0_u32;
+            while guard < 128_u32 {
+                let pend = call1(self.fn_pending, self.display);
+                if pend == 0_u64 { break; }
+                _ = call2(self.fn_next_event, self.display, slice_mut_ptr(&mut ev_buf));
+                let ety = read_i32_le(&ev_buf, 0_usize);
+                if ety == EV_EXPOSE {
+                    q.push(.RedrawRequested);
+                } else if ety == EV_CONFIGURE_NOTIFY {
+                    let nw = read_i32_le(&ev_buf, 56_usize);
+                    let nh = read_i32_le(&ev_buf, 60_usize);
+                    if nw > 0_i32 && nh > 0_i32 {
+                        let w32 = nw.bitcast.[u32]();
+                        let h32 = nh.bitcast.[u32]();
+                        if w32 != self.width || h32 != self.height {
+                            self.width = w32;
+                            self.height = h32;
+                            q.push(.Resized(events.WindowSize.{ width: w32, height: h32 }));
+                        }
+                    }
+                } else if ety == EV_MOTION_NOTIFY {
+                    let x = read_i32_le(&ev_buf, 64_usize).to_float.[f32]();
+                    let y = read_i32_le(&ev_buf, 68_usize).to_float.[f32]();
+                    let st = read_i32_le(&ev_buf, 80_usize).bitcast.[u32]();
+                    q.push(.MouseMove(events.MouseMoveEvent.{ x: x, y: y, mods: x11_mods(st) }));
+                } else if ety == EV_BUTTON_PRESS || ety == EV_BUTTON_RELEASE {
+                    let x = read_i32_le(&ev_buf, 64_usize).to_float.[f32]();
+                    let y = read_i32_le(&ev_buf, 68_usize).to_float.[f32]();
+                    let st = read_i32_le(&ev_buf, 80_usize).bitcast.[u32]();
+                    let btn_code = read_i32_le(&ev_buf, 84_usize).bitcast.[u32]();
+                    let mods = x11_mods(st);
+                    if ety == EV_BUTTON_PRESS && (btn_code == 4_u32 || btn_code == 5_u32) {
+                        let dy: f32 = if btn_code == 4_u32 { 36.0_f32 } else { -36.0_f32 };
+                        q.push(.MouseWheel(events.MouseWheelEvent.{ dx: 0.0_f32, dy: dy, x: x, y: y, mods: mods }));
+                    } else {
+                        let btn: events.MouseButton = if btn_code == 1_u32 { .Left } else if btn_code == 3_u32 { .Right } else { .Middle };
+                        if ety == EV_BUTTON_PRESS {
+                            q.push(.MouseDown(events.MouseButtonEvent.{ button: btn, x: x, y: y, click_count: 1_u8, mods: mods }));
+                        } else {
+                            q.push(.MouseUp(events.MouseButtonEvent.{ button: btn, x: x, y: y, click_count: 0_u8, mods: mods }));
+                        }
+                    }
+                } else if ety == EV_KEY_PRESS || ety == EV_KEY_RELEASE {
+                    let st = read_i32_le(&ev_buf, 80_usize).bitcast.[u32]();
+                    let kc = read_i32_le(&ev_buf, 84_usize).bitcast.[u32]();
+                    let mods = x11_mods(st);
+                    let idx: u64 = if mods.has_shift() { 1_u64 } else { 0_u64 };
+                    var sym: u32 = 0_u32;
+                    if self.fn_lookup_keysym != 0_u64 {
+                        sym = call2(self.fn_lookup_keysym, slice_ptr(&ev_buf), idx).trunc.[u32]();
+                    }
+                    let key = if sym != 0_u32 { events.key_from_xkb_sym(sym) } else if kc >= 8_u32 { events.key_from_evdev(kc - 8_u32) } else { .Unknown };
+                    if ety == EV_KEY_PRESS {
+                        q.push(.KeyDown(events.KeyEvent.{ key: key, scancode: kc, repeat: false, mods: mods }));
+                        if sym >= 0x20_u32 && sym <= 0x7E_u32 && !mods.has_ctrl() && !mods.has_alt() {
+                            q.push(.TextInput(sym));
+                        }
+                    } else {
+                        q.push(.KeyUp(events.KeyEvent.{ key: key, scancode: kc, repeat: false, mods: mods }));
+                    }
+                } else if ety == EV_FOCUS_IN {
+                    q.push(.FocusChanged(true));
+                } else if ety == EV_FOCUS_OUT {
+                    q.push(.FocusChanged(false));
+                } else if ety == EV_CLIENT_MESSAGE {
+                    let atom0 = read_u64_le(&ev_buf, 56_usize);
+                    if atom0 == self.wm_delete {
+                        self.should_close = true;
+                        q.push(.CloseRequested);
+                    }
+                }
+                guard = guard +% 1_u32;
+            }
+        } else {
+            _ = self;
+            _ = q;
+        }
+    }
+
+    pub fn set_title_bytes(self: *mut Self, src: *[u8]) {
+        comptime if @target_os() == .Linux {
+            if self.display == 0_u64 || self.window == 0_u64 || self.fn_store_name == 0_u64 { return; }
+            var cbuf: [256]u8 = [0_u8; 256];
+            let n: usize = if src.len < 255_usize { src.len } else { 255_usize };
+            var i: usize = 0_usize;
+            while i < n { cbuf[i] = src[i]; i = i +% 1_usize; }
+            _ = call3(self.fn_store_name, self.display, self.window, slice_ptr(&cbuf));
+            if self.fn_flush != 0_u64 { _ = call1(self.fn_flush, self.display); }
+        } else {
+            _ = self;
+            _ = src;
+        }
+    }
+
+    pub fn set_title(self: *mut Self, title: *str) {
+        self.set_title_bytes(title.as_bytes());
+    }
+
+    pub fn close(self: *mut Self) {
+        comptime if @target_os() == .Linux {
+            if self.display != 0_u64 {
+                if self.window != 0_u64 && self.fn_destroy_window != 0_u64 {
+                    _ = call2(self.fn_destroy_window, self.display, self.window);
+                }
+                if self.fn_close_display != 0_u64 {
+                    _ = call1(self.fn_close_display, self.display);
+                }
+                self.display = 0_u64;
+                self.window = 0_u64;
+            }
+            if self.lib_x11_xcb != 0_u64 { raw { _ = dlclose(self.lib_x11_xcb); } self.lib_x11_xcb = 0_u64; }
+            if self.lib_x11 != 0_u64 { raw { _ = dlclose(self.lib_x11); } self.lib_x11 = 0_u64; }
+        }
+        self.opened = false;
+    }
+}
+
+pub fn x11_mods(state: u32) -> events.Modifiers {
+    var b: u8 = 0_u8;
+    if (state & 1_u32) != 0_u32 { b = b | events.MOD_SHIFT; }
+    if (state & 4_u32) != 0_u32 { b = b | events.MOD_CTRL; }
+    if (state & 8_u32) != 0_u32 { b = b | events.MOD_ALT; }
+    if (state & 64_u32) != 0_u32 { b = b | events.MOD_META; }
+    return events.Modifiers.from_bits(b);
+}

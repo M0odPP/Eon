@@ -1,0 +1,1260 @@
+module eon_win.platform.wayland @hal;
+
+import eon_win.events;
+
+// ============================================================================
+// Native Linux Wayland Client Adapter (`libwayland-client.so.0` +
+// `libxkbcommon.so.0` via `dlopen`/`dlsym`, non-variadic `wl_proxy_marshal_array_flags`
+// + `wl_proxy_add_dispatcher`, `xdg-shell`, `wl_shm` software present,
+// `VK_KHR_wayland_surface` handles) — Zero C Toolchain!
+// ============================================================================
+
+const RTLD_LAZY: i32 = 1_i32;
+const PROT_READ: u64 = 1_u64;
+const PROT_WRITE: u64 = 2_u64;
+const MAP_SHARED: u64 = 1_u64;
+const POLLIN: i16 = 1_i16;
+const WL_SHM_FORMAT_XRGB8888: u32 = 1_u32;
+const WL_MARSHAL_FLAG_DESTROY: u32 = 1_u32;
+
+const BTN_LEFT: u32 = 0x110_u32;
+const BTN_RIGHT: u32 = 0x111_u32;
+const BTN_MIDDLE: u32 = 0x112_u32;
+const BTN_SIDE: u32 = 0x113_u32;
+const BTN_EXTRA: u32 = 0x114_u32;
+
+extern "C" fn dlopen(path: u64, flags: i32) -> u64;
+extern "C" fn dlsym(handle: u64, sym: u64) -> u64;
+extern "C" fn dlclose(handle: u64) -> i32;
+
+@inline pub fn sys_nr_close() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 57_u64; } else { return 3_u64; } }
+@inline pub fn sys_nr_ftruncate() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 46_u64; } else { return 77_u64; } }
+@inline pub fn sys_nr_mmap() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 222_u64; } else { return 9_u64; } }
+@inline pub fn sys_nr_munmap() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 215_u64; } else { return 11_u64; } }
+@inline pub fn sys_nr_memfd_create() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 279_u64; } else { return 319_u64; } }
+@inline pub fn sys_nr_ppoll() -> u64 { comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 { return 73_u64; } else { return 271_u64; } }
+
+@naked
+pub fn sys1(_nr: u64, _a0: u64) -> i64 {
+    comptime if @target_os() == .Linux && @target_arch() == .AArch64 {
+        raw { asm("mov x8, x0; mov x0, x1; svc #0; ret", options(noreturn)); }
+    } else comptime if @target_os() == .Linux && @target_arch() == .RiscV64 {
+        raw { asm("mv a7, a0; mv a0, a1; ecall; ret", options(noreturn)); }
+    } else comptime if @target_os() == .Linux {
+        raw { asm("mov rax, rdi; mov rdi, rsi; syscall; ret", options(noreturn)); }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+    return 0_i64;
+}
+
+@naked
+pub fn sys2(_nr: u64, _a0: u64, _a1: u64) -> i64 {
+    comptime if @target_os() == .Linux && @target_arch() == .AArch64 {
+        raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; svc #0; ret", options(noreturn)); }
+    } else comptime if @target_os() == .Linux && @target_arch() == .RiscV64 {
+        raw { asm("mv a7, a0; mv a0, a1; mv a1, a2; ecall; ret", options(noreturn)); }
+    } else comptime if @target_os() == .Linux {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; syscall; ret", options(noreturn)); }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+    return 0_i64;
+}
+
+@naked
+pub fn sys5(_nr: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64) -> i64 {
+    comptime if @target_os() == .Linux && @target_arch() == .AArch64 {
+        raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; mov x4, x5; svc #0; ret", options(noreturn)); }
+    } else comptime if @target_os() == .Linux && @target_arch() == .RiscV64 {
+        raw { asm("mv a7, a0; mv a0, a1; mv a1, a2; mv a2, a3; mv a3, a4; mv a4, a5; ecall; ret", options(noreturn)); }
+    } else comptime if @target_os() == .Linux {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r10, r8; mov r8, r9; syscall; ret", options(noreturn)); }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+    return 0_i64;
+}
+
+@naked
+pub fn sys6(_nr: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> i64 {
+    comptime if @target_os() == .Linux && @target_arch() == .AArch64 {
+        raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; mov x4, x5; mov x5, x6; svc #0; ret", options(noreturn)); }
+    } else comptime if @target_os() == .Linux && @target_arch() == .RiscV64 {
+        raw { asm("mv a7, a0; mv a0, a1; mv a1, a2; mv a2, a3; mv a3, a4; mv a4, a5; mv a5, a6; ecall; ret", options(noreturn)); }
+    } else comptime if @target_os() == .Linux {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r11, r10; mov r10, r8; mov r8, r9; mov r9, r11; syscall; ret", options(noreturn)); }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+    return 0_i64;
+}
+
+@naked
+pub fn slice_ptr(_s: *[u8]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn u64_slice_ptr(_s: *[u64]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn wl_msg_slice_ptr(_s: *[WlMessage]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn wl_iface_ptr(_p: *WlInterface) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn wl_state_ptr(_p: *mut WaylandState) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn disp_fn_ptr(_f: fn(u64, u64, u32, u64, u64) -> i32) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call1(_fp: u64, _a0: u64) -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x9, x0; mov x0, x1; br x9", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t1, a0; mv a0, a1; jr t1", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; jmp rax", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call2(_fp: u64, _a0: u64, _a1: u64) -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x9, x0; mov x0, x1; mov x1, x2; br x9", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t1, a0; mv a0, a1; mv a1, a2; jr t1", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; jmp rax", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call3(_fp: u64, _a0: u64, _a1: u64, _a2: u64) -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x9, x0; mov x0, x1; mov x1, x2; mov x2, x3; br x9", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t1, a0; mv a0, a1; mv a1, a2; mv a2, a3; jr t1", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; jmp rax", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call4(_fp: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64) -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x9, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; br x9", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t1, a0; mv a0, a1; mv a1, a2; mv a2, a3; mv a3, a4; jr t1", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; jmp rax", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call6(_fp: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x9, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; mov x4, x5; mov x5, x6; br x9", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t1, a0; mv a0, a1; mv a1, a2; mv a2, a3; mv a3, a4; mv a4, a5; mv a5, a6; jr t1", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; mov r8, r9; mov r9, r10; jmp rax", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call7_x64(_a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _fp: u64, _pad: u64, _a6: u64) -> u64 {
+    comptime if @target_arch() == .X86_64 {
+        raw { asm("jmp r10", options(noreturn)); }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call7_reg(_fp: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> u64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x9, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; mov x4, x5; mov x5, x6; mov x6, x7; br x9", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv t1, a0; mv a0, a1; mv a1, a2; mv a2, a3; mv a3, a4; mv a4, a5; mv a5, a6; mv a6, a7; jr t1", options(noreturn)); }
+    } else {
+        raw { asm("ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+pub fn call7(fp: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
+    comptime if @target_arch() == .X86_64 {
+        return call7_x64(a0, a1, a2, a3, a4, a5, fp, 0_u64, a6);
+    } else {
+        return call7_reg(fp, a0, a1, a2, a3, a4, a5, a6);
+    }
+}
+
+// Wayland ABI descriptors (exact match to `/usr/include/wayland-util.h`)
+@layout(c)
+struct WlMessage {
+    name: u64;
+    signature: u64;
+    types: u64;
+}
+
+@layout(c)
+struct WlInterface {
+    name: u64;
+    version: i32;
+    method_count: i32;
+    methods: u64;
+    event_count: i32;
+    _pad0: i32;
+    events: u64;
+}
+
+@layout(c)
+struct PollFd {
+    fd: i32;
+    events: i16;
+    revents: i16;
+}
+
+@layout(c)
+struct Timespec {
+    tv_sec: i64;
+    tv_nsec: i64;
+}
+
+@naked
+pub fn pollfd_ptr(_p: *mut PollFd) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn timespec_ptr(_p: *Timespec) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+pub fn cstr_eq(ptr: u64, lit: *[u8]) -> bool {
+    if ptr == 0_u64 { return false; }
+    var i: usize = 0_usize;
+    while i < lit.len {
+        var b: u8 = 0_u8;
+        raw { b = rawptr.[u8].from_usize((ptr +% i.widen.[u64]()).trunc.[usize]()).*; }
+        if b != lit[i] { return false; }
+        i = i +% 1_usize;
+    }
+    var term: u8 = 1_u8;
+    raw { term = rawptr.[u8].from_usize((ptr +% lit.len.widen.[u64]()).trunc.[usize]()).*; }
+    return term == 0_u8;
+}
+
+pub fn wl_arg_u32(args: u64, idx: usize) -> u32 {
+    raw { return rawptr.[u32].from_usize((args +% (idx *% 8_usize).widen.[u64]()).trunc.[usize]()).*; }
+}
+
+pub fn wl_arg_i32(args: u64, idx: usize) -> i32 {
+    raw { return rawptr.[i32].from_usize((args +% (idx *% 8_usize).widen.[u64]()).trunc.[usize]()).*; }
+}
+
+pub fn wl_arg_u64(args: u64, idx: usize) -> u64 {
+    raw { return rawptr.[u64].from_usize((args +% (idx *% 8_usize).widen.[u64]()).trunc.[usize]()).*; }
+}
+
+pub fn dl_open(name_z: *[u8]) -> u64 {
+    comptime if @target_os() == .Linux {
+        raw { return dlopen(slice_ptr(name_z), RTLD_LAZY); }
+    } else {
+        _ = name_z;
+        return 0_u64;
+    }
+}
+
+pub fn dl_sym(h: u64, name_z: *[u8]) -> u64 {
+    comptime if @target_os() == .Linux {
+        if h == 0_u64 { return 0_u64; }
+        raw { return dlsym(h, slice_ptr(name_z)); }
+    } else {
+        _ = h; _ = name_z;
+        return 0_u64;
+    }
+}
+
+pub struct WaylandState {
+    pub lib_wl: u64;
+    pub lib_xkb: u64;
+    pub display: u64;
+    pub registry: u64;
+    pub compositor: u64;
+    pub shm: u64;
+    pub surface: u64;
+    pub xdg_wm_base: u64;
+    pub xdg_surface: u64;
+    pub xdg_toplevel: u64;
+    pub seat: u64;
+    pub pointer: u64;
+    pub keyboard: u64;
+    pub touch: u64;
+
+    // Function pointers resolved from libwayland-client.so.0
+    pub fn_disconnect: u64;
+    pub fn_roundtrip: u64;
+    pub fn_dispatch_pending: u64;
+    pub fn_prepare_read: u64;
+    pub fn_read_events: u64;
+    pub fn_cancel_read: u64;
+    pub fn_flush: u64;
+    pub fn_get_fd: u64;
+    pub fn_marshal_array_flags: u64;
+    pub fn_add_dispatcher: u64;
+    pub fn_proxy_destroy: u64;
+    pub fn_proxy_get_version: u64;
+
+    // Standard wl_interface pointers from libwayland-client.so.0
+    pub iface_registry: u64;
+    pub iface_compositor: u64;
+    pub iface_surface: u64;
+    pub iface_shm: u64;
+    pub iface_shm_pool: u64;
+    pub iface_buffer: u64;
+    pub iface_seat: u64;
+    pub iface_pointer: u64;
+    pub iface_keyboard: u64;
+    pub iface_touch: u64;
+
+    // xkbcommon function pointers & state
+    pub xkb_ctx: u64;
+    pub xkb_keymap: u64;
+    pub xkb_state: u64;
+    pub fn_xkb_ctx_new: u64;
+    pub fn_xkb_ctx_unref: u64;
+    pub fn_xkb_keymap_new_from_str: u64;
+    pub fn_xkb_keymap_unref: u64;
+    pub fn_xkb_state_new: u64;
+    pub fn_xkb_state_unref: u64;
+    pub fn_xkb_state_update_key: u64;
+    pub fn_xkb_state_update_mask: u64;
+    pub fn_xkb_state_get_one_sym: u64;
+    pub fn_xkb_state_get_utf32: u64;
+
+    // Inline xdg-shell protocol tables (lifetime == WaylandState)
+    xdg_null_types: [8]u64;
+    xdg_get_surf_types: [2]u64;
+    xdg_get_top_types: [1]u64;
+    xdg_wm_reqs: [4]WlMessage;
+    xdg_wm_evs: [1]WlMessage;
+    xdg_surf_reqs: [5]WlMessage;
+    xdg_surf_evs: [1]WlMessage;
+    xdg_top_reqs: [14]WlMessage;
+    xdg_top_evs: [4]WlMessage;
+    pub iface_xdg_wm_base: WlInterface;
+    pub iface_xdg_surface: WlInterface;
+    pub iface_xdg_toplevel: WlInterface;
+
+    // SHM software presentation buffer
+    pub shm_fd: i32;
+    pub shm_pool: u64;
+    pub shm_buffer: u64;
+    pub shm_ptr: u64;
+    pub shm_size: usize;
+    pub shm_w: u32;
+    pub shm_h: u32;
+
+    // Live window state
+    pub width: u32;
+    pub height: u32;
+    pub pending_w: u32;
+    pub pending_h: u32;
+    pub scale_factor: f32;
+    pub configured: bool;
+    pub should_close: bool;
+    pub pointer_x: f32;
+    pub pointer_y: f32;
+    pub mods: u8;
+    pub queue_ptr: u64;
+}
+
+@naked
+pub fn queue_mut_ptr(_q: *mut events.EventQueue) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+pub fn push_ev(qp: u64, ev: events.PlatformEvent) {
+    if qp != 0_u64 {
+        raw {
+            let q = rawptr_mut.[events.EventQueue].from_usize(qp.trunc.[usize]());
+            q.*.push(ev);
+        }
+    }
+}
+
+pub fn wl_marshal(st: *WaylandState, proxy: u64, op: u32, wl_if: u64, ver: u32, flags: u32, args: *[u64]) -> u64 {
+    if proxy == 0_u64 || st.fn_marshal_array_flags == 0_u64 { return 0_u64; }
+    return call6(
+        st.fn_marshal_array_flags,
+        proxy,
+        op.widen.[u64](),
+        wl_if,
+        ver.widen.[u64](),
+        flags.widen.[u64](),
+        u64_slice_ptr(args),
+    );
+}
+
+pub fn wl_bind_global(st: *mut WaylandState, name: u32, iface_ptr: u64, iface_name_z: *[u8], ver: u32) -> u64 {
+    let args: [4]u64 = [
+        name.widen.[u64](),
+        slice_ptr(iface_name_z),
+        ver.widen.[u64](),
+        0_u64,
+    ];
+    return wl_marshal(st, st.registry, 0_u32, iface_ptr, ver, 0_u32, &args);
+}
+
+pub fn wl_add_disp(st: *mut WaylandState, proxy: u64) {
+    if proxy == 0_u64 || st.fn_add_dispatcher == 0_u64 { return; }
+    let self_addr = wl_state_ptr(st);
+    _ = call4(st.fn_add_dispatcher, proxy, disp_fn_ptr(eon_wl_dispatch), self_addr, self_addr);
+}
+
+@extern("C")
+pub fn eon_wl_dispatch(user_data: u64, target: u64, opcode: u32, _msg: u64, args: u64) -> i32 {
+    comptime if @target_os() == .Linux {
+        if user_data == 0_u64 || target == 0_u64 { return 0_i32; }
+        raw {
+            let st = rawptr_mut.[WaylandState].from_usize(user_data.trunc.[usize]());
+            if target == st.*.registry {
+                if opcode == 0_u32 {
+                    let gname = wl_arg_u32(args, 0_usize);
+                    let giface = wl_arg_u64(args, 1_usize);
+                    let gver = wl_arg_u32(args, 2_usize);
+                    if cstr_eq(giface, "wl_compositor".as_bytes()) && st.*.compositor == 0_u64 {
+                        let v: u32 = if gver < 4_u32 { gver } else { 4_u32 };
+                        st.*.compositor = wl_bind_global(&mut st.*, gname, st.*.iface_compositor, "wl_compositor\0".as_bytes(), v);
+                    } else if cstr_eq(giface, "wl_shm".as_bytes()) && st.*.shm == 0_u64 {
+                        st.*.shm = wl_bind_global(&mut st.*, gname, st.*.iface_shm, "wl_shm\0".as_bytes(), 1_u32);
+                    } else if cstr_eq(giface, "xdg_wm_base".as_bytes()) && st.*.xdg_wm_base == 0_u64 {
+                        let v: u32 = if gver < 2_u32 { gver } else { 2_u32 };
+                        let xdg_if = wl_iface_ptr(&st.*.iface_xdg_wm_base);
+                        let xb = wl_bind_global(&mut st.*, gname, xdg_if, "xdg_wm_base\0".as_bytes(), v);
+                        st.*.xdg_wm_base = xb;
+                        wl_add_disp(&mut st.*, xb);
+                    } else if cstr_eq(giface, "wl_seat".as_bytes()) && st.*.seat == 0_u64 {
+                        let v: u32 = if gver < 5_u32 { gver } else { 5_u32 };
+                        let seat = wl_bind_global(&mut st.*, gname, st.*.iface_seat, "wl_seat\0".as_bytes(), v);
+                        st.*.seat = seat;
+                        wl_add_disp(&mut st.*, seat);
+                    }
+                }
+                return 0_i32;
+            }
+            if target == st.*.xdg_wm_base {
+                if opcode == 0_u32 {
+                    let serial = wl_arg_u32(args, 0_usize);
+                    let pargs: [1]u64 = [serial.widen.[u64]()];
+                    _ = wl_marshal(&st.*, target, 3_u32, 0_u64, 1_u32, 0_u32, &pargs);
+                }
+                return 0_i32;
+            }
+            if target == st.*.xdg_surface {
+                if opcode == 0_u32 {
+                    let serial = wl_arg_u32(args, 0_usize);
+                    let aargs: [1]u64 = [serial.widen.[u64]()];
+                    _ = wl_marshal(&st.*, target, 4_u32, 0_u64, 1_u32, 0_u32, &aargs);
+                    if st.*.pending_w > 0_u32 && st.*.pending_h > 0_u32 {
+                        if st.*.pending_w != st.*.width || st.*.pending_h != st.*.height {
+                            st.*.width = st.*.pending_w;
+                            st.*.height = st.*.pending_h;
+                            push_ev(st.*.queue_ptr, .Resized(events.WindowSize.{ width: st.*.width, height: st.*.height }));
+                        }
+                        st.*.pending_w = 0_u32;
+                        st.*.pending_h = 0_u32;
+                    }
+                    st.*.configured = true;
+                    push_ev(st.*.queue_ptr, .RedrawRequested);
+                }
+                return 0_i32;
+            }
+            if target == st.*.xdg_toplevel {
+                if opcode == 0_u32 {
+                    let nw = wl_arg_i32(args, 0_usize);
+                    let nh = wl_arg_i32(args, 1_usize);
+                    if nw > 0_i32 && nh > 0_i32 {
+                        st.*.pending_w = nw.bitcast.[u32]();
+                        st.*.pending_h = nh.bitcast.[u32]();
+                    }
+                } else if opcode == 1_u32 {
+                    st.*.should_close = true;
+                    push_ev(st.*.queue_ptr, .CloseRequested);
+                }
+                return 0_i32;
+            }
+            if target == st.*.seat {
+                if opcode == 0_u32 {
+                    let caps = wl_arg_u32(args, 0_usize);
+                    let empty_a: [1]u64 = [0_u64];
+                    if (caps & 1_u32) != 0_u32 && st.*.pointer == 0_u64 {
+                        let ptr = wl_marshal(&st.*, target, 0_u32, st.*.iface_pointer, 1_u32, 0_u32, &empty_a);
+                        st.*.pointer = ptr;
+                        wl_add_disp(&mut st.*, ptr);
+                    }
+                    if (caps & 2_u32) != 0_u32 && st.*.keyboard == 0_u64 {
+                        let kbd = wl_marshal(&st.*, target, 1_u32, st.*.iface_keyboard, 1_u32, 0_u32, &empty_a);
+                        st.*.keyboard = kbd;
+                        wl_add_disp(&mut st.*, kbd);
+                    }
+                    if (caps & 4_u32) != 0_u32 && st.*.touch == 0_u64 {
+                        let tch = wl_marshal(&st.*, target, 2_u32, st.*.iface_touch, 1_u32, 0_u32, &empty_a);
+                        st.*.touch = tch;
+                        wl_add_disp(&mut st.*, tch);
+                    }
+                }
+                return 0_i32;
+            }
+            if target == st.*.pointer {
+                if opcode == 0_u32 {
+                    let fx = wl_arg_i32(args, 2_usize).to_float.[f32]() / 256.0_f32;
+                    let fy = wl_arg_i32(args, 3_usize).to_float.[f32]() / 256.0_f32;
+                    st.*.pointer_x = fx;
+                    st.*.pointer_y = fy;
+                    push_ev(st.*.queue_ptr, .MouseMove(events.MouseMoveEvent.{ x: fx, y: fy, mods: events.Modifiers.from_bits(st.*.mods) }));
+                } else if opcode == 2_u32 {
+                    let fx = wl_arg_i32(args, 1_usize).to_float.[f32]() / 256.0_f32;
+                    let fy = wl_arg_i32(args, 2_usize).to_float.[f32]() / 256.0_f32;
+                    st.*.pointer_x = fx;
+                    st.*.pointer_y = fy;
+                    push_ev(st.*.queue_ptr, .MouseMove(events.MouseMoveEvent.{ x: fx, y: fy, mods: events.Modifiers.from_bits(st.*.mods) }));
+                } else if opcode == 3_u32 {
+                    let btn_c = wl_arg_u32(args, 2_usize);
+                    let state = wl_arg_u32(args, 3_usize);
+                    let btn: events.MouseButton = if btn_c == BTN_LEFT { .Left }
+                        else if btn_c == BTN_RIGHT { .Right }
+                        else if btn_c == BTN_MIDDLE { .Middle }
+                        else if btn_c == BTN_SIDE { .Back }
+                        else { .Forward };
+                    let mods = events.Modifiers.from_bits(st.*.mods);
+                    if state != 0_u32 {
+                        push_ev(st.*.queue_ptr, .MouseDown(events.MouseButtonEvent.{ button: btn, x: st.*.pointer_x, y: st.*.pointer_y, click_count: 1_u8, mods: mods }));
+                    } else {
+                        push_ev(st.*.queue_ptr, .MouseUp(events.MouseButtonEvent.{ button: btn, x: st.*.pointer_x, y: st.*.pointer_y, click_count: 0_u8, mods: mods }));
+                    }
+                } else if opcode == 4_u32 {
+                    let axis = wl_arg_u32(args, 1_usize);
+                    let val = wl_arg_i32(args, 2_usize).to_float.[f32]() / 256.0_f32;
+                    let dx: f32 = if axis == 1_u32 { -val } else { 0.0_f32 };
+                    let dy: f32 = if axis == 0_u32 { -val } else { 0.0_f32 };
+                    push_ev(st.*.queue_ptr, .MouseWheel(events.MouseWheelEvent.{ dx: dx, dy: dy, x: st.*.pointer_x, y: st.*.pointer_y, mods: events.Modifiers.from_bits(st.*.mods) }));
+                }
+                return 0_i32;
+            }
+            if target == st.*.keyboard {
+                if opcode == 0_u32 {
+                    let fmt = wl_arg_u32(args, 0_usize);
+                    let fd = wl_arg_i32(args, 1_usize);
+                    let sz = wl_arg_u32(args, 2_usize);
+                    if fmt == 1_u32 && fd >= 0_i32 && sz > 0_u32 && st.*.xkb_ctx != 0_u64 && st.*.fn_xkb_keymap_new_from_str != 0_u64 {
+                        let map = sys6(sys_nr_mmap(), 0_u64, sz.widen.[u64](), PROT_READ, MAP_SHARED, fd.bitcast.[u32]().widen.[u64](), 0_u64);
+                        if map > 0_i64 {
+                            if st.*.xkb_state != 0_u64 && st.*.fn_xkb_state_unref != 0_u64 {
+                                _ = call1(st.*.fn_xkb_state_unref, st.*.xkb_state);
+                                st.*.xkb_state = 0_u64;
+                            }
+                            if st.*.xkb_keymap != 0_u64 && st.*.fn_xkb_keymap_unref != 0_u64 {
+                                _ = call1(st.*.fn_xkb_keymap_unref, st.*.xkb_keymap);
+                                st.*.xkb_keymap = 0_u64;
+                            }
+                            let km = call4(st.*.fn_xkb_keymap_new_from_str, st.*.xkb_ctx, map.bitcast.[u64](), 1_u64, 0_u64);
+                            st.*.xkb_keymap = km;
+                            if km != 0_u64 && st.*.fn_xkb_state_new != 0_u64 {
+                                st.*.xkb_state = call1(st.*.fn_xkb_state_new, km);
+                            }
+                            _ = sys2(sys_nr_munmap(), map.bitcast.[u64](), sz.widen.[u64]());
+                        }
+                    }
+                    if fd >= 0_i32 {
+                        _ = sys1(sys_nr_close(), fd.bitcast.[u32]().widen.[u64]());
+                    }
+                } else if opcode == 1_u32 {
+                    push_ev(st.*.queue_ptr, .FocusChanged(true));
+                } else if opcode == 2_u32 {
+                    push_ev(st.*.queue_ptr, .FocusChanged(false));
+                } else if opcode == 3_u32 {
+                    let sc = wl_arg_u32(args, 2_usize);
+                    let state = wl_arg_u32(args, 3_usize);
+                    let xkb_kc = sc +% 8_u32;
+                    var key = events.key_from_evdev(sc);
+                    var ch: u32 = 0_u32;
+                    if st.*.xkb_state != 0_u64 && st.*.fn_xkb_state_get_one_sym != 0_u64 {
+                        let sym = call2(st.*.fn_xkb_state_get_one_sym, st.*.xkb_state, xkb_kc.widen.[u64]()).trunc.[u32]();
+                        let xk = events.key_from_xkb_sym(sym);
+                        if xk != .Unknown { key = xk; }
+                        if state != 0_u32 && st.*.fn_xkb_state_get_utf32 != 0_u64 {
+                            ch = call2(st.*.fn_xkb_state_get_utf32, st.*.xkb_state, xkb_kc.widen.[u64]()).trunc.[u32]();
+                        }
+                    }
+                    if key == .Shift {
+                        if state != 0_u32 { st.*.mods = st.*.mods | events.MOD_SHIFT; }
+                        else { st.*.mods = st.*.mods & (~events.MOD_SHIFT); }
+                    } else if key == .Control {
+                        if state != 0_u32 { st.*.mods = st.*.mods | events.MOD_CTRL; }
+                        else { st.*.mods = st.*.mods & (~events.MOD_CTRL); }
+                    } else if key == .Alt {
+                        if state != 0_u32 { st.*.mods = st.*.mods | events.MOD_ALT; }
+                        else { st.*.mods = st.*.mods & (~events.MOD_ALT); }
+                    } else if key == .Meta {
+                        if state != 0_u32 { st.*.mods = st.*.mods | events.MOD_META; }
+                        else { st.*.mods = st.*.mods & (~events.MOD_META); }
+                    }
+                    let mods = events.Modifiers.from_bits(st.*.mods);
+                    if state != 0_u32 {
+                        push_ev(st.*.queue_ptr, .KeyDown(events.KeyEvent.{ key: key, scancode: sc, repeat: false, mods: mods }));
+                        if ch >= 0x20_u32 && ch != 0x7F_u32 && !mods.has_ctrl() && !mods.has_alt() {
+                            push_ev(st.*.queue_ptr, .TextInput(ch));
+                        }
+                    } else {
+                        push_ev(st.*.queue_ptr, .KeyUp(events.KeyEvent.{ key: key, scancode: sc, repeat: false, mods: mods }));
+                    }
+                } else if opcode == 4_u32 {
+                    let dep = wl_arg_u32(args, 1_usize);
+                    let lat = wl_arg_u32(args, 2_usize);
+                    let lck = wl_arg_u32(args, 3_usize);
+                    let grp = wl_arg_u32(args, 4_usize);
+                    if st.*.xkb_state != 0_u64 && st.*.fn_xkb_state_update_mask != 0_u64 {
+                        _ = call7(st.*.fn_xkb_state_update_mask, st.*.xkb_state, dep.widen.[u64](), lat.widen.[u64](), lck.widen.[u64](), 0_u64, 0_u64, grp.widen.[u64]());
+                    }
+                    var mb: u8 = 0_u8;
+                    if (dep & 1_u32) != 0_u32 { mb = mb | events.MOD_SHIFT; }
+                    if (dep & 4_u32) != 0_u32 { mb = mb | events.MOD_CTRL; }
+                    if (dep & 8_u32) != 0_u32 { mb = mb | events.MOD_ALT; }
+                    if (dep & 64_u32) != 0_u32 { mb = mb | events.MOD_META; }
+                    st.*.mods = mb;
+                }
+                return 0_i32;
+            }
+            if target == st.*.touch {
+                if opcode == 0_u32 {
+                    let id = wl_arg_u32(args, 3_usize);
+                    let x = wl_arg_i32(args, 4_usize).to_float.[f32]() / 256.0_f32;
+                    let y = wl_arg_i32(args, 5_usize).to_float.[f32]() / 256.0_f32;
+                    push_ev(st.*.queue_ptr, .Touch(events.TouchEvent.{ id: id, phase: .Started, x: x, y: y }));
+                } else if opcode == 1_u32 {
+                    let id = wl_arg_u32(args, 2_usize);
+                    push_ev(st.*.queue_ptr, .Touch(events.TouchEvent.{ id: id, phase: .Ended, x: st.*.pointer_x, y: st.*.pointer_y }));
+                } else if opcode == 2_u32 {
+                    let id = wl_arg_u32(args, 1_usize);
+                    let x = wl_arg_i32(args, 2_usize).to_float.[f32]() / 256.0_f32;
+                    let y = wl_arg_i32(args, 3_usize).to_float.[f32]() / 256.0_f32;
+                    push_ev(st.*.queue_ptr, .Touch(events.TouchEvent.{ id: id, phase: .Moved, x: x, y: y }));
+                }
+                return 0_i32;
+            }
+        }
+        return 0_i32;
+    } else {
+        _ = user_data; _ = target; _ = opcode; _ = args;
+        return 0_i32;
+    }
+}
+
+pub fn empty_wl_msg() -> WlMessage {
+    return WlMessage.{ name: 0_u64, signature: 0_u64, types: 0_u64 };
+}
+
+pub fn empty_wl_iface() -> WlInterface {
+    return WlInterface.{ name: 0_u64, version: 1_i32, method_count: 0_i32, methods: 0_u64, event_count: 0_i32, _pad0: 0_i32, events: 0_u64 };
+}
+
+pub fn init_xdg_ifaces(st: *mut WaylandState) {
+    let nt = u64_slice_ptr(&st.xdg_null_types);
+
+    // Pre-populate type tables (note: pointers inside `st` stay stable while `st` is pinned in caller)
+    st.xdg_get_surf_types[0_usize] = wl_iface_ptr(&st.iface_xdg_surface);
+    st.xdg_get_surf_types[1_usize] = st.iface_surface;
+    st.xdg_get_top_types[0_usize] = wl_iface_ptr(&st.iface_xdg_toplevel);
+
+    // xdg_wm_base (v2)
+    st.xdg_wm_reqs[0_usize] = WlMessage.{ name: slice_ptr("destroy\0".as_bytes()), signature: slice_ptr("\0".as_bytes()), types: nt };
+    st.xdg_wm_reqs[1_usize] = WlMessage.{ name: slice_ptr("create_positioner\0".as_bytes()), signature: slice_ptr("n\0".as_bytes()), types: nt };
+    st.xdg_wm_reqs[2_usize] = WlMessage.{ name: slice_ptr("get_xdg_surface\0".as_bytes()), signature: slice_ptr("no\0".as_bytes()), types: u64_slice_ptr(&st.xdg_get_surf_types) };
+    st.xdg_wm_reqs[3_usize] = WlMessage.{ name: slice_ptr("pong\0".as_bytes()), signature: slice_ptr("u\0".as_bytes()), types: nt };
+    st.xdg_wm_evs[0_usize] = WlMessage.{ name: slice_ptr("ping\0".as_bytes()), signature: slice_ptr("u\0".as_bytes()), types: nt };
+    st.iface_xdg_wm_base = WlInterface.{
+        name: slice_ptr("xdg_wm_base\0".as_bytes()),
+        version: 2_i32,
+        method_count: 4_i32,
+        methods: wl_msg_slice_ptr(&st.xdg_wm_reqs),
+        event_count: 1_i32,
+        _pad0: 0_i32,
+        events: wl_msg_slice_ptr(&st.xdg_wm_evs),
+    };
+
+    // xdg_surface (v2)
+    st.xdg_surf_reqs[0_usize] = WlMessage.{ name: slice_ptr("destroy\0".as_bytes()), signature: slice_ptr("\0".as_bytes()), types: nt };
+    st.xdg_surf_reqs[1_usize] = WlMessage.{ name: slice_ptr("get_toplevel\0".as_bytes()), signature: slice_ptr("n\0".as_bytes()), types: u64_slice_ptr(&st.xdg_get_top_types) };
+    st.xdg_surf_reqs[2_usize] = WlMessage.{ name: slice_ptr("get_popup\0".as_bytes()), signature: slice_ptr("n?oo\0".as_bytes()), types: nt };
+    st.xdg_surf_reqs[3_usize] = WlMessage.{ name: slice_ptr("set_window_geometry\0".as_bytes()), signature: slice_ptr("iiii\0".as_bytes()), types: nt };
+    st.xdg_surf_reqs[4_usize] = WlMessage.{ name: slice_ptr("ack_configure\0".as_bytes()), signature: slice_ptr("u\0".as_bytes()), types: nt };
+    st.xdg_surf_evs[0_usize] = WlMessage.{ name: slice_ptr("configure\0".as_bytes()), signature: slice_ptr("u\0".as_bytes()), types: nt };
+    st.iface_xdg_surface = WlInterface.{
+        name: slice_ptr("xdg_surface\0".as_bytes()),
+        version: 2_i32,
+        method_count: 5_i32,
+        methods: wl_msg_slice_ptr(&st.xdg_surf_reqs),
+        event_count: 1_i32,
+        _pad0: 0_i32,
+        events: wl_msg_slice_ptr(&st.xdg_surf_evs),
+    };
+
+    // xdg_toplevel (v2)
+    st.xdg_top_reqs[0_usize] = WlMessage.{ name: slice_ptr("destroy\0".as_bytes()), signature: slice_ptr("\0".as_bytes()), types: nt };
+    st.xdg_top_reqs[1_usize] = WlMessage.{ name: slice_ptr("set_parent\0".as_bytes()), signature: slice_ptr("?o\0".as_bytes()), types: nt };
+    st.xdg_top_reqs[2_usize] = WlMessage.{ name: slice_ptr("set_title\0".as_bytes()), signature: slice_ptr("s\0".as_bytes()), types: nt };
+    st.xdg_top_reqs[3_usize] = WlMessage.{ name: slice_ptr("set_app_id\0".as_bytes()), signature: slice_ptr("s\0".as_bytes()), types: nt };
+    st.xdg_top_reqs[4_usize] = WlMessage.{ name: slice_ptr("show_window_menu\0".as_bytes()), signature: slice_ptr("ouii\0".as_bytes()), types: nt };
+    st.xdg_top_reqs[5_usize] = WlMessage.{ name: slice_ptr("move\0".as_bytes()), signature: slice_ptr("ou\0".as_bytes()), types: nt };
+    st.xdg_top_reqs[6_usize] = WlMessage.{ name: slice_ptr("resize\0".as_bytes()), signature: slice_ptr("ouu\0".as_bytes()), types: nt };
+    st.xdg_top_reqs[7_usize] = WlMessage.{ name: slice_ptr("set_max_size\0".as_bytes()), signature: slice_ptr("ii\0".as_bytes()), types: nt };
+    st.xdg_top_reqs[8_usize] = WlMessage.{ name: slice_ptr("set_min_size\0".as_bytes()), signature: slice_ptr("ii\0".as_bytes()), types: nt };
+    st.xdg_top_reqs[9_usize] = WlMessage.{ name: slice_ptr("set_maximized\0".as_bytes()), signature: slice_ptr("\0".as_bytes()), types: nt };
+    st.xdg_top_reqs[10_usize] = WlMessage.{ name: slice_ptr("unset_maximized\0".as_bytes()), signature: slice_ptr("\0".as_bytes()), types: nt };
+    st.xdg_top_reqs[11_usize] = WlMessage.{ name: slice_ptr("set_fullscreen\0".as_bytes()), signature: slice_ptr("?o\0".as_bytes()), types: nt };
+    st.xdg_top_reqs[12_usize] = WlMessage.{ name: slice_ptr("unset_fullscreen\0".as_bytes()), signature: slice_ptr("\0".as_bytes()), types: nt };
+    st.xdg_top_reqs[13_usize] = WlMessage.{ name: slice_ptr("set_minimized\0".as_bytes()), signature: slice_ptr("\0".as_bytes()), types: nt };
+    st.xdg_top_evs[0_usize] = WlMessage.{ name: slice_ptr("configure\0".as_bytes()), signature: slice_ptr("iia\0".as_bytes()), types: nt };
+    st.xdg_top_evs[1_usize] = WlMessage.{ name: slice_ptr("close\0".as_bytes()), signature: slice_ptr("\0".as_bytes()), types: nt };
+    st.xdg_top_evs[2_usize] = WlMessage.{ name: slice_ptr("configure_bounds\0".as_bytes()), signature: slice_ptr("4ii\0".as_bytes()), types: nt };
+    st.xdg_top_evs[3_usize] = WlMessage.{ name: slice_ptr("wm_capabilities\0".as_bytes()), signature: slice_ptr("5a\0".as_bytes()), types: nt };
+    st.iface_xdg_toplevel = WlInterface.{
+        name: slice_ptr("xdg_toplevel\0".as_bytes()),
+        version: 2_i32,
+        method_count: 14_i32,
+        methods: wl_msg_slice_ptr(&st.xdg_top_reqs),
+        event_count: 4_i32,
+        _pad0: 0_i32,
+        events: wl_msg_slice_ptr(&st.xdg_top_evs),
+    };
+}
+
+pub struct WaylandWindow {
+    pub st: WaylandState;
+    pub opened: bool;
+}
+
+impl WaylandWindow {
+    pub fn empty() -> WaylandWindow {
+        return WaylandWindow.{
+            st: WaylandState.{
+                lib_wl: 0_u64,
+                lib_xkb: 0_u64,
+                display: 0_u64,
+                registry: 0_u64,
+                compositor: 0_u64,
+                shm: 0_u64,
+                surface: 0_u64,
+                xdg_wm_base: 0_u64,
+                xdg_surface: 0_u64,
+                xdg_toplevel: 0_u64,
+                seat: 0_u64,
+                pointer: 0_u64,
+                keyboard: 0_u64,
+                touch: 0_u64,
+                fn_disconnect: 0_u64,
+                fn_roundtrip: 0_u64,
+                fn_dispatch_pending: 0_u64,
+                fn_prepare_read: 0_u64,
+                fn_read_events: 0_u64,
+                fn_cancel_read: 0_u64,
+                fn_flush: 0_u64,
+                fn_get_fd: 0_u64,
+                fn_marshal_array_flags: 0_u64,
+                fn_add_dispatcher: 0_u64,
+                fn_proxy_destroy: 0_u64,
+                fn_proxy_get_version: 0_u64,
+                iface_registry: 0_u64,
+                iface_compositor: 0_u64,
+                iface_surface: 0_u64,
+                iface_shm: 0_u64,
+                iface_shm_pool: 0_u64,
+                iface_buffer: 0_u64,
+                iface_seat: 0_u64,
+                iface_pointer: 0_u64,
+                iface_keyboard: 0_u64,
+                iface_touch: 0_u64,
+                xkb_ctx: 0_u64,
+                xkb_keymap: 0_u64,
+                xkb_state: 0_u64,
+                fn_xkb_ctx_new: 0_u64,
+                fn_xkb_ctx_unref: 0_u64,
+                fn_xkb_keymap_new_from_str: 0_u64,
+                fn_xkb_keymap_unref: 0_u64,
+                fn_xkb_state_new: 0_u64,
+                fn_xkb_state_unref: 0_u64,
+                fn_xkb_state_update_key: 0_u64,
+                fn_xkb_state_update_mask: 0_u64,
+                fn_xkb_state_get_one_sym: 0_u64,
+                fn_xkb_state_get_utf32: 0_u64,
+                xdg_null_types: [0_u64; 8],
+                xdg_get_surf_types: [0_u64; 2],
+                xdg_get_top_types: [0_u64; 1],
+                xdg_wm_reqs: [empty_wl_msg(); 4],
+                xdg_wm_evs: [empty_wl_msg(); 1],
+                xdg_surf_reqs: [empty_wl_msg(); 5],
+                xdg_surf_evs: [empty_wl_msg(); 1],
+                xdg_top_reqs: [empty_wl_msg(); 14],
+                xdg_top_evs: [empty_wl_msg(); 4],
+                iface_xdg_wm_base: empty_wl_iface(),
+                iface_xdg_surface: empty_wl_iface(),
+                iface_xdg_toplevel: empty_wl_iface(),
+                shm_fd: -1_i32,
+                shm_pool: 0_u64,
+                shm_buffer: 0_u64,
+                shm_ptr: 0_u64,
+                shm_size: 0_usize,
+                shm_w: 0_u32,
+                shm_h: 0_u32,
+                width: 0_u32,
+                height: 0_u32,
+                pending_w: 0_u32,
+                pending_h: 0_u32,
+                scale_factor: 1.0_f32,
+                configured: false,
+                should_close: false,
+                pointer_x: 0.0_f32,
+                pointer_y: 0.0_f32,
+                mods: 0_u8,
+                queue_ptr: 0_u64,
+            },
+            opened: false,
+        };
+    }
+
+    pub fn open_into(self: *mut Self, opts: *events.WindowOptions) -> bool {
+        self.st.width = opts.width;
+        self.st.height = opts.height;
+        self.st.scale_factor = 1.0_f32;
+        self.st.should_close = false;
+        self.st.configured = false;
+        comptime if @target_os() == .Linux {
+            let lib = dl_open("libwayland-client.so.0\0".as_bytes());
+            if lib == 0_u64 { return false; }
+            let f_conn = dl_sym(lib, "wl_display_connect\0".as_bytes());
+            self.st.fn_disconnect = dl_sym(lib, "wl_display_disconnect\0".as_bytes());
+            self.st.fn_roundtrip = dl_sym(lib, "wl_display_roundtrip\0".as_bytes());
+            self.st.fn_dispatch_pending = dl_sym(lib, "wl_display_dispatch_pending\0".as_bytes());
+            self.st.fn_prepare_read = dl_sym(lib, "wl_display_prepare_read\0".as_bytes());
+            self.st.fn_read_events = dl_sym(lib, "wl_display_read_events\0".as_bytes());
+            self.st.fn_cancel_read = dl_sym(lib, "wl_display_cancel_read\0".as_bytes());
+            self.st.fn_flush = dl_sym(lib, "wl_display_flush\0".as_bytes());
+            self.st.fn_get_fd = dl_sym(lib, "wl_display_get_fd\0".as_bytes());
+            self.st.fn_marshal_array_flags = dl_sym(lib, "wl_proxy_marshal_array_flags\0".as_bytes());
+            self.st.fn_add_dispatcher = dl_sym(lib, "wl_proxy_add_dispatcher\0".as_bytes());
+            self.st.fn_proxy_destroy = dl_sym(lib, "wl_proxy_destroy\0".as_bytes());
+            self.st.fn_proxy_get_version = dl_sym(lib, "wl_proxy_get_version\0".as_bytes());
+
+            self.st.iface_registry = dl_sym(lib, "wl_registry_interface\0".as_bytes());
+            self.st.iface_compositor = dl_sym(lib, "wl_compositor_interface\0".as_bytes());
+            self.st.iface_surface = dl_sym(lib, "wl_surface_interface\0".as_bytes());
+            self.st.iface_shm = dl_sym(lib, "wl_shm_interface\0".as_bytes());
+            self.st.iface_shm_pool = dl_sym(lib, "wl_shm_pool_interface\0".as_bytes());
+            self.st.iface_buffer = dl_sym(lib, "wl_buffer_interface\0".as_bytes());
+            self.st.iface_seat = dl_sym(lib, "wl_seat_interface\0".as_bytes());
+            self.st.iface_pointer = dl_sym(lib, "wl_pointer_interface\0".as_bytes());
+            self.st.iface_keyboard = dl_sym(lib, "wl_keyboard_interface\0".as_bytes());
+            self.st.iface_touch = dl_sym(lib, "wl_touch_interface\0".as_bytes());
+
+            if f_conn == 0_u64 || self.st.fn_marshal_array_flags == 0_u64 || self.st.fn_add_dispatcher == 0_u64 {
+                raw { _ = dlclose(lib); }
+                return false;
+            }
+            let dpy = call1(f_conn, 0_u64);
+            if dpy == 0_u64 {
+                raw { _ = dlclose(lib); }
+                return false;
+            }
+            self.st.lib_wl = lib;
+            self.st.display = dpy;
+
+            // Optional libxkbcommon for accurate keyboard layout & Unicode text translation.
+            let xkb = dl_open("libxkbcommon.so.0\0".as_bytes());
+            if xkb != 0_u64 {
+                self.st.lib_xkb = xkb;
+                self.st.fn_xkb_ctx_new = dl_sym(xkb, "xkb_context_new\0".as_bytes());
+                self.st.fn_xkb_ctx_unref = dl_sym(xkb, "xkb_context_unref\0".as_bytes());
+                self.st.fn_xkb_keymap_new_from_str = dl_sym(xkb, "xkb_keymap_new_from_string\0".as_bytes());
+                self.st.fn_xkb_keymap_unref = dl_sym(xkb, "xkb_keymap_unref\0".as_bytes());
+                self.st.fn_xkb_state_new = dl_sym(xkb, "xkb_state_new\0".as_bytes());
+                self.st.fn_xkb_state_unref = dl_sym(xkb, "xkb_state_unref\0".as_bytes());
+                self.st.fn_xkb_state_update_key = dl_sym(xkb, "xkb_state_update_key\0".as_bytes());
+                self.st.fn_xkb_state_update_mask = dl_sym(xkb, "xkb_state_update_mask\0".as_bytes());
+                self.st.fn_xkb_state_get_one_sym = dl_sym(xkb, "xkb_state_key_get_one_sym\0".as_bytes());
+                self.st.fn_xkb_state_get_utf32 = dl_sym(xkb, "xkb_state_key_get_utf32\0".as_bytes());
+                if self.st.fn_xkb_ctx_new != 0_u64 {
+                    self.st.xkb_ctx = call1(self.st.fn_xkb_ctx_new, 0_u64);
+                }
+            }
+
+            init_xdg_ifaces(&mut self.st);
+
+            // wl_display.get_registry (REQ 1)
+            let reg_args: [1]u64 = [0_u64];
+            let reg = wl_marshal(&self.st, dpy, 1_u32, self.st.iface_registry, 1_u32, 0_u32, &reg_args);
+            self.st.registry = reg;
+            wl_add_disp(&mut self.st, reg);
+            _ = call1(self.st.fn_roundtrip, dpy);
+
+            if self.st.compositor == 0_u64 || self.st.xdg_wm_base == 0_u64 {
+                self.close();
+                return false;
+            }
+
+            // wl_compositor.create_surface (REQ 0)
+            let cs_args: [1]u64 = [0_u64];
+            let surf = wl_marshal(&self.st, self.st.compositor, 0_u32, self.st.iface_surface, 1_u32, 0_u32, &cs_args);
+            self.st.surface = surf;
+            if surf == 0_u64 {
+                self.close();
+                return false;
+            }
+
+            // xdg_wm_base.get_xdg_surface (REQ 2: new_id, wl_surface)
+            let xs_args: [2]u64 = [0_u64, surf];
+            let xsurf = wl_marshal(&self.st, self.st.xdg_wm_base, 2_u32, wl_iface_ptr(&self.st.iface_xdg_surface), 1_u32, 0_u32, &xs_args);
+            self.st.xdg_surface = xsurf;
+            wl_add_disp(&mut self.st, xsurf);
+
+            // xdg_surface.get_toplevel (REQ 1)
+            let xt_args: [1]u64 = [0_u64];
+            let xtop = wl_marshal(&self.st, xsurf, 1_u32, wl_iface_ptr(&self.st.iface_xdg_toplevel), 1_u32, 0_u32, &xt_args);
+            self.st.xdg_toplevel = xtop;
+            wl_add_disp(&mut self.st, xtop);
+
+            // Set title, app_id, min_size, and initial commit
+            self.set_title_bytes(opts.title_bytes());
+            let aid_args: [1]u64 = [slice_ptr("dev.eon.app\0".as_bytes())];
+            _ = wl_marshal(&self.st, xtop, 3_u32, 0_u64, 1_u32, 0_u32, &aid_args);
+            let min_args: [2]u64 = [opts.min_width.widen.[u64](), opts.min_height.widen.[u64]()];
+            _ = wl_marshal(&self.st, xtop, 8_u32, 0_u64, 1_u32, 0_u32, &min_args);
+            if !opts.resizable {
+                let max_args: [2]u64 = [opts.width.widen.[u64](), opts.height.widen.[u64]()];
+                _ = wl_marshal(&self.st, xtop, 7_u32, 0_u64, 1_u32, 0_u32, &max_args);
+            }
+            let empty_a: [1]u64 = [0_u64];
+            // wl_surface.commit (REQ 6)
+            _ = wl_marshal(&self.st, surf, 6_u32, 0_u64, 1_u32, 0_u32, &empty_a);
+            _ = call1(self.st.fn_roundtrip, dpy);
+            self.opened = true;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    pub fn surface_info(self: *Self) -> events.SurfaceInfo {
+        return events.SurfaceInfo.{
+            kind: .Wayland,
+            display_handle: self.st.display,
+            window_handle: self.st.surface,
+            extra_handle: self.st.xdg_toplevel,
+            width: self.st.width,
+            height: self.st.height,
+            scale_factor: self.st.scale_factor,
+            fb_base_addr: 0_u64,
+            fb_pitch_bytes: 0_u32,
+            fb_is_bgr: true,
+        };
+    }
+
+    pub fn poll_events(self: *mut Self, out_q: *mut events.EventQueue) {
+        comptime if @target_os() == .Linux {
+            if !self.opened || self.st.display == 0_u64 { return; }
+            self.st.queue_ptr = queue_mut_ptr(out_q);
+            _ = call1(self.st.fn_dispatch_pending, self.st.display);
+            _ = call1(self.st.fn_flush, self.st.display);
+            if self.st.fn_prepare_read != 0_u64 && self.st.fn_get_fd != 0_u64 {
+                let pr = call1(self.st.fn_prepare_read, self.st.display).trunc.[i32]();
+                if pr == 0_i32 {
+                    let fd = call1(self.st.fn_get_fd, self.st.display).trunc.[i32]();
+                    var pfd = PollFd.{ fd: fd, events: POLLIN, revents: 0_i16 };
+                    let ts = Timespec.{ tv_sec: 0_i64, tv_nsec: 0_i64 };
+                    let ready = sys5(sys_nr_ppoll(), pollfd_ptr(&mut pfd), 1_u64, timespec_ptr(&ts), 0_u64, 0_u64);
+                    if ready > 0_i64 && (pfd.revents & POLLIN) != 0_i16 {
+                        _ = call1(self.st.fn_read_events, self.st.display);
+                        _ = call1(self.st.fn_dispatch_pending, self.st.display);
+                    } else {
+                        _ = call1(self.st.fn_cancel_read, self.st.display);
+                    }
+                } else {
+                    _ = call1(self.st.fn_dispatch_pending, self.st.display);
+                }
+            }
+            self.st.queue_ptr = 0_u64;
+        } else {
+            _ = self;
+            _ = out_q;
+        }
+    }
+
+    pub fn set_title_bytes(self: *mut Self, src: *[u8]) {
+        comptime if @target_os() == .Linux {
+            if self.st.xdg_toplevel == 0_u64 { return; }
+            var cbuf: [256]u8 = [0_u8; 256];
+            let n: usize = if src.len < 255_usize { src.len } else { 255_usize };
+            var i: usize = 0_usize;
+            while i < n { cbuf[i] = src[i]; i = i +% 1_usize; }
+            let args: [1]u64 = [slice_ptr(&cbuf)];
+            _ = wl_marshal(&self.st, self.st.xdg_toplevel, 2_u32, 0_u64, 1_u32, 0_u32, &args);
+        } else {
+            _ = self;
+            _ = src;
+        }
+    }
+
+    pub fn set_title(self: *mut Self, title: *str) {
+        self.set_title_bytes(title.as_bytes());
+    }
+
+    pub fn destroy_shm(self: *mut Self) {
+        comptime if @target_os() == .Linux {
+            let empty_a: [1]u64 = [0_u64];
+            if self.st.shm_buffer != 0_u64 {
+                _ = wl_marshal(&self.st, self.st.shm_buffer, 0_u32, 0_u64, 1_u32, WL_MARSHAL_FLAG_DESTROY, &empty_a);
+                self.st.shm_buffer = 0_u64;
+            }
+            if self.st.shm_pool != 0_u64 {
+                _ = wl_marshal(&self.st, self.st.shm_pool, 1_u32, 0_u64, 1_u32, WL_MARSHAL_FLAG_DESTROY, &empty_a);
+                self.st.shm_pool = 0_u64;
+            }
+            if self.st.shm_ptr != 0_u64 && self.st.shm_size > 0_usize {
+                _ = sys2(sys_nr_munmap(), self.st.shm_ptr, self.st.shm_size.widen.[u64]());
+                self.st.shm_ptr = 0_u64;
+                self.st.shm_size = 0_usize;
+            }
+            if self.st.shm_fd >= 0_i32 {
+                _ = sys1(sys_nr_close(), self.st.shm_fd.bitcast.[u32]().widen.[u64]());
+                self.st.shm_fd = -1_i32;
+            }
+            self.st.shm_w = 0_u32;
+            self.st.shm_h = 0_u32;
+        } else {
+            _ = self;
+        }
+    }
+
+    pub fn ensure_shm(self: *mut Self, w: u32, h: u32) -> bool {
+        comptime if @target_os() == .Linux {
+            if self.st.shm == 0_u64 || w == 0_u32 || h == 0_u32 { return false; }
+            if self.st.shm_ptr != 0_u64 && self.st.shm_w == w && self.st.shm_h == h {
+                return true;
+            }
+            self.destroy_shm();
+            let stride = w *% 4_u32;
+            let sz = stride.widen.[usize]() *% h.widen.[usize]();
+            let fd = sys2(sys_nr_memfd_create(), slice_ptr("eon_wl_shm\0".as_bytes()), 1_u64).trunc.[i32]();
+            if fd < 0_i32 { return false; }
+            let tr = sys2(sys_nr_ftruncate(), fd.bitcast.[u32]().widen.[u64](), sz.widen.[u64]());
+            if tr < 0_i64 {
+                _ = sys1(sys_nr_close(), fd.bitcast.[u32]().widen.[u64]());
+                return false;
+            }
+            let ptr = sys6(sys_nr_mmap(), 0_u64, sz.widen.[u64](), PROT_READ | PROT_WRITE, MAP_SHARED, fd.bitcast.[u32]().widen.[u64](), 0_u64);
+            if ptr <= 0_i64 {
+                _ = sys1(sys_nr_close(), fd.bitcast.[u32]().widen.[u64]());
+                return false;
+            }
+            let p_args: [3]u64 = [0_u64, fd.bitcast.[u32]().widen.[u64](), sz.widen.[u64]()];
+            let shm_p = wl_marshal(&self.st, self.st.shm, 0_u32, self.st.iface_shm_pool, 1_u32, 0_u32, &p_args);
+            if shm_p == 0_u64 {
+                _ = sys2(sys_nr_munmap(), ptr.bitcast.[u64](), sz.widen.[u64]());
+                _ = sys1(sys_nr_close(), fd.bitcast.[u32]().widen.[u64]());
+                return false;
+            }
+            let b_args: [6]u64 = [0_u64, 0_u64, w.widen.[u64](), h.widen.[u64](), stride.widen.[u64](), WL_SHM_FORMAT_XRGB8888.widen.[u64]()];
+            let buf = wl_marshal(&self.st, shm_p, 0_u32, self.st.iface_buffer, 1_u32, 0_u32, &b_args);
+            self.st.shm_fd = fd;
+            self.st.shm_pool = shm_p;
+            self.st.shm_buffer = buf;
+            self.st.shm_ptr = ptr.bitcast.[u64]();
+            self.st.shm_size = sz;
+            self.st.shm_w = w;
+            self.st.shm_h = h;
+            return buf != 0_u64;
+        } else {
+            _ = self; _ = w; _ = h;
+            return false;
+        }
+    }
+
+    /// Software presentation fallback over `wl_shm` (RGBA8 -> XRGB8888 attach + damage + commit).
+    pub fn present_rgba8(self: *mut Self, rgba: *[u8], w: u32, h: u32) {
+        comptime if @target_os() == .Linux {
+            if !self.opened || self.st.surface == 0_u64 { return; }
+            if !self.ensure_shm(w, h) { return; }
+            let n_px = w.widen.[usize]() *% h.widen.[usize]();
+            if rgba.len >= 4_usize {
+                let lim = rgba.len - 4_usize;
+                var i: usize = 0_usize;
+                while i < n_px {
+                    let si = i *% 4_usize;
+                    if si <= lim {
+                        let r = rgba[si].widen.[u32]();
+                        let g = rgba[si + 1_usize].widen.[u32]();
+                        let b = rgba[si + 2_usize].widen.[u32]();
+                        let xrgb = b | (g << 8_u32) | (r << 16_u32) | 0xFF000000_u32;
+                        raw {
+                            let p = rawptr_mut.[u32].from_usize((self.st.shm_ptr +% si.widen.[u64]()).trunc.[usize]());
+                            p.* = xrgb;
+                        }
+                    }
+                    i = i +% 1_usize;
+                }
+            }
+            let att_args: [3]u64 = [self.st.shm_buffer, 0_u64, 0_u64];
+            _ = wl_marshal(&self.st, self.st.surface, 1_u32, 0_u64, 1_u32, 0_u32, &att_args);
+            let dmg_args: [4]u64 = [0_u64, 0_u64, w.widen.[u64](), h.widen.[u64]()];
+            _ = wl_marshal(&self.st, self.st.surface, 2_u32, 0_u64, 1_u32, 0_u32, &dmg_args);
+            let empty_a: [1]u64 = [0_u64];
+            _ = wl_marshal(&self.st, self.st.surface, 6_u32, 0_u64, 1_u32, 0_u32, &empty_a);
+            _ = call1(self.st.fn_flush, self.st.display);
+        } else {
+            _ = self; _ = rgba; _ = w; _ = h;
+        }
+    }
+
+    pub fn close(self: *mut Self) {
+        comptime if @target_os() == .Linux {
+            self.destroy_shm();
+            let empty_a: [1]u64 = [0_u64];
+            if self.st.xdg_toplevel != 0_u64 {
+                _ = wl_marshal(&self.st, self.st.xdg_toplevel, 0_u32, 0_u64, 1_u32, WL_MARSHAL_FLAG_DESTROY, &empty_a);
+                self.st.xdg_toplevel = 0_u64;
+            }
+            if self.st.xdg_surface != 0_u64 {
+                _ = wl_marshal(&self.st, self.st.xdg_surface, 0_u32, 0_u64, 1_u32, WL_MARSHAL_FLAG_DESTROY, &empty_a);
+                self.st.xdg_surface = 0_u64;
+            }
+            if self.st.surface != 0_u64 {
+                _ = wl_marshal(&self.st, self.st.surface, 0_u32, 0_u64, 1_u32, WL_MARSHAL_FLAG_DESTROY, &empty_a);
+                self.st.surface = 0_u64;
+            }
+            if self.st.pointer != 0_u64 && self.st.fn_proxy_destroy != 0_u64 {
+                _ = call1(self.st.fn_proxy_destroy, self.st.pointer);
+                self.st.pointer = 0_u64;
+            }
+            if self.st.keyboard != 0_u64 && self.st.fn_proxy_destroy != 0_u64 {
+                _ = call1(self.st.fn_proxy_destroy, self.st.keyboard);
+                self.st.keyboard = 0_u64;
+            }
+            if self.st.touch != 0_u64 && self.st.fn_proxy_destroy != 0_u64 {
+                _ = call1(self.st.fn_proxy_destroy, self.st.touch);
+                self.st.touch = 0_u64;
+            }
+            if self.st.seat != 0_u64 && self.st.fn_proxy_destroy != 0_u64 {
+                _ = call1(self.st.fn_proxy_destroy, self.st.seat);
+                self.st.seat = 0_u64;
+            }
+            if self.st.xdg_wm_base != 0_u64 {
+                _ = wl_marshal(&self.st, self.st.xdg_wm_base, 0_u32, 0_u64, 1_u32, WL_MARSHAL_FLAG_DESTROY, &empty_a);
+                self.st.xdg_wm_base = 0_u64;
+            }
+            if self.st.shm != 0_u64 && self.st.fn_proxy_destroy != 0_u64 {
+                _ = call1(self.st.fn_proxy_destroy, self.st.shm);
+                self.st.shm = 0_u64;
+            }
+            if self.st.compositor != 0_u64 && self.st.fn_proxy_destroy != 0_u64 {
+                _ = call1(self.st.fn_proxy_destroy, self.st.compositor);
+                self.st.compositor = 0_u64;
+            }
+            if self.st.registry != 0_u64 && self.st.fn_proxy_destroy != 0_u64 {
+                _ = call1(self.st.fn_proxy_destroy, self.st.registry);
+                self.st.registry = 0_u64;
+            }
+            if self.st.display != 0_u64 && self.st.fn_disconnect != 0_u64 {
+                _ = call1(self.st.fn_disconnect, self.st.display);
+                self.st.display = 0_u64;
+            }
+            if self.st.xkb_state != 0_u64 && self.st.fn_xkb_state_unref != 0_u64 {
+                _ = call1(self.st.fn_xkb_state_unref, self.st.xkb_state);
+                self.st.xkb_state = 0_u64;
+            }
+            if self.st.xkb_keymap != 0_u64 && self.st.fn_xkb_keymap_unref != 0_u64 {
+                _ = call1(self.st.fn_xkb_keymap_unref, self.st.xkb_keymap);
+                self.st.xkb_keymap = 0_u64;
+            }
+            if self.st.xkb_ctx != 0_u64 && self.st.fn_xkb_ctx_unref != 0_u64 {
+                _ = call1(self.st.fn_xkb_ctx_unref, self.st.xkb_ctx);
+                self.st.xkb_ctx = 0_u64;
+            }
+            if self.st.lib_xkb != 0_u64 {
+                raw { _ = dlclose(self.st.lib_xkb); }
+                self.st.lib_xkb = 0_u64;
+            }
+            if self.st.lib_wl != 0_u64 {
+                raw { _ = dlclose(self.st.lib_wl); }
+                self.st.lib_wl = 0_u64;
+            }
+        }
+        self.opened = false;
+    }
+}

@@ -1,0 +1,795 @@
+module eon_win.platform.win32 @hal;
+
+import eon_win.events;
+
+// ============================================================================
+// Windows Win32 Windowing & Input Adapter (`user32.dll`, `gdi32.dll`,
+// `kernel32.dll`) — Zero C Toolchain, Verified Live in Wine & Win64!
+// ============================================================================
+
+const WS_OVERLAPPEDWINDOW: u32 = 0x00CF0000_u32;
+const WS_VISIBLE: u32 = 0x10000000_u32;
+const WS_THICKFRAME: u32 = 0x00040000_u32;
+const WS_MAXIMIZEBOX: u32 = 0x00010000_u32;
+const CS_HREDRAW: u32 = 0x0002_u32;
+const CS_VREDRAW: u32 = 0x0001_u32;
+const CS_OWNDC: u32 = 0x0020_u32;
+const CW_USEDEFAULT: i32 = -2147483648_i32;
+const SW_SHOW: i32 = 5_i32;
+const PM_REMOVE: u32 = 0x0001_u32;
+const GWLP_USERDATA: i32 = -21_i32;
+const CF_UNICODETEXT: u32 = 13_u32;
+const GMEM_MOVEABLE: u32 = 0x0002_u32;
+const DIB_RGB_COLORS: u32 = 0_u32;
+const SRCCOPY: u32 = 0x00CC0020_u32;
+const BI_RGB: u32 = 0_u32;
+
+const WM_DESTROY: u32 = 0x0002_u32;
+const WM_SIZE: u32 = 0x0005_u32;
+const WM_SETFOCUS: u32 = 0x0007_u32;
+const WM_KILLFOCUS: u32 = 0x0008_u32;
+const WM_PAINT: u32 = 0x000F_u32;
+const WM_CLOSE: u32 = 0x0010_u32;
+const WM_QUIT: u32 = 0x0012_u32;
+const WM_NCCREATE: u32 = 0x0081_u32;
+const WM_KEYDOWN: u32 = 0x0100_u32;
+const WM_KEYUP: u32 = 0x0101_u32;
+const WM_CHAR: u32 = 0x0102_u32;
+const WM_SYSKEYDOWN: u32 = 0x0104_u32;
+const WM_SYSKEYUP: u32 = 0x0105_u32;
+const WM_MOUSEMOVE: u32 = 0x0200_u32;
+const WM_LBUTTONDOWN: u32 = 0x0201_u32;
+const WM_LBUTTONUP: u32 = 0x0202_u32;
+const WM_RBUTTONDOWN: u32 = 0x0204_u32;
+const WM_RBUTTONUP: u32 = 0x0205_u32;
+const WM_MBUTTONDOWN: u32 = 0x0207_u32;
+const WM_MBUTTONUP: u32 = 0x0208_u32;
+const WM_MOUSEWHEEL: u32 = 0x020A_u32;
+const WM_DPICHANGED: u32 = 0x02E0_u32;
+
+const VK_SHIFT: i32 = 0x10_i32;
+const VK_CONTROL: i32 = 0x11_i32;
+const VK_MENU: i32 = 0x12_i32;
+
+const IDC_ARROW: u64 = 32512_u64;
+const IDC_IBEAM: u64 = 32513_u64;
+const IDC_SIZEWE: u64 = 32644_u64;
+const IDC_SIZENS: u64 = 32645_u64;
+const IDC_NO: u64 = 32648_u64;
+const IDC_HAND: u64 = 32649_u64;
+
+@layout(c)
+struct WndClassExW {
+    cb_size: u32;
+    style: u32;
+    lpfn_wnd_proc: u64;
+    cb_cls_extra: i32;
+    cb_wnd_extra: i32;
+    h_instance: u64;
+    h_icon: u64;
+    h_cursor: u64;
+    hbr_background: u64;
+    lpsz_menu_name: u64;
+    lpsz_class_name: u64;
+    h_icon_sm: u64;
+}
+
+@layout(c)
+struct WinPoint {
+    x: i32;
+    y: i32;
+}
+
+@layout(c)
+struct WinRect {
+    left: i32;
+    top: i32;
+    right: i32;
+    bottom: i32;
+}
+
+@layout(c)
+struct WinMsg {
+    hwnd: u64;
+    message: u32;
+    _pad0: u32;
+    wparam: u64;
+    lparam: i64;
+    time: u32;
+    pt: WinPoint;
+    _pad1: u32;
+}
+
+@layout(c)
+struct PaintStruct {
+    hdc: u64;
+    f_erase: i32;
+    rc_paint: WinRect;
+    f_restore: i32;
+    f_inc_update: i32;
+    rgb_reserved: [32]u8;
+}
+
+@layout(c)
+struct BitmapInfoHeader {
+    bi_size: u32;
+    bi_width: i32;
+    bi_height: i32;
+    bi_planes: u16;
+    bi_bit_count: u16;
+    bi_compression: u32;
+    bi_size_image: u32;
+    bi_xpels_per_meter: i32;
+    bi_ypels_per_meter: i32;
+    bi_clr_used: u32;
+    bi_clr_important: u32;
+}
+
+extern "C" fn GetModuleHandleW(name: u64) -> u64;
+extern "C" fn RegisterClassExW(wc: *WndClassExW) -> u16;
+extern "C" fn CreateWindowExW(
+    ex_style: u32,
+    class_name: u64,
+    window_name: u64,
+    style: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    parent: u64,
+    menu: u64,
+    hinst: u64,
+    param: u64,
+) -> u64;
+extern "C" fn DestroyWindow(hwnd: u64) -> i32;
+extern "C" fn ShowWindow(hwnd: u64, cmd: i32) -> i32;
+extern "C" fn UpdateWindow(hwnd: u64) -> i32;
+extern "C" fn DefWindowProcW(hwnd: u64, msg: u32, wp: u64, lp: i64) -> i64;
+extern "C" fn PeekMessageW(msg: *mut WinMsg, hwnd: u64, fmin: u32, fmax: u32, rem: u32) -> i32;
+extern "C" fn TranslateMessage(msg: *WinMsg) -> i32;
+extern "C" fn DispatchMessageW(msg: *WinMsg) -> i64;
+extern "C" fn PostQuitMessage(code: i32);
+extern "C" fn SetWindowLongPtrW(hwnd: u64, idx: i32, val: i64) -> i64;
+extern "C" fn GetWindowLongPtrW(hwnd: u64, idx: i32) -> i64;
+extern "C" fn GetClientRect(hwnd: u64, rc: *mut WinRect) -> i32;
+extern "C" fn AdjustWindowRectEx(rc: *mut WinRect, style: u32, menu: i32, ex_style: u32) -> i32;
+extern "C" fn SetWindowTextW(hwnd: u64, text: u64) -> i32;
+extern "C" fn InvalidateRect(hwnd: u64, rc: u64, erase: i32) -> i32;
+extern "C" fn BeginPaint(hwnd: u64, ps: *mut PaintStruct) -> u64;
+extern "C" fn EndPaint(hwnd: u64, ps: *PaintStruct) -> i32;
+extern "C" fn GetDC(hwnd: u64) -> u64;
+extern "C" fn ReleaseDC(hwnd: u64, hdc: u64) -> i32;
+extern "C" fn LoadCursorW(hinst: u64, name: u64) -> u64;
+extern "C" fn SetCursor(hcur: u64) -> u64;
+extern "C" fn GetKeyState(vk: i32) -> i16;
+extern "C" fn SetProcessDpiAwarenessContext(ctx: i64) -> i32;
+extern "C" fn GetDpiForWindow(hwnd: u64) -> u32;
+extern "C" fn OpenClipboard(hwnd: u64) -> i32;
+extern "C" fn CloseClipboard() -> i32;
+extern "C" fn EmptyClipboard() -> i32;
+extern "C" fn GetClipboardData(fmt: u32) -> u64;
+extern "C" fn SetClipboardData(fmt: u32, hmem: u64) -> u64;
+extern "C" fn GlobalAlloc(flags: u32, bytes: usize) -> u64;
+extern "C" fn GlobalLock(hmem: u64) -> u64;
+extern "C" fn GlobalUnlock(hmem: u64) -> i32;
+extern "C" fn StretchDIBits(
+    hdc: u64,
+    xd: i32,
+    yd: i32,
+    wd: i32,
+    hd: i32,
+    xs: i32,
+    ys: i32,
+    ws: i32,
+    hs: i32,
+    bits: u64,
+    bmi: *BitmapInfoHeader,
+    usage: u32,
+    rop: u32,
+) -> i32;
+
+@naked
+pub fn u16_slice_addr(_s: *[u16]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn u8_slice_addr(_s: *[u8]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn state_mut_addr(_p: *mut Win32State) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn wndproc_fn_addr(_f: fn(u64, u32, u64, i64) -> i64) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+pub fn utf8_to_utf16_z(src: *[u8], dst: *mut [u16]) -> usize {
+    if dst.len == 0_usize {
+        return 0_usize;
+    }
+    let lim = dst.len - 1_usize;
+    var di: usize = 0_usize;
+    var si: usize = 0_usize;
+    while si < src.len && di < lim {
+        let b = src[si];
+        if b < 0x80_u8 {
+            dst[di] = b.widen.[u16]();
+            di = di +% 1_usize;
+            si = si +% 1_usize;
+        } else if (b & 0xE0_u8) == 0xC0_u8 && si +% 1_usize < src.len {
+            let cp = (((b & 0x1F_u8).widen.[u16]()) << 6_u16) | (src[si +% 1_usize] & 0x3F_u8).widen.[u16]();
+            dst[di] = cp;
+            di = di +% 1_usize;
+            si = si +% 2_usize;
+        } else if (b & 0xF0_u8) == 0xE0_u8 && si +% 2_usize < src.len {
+            let cp = (((b & 0x0F_u8).widen.[u16]()) << 12_u16)
+                | (((src[si +% 1_usize] & 0x3F_u8).widen.[u16]()) << 6_u16)
+                | (src[si +% 2_usize] & 0x3F_u8).widen.[u16]();
+            dst[di] = cp;
+            di = di +% 1_usize;
+            si = si +% 3_usize;
+        } else {
+            dst[di] = b'?'.widen.[u16]();
+            di = di +% 1_usize;
+            si = si +% 1_usize;
+        }
+    }
+    if di < dst.len {
+        dst[di] = 0_u16;
+    }
+    return di;
+}
+
+pub struct Win32State {
+    pub hwnd: u64;
+    pub hinstance: u64;
+    pub width: u32;
+    pub height: u32;
+    pub scale_factor: f32;
+    pub should_close: bool;
+    pub queue_ptr: u64;
+}
+
+@naked
+pub fn queue_mut_ptr(_q: *mut events.EventQueue) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+pub fn push_ev(qp: u64, ev: events.PlatformEvent) {
+    if qp != 0_u64 {
+        raw {
+            let q = rawptr_mut.[events.EventQueue].from_usize(qp.trunc.[usize]());
+            q.*.push(ev);
+        }
+    }
+}
+
+pub fn query_win32_mods() -> events.Modifiers {
+    comptime if @target_os() == .Windows {
+        var bits: u8 = 0_u8;
+        raw {
+            if (GetKeyState(VK_SHIFT) & (-32768_i16)) != 0_i16 { bits = bits | events.MOD_SHIFT; }
+            if (GetKeyState(VK_CONTROL) & (-32768_i16)) != 0_i16 { bits = bits | events.MOD_CTRL; }
+            if (GetKeyState(VK_MENU) & (-32768_i16)) != 0_i16 { bits = bits | events.MOD_ALT; }
+        }
+        return events.Modifiers.from_bits(bits);
+    } else {
+        return events.Modifiers.none();
+    }
+}
+
+@inline
+pub fn lo_i16(lp: i64) -> f32 {
+    let v = (lp & 0xFFFF_i64).trunc.[i16]();
+    return v.widen.[i32]().to_float.[f32]();
+}
+
+@inline
+pub fn hi_i16(lp: i64) -> f32 {
+    let v = ((lp >> 16_i64) & 0xFFFF_i64).trunc.[i16]();
+    return v.widen.[i32]().to_float.[f32]();
+}
+
+@extern("C")
+pub fn eon_win32_wndproc(hwnd: u64, msg: u32, wp: u64, lp: i64) -> i64 {
+    comptime if @target_os() == .Windows {
+        if msg == WM_NCCREATE {
+            raw {
+                // First field of CREATESTRUCTW is `lpCreateParams` (offset 0).
+                let cs_ptr = rawptr.[u64].from_usize(lp.bitcast.[u64]().trunc.[usize]());
+                let state_ptr = cs_ptr.*;
+                _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr.bitcast.[i64]());
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
+        }
+        var raw_st: i64 = 0_i64;
+        raw {
+            raw_st = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+        }
+        if raw_st != 0_i64 {
+            raw {
+                let st = rawptr_mut.[Win32State].from_usize(raw_st.bitcast.[u64]().trunc.[usize]());
+                if msg == WM_CLOSE {
+                    st.*.should_close = true;
+                    push_ev(st.*.queue_ptr, .CloseRequested);
+                    return 0_i64;
+                }
+                if msg == WM_DESTROY {
+                    st.*.should_close = true;
+                    PostQuitMessage(0_i32);
+                    return 0_i64;
+                }
+                if msg == WM_SIZE {
+                    let nw = (lp & 0xFFFF_i64).bitcast.[u64]().trunc.[u32]();
+                    let nh = ((lp >> 16_i64) & 0xFFFF_i64).bitcast.[u64]().trunc.[u32]();
+                    if nw > 0_u32 && nh > 0_u32 {
+                        st.*.width = nw;
+                        st.*.height = nh;
+                        push_ev(st.*.queue_ptr, .Resized(events.WindowSize.{ width: nw, height: nh }));
+                    }
+                    return 0_i64;
+                }
+                if msg == WM_DPICHANGED {
+                    let dpi = (wp & 0xFFFF_u64).trunc.[u32]();
+                    if dpi >= 48_u32 {
+                        let sc = dpi.to_float.[f32]() / 96.0_f32;
+                        st.*.scale_factor = sc;
+                        push_ev(st.*.queue_ptr, .ScaleFactorChanged(sc));
+                    }
+                    return 0_i64;
+                }
+                if msg == WM_PAINT {
+                    var ps = PaintStruct.{
+                        hdc: 0_u64,
+                        f_erase: 0_i32,
+                        rc_paint: WinRect.{ left: 0_i32, top: 0_i32, right: 0_i32, bottom: 0_i32 },
+                        f_restore: 0_i32,
+                        f_inc_update: 0_i32,
+                        rgb_reserved: [0_u8; 32],
+                    };
+                    _ = BeginPaint(hwnd, &mut ps);
+                    _ = EndPaint(hwnd, &ps);
+                    push_ev(st.*.queue_ptr, .RedrawRequested);
+                    return 0_i64;
+                }
+                if msg == WM_SETFOCUS {
+                    push_ev(st.*.queue_ptr, .FocusChanged(true));
+                    return 0_i64;
+                }
+                if msg == WM_KILLFOCUS {
+                    push_ev(st.*.queue_ptr, .FocusChanged(false));
+                    return 0_i64;
+                }
+                if msg == WM_MOUSEMOVE {
+                    let mods = query_win32_mods();
+                    push_ev(st.*.queue_ptr, .MouseMove(events.MouseMoveEvent.{ x: lo_i16(lp), y: hi_i16(lp), mods: mods }));
+                    return 0_i64;
+                }
+                if msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN {
+                    let btn: events.MouseButton = if msg == WM_LBUTTONDOWN { .Left } else if msg == WM_RBUTTONDOWN { .Right } else { .Middle };
+                    push_ev(st.*.queue_ptr, .MouseDown(events.MouseButtonEvent.{ button: btn, x: lo_i16(lp), y: hi_i16(lp), click_count: 1_u8, mods: query_win32_mods() }));
+                    return 0_i64;
+                }
+                if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP {
+                    let btn: events.MouseButton = if msg == WM_LBUTTONUP { .Left } else if msg == WM_RBUTTONUP { .Right } else { .Middle };
+                    push_ev(st.*.queue_ptr, .MouseUp(events.MouseButtonEvent.{ button: btn, x: lo_i16(lp), y: hi_i16(lp), click_count: 0_u8, mods: query_win32_mods() }));
+                    return 0_i64;
+                }
+                if msg == WM_MOUSEWHEEL {
+                    let delta_i = ((wp >> 16_u64) & 0xFFFF_u64).trunc.[u16]().bitcast.[i16]();
+                    let dy = delta_i.widen.[i32]().to_float.[f32]() / 120.0_f32 * 36.0_f32;
+                    push_ev(st.*.queue_ptr, .MouseWheel(events.MouseWheelEvent.{ dx: 0.0_f32, dy: dy, x: lo_i16(lp), y: hi_i16(lp), mods: query_win32_mods() }));
+                    return 0_i64;
+                }
+                if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
+                    let key = events.key_from_vk((wp & 0xFFFF_u64).trunc.[u32]());
+                    let sc = ((lp >> 16_i64) & 0xFF_i64).bitcast.[u64]().trunc.[u32]();
+                    let rep = ((lp >> 30_i64) & 1_i64) != 0_i64;
+                    push_ev(st.*.queue_ptr, .KeyDown(events.KeyEvent.{ key: key, scancode: sc, repeat: rep, mods: query_win32_mods() }));
+                    return 0_i64;
+                }
+                if msg == WM_KEYUP || msg == WM_SYSKEYUP {
+                    let key = events.key_from_vk((wp & 0xFFFF_u64).trunc.[u32]());
+                    let sc = ((lp >> 16_i64) & 0xFF_i64).bitcast.[u64]().trunc.[u32]();
+                    push_ev(st.*.queue_ptr, .KeyUp(events.KeyEvent.{ key: key, scancode: sc, repeat: false, mods: query_win32_mods() }));
+                    return 0_i64;
+                }
+                if msg == WM_CHAR {
+                    let ch = (wp & 0xFFFF_u64).trunc.[u32]();
+                    if ch >= 0x20_u32 && ch != 0x7F_u32 {
+                        push_ev(st.*.queue_ptr, .TextInput(ch));
+                    }
+                    return 0_i64;
+                }
+            }
+        }
+        raw {
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+    } else {
+        _ = hwnd;
+        _ = msg;
+        _ = wp;
+        _ = lp;
+        return 0_i64;
+    }
+}
+
+pub struct Win32Window {
+    pub state: Win32State;
+    pub opened: bool;
+}
+
+impl Win32Window {
+    pub fn empty() -> Win32Window {
+        return Win32Window.{
+            state: Win32State.{
+                hwnd: 0_u64,
+                hinstance: 0_u64,
+                width: 0_u32,
+                height: 0_u32,
+                scale_factor: 1.0_f32,
+                should_close: false,
+                queue_ptr: 0_u64,
+            },
+            opened: false,
+        };
+    }
+
+    pub fn open_into(self: *mut Self, opts: *events.WindowOptions) -> bool {
+        self.state.width = opts.width;
+        self.state.height = opts.height;
+        self.state.scale_factor = 1.0_f32;
+        self.state.should_close = false;
+        comptime if @target_os() == .Windows {
+            var cls_w: [32]u16 = [0_u16; 32];
+            var title_w: [256]u16 = [0_u16; 256];
+            _ = utf8_to_utf16_z("EonWin32Window".as_bytes(), &mut cls_w);
+            _ = utf8_to_utf16_z(opts.title_bytes(), &mut title_w);
+            raw {
+                // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+                _ = SetProcessDpiAwarenessContext(-4_i64);
+                let hinst = GetModuleHandleW(0_u64);
+                self.state.hinstance = hinst;
+                let wc = WndClassExW.{
+                    cb_size: 80_u32,
+                    style: CS_HREDRAW | CS_VREDRAW | CS_OWNDC,
+                    lpfn_wnd_proc: wndproc_fn_addr(eon_win32_wndproc),
+                    cb_cls_extra: 0_i32,
+                    cb_wnd_extra: 0_i32,
+                    h_instance: hinst,
+                    h_icon: 0_u64,
+                    h_cursor: LoadCursorW(0_u64, IDC_ARROW),
+                    hbr_background: 0_u64,
+                    lpsz_menu_name: 0_u64,
+                    lpsz_class_name: u16_slice_addr(&cls_w),
+                    h_icon_sm: 0_u64,
+                };
+                _ = RegisterClassExW(&wc);
+                var style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+                if !opts.resizable {
+                    style = style & (~(WS_THICKFRAME | WS_MAXIMIZEBOX));
+                }
+                var rc = WinRect.{
+                    left: 0_i32,
+                    top: 0_i32,
+                    right: opts.width.bitcast.[i32](),
+                    bottom: opts.height.bitcast.[i32](),
+                };
+                _ = AdjustWindowRectEx(&mut rc, style, 0_i32, 0_u32);
+                let win_w = rc.right -% rc.left;
+                let win_h = rc.bottom -% rc.top;
+                let hwnd = CreateWindowExW(
+                    0_u32,
+                    u16_slice_addr(&cls_w),
+                    u16_slice_addr(&title_w),
+                    style,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    win_w,
+                    win_h,
+                    0_u64,
+                    0_u64,
+                    hinst,
+                    state_mut_addr(&mut self.state),
+                );
+                if hwnd == 0_u64 {
+                    return false;
+                }
+                self.state.hwnd = hwnd;
+                let dpi = GetDpiForWindow(hwnd);
+                if dpi >= 48_u32 {
+                    self.state.scale_factor = dpi.to_float.[f32]() / 96.0_f32;
+                }
+                _ = ShowWindow(hwnd, SW_SHOW);
+                _ = UpdateWindow(hwnd);
+            }
+            self.opened = true;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    pub fn surface_info(self: *Self) -> events.SurfaceInfo {
+        return events.SurfaceInfo.{
+            kind: .Win32,
+            display_handle: self.state.hinstance,
+            window_handle: self.state.hwnd,
+            extra_handle: 0_u64,
+            width: self.state.width,
+            height: self.state.height,
+            scale_factor: self.state.scale_factor,
+            fb_base_addr: 0_u64,
+            fb_pitch_bytes: 0_u32,
+            fb_is_bgr: true,
+        };
+    }
+
+    pub fn poll_events(self: *mut Self, out_q: *mut events.EventQueue) {
+        comptime if @target_os() == .Windows {
+            if !self.opened || self.state.hwnd == 0_u64 {
+                return;
+            }
+            var msg = WinMsg.{
+                hwnd: 0_u64,
+                message: 0_u32,
+                _pad0: 0_u32,
+                wparam: 0_u64,
+                lparam: 0_i64,
+                time: 0_u32,
+                pt: WinPoint.{ x: 0_i32, y: 0_i32 },
+                _pad1: 0_u32,
+            };
+            self.state.queue_ptr = queue_mut_ptr(out_q);
+            var guard: u32 = 0_u32;
+            while guard < 128_u32 {
+                var got: i32 = 0_i32;
+                raw {
+                    got = PeekMessageW(&mut msg, 0_u64, 0_u32, 0_u32, PM_REMOVE);
+                }
+                if got == 0_i32 {
+                    break;
+                }
+                if msg.message == WM_QUIT {
+                    self.state.should_close = true;
+                    out_q.push(.CloseRequested);
+                    break;
+                }
+                raw {
+                    _ = TranslateMessage(&msg);
+                    _ = DispatchMessageW(&msg);
+                }
+                guard = guard +% 1_u32;
+            }
+            self.state.queue_ptr = 0_u64;
+        } else {
+            _ = self;
+            _ = out_q;
+        }
+    }
+
+    pub fn set_title(self: *mut Self, title: *str) {
+        comptime if @target_os() == .Windows {
+            if self.state.hwnd == 0_u64 { return; }
+            var title_w: [256]u16 = [0_u16; 256];
+            _ = utf8_to_utf16_z(title.as_bytes(), &mut title_w);
+            raw { _ = SetWindowTextW(self.state.hwnd, u16_slice_addr(&title_w)); }
+        } else {
+            _ = self;
+            _ = title;
+        }
+    }
+
+    pub fn set_cursor(self: *mut Self, shape: events.CursorShape) {
+        comptime if @target_os() == .Windows {
+            if self.state.hwnd == 0_u64 { return; }
+            let id: u64 = match shape {
+                .Default => IDC_ARROW,
+                .Pointer => IDC_HAND,
+                .Text => IDC_IBEAM,
+                .Grab => IDC_HAND,
+                .Grabbing => IDC_HAND,
+                .NotAllowed => IDC_NO,
+                .ResizeEW => IDC_SIZEWE,
+                .ResizeNS => IDC_SIZENS,
+            };
+            raw {
+                let hc = LoadCursorW(0_u64, id);
+                if hc != 0_u64 { _ = SetCursor(hc); }
+            }
+        } else {
+            _ = self;
+            _ = shape;
+        }
+    }
+
+    pub fn request_redraw(self: *mut Self) {
+        comptime if @target_os() == .Windows {
+            if self.state.hwnd != 0_u64 {
+                raw { _ = InvalidateRect(self.state.hwnd, 0_u64, 0_i32); }
+            }
+        } else {
+            _ = self;
+        }
+    }
+
+    pub fn clipboard_set(self: *mut Self, text: *[u8]) -> bool {
+        comptime if @target_os() == .Windows {
+            var wide: [2048]u16 = [0_u16; 2048];
+            let n = utf8_to_utf16_z(text, &mut wide);
+            let bytes = (n +% 1_usize) *% 2_usize;
+            raw {
+                if OpenClipboard(self.state.hwnd) == 0_i32 { return false; }
+                _ = EmptyClipboard();
+                let hmem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+                if hmem == 0_u64 { _ = CloseClipboard(); return false; }
+                let dst = GlobalLock(hmem);
+                if dst != 0_u64 {
+                    var i: usize = 0_usize;
+                    while i <= n && i < 2048_usize {
+                        let p = rawptr_mut.[u16].from_usize((dst +% (i *% 2_usize).widen.[u64]()).trunc.[usize]());
+                        p.* = wide[i];
+                        i = i +% 1_usize;
+                    }
+                    _ = GlobalUnlock(hmem);
+                    _ = SetClipboardData(CF_UNICODETEXT, hmem);
+                }
+                _ = CloseClipboard();
+            }
+            return true;
+        } else {
+            _ = self;
+            _ = text;
+            return false;
+        }
+    }
+
+    pub fn clipboard_get(self: *mut Self, dst: *mut events.ClipboardBuf) -> bool {
+        dst.clear();
+        comptime if @target_os() == .Windows {
+            raw {
+                if OpenClipboard(self.state.hwnd) == 0_i32 { return false; }
+                let hmem = GetClipboardData(CF_UNICODETEXT);
+                if hmem == 0_u64 { _ = CloseClipboard(); return false; }
+                let src = GlobalLock(hmem);
+                if src != 0_u64 {
+                    var out_len: usize = 0_usize;
+                    var i: usize = 0_usize;
+                    while i < 512_usize && out_len < 508_usize {
+                        let ch = rawptr.[u16].from_usize((src +% (i *% 2_usize).widen.[u64]()).trunc.[usize]()).*;
+                        if ch == 0_u16 { break; }
+                        if ch < 0x80_u16 {
+                            dst.data[out_len] = ch.trunc.[u8]();
+                            out_len = out_len +% 1_usize;
+                        } else if ch < 0x800_u16 {
+                            dst.data[out_len] = (0xC0_u16 | (ch >> 6_u16)).trunc.[u8]();
+                            dst.data[out_len +% 1_usize] = (0x80_u16 | (ch & 0x3F_u16)).trunc.[u8]();
+                            out_len = out_len +% 2_usize;
+                        } else {
+                            dst.data[out_len] = (0xE0_u16 | (ch >> 12_u16)).trunc.[u8]();
+                            dst.data[out_len +% 1_usize] = (0x80_u16 | ((ch >> 6_u16) & 0x3F_u16)).trunc.[u8]();
+                            dst.data[out_len +% 2_usize] = (0x80_u16 | (ch & 0x3F_u16)).trunc.[u8]();
+                            out_len = out_len +% 3_usize;
+                        }
+                        i = i +% 1_usize;
+                    }
+                    dst.len = out_len;
+                    _ = GlobalUnlock(hmem);
+                }
+                _ = CloseClipboard();
+            }
+            return dst.len > 0_usize;
+        } else {
+            _ = self;
+            return false;
+        }
+    }
+
+    /// Blit RGBA8 software buffer to the Win32 window client area via GDI `StretchDIBits` (row-wise BGRA swap).
+    pub fn present_rgba8(self: *mut Self, rgba: *[u8], w: u32, h: u32) {
+        comptime if @target_os() == .Windows {
+            if !self.opened || self.state.hwnd == 0_u64 || w == 0_u32 || h == 0_u32 {
+                return;
+            }
+            let row_w: u32 = if w <= 1024_u32 { w } else { 1024_u32 };
+            let bmi = BitmapInfoHeader.{
+                bi_size: 40_u32,
+                bi_width: row_w.bitcast.[i32](),
+                bi_height: -1_i32,
+                bi_planes: 1_u16,
+                bi_bit_count: 32_u16,
+                bi_compression: BI_RGB,
+                bi_size_image: 0_u32,
+                bi_xpels_per_meter: 0_i32,
+                bi_ypels_per_meter: 0_i32,
+                bi_clr_used: 0_u32,
+                bi_clr_important: 0_u32,
+            };
+            var bgra_row: [4096]u8 = [0_u8; 4096];
+            raw {
+                let hdc = GetDC(self.state.hwnd);
+                if hdc != 0_u64 {
+                    var y: u32 = 0_u32;
+                    while y < h {
+                        let base = (y *% w).widen.[usize]() *% 4_usize;
+                        var x: u32 = 0_u32;
+                        while x < row_w {
+                            let si = base +% x.widen.[usize]() *% 4_usize;
+                            let di = x.widen.[usize]() *% 4_usize;
+                            if rgba.len >= 4_usize && si <= rgba.len - 4_usize && di <= 4092_usize {
+                                bgra_row[di] = rgba[si + 2_usize];
+                                bgra_row[di + 1_usize] = rgba[si + 1_usize];
+                                bgra_row[di + 2_usize] = rgba[si];
+                                bgra_row[di + 3_usize] = rgba[si + 3_usize];
+                            }
+                            x = x +% 1_u32;
+                        }
+                        _ = StretchDIBits(
+                            hdc,
+                            0_i32,
+                            y.bitcast.[i32](),
+                            row_w.bitcast.[i32](),
+                            1_i32,
+                            0_i32,
+                            0_i32,
+                            row_w.bitcast.[i32](),
+                            1_i32,
+                            u8_slice_addr(&bgra_row),
+                            &bmi,
+                            DIB_RGB_COLORS,
+                            SRCCOPY,
+                        );
+                        y = y +% 1_u32;
+                    }
+                    _ = ReleaseDC(self.state.hwnd, hdc);
+                }
+            }
+        } else {
+            _ = self;
+            _ = rgba;
+            _ = w;
+            _ = h;
+        }
+    }
+
+    pub fn close(self: *mut Self) {
+        comptime if @target_os() == .Windows {
+            if self.state.hwnd != 0_u64 {
+                raw { _ = DestroyWindow(self.state.hwnd); }
+                self.state.hwnd = 0_u64;
+            }
+        }
+        self.opened = false;
+    }
+}
