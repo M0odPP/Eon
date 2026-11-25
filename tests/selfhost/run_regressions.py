@@ -493,6 +493,207 @@ def test_m11_opt_and_dbm(eonc: str):
     print("[PASS] M1.1 optimizer, -Oz, linker GC+ICF, and DBM ergonomics")
 
 
+def test_m12_deps_lock_and_impl_cutoff(eonc: str):
+    """Verify M1.2: multi-package build.eon deps, deterministic eon.lock, .emi libs,
+    per-package allow_hal enforcement, cycle detection, and item-level impl method .emi diff."""
+    with tempfile.TemporaryDirectory(prefix="eon_m12_reg_") as td:
+        td_p = Path(td)
+
+        # 1. Multi-package transitive graph: app -> mathlib -> coreutil + .emi library build
+        (td_p / "coreutil" / "src").mkdir(parents=True)
+        (td_p / "coreutil" / "build.eon").write_text(
+            "module coreutil.build;\n"
+            "pub fn build(b: *mut BuildCap) {\n"
+            "    b.set_out_dir(\"out\");\n"
+            "    b.add_lib(\"coreutil\", \"src\");\n"
+            "}\n"
+        )
+        (td_p / "coreutil" / "src" / "util.eon").write_text(
+            "module coreutil.util;\n"
+            "pub fn base_val() -> i32 { return 10_i32; }\n"
+        )
+
+        (td_p / "mathlib" / "src").mkdir(parents=True)
+        (td_p / "mathlib" / "build.eon").write_text(
+            "module mathlib.build;\n"
+            "pub fn build(b: *mut BuildCap) {\n"
+            "    b.set_out_dir(\"out\");\n"
+            "    b.add_dep(\"coreutil\", \"../coreutil\");\n"
+            "    b.add_lib(\"mathlib\", \"src\");\n"
+            "}\n"
+        )
+        (td_p / "mathlib" / "src" / "math.eon").write_text(
+            "module mathlib.math;\n"
+            "import coreutil.util;\n"
+            "pub fn compute() -> i32 { return util.base_val() +% 32_i32; }\n"
+        )
+
+        (td_p / "app" / "src").mkdir(parents=True)
+        (td_p / "app" / "build.eon").write_text(
+            "module app.build;\n"
+            "pub fn build(b: *mut BuildCap) {\n"
+            "    b.set_out_dir(\"out\");\n"
+            "    b.add_dep(\"mathlib\", \"../mathlib\");\n"
+            "    b.add_exe(\"app\", \"src\");\n"
+            "}\n"
+        )
+        (td_p / "app" / "src" / "main.eon").write_text(
+            "module app.main;\n"
+            "import mathlib.math;\n"
+            "pub fn main() -> i32 {\n"
+            "    return if math.compute() == 42_i32 { 0_i32 } else { 1_i32 };\n"
+            "}\n"
+        )
+
+        # Build .emi library directly
+        r_lib = run_cmd([eonc, "build", "--release", str(td_p / "mathlib")], cwd=td_p)
+        assert r_lib.returncode == 0, f"mathlib .emi build failed:\n{r_lib.stdout}\n{r_lib.stderr}"
+        emi_file = td_p / "mathlib" / "out" / "mathlib.emi"
+        assert emi_file.exists(), "expected mathlib/out/mathlib.emi"
+        assert emi_file.read_bytes()[:4] == b"EOMI", "mathlib.emi missing EOMI magic header"
+
+        # Build app with transitive deps and deterministic eon.lock
+        r_app1 = run_cmd([eonc, "build", "--release", str(td_p / "app")], cwd=td_p)
+        assert r_app1.returncode == 0, f"app build failed:\n{r_app1.stdout}\n{r_app1.stderr}"
+        assert subprocess.run([str(td_p / "app" / "out" / "app")]).returncode == 0
+        lock_file = td_p / "app" / "eon.lock"
+        assert lock_file.exists(), "expected app/eon.lock to be generated"
+        lock1 = lock_file.read_text()
+        assert 'name = "coreutil"' in lock1 and 'name = "mathlib"' in lock1, f"unexpected eon.lock:\n{lock1}"
+        assert lock1.index('name = "coreutil"') < lock1.index('name = "mathlib"'), "eon.lock entries not sorted"
+
+        r_app2 = run_cmd([eonc, "build", "--release", str(td_p / "app")], cwd=td_p)
+        assert r_app2.returncode == 0, f"app rebuild failed:\n{r_app2.stderr}"
+        lock2 = lock_file.read_text()
+        assert lock1 == lock2, "eon.lock is not deterministic across repeated builds"
+
+        # 2. Per-package allow_hal enforcement (cannot escalate @hal without root build.eon approval)
+        (td_p / "haldep" / "src").mkdir(parents=True)
+        (td_p / "haldep" / "build.eon").write_text(
+            "module haldep.build;\n"
+            "pub fn build(b: *mut BuildCap) {\n"
+            "    b.allow_hal(\"haldep.hw\");\n"
+            "    b.add_lib(\"haldep\", \"src\");\n"
+            "}\n"
+        )
+        (td_p / "haldep" / "src" / "hw.hal.eon").write_text(
+            "module haldep.hw @hal;\n"
+            "pub fn ping() -> i32 { return 7_i32; }\n"
+        )
+        (td_p / "halroot" / "src").mkdir(parents=True)
+        (td_p / "halroot" / "src" / "main.eon").write_text(
+            "module halroot.main;\n"
+            "import haldep.hw;\n"
+            "pub fn main() -> i32 { return if hw.ping() == 7_i32 { 0_i32 } else { 1_i32 }; }\n"
+        )
+        (td_p / "halroot" / "build.eon").write_text(
+            "module halroot.build;\n"
+            "pub fn build(b: *mut BuildCap) {\n"
+            "    b.add_dep(\"haldep\", \"../haldep\");\n"
+            "    b.add_exe(\"halroot\", \"src\");\n"
+            "}\n"
+        )
+        r_deny = run_cmd([eonc, "build", "--release", str(td_p / "halroot")], cwd=td_p)
+        assert r_deny.returncode != 0 and "not authorized in root build.eon" in (r_deny.stdout + r_deny.stderr), (
+            f"Expected allow_hal escalation rejection, got rc={r_deny.returncode}:\n{r_deny.stdout}\n{r_deny.stderr}"
+        )
+
+        # Grant explicit allow_hal in root build.eon -> MUST succeed
+        (td_p / "halroot" / "build.eon").write_text(
+            "module halroot.build;\n"
+            "pub fn build(b: *mut BuildCap) {\n"
+            "    b.allow_hal(\"haldep.hw\");\n"
+            "    b.add_dep(\"haldep\", \"../haldep\");\n"
+            "    b.add_exe(\"halroot\", \"src\");\n"
+            "}\n"
+        )
+        r_allow = run_cmd([eonc, "build", "--release", str(td_p / "halroot")], cwd=td_p)
+        assert r_allow.returncode == 0, f"Authorized halroot build failed:\n{r_allow.stdout}\n{r_allow.stderr}"
+        assert subprocess.run([str(td_p / "halroot" / "out" / "halroot")]).returncode == 0
+
+        # 3. Dependency cycle detection
+        (td_p / "cyca" / "src").mkdir(parents=True)
+        (td_p / "cycb" / "src").mkdir(parents=True)
+        (td_p / "cyca" / "build.eon").write_text(
+            "module cyca.build;\n"
+            "pub fn build(b: *mut BuildCap) { b.add_dep(\"cycb\", \"../cycb\"); b.add_exe(\"cyca\", \"src\"); }\n"
+        )
+        (td_p / "cycb" / "build.eon").write_text(
+            "module cycb.build;\n"
+            "pub fn build(b: *mut BuildCap) { b.add_dep(\"cyca\", \"../cyca\"); b.add_lib(\"cycb\", \"src\"); }\n"
+        )
+        (td_p / "cyca" / "src" / "main.eon").write_text("module cyca.main;\npub fn main() -> i32 { return 0_i32; }\n")
+        (td_p / "cycb" / "src" / "lib.eon").write_text("module cycb.lib;\npub fn f() -> i32 { return 1_i32; }\n")
+        r_cyc = run_cmd([eonc, "build", "--release", str(td_p / "cyca")], cwd=td_p)
+        assert r_cyc.returncode != 0 and "dependency cycle" in (r_cyc.stdout + r_cyc.stderr), (
+            f"Expected dependency cycle error, got rc={r_cyc.returncode}:\n{r_cyc.stdout}\n{r_cyc.stderr}"
+        )
+
+        # 4. Item-level impl method .emi stub diff
+        impl_dir = td_p / "impl_inc"
+        impl_dir.mkdir()
+        ctr_path = impl_dir / "ctr.eon"
+        main_path = impl_dir / "main.eon"
+        cache_dir = impl_dir / "cache"
+        out_bin = impl_dir / "ctr_app"
+        ctr_path.write_text(
+            "module inc.ctr;\n"
+            "pub struct Counter { pub v: i32; }\n"
+            "impl Counter {\n"
+            "    fn step(self: *Self) -> i32 { return if self.v >= 0_i32 { 1_i32 } else { 0_i32 }; }\n"
+            "    pub fn inc(self: *mut Self) -> i32 {\n"
+            "        self.v = self.v +% self.step();\n"
+            "        return self.v;\n"
+            "    }\n"
+            "}\n"
+        )
+        main_path.write_text(
+            "module inc.main;\n"
+            "import inc.ctr;\n"
+            "pub fn main() -> i32 {\n"
+            "    var c = ctr.Counter.{ v: 10_i32 };\n"
+            "    return c.inc();\n"
+            "}\n"
+        )
+        r_i1 = run_cmd([eonc, "build", "--release", "--emi-cache", str(cache_dir), str(ctr_path), str(main_path), "-o", str(out_bin)], cwd=impl_dir)
+        assert r_i1.returncode == 0, f"impl cold build failed:\n{r_i1.stderr}"
+        assert subprocess.run([str(out_bin)]).returncode == 11
+
+        # Add a new pub method + mutate private impl method
+        ctr_path.write_text(
+            "module inc.ctr;\n"
+            "pub struct Counter { pub v: i32; }\n"
+            "impl Counter {\n"
+            "    fn step(self: *Self) -> i32 { return if self.v >= 0_i32 { 12_i32 } else { 0_i32 }; }\n"
+            "    pub fn inc(self: *mut Self) -> i32 {\n"
+            "        self.v = self.v +% self.step();\n"
+            "        return self.v;\n"
+            "    }\n"
+            "    pub fn bonus(self: *Self) -> i32 { return self.v +% 5_i32; }\n"
+            "}\n"
+        )
+        r_i2 = run_cmd([eonc, "build", "--release", "--emi-cache", str(cache_dir), str(ctr_path), str(main_path), "-o", str(out_bin)], cwd=impl_dir)
+        assert r_i2.returncode == 0, f"impl additive/private rebuild failed:\n{r_i2.stderr}"
+        assert subprocess.run([str(out_bin)]).returncode == 22
+
+        # Breaking edit to pub impl method signature -> MUST fail
+        ctr_path.write_text(
+            "module inc.ctr;\n"
+            "pub struct Counter { pub v: i32; }\n"
+            "impl Counter {\n"
+            "    fn step(self: *Self) -> i32 { return if self.v >= 0_i32 { 12_i32 } else { 0_i32 }; }\n"
+            "    pub fn inc(self: *mut Self, delta: i32) -> i32 {\n"
+            "        self.v = self.v +% delta +% self.step();\n"
+            "        return self.v;\n"
+            "    }\n"
+            "}\n"
+        )
+        r_i3 = run_cmd([eonc, "build", "--release", "--emi-cache", str(cache_dir), str(ctr_path), str(main_path), "-o", str(out_bin)], cwd=impl_dir)
+        assert r_i3.returncode != 0, "Expected breaking impl method signature edit to fail build!"
+
+    print("[PASS] M1.2 multi-package deps, eon.lock, .emi libs, allow_hal, cycle detection, and impl method diff")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--eonc", default=str(ROOT / "selfhost/out/eonc2_rel"))
@@ -503,6 +704,7 @@ def main() -> int:
     test_real_native_stack_budget(eonc)
     test_dwarf5_debug_info(eonc)
     test_m11_opt_and_dbm(eonc)
+    test_m12_deps_lock_and_impl_cutoff(eonc)
     print("ALL SELFHOST SOUNDNESS REGRESSIONS PASSED!")
     return 0
 

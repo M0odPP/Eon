@@ -242,7 +242,18 @@ fn eff_flags_eq(a: EffFlags, b: EffFlags) -> bool {
 
 struct CallEdge {
     callee_fn_id: u32;
+    has_key: bool;
+    callee_key: cfg_ir.CfgFnKey;
     span: span.Span;
+}
+
+fn call_edge_key(key: cfg_ir.CfgFnKey, sp: span.Span) -> CallEdge {
+    return CallEdge.{
+        callee_fn_id: cfg_ir.CFG_NONE,
+        has_key: true,
+        callee_key: key,
+        span: sp,
+    };
 }
 
 struct DynStackCall {
@@ -315,6 +326,16 @@ impl CallGraphState {
         };
     }
 
+    fn ensure_len(self: *mut Self, alloc: *mut AllocCap, n_fns: usize) -> !OutOfMemory {
+        while self.is_active.len() < n_fns {
+            try self.is_active.push(alloc, false);
+            try self.fn_calls_range.push(alloc, ast.range_empty());
+            try self.fn_dyn_range.push(alloc, ast.range_empty());
+            try self.iface_links.push(alloc, iface_link_empty());
+        }
+        return;
+    }
+
     fn destroy(self: CallGraphState, alloc: *mut AllocCap) {
         let CallGraphState.{
             is_active,
@@ -376,6 +397,18 @@ impl EffectsDataState {
             total_stack: total_stack,
             has_unbounded_dyn: has_unbounded_dyn,
         };
+    }
+
+    fn ensure_len(self: *mut Self, alloc: *mut AllocCap, n_fns: usize) -> !OutOfMemory {
+        while self.intrinsics.len() < n_fns {
+            try self.intrinsics.push(alloc, intrinsic_empty());
+            try self.eff_flags.push(alloc, eff_flags_empty());
+            try self.own_stack.push(alloc, 0_u64);
+            try self.has_total_stack.push(alloc, false);
+            try self.total_stack.push(alloc, 0_u64);
+            try self.has_unbounded_dyn.push(alloc, false);
+        }
+        return;
     }
 
     fn destroy(self: EffectsDataState, alloc: *mut AllocCap) {
@@ -440,6 +473,17 @@ impl CycleDfsState {
         };
     }
 
+    fn ensure_len(self: *mut Self, alloc: *mut AllocCap, n_fns: usize) -> !OutOfMemory {
+        while self.color.len() < n_fns {
+            try self.color.push(alloc, 0_u8);
+            try self.in_cycle.push(alloc, false);
+            try self.has_cycle_span.push(alloc, false);
+            try self.cycle_span.push(alloc, span.span_dummy());
+            try self.visiting.push(alloc, false);
+        }
+        return;
+    }
+
     fn destroy(self: CycleDfsState, alloc: *mut AllocCap) {
         let CycleDfsState.{
             color,
@@ -481,6 +525,13 @@ impl EffectsState {
             dfs: dfs,
             msg_buf: msg_buf,
         };
+    }
+
+    fn ensure_len(self: *mut Self, alloc: *mut AllocCap, n_fns: usize) -> !OutOfMemory {
+        try self.cg.ensure_len(alloc, n_fns);
+        try self.data.ensure_len(alloc, n_fns);
+        try self.dfs.ensure_len(alloc, n_fns);
+        return;
     }
 
     fn destroy(self: EffectsState, alloc: *mut AllocCap) {
@@ -709,9 +760,7 @@ fn collect_assign_stmt_into(
             }
         }
     } else if rv.kind == .MakeClosure {
-        if let cl_id = cfg.find_fn_by_key(cfg_ir.fn_key_closure(rv.aux_u32)) {
-            try call_edges.push(alloc, CallEdge.{ callee_fn_id: cl_id, span: stmt.span });
-        }
+        try call_edges.push(alloc, call_edge_key(cfg_ir.fn_key_closure(rv.aux_u32), stmt.span));
     }
     return;
 }
@@ -730,29 +779,16 @@ fn collect_call_stmt_into(
 ) -> !OutOfMemory {
     match call.callee.kind {
         .DirectFn => {
-            if let cid = cfg.find_fn_by_key(cfg_ir.fn_key_top_def(call.callee.a)) {
-                try call_edges.push(alloc, CallEdge.{ callee_fn_id: cid, span: sp });
-            }
+            try call_edges.push(alloc, call_edge_key(cfg_ir.fn_key_top_def(call.callee.a), sp));
         }
         .Method => {
-            let key = cfg_ir.fn_key_impl_method(call.callee.a, call.callee.b);
-            if let cid = cfg.find_fn_by_key(key) {
-                try call_edges.push(alloc, CallEdge.{ callee_fn_id: cid, span: sp });
-            }
+            try call_edges.push(
+                alloc,
+                call_edge_key(cfg_ir.fn_key_impl_method(call.callee.a, call.callee.b), sp),
+            );
         }
         .GenericInst => {
-            if let inst_id = cfg.find_fn_by_key(cfg_ir.fn_key_generic_inst(call.callee.a)) {
-                if let inst_fn = cfg.get_fn(inst_id) {
-                    if inst_fn.has_base_generic {
-                        if let base_id = cfg.find_fn_by_key(inst_fn.base_generic_key) {
-                            try call_edges.push(
-                                alloc,
-                                CallEdge.{ callee_fn_id: base_id, span: sp },
-                            );
-                        }
-                    }
-                }
-            }
+            try call_edges.push(alloc, call_edge_key(cfg_ir.fn_key_generic_inst(call.callee.a), sp));
         }
         .DynCall => {
             let iface_def = call.callee.a;
@@ -1008,6 +1044,7 @@ impl WorkerEffCollect {
 
 fn eff_collect_worker_loop(
     wid: u32,
+    fn_start: u32,
     alloc: *mut AllocCap,
     next_pos: *mut sync.AtomicCounter,
     fn_ids: *[u32],
@@ -1033,7 +1070,7 @@ fn eff_collect_worker_loop(
             alloc, cfg, fi, f, env, &mut w.call_edges, &mut w.dyn_calls, &mut w.diags,
             &mut eff, &mut own, &mut has_ub,
         );
-        let fiu = fi.widen.[usize]();
+        let fiu = (fi -% fn_start).widen.[usize]();
         if fiu < results.len {
             results[fiu] = EffCollectRes.{
                 has_res: true,
@@ -1055,6 +1092,7 @@ fn eff_collect_worker_loop(
 
 fn run_eff_collect_entry(
     wid: u32,
+    fn_start: u32,
     alloc: *mut AllocCap,
     next_pos: *mut sync.AtomicCounter,
     fn_ids: *[u32],
@@ -1063,13 +1101,14 @@ fn run_eff_collect_entry(
     results: *mut [EffCollectRes],
     w: *mut WorkerEffCollect,
 ) {
-    eff_collect_worker_loop(wid, alloc, next_pos, fn_ids, cfg, env, results, w) catch {
+    eff_collect_worker_loop(wid, fn_start, alloc, next_pos, fn_ids, cfg, env, results, w) catch {
         w.oom = true;
     };
 }
 
 fn dispatch_eff_collect_workers(
     nw: usize,
+    fn_start: u32,
     alloc: *mut AllocCap,
     next_pos: *mut sync.AtomicCounter,
     fn_ids: *[u32],
@@ -1090,18 +1129,18 @@ fn dispatch_eff_collect_workers(
     w11: *mut WorkerEffCollect,
 ) {
     par for wi in 0_usize..nw {
-        if wi == 0_usize { run_eff_collect_entry(0_u32, alloc, next_pos, fn_ids, cfg, env, results, w0); }
-        else if wi == 1_usize { run_eff_collect_entry(1_u32, alloc, next_pos, fn_ids, cfg, env, results, w1); }
-        else if wi == 2_usize { run_eff_collect_entry(2_u32, alloc, next_pos, fn_ids, cfg, env, results, w2); }
-        else if wi == 3_usize { run_eff_collect_entry(3_u32, alloc, next_pos, fn_ids, cfg, env, results, w3); }
-        else if wi == 4_usize { run_eff_collect_entry(4_u32, alloc, next_pos, fn_ids, cfg, env, results, w4); }
-        else if wi == 5_usize { run_eff_collect_entry(5_u32, alloc, next_pos, fn_ids, cfg, env, results, w5); }
-        else if wi == 6_usize { run_eff_collect_entry(6_u32, alloc, next_pos, fn_ids, cfg, env, results, w6); }
-        else if wi == 7_usize { run_eff_collect_entry(7_u32, alloc, next_pos, fn_ids, cfg, env, results, w7); }
-        else if wi == 8_usize { run_eff_collect_entry(8_u32, alloc, next_pos, fn_ids, cfg, env, results, w8); }
-        else if wi == 9_usize { run_eff_collect_entry(9_u32, alloc, next_pos, fn_ids, cfg, env, results, w9); }
-        else if wi == 10_usize { run_eff_collect_entry(10_u32, alloc, next_pos, fn_ids, cfg, env, results, w10); }
-        else if wi == 11_usize { run_eff_collect_entry(11_u32, alloc, next_pos, fn_ids, cfg, env, results, w11); }
+        if wi == 0_usize { run_eff_collect_entry(0_u32, fn_start, alloc, next_pos, fn_ids, cfg, env, results, w0); }
+        else if wi == 1_usize { run_eff_collect_entry(1_u32, fn_start, alloc, next_pos, fn_ids, cfg, env, results, w1); }
+        else if wi == 2_usize { run_eff_collect_entry(2_u32, fn_start, alloc, next_pos, fn_ids, cfg, env, results, w2); }
+        else if wi == 3_usize { run_eff_collect_entry(3_u32, fn_start, alloc, next_pos, fn_ids, cfg, env, results, w3); }
+        else if wi == 4_usize { run_eff_collect_entry(4_u32, fn_start, alloc, next_pos, fn_ids, cfg, env, results, w4); }
+        else if wi == 5_usize { run_eff_collect_entry(5_u32, fn_start, alloc, next_pos, fn_ids, cfg, env, results, w5); }
+        else if wi == 6_usize { run_eff_collect_entry(6_u32, fn_start, alloc, next_pos, fn_ids, cfg, env, results, w6); }
+        else if wi == 7_usize { run_eff_collect_entry(7_u32, fn_start, alloc, next_pos, fn_ids, cfg, env, results, w7); }
+        else if wi == 8_usize { run_eff_collect_entry(8_u32, fn_start, alloc, next_pos, fn_ids, cfg, env, results, w8); }
+        else if wi == 9_usize { run_eff_collect_entry(9_u32, fn_start, alloc, next_pos, fn_ids, cfg, env, results, w9); }
+        else if wi == 10_usize { run_eff_collect_entry(10_u32, fn_start, alloc, next_pos, fn_ids, cfg, env, results, w10); }
+        else if wi == 11_usize { run_eff_collect_entry(11_u32, fn_start, alloc, next_pos, fn_ids, cfg, env, results, w11); }
     }
 }
 
@@ -1175,21 +1214,53 @@ fn resolve_effects_workers(jobs: u32, n_items: usize) -> usize {
     return 12_usize;
 }
 
-fn collect_all_fn_info_with_jobs(
+fn resolve_deferred_call_edges(cfg: *cfg_ir.CfgProgram, cg: *mut CallGraphState) {
+    let edges = cg.call_edges.as_mut_slice();
+    var i: usize = 0_usize;
+    while i < edges.len {
+        if edges[i].has_key {
+            edges[i].has_key = false;
+            edges[i].callee_fn_id = cfg_ir.CFG_NONE;
+            let key = edges[i].callee_key;
+            if key.kind == .GenericInst {
+                if let inst_id = cfg.find_fn_by_key(key) {
+                    if let inst_fn = cfg.get_fn(inst_id) {
+                        if inst_fn.has_base_generic {
+                            if let base_id = cfg.find_fn_by_key(inst_fn.base_generic_key) {
+                                edges[i].callee_fn_id = base_id;
+                            }
+                        }
+                    }
+                }
+            } else if let cid = cfg.find_fn_by_key(key) {
+                edges[i].callee_fn_id = cid;
+            }
+        }
+        i = i +% 1_usize;
+    }
+}
+
+fn collect_fn_range_with_jobs(
     alloc: *mut AllocCap,
     cfg: *cfg_ir.CfgProgram,
     env: *types.TypeEnv,
+    fn_start: u32,
+    fn_end: u32,
     state: *mut EffectsState,
     diags: *mut diag.DiagBag,
     jobs: u32,
 ) -> !OutOfMemory {
-    build_iface_method_links(cfg, env, &mut state.cg);
     let n_fns = cfg.fn_count();
-    let n_u = n_fns.widen.[usize]();
+    let lim = if fn_end > n_fns { n_fns } else { fn_end };
+    if fn_start >= lim {
+        return;
+    }
+    try state.ensure_len(alloc, n_fns.widen.[usize]());
+    let n_u = (lim - fn_start).widen.[usize]();
     let nw = resolve_effects_workers(jobs, n_u);
     if nw <= 1_usize {
-        var fi: u32 = 0_u32;
-        while fi < n_fns {
+        var fi: u32 = fn_start;
+        while fi < lim {
             if let f = cfg.get_fn(fi) {
                 if f.key.kind != .GenericInst {
                     try collect_single_fn(alloc, cfg, fi, f, env, state, diags);
@@ -1204,8 +1275,8 @@ fn collect_all_fn_info_with_jobs(
     errdefer fn_ids.destroy(alloc);
     var results = try col.DynBuf.[EffCollectRes].init(alloc, n_u);
     errdefer results.destroy(alloc);
-    var fi: u32 = 0_u32;
-    while fi < n_fns {
+    var fi: u32 = fn_start;
+    while fi < lim {
         try results.push(alloc, eff_collect_res_empty());
         if let f = cfg.get_fn(fi) {
             if f.key.kind != .GenericInst {
@@ -1230,29 +1301,31 @@ fn collect_all_fn_info_with_jobs(
 
     var next_pos = sync.AtomicCounter.init(0_u64);
     dispatch_eff_collect_workers(
-        nw, alloc, &mut next_pos, fn_ids.as_slice(), cfg, env, results.as_mut_slice(),
+        nw, fn_start, alloc, &mut next_pos, fn_ids.as_slice(), cfg, env, results.as_mut_slice(),
         &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5,
         &mut w6, &mut w7, &mut w8, &mut w9, &mut w10, &mut w11,
     );
     try check_eff_collect_oom(&w0, &w1, &w2, &w3, &w4, &w5, &w6, &w7, &w8, &w9, &w10, &w11);
 
     let rs = results.as_slice();
+    let base_fid = fn_start.widen.[usize]();
     var ci: usize = 0_usize;
     while ci < rs.len {
         if rs[ci].has_res {
+            let fid = base_fid +% ci;
             let wid = rs[ci].wid;
-            if wid == 0_u32 { try commit_eff_collect_from_worker(alloc, ci, &rs[ci], &w0, state, diags); }
-            else if wid == 1_u32 { try commit_eff_collect_from_worker(alloc, ci, &rs[ci], &w1, state, diags); }
-            else if wid == 2_u32 { try commit_eff_collect_from_worker(alloc, ci, &rs[ci], &w2, state, diags); }
-            else if wid == 3_u32 { try commit_eff_collect_from_worker(alloc, ci, &rs[ci], &w3, state, diags); }
-            else if wid == 4_u32 { try commit_eff_collect_from_worker(alloc, ci, &rs[ci], &w4, state, diags); }
-            else if wid == 5_u32 { try commit_eff_collect_from_worker(alloc, ci, &rs[ci], &w5, state, diags); }
-            else if wid == 6_u32 { try commit_eff_collect_from_worker(alloc, ci, &rs[ci], &w6, state, diags); }
-            else if wid == 7_u32 { try commit_eff_collect_from_worker(alloc, ci, &rs[ci], &w7, state, diags); }
-            else if wid == 8_u32 { try commit_eff_collect_from_worker(alloc, ci, &rs[ci], &w8, state, diags); }
-            else if wid == 9_u32 { try commit_eff_collect_from_worker(alloc, ci, &rs[ci], &w9, state, diags); }
-            else if wid == 10_u32 { try commit_eff_collect_from_worker(alloc, ci, &rs[ci], &w10, state, diags); }
-            else { try commit_eff_collect_from_worker(alloc, ci, &rs[ci], &w11, state, diags); }
+            if wid == 0_u32 { try commit_eff_collect_from_worker(alloc, fid, &rs[ci], &w0, state, diags); }
+            else if wid == 1_u32 { try commit_eff_collect_from_worker(alloc, fid, &rs[ci], &w1, state, diags); }
+            else if wid == 2_u32 { try commit_eff_collect_from_worker(alloc, fid, &rs[ci], &w2, state, diags); }
+            else if wid == 3_u32 { try commit_eff_collect_from_worker(alloc, fid, &rs[ci], &w3, state, diags); }
+            else if wid == 4_u32 { try commit_eff_collect_from_worker(alloc, fid, &rs[ci], &w4, state, diags); }
+            else if wid == 5_u32 { try commit_eff_collect_from_worker(alloc, fid, &rs[ci], &w5, state, diags); }
+            else if wid == 6_u32 { try commit_eff_collect_from_worker(alloc, fid, &rs[ci], &w6, state, diags); }
+            else if wid == 7_u32 { try commit_eff_collect_from_worker(alloc, fid, &rs[ci], &w7, state, diags); }
+            else if wid == 8_u32 { try commit_eff_collect_from_worker(alloc, fid, &rs[ci], &w8, state, diags); }
+            else if wid == 9_u32 { try commit_eff_collect_from_worker(alloc, fid, &rs[ci], &w9, state, diags); }
+            else if wid == 10_u32 { try commit_eff_collect_from_worker(alloc, fid, &rs[ci], &w10, state, diags); }
+            else { try commit_eff_collect_from_worker(alloc, fid, &rs[ci], &w11, state, diags); }
         }
         ci = ci +% 1_usize;
     }
@@ -1262,6 +1335,20 @@ fn collect_all_fn_info_with_jobs(
     w3.destroy(alloc); w2.destroy(alloc); w1.destroy(alloc); w0.destroy(alloc);
     results.destroy(alloc);
     fn_ids.destroy(alloc);
+    return;
+}
+
+fn collect_all_fn_info_with_jobs(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    env: *types.TypeEnv,
+    state: *mut EffectsState,
+    diags: *mut diag.DiagBag,
+    jobs: u32,
+) -> !OutOfMemory {
+    build_iface_method_links(cfg, env, &mut state.cg);
+    try collect_fn_range_with_jobs(alloc, cfg, env, 0_u32, cfg.fn_count(), state, diags, jobs);
+    resolve_deferred_call_edges(cfg, &mut state.cg);
     return;
 }
 
@@ -3481,6 +3568,72 @@ fn check_ast_concurrency_with_jobs(
 // ===========================================================================
 // Section 8: Public Entrypoint
 // ===========================================================================
+
+/// Streaming effects collector for batched CFG -> EIR compilation:
+/// collects per-function intrinsic effects, stack frames, and call edges per CFG batch
+/// before CFG body pools are freed, then runs whole-program cycle/effect/stack checks in `finalize`.
+pub linear struct EffectsStream {
+    state: EffectsState;
+    collect_diags: diag.DiagBag;
+}
+
+impl EffectsStream {
+    pub fn init(alloc: *mut AllocCap) -> EffectsStream ! OutOfMemory {
+        let state = try EffectsState.init(alloc, 64_usize);
+        errdefer state.destroy(alloc);
+        let collect_diags = try diag.DiagBag.init(alloc);
+        return EffectsStream.{
+            state: state,
+            collect_diags: collect_diags,
+        };
+    }
+
+    pub fn destroy(self: EffectsStream, alloc: *mut AllocCap) {
+        let EffectsStream.{ state, collect_diags } = self;
+        collect_diags.destroy(alloc);
+        state.destroy(alloc);
+    }
+
+    pub fn collect_range_with_jobs(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        cfg: *cfg_ir.CfgProgram,
+        env: *types.TypeEnv,
+        fn_start: u32,
+        fn_end: u32,
+        jobs: u32,
+    ) -> !OutOfMemory {
+        try collect_fn_range_with_jobs(
+            alloc, cfg, env, fn_start, fn_end, &mut self.state, &mut self.collect_diags, jobs,
+        );
+        return;
+    }
+
+    pub fn finalize(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        arena: *ast.AstArena,
+        prog: *resolve.ResolvedProgram,
+        env: *types.TypeEnv,
+        cfg: *cfg_ir.CfgProgram,
+        interner: *span.SymInterner,
+        diags: *mut diag.DiagBag,
+        jobs: u32,
+    ) -> EffectsReport ! OutOfMemory {
+        let n_cd = self.collect_diags.count().trunc.[u32]();
+        if n_cd > 0_u32 {
+            try diags.append_diag_range(alloc, &self.collect_diags, 0_u32, n_cd);
+        }
+        try self.state.ensure_len(alloc, cfg.fn_count().widen.[usize]());
+        build_iface_method_links(cfg, env, &mut self.state.cg);
+        resolve_deferred_call_edges(cfg, &mut self.state.cg);
+        try detect_recursion_cycles(alloc, cfg, interner, &mut self.state, diags);
+        try enforce_effect_contracts(alloc, cfg, interner, &mut self.state, diags);
+        try check_all_stacks(alloc, prog, env, cfg, interner, &mut self.state, diags);
+        try check_ast_concurrency_with_jobs(alloc, arena, prog, env, interner, diags, jobs);
+        return try build_effects_report(alloc, cfg, &self.state);
+    }
+}
 
 pub fn check_effects_and_concurrency_with_jobs(
     alloc: *mut AllocCap,

@@ -20,7 +20,7 @@ const MAX_DBM_VERTS: usize = 64_usize;
 const WIDEN_AFTER_ITERS: usize = 3_usize;
 const MAX_FIXPOINT_ITERS: usize = 32_usize;
 const NARROW_ITERS: usize = 2_usize;
-const COMPACT_MAT_THRESHOLD: usize = 262144_usize;
+const COMPACT_MAT_THRESHOLD: usize = 32768_usize;
 
 pub struct FnVerifyInfo {
     pub proven_checks: usize;
@@ -2438,7 +2438,7 @@ impl BlockLiveness {
         self.n_blocks = 0_usize;
         self.n_vals = 0_usize;
         self.words_per_blk = 0_usize;
-        if self.live_in.cap() > 131072_usize {
+        if self.live_in.cap() > 4096_usize {
             let nl = try col.DynBuf.[u64].init(alloc, 64_usize);
             self.live_in.destroy(alloc);
             self.live_in = nl;
@@ -10454,8 +10454,14 @@ impl FnVerifyCtx {
     fn reset_for_fn(self: *mut Self, alloc: *mut AllocCap, n_blocks: usize) -> !OutOfMemory {
         self.preds.clear();
         try self.liveness.reset(alloc);
-        // High-water shrink if a huge function bloated spool or tmp_pool.
-        if self.spool.core.intervals.cap() > 131072_usize || self.spool.core.mat.cap() > 131072_usize {
+        // High-water shrink if a large function bloated spool or tmp_pool.
+        if self.spool.core.intervals.cap() > 16384_usize
+            || self.spool.core.mat.cap() > 16384_usize
+            || self.spool.aux.preds.cap() > 16384_usize
+            || self.spool.aux.known_bits.cap() > 16384_usize
+            || self.spool.aux.const_lits.cap() > 16384_usize
+            || self.spool.aux.val_slot_origin.cap() > 16384_usize
+        {
             let fresh_s = try StatePool.init(alloc);
             self.spool.destroy(alloc);
             self.spool = fresh_s;
@@ -10470,7 +10476,11 @@ impl FnVerifyCtx {
             self.spool.prof_peak_iv = 0_u64;
             self.spool.prof_peak_mat = 0_u64;
         }
-        if self.tmp_pool.core.intervals.cap() > 65536_usize || self.tmp_pool.core.mat.cap() > 65536_usize {
+        if self.tmp_pool.core.intervals.cap() > 8192_usize
+            || self.tmp_pool.core.mat.cap() > 8192_usize
+            || self.tmp_pool.aux.preds.cap() > 8192_usize
+            || self.tmp_pool.aux.known_bits.cap() > 8192_usize
+        {
             let fresh_t = try StatePool.init(alloc);
             self.tmp_pool.destroy(alloc);
             self.tmp_pool = fresh_t;
@@ -10571,6 +10581,9 @@ impl FnVerifyCtx {
         if self.spool.core.mat.len() <= self.next_compact_mat
             && self.spool.core.intervals.len() <= self.next_compact_iv
             && self.spool.aux.preds.len() <= self.next_compact_preds
+            && self.spool.aux.known_bits.len() <= self.next_compact_preds
+            && self.spool.aux.const_lits.len() <= self.next_compact_preds
+            && self.spool.aux.val_slot_origin.len() <= self.next_compact_preds
         {
             return;
         }
@@ -10603,10 +10616,13 @@ impl FnVerifyCtx {
         self.spool = fresh;
         let live_mat = self.spool.core.mat.len();
         let live_iv = self.spool.core.intervals.len();
-        let live_pr = self.spool.aux.preds.len();
-        self.next_compact_mat = (live_mat *% 2_usize) +% COMPACT_MAT_THRESHOLD;
-        self.next_compact_iv = (live_iv *% 2_usize) +% COMPACT_MAT_THRESHOLD;
-        self.next_compact_preds = (live_pr *% 2_usize) +% COMPACT_MAT_THRESHOLD;
+        var live_pr = self.spool.aux.preds.len();
+        if self.spool.aux.known_bits.len() > live_pr { live_pr = self.spool.aux.known_bits.len(); }
+        if self.spool.aux.const_lits.len() > live_pr { live_pr = self.spool.aux.const_lits.len(); }
+        if self.spool.aux.val_slot_origin.len() > live_pr { live_pr = self.spool.aux.val_slot_origin.len(); }
+        self.next_compact_mat = live_mat +% (if live_mat > COMPACT_MAT_THRESHOLD { live_mat >> 1_usize } else { COMPACT_MAT_THRESHOLD });
+        self.next_compact_iv = live_iv +% (if live_iv > COMPACT_MAT_THRESHOLD { live_iv >> 1_usize } else { COMPACT_MAT_THRESHOLD });
+        self.next_compact_preds = live_pr +% (if live_pr > COMPACT_MAT_THRESHOLD { live_pr >> 1_usize } else { COMPACT_MAT_THRESHOLD });
         return;
     }
 }
@@ -11501,7 +11517,7 @@ linear struct WorkerVerifyOut {
     ranges_spans: col.DynBuf[ast.IdRange];
     proven_pool: col.DynBuf[eir.EirProvenSafeInst];
     proven_spans: col.DynBuf[ast.IdRange];
-    facts_pool: col.DynBuf[eir.EirValueFact];
+    facts_pool: col.DynBuf[u8];
     facts_spans: col.DynBuf[ast.IdRange];
     flags_pool: col.DynBuf[ProvenInstFlag];
     flags_spans: col.DynBuf[ast.IdRange];
@@ -11522,7 +11538,7 @@ impl WorkerVerifyOut {
         errdefer proven_pool.destroy(alloc);
         let proven_spans = try col.DynBuf.[ast.IdRange].init(alloc, 32_usize);
         errdefer proven_spans.destroy(alloc);
-        let facts_pool = try col.DynBuf.[eir.EirValueFact].init(alloc, 128_usize);
+        let facts_pool = try col.DynBuf.[u8].init(alloc, 128_usize);
         errdefer facts_pool.destroy(alloc);
         let facts_spans = try col.DynBuf.[ast.IdRange].init(alloc, 32_usize);
         errdefer facts_spans.destroy(alloc);
@@ -11635,8 +11651,14 @@ fn verify_worker_loop(
         try out.proven_spans.push(alloc, ast.range_new(ps, proven_buf.len().trunc.[u32]()));
 
         let fs = out.facts_pool.len().trunc.[u32]();
-        try out.facts_pool.push_slice(alloc, facts_buf.as_slice());
-        try out.facts_spans.push(alloc, ast.range_new(fs, facts_buf.len().trunc.[u32]()));
+        let fbs = facts_buf.as_slice();
+        try out.facts_pool.reserve(alloc, fbs.len);
+        var fbi: usize = 0_usize;
+        while fbi < fbs.len {
+            try out.facts_pool.push(alloc, eir.pack_value_fact(&fbs[fbi]));
+            fbi = fbi +% 1_usize;
+        }
+        try out.facts_spans.push(alloc, ast.range_new(fs, fbs.len.trunc.[u32]()));
 
         let fls = out.flags_pool.len().trunc.[u32]();
         try out.flags_pool.push_slice(alloc, inst_flags_buf.as_slice());
@@ -11741,7 +11763,7 @@ fn commit_worker_fn_result(
         try eir_prog.set_fn_proven_safe_insts(alloc, fi, slice_range.[eir.EirProvenSafeInst](w.proven_pool.as_slice(), ps.*));
     }
     if let fs = w.facts_spans.get(li) {
-        try eir_prog.set_fn_value_facts(alloc, fi, slice_range.[eir.EirValueFact](w.facts_pool.as_slice(), fs.*));
+        try eir_prog.set_fn_value_fact_bytes(alloc, fi, slice_range.[u8](w.facts_pool.as_slice(), fs.*));
     }
     if let fls = w.flags_spans.get(li) {
         let fl_sl = slice_range.[ProvenInstFlag](w.flags_pool.as_slice(), fls.*);
@@ -11878,6 +11900,8 @@ fn verify_program_parallel(
 
     let n_fns = eir_prog.fn_count();
     let n_u = n_fns.widen.[usize]();
+    var giant_order = try col.DynBuf.[u32].init(alloc, 32_usize);
+    errdefer giant_order.destroy(alloc);
     var work_order = try col.DynBuf.[u32].init(alloc, n_u);
     errdefer work_order.destroy(alloc);
     var weights = try col.DynBuf.[u32].init(alloc, n_u);
@@ -11890,12 +11914,17 @@ fn verify_program_parallel(
         var blks: u32 = 0_u32;
         if let f = eir_prog.get_fn(fi) {
             blks = f.blocks.len;
-            try work_order.push(alloc, fi);
+            if blks >= 400_u32 {
+                try giant_order.push(alloc, fi);
+            } else {
+                try work_order.push(alloc, fi);
+            }
         }
         try weights.push(alloc, blks);
         try fn_loc.push(alloc, 0_u64);
         fi = fi +% 1_u32;
     }
+    sort_work_order_desc(giant_order.as_mut_slice(), weights.as_slice());
     sort_work_order_desc(work_order.as_mut_slice(), weights.as_slice());
 
     var w0 = try WorkerVerifyOut.init(alloc);
@@ -11925,12 +11954,26 @@ fn verify_program_parallel(
 
     var next_pos = sync.AtomicCounter.init(0_u64);
     let nw = if n_workers > 12_usize { 12_usize } else { n_workers };
-    dispatch_verify_workers(
-        nw, alloc, &mut next_pos, work_order.as_slice(), fn_loc.as_mut_slice(),
-        arena, eir_prog, env, interner,
-        &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5,
-        &mut w6, &mut w7, &mut w8, &mut w9, &mut w10, &mut w11,
-    );
+    // Run huge CFG functions (>=400 blocks) with at most 2 concurrent workers so their
+    // DBM StatePools do not multiply across 12 simultaneous threads and spike Peak RSS.
+    if !giant_order.is_empty() {
+        let gnw = if nw > 2_usize { 2_usize } else { nw };
+        dispatch_verify_workers(
+            gnw, alloc, &mut next_pos, giant_order.as_slice(), fn_loc.as_mut_slice(),
+            arena, eir_prog, env, interner,
+            &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5,
+            &mut w6, &mut w7, &mut w8, &mut w9, &mut w10, &mut w11,
+        );
+    }
+    if !work_order.is_empty() {
+        next_pos.store(0_u64, .Release);
+        dispatch_verify_workers(
+            nw, alloc, &mut next_pos, work_order.as_slice(), fn_loc.as_mut_slice(),
+            arena, eir_prog, env, interner,
+            &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5,
+            &mut w6, &mut w7, &mut w8, &mut w9, &mut w10, &mut w11,
+        );
+    }
 
     if w0.oom || w1.oom || w2.oom || w3.oom || w4.oom || w5.oom
         || w6.oom || w7.oom || w8.oom || w9.oom || w10.oom || w11.oom
@@ -12015,6 +12058,7 @@ fn verify_program_parallel(
     fn_loc.destroy(alloc);
     weights.destroy(alloc);
     work_order.destroy(alloc);
+    giant_order.destroy(alloc);
     return report;
 }
 

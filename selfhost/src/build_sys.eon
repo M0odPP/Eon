@@ -12,6 +12,7 @@ import eonc.ast;
 pub enum BuildTargetKind : u8 {
     Exe = 0,
     SharedLib = 1,
+    EmiLib = 2,
 }
 
 pub struct BuildTarget {
@@ -20,10 +21,16 @@ pub struct BuildTarget {
     pub kind: BuildTargetKind;
 }
 
+pub struct BuildDep {
+    pub name_range: ast.IdRange;
+    pub path_range: ast.IdRange;
+}
+
 pub linear struct BuildPlan {
     pub pkg_root_range: ast.IdRange;
     pub out_dir_range: ast.IdRange;
     pub targets: col.DynBuf[BuildTarget];
+    pub deps: col.DynBuf[BuildDep];
     pub link_libs: col.DynBuf[ast.IdRange];
     pub allow_hal: col.DynBuf[ast.IdRange];
     pub sanitize: bool;
@@ -176,6 +183,38 @@ pub fn validate_sandbox_rel_path(
     return true;
 }
 
+pub fn validate_dep_rel_path(
+    alloc: *mut AllocCap,
+    rel: *[u8],
+    err_out: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    if rel.len == 0_usize {
+        try err_out.push_str_grow(
+            alloc,
+            "build.eon sandbox error: dependency path cannot be empty",
+        );
+        return false;
+    }
+    if rel[0_usize] == b'/' || rel[0_usize] == b'\\' {
+        try err_out.push_str_grow(alloc, "build.eon sandbox error: absolute dependency path `");
+        try err_out.push_bytes_grow(alloc, rel);
+        try err_out.push_str_grow(alloc, "` is forbidden");
+        return false;
+    }
+    var ci: usize = 0_usize;
+    while ci < rel.len {
+        let ch = rel[ci];
+        if ch == 0_u8 || ch == b'\\' || ch < 0x20_u8 || ch == 0x7F_u8 {
+            try err_out.push_str_grow(alloc, "build.eon sandbox error: invalid dependency path `");
+            try err_out.push_bytes_grow(alloc, rel);
+            try err_out.push_byte_grow(alloc, b'`');
+            return false;
+        }
+        ci = ci +% 1_usize;
+    }
+    return true;
+}
+
 pub fn validate_target_name(
     alloc: *mut AllocCap,
     name: *[u8],
@@ -212,6 +251,8 @@ impl BuildPlan {
     pub fn init(alloc: *mut AllocCap, pkg_root: *[u8]) -> BuildPlan ! OutOfMemory {
         let targets = try col.DynBuf.[BuildTarget].init(alloc, 4_usize);
         errdefer targets.destroy(alloc);
+        let deps = try col.DynBuf.[BuildDep].init(alloc, 4_usize);
+        errdefer deps.destroy(alloc);
         let link_libs = try col.DynBuf.[ast.IdRange].init(alloc, 4_usize);
         errdefer link_libs.destroy(alloc);
         let allow_hal = try col.DynBuf.[ast.IdRange].init(alloc, 4_usize);
@@ -232,6 +273,7 @@ impl BuildPlan {
             pkg_root_range: pkg_root_range,
             out_dir_range: out_dir_range,
             targets: targets,
+            deps: deps,
             link_libs: link_libs,
             allow_hal: allow_hal,
             sanitize: false,
@@ -284,6 +326,56 @@ impl BuildPlan {
                 name_range: name_range,
                 root_range: root_range,
                 kind: .SharedLib,
+            },
+        );
+        return;
+    }
+
+    pub fn add_lib(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        name: *[u8],
+        root: *[u8],
+    ) -> !OutOfMemory {
+        let name_range = try self.intern_bytes(alloc, name);
+        let root_range = try self.intern_bytes(alloc, root);
+        try self.targets.push(
+            alloc,
+            BuildTarget.{
+                name_range: name_range,
+                root_range: root_range,
+                kind: .EmiLib,
+            },
+        );
+        return;
+    }
+
+    pub fn add_dep(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        name: *[u8],
+        path: *[u8],
+    ) -> !OutOfMemory {
+        let count = self.deps.len();
+        var i: usize = 0_usize;
+        while i < count {
+            if str.bytes_eq(self.dep_name(i), name) {
+                let pr = try self.intern_bytes(alloc, path);
+                let ds = self.deps.as_mut_slice();
+                if i < ds.len {
+                    ds[i].path_range = pr;
+                }
+                return;
+            }
+            i = i +% 1_usize;
+        }
+        let name_range = try self.intern_bytes(alloc, name);
+        let path_range = try self.intern_bytes(alloc, path);
+        try self.deps.push(
+            alloc,
+            BuildDep.{
+                name_range: name_range,
+                path_range: path_range,
             },
         );
         return;
@@ -363,12 +455,45 @@ impl BuildPlan {
         return self.targets.len();
     }
 
+    pub fn dep_count(self: *Self) -> usize {
+        return self.deps.len();
+    }
+
     pub fn link_lib_count(self: *Self) -> usize {
         return self.link_libs.len();
     }
 
     pub fn allow_hal_count(self: *Self) -> usize {
         return self.allow_hal.len();
+    }
+
+    pub fn allows_hal_mod(self: *Self, mod_name: *[u8]) -> bool {
+        var i: usize = 0_usize;
+        while i < self.allow_hal.len() {
+            if str.bytes_eq(self.allow_hal_at(i), mod_name) {
+                return true;
+            }
+            i = i +% 1_usize;
+        }
+        return false;
+    }
+
+    pub view fn dep_name(self: *Self, idx: usize) -> *[u8] {
+        let empty: *str = "";
+        let ds = self.deps.as_slice();
+        if idx < ds.len {
+            return slice_id_range(self.str_bytes.as_slice(), ds[idx].name_range);
+        }
+        return empty.as_bytes();
+    }
+
+    pub view fn dep_path(self: *Self, idx: usize) -> *[u8] {
+        let empty: *str = "";
+        let ds = self.deps.as_slice();
+        if idx < ds.len {
+            return slice_id_range(self.str_bytes.as_slice(), ds[idx].path_range);
+        }
+        return empty.as_bytes();
     }
 
     pub view fn pkg_root(self: *Self) -> *[u8] {
@@ -457,6 +582,7 @@ impl BuildPlan {
             pkg_root_range: _,
             out_dir_range: _,
             targets,
+            deps,
             link_libs,
             allow_hal,
             sanitize: _,
@@ -465,6 +591,7 @@ impl BuildPlan {
             str_bytes,
         } = self;
         targets.destroy(alloc);
+        deps.destroy(alloc);
         link_libs.destroy(alloc);
         allow_hal.destroy(alloc);
         str_bytes.destroy(alloc);
@@ -498,6 +625,19 @@ pub fn validate_plan_paths(
             return false;
         }
         i = i +% 1_usize;
+    }
+    let dcount = plan.deps.len();
+    var di: usize = 0_usize;
+    while di < dcount {
+        let dname_ok = try validate_target_name(alloc, plan.dep_name(di), err_out);
+        if !dname_ok {
+            return false;
+        }
+        let dpath_ok = try validate_dep_rel_path(alloc, plan.dep_path(di), err_out);
+        if !dpath_ok {
+            return false;
+        }
+        di = di +% 1_usize;
     }
     return true;
 }
@@ -1449,6 +1589,22 @@ pub fn format_build_summary(
         try out.push_str_grow(alloc, "]\n");
     }
 
+    let n_deps = plan.deps.len();
+    if n_deps > 0_usize {
+        try out.push_str_grow(alloc, "  deps: [");
+        var di: usize = 0_usize;
+        while di < n_deps {
+            if di > 0_usize {
+                try out.push_str_grow(alloc, ", ");
+            }
+            try out.push_bytes_grow(alloc, plan.dep_name(di));
+            try out.push_byte_grow(alloc, b'=');
+            try out.push_bytes_grow(alloc, plan.dep_path(di));
+            di = di +% 1_usize;
+        }
+        try out.push_str_grow(alloc, "]\n");
+    }
+
     let ts = plan.targets.as_slice();
     try out.push_str_grow(alloc, "  targets: ");
     try out.push_u64_grow(alloc, ts.len.widen.[u64]());
@@ -1461,6 +1617,7 @@ pub fn format_build_summary(
         match ts[ti].kind {
             .Exe => { try out.push_str_grow(alloc, " (exe) -> "); }
             .SharedLib => { try out.push_str_grow(alloc, " (shared) -> "); }
+            .EmiLib => { try out.push_str_grow(alloc, " (lib) -> "); }
         }
         try out.push_bytes_grow(alloc, plan.target_root(ti));
         try out.push_byte_grow(alloc, b'\n');

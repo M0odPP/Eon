@@ -147,6 +147,70 @@ pub fn view_source_index(env: *types.TypeEnv, sig: *types.FnSig) -> ViewSourceRe
     return ViewSourceResult.{ kind: .Missing, index: 0_usize, span: span.span_dummy() };
 }
 
+fn param_is_borrow_source_subst(
+    env: *types.TypeEnv,
+    ty: types.TyId,
+    gargs: *[types.GenericVal],
+) -> bool {
+    let tn = env.get(ty);
+    if tn.kind == .GenericParam {
+        let gi = tn.primary.widen.[usize]();
+        if gi < gargs.len && gargs[gi].kind == .Ty {
+            return env.is_borrow_or_view(gargs[gi].id);
+        }
+        return false;
+    }
+    return env.is_borrow_or_view(ty);
+}
+
+fn view_source_index_subst(
+    env: *types.TypeEnv,
+    sig: *types.FnSig,
+    gargs: *[types.GenericVal],
+) -> ?usize {
+    let params = env.params_range(sig.params);
+    var marked_count: usize = 0_usize;
+    var marked_idx: usize = 0_usize;
+    var i: usize = 0_usize;
+    while i < params.len {
+        if params[i].modifier == .From {
+            marked_count = marked_count +% 1_usize;
+            if marked_count == 1_usize {
+                marked_idx = i;
+            }
+        }
+        i = i +% 1_usize;
+    }
+    if marked_count > 1_usize {
+        return null;
+    }
+    if marked_count == 1_usize && marked_idx < params.len {
+        if !param_is_borrow_source_subst(env, params[marked_idx].ty, gargs) {
+            return null;
+        }
+    }
+    if params.len > 0_usize && params[0_usize].is_self && param_is_borrow_source_subst(env, params[0_usize].ty, gargs) {
+        return 0_usize;
+    }
+    if marked_count == 1_usize {
+        return marked_idx;
+    }
+    var cand_count: usize = 0_usize;
+    var cand_idx: usize = 0_usize;
+    var ci: usize = 0_usize;
+    while ci < params.len {
+        if param_is_borrow_source_subst(env, params[ci].ty, gargs) {
+            cand_count = cand_count +% 1_usize;
+            cand_idx = ci;
+        }
+        ci = ci +% 1_usize;
+    }
+    if cand_count == 1_usize {
+        return cand_idx;
+    }
+    return null;
+}
+
 fn callee_view_source_index(
     callee: *cfg_ir.CfgCallee,
     cfg: *cfg_ir.CfgProgram,
@@ -193,6 +257,28 @@ fn callee_view_source_index(
                     let vs = view_source_index(env, &gf.sig);
                     if vs.kind == .Ok {
                         return vs.index;
+                    }
+                }
+            }
+            let insts = cfg.generic_insts_slice();
+            let ii = callee.a.widen.[usize]();
+            if ii < insts.len {
+                let entry = insts[ii];
+                let gargs = cfg.gvals_slice(entry.gargs);
+                if entry.base_key.kind == .TopDef {
+                    if let sig = env.get_fn(entry.base_key.a) {
+                        return view_source_index_subst(env, sig, gargs);
+                    }
+                } else if entry.base_key.kind == .ImplMethod {
+                    if let im = env.decls.impls.get(entry.base_key.a.widen.[usize]()) {
+                        let ms = env.impl_methods_range(im.methods);
+                        var mi: usize = 0_usize;
+                        while mi < ms.len {
+                            if ms[mi].sub_idx == entry.base_key.b {
+                                return view_source_index_subst(env, &ms[mi].sig, gargs);
+                            }
+                            mi = mi +% 1_usize;
+                        }
                     }
                 }
             }
@@ -4875,18 +4961,24 @@ fn commit_worker_borrow_diags(
     return;
 }
 
-pub fn analyze_program_with_jobs(
+pub fn analyze_fn_range_with_jobs(
     alloc: *mut AllocCap,
     prog: *resolve.ResolvedProgram,
     env: *types.TypeEnv,
     cfg: *cfg_ir.CfgProgram,
+    fn_start: u32,
+    fn_end: u32,
     interner: *span.SymInterner,
     diags: *mut diag.DiagBag,
     jobs: u32,
 ) -> !OutOfMemory {
     _ = prog;
-    let n_fns = cfg.fn_count();
-    let n_u = n_fns.widen.[usize]();
+    let total_fns = cfg.fn_count();
+    let lim = if fn_end > total_fns { total_fns } else { fn_end };
+    if fn_start >= lim {
+        return;
+    }
+    let n_u = (lim - fn_start).widen.[usize]();
     var nw: usize = 1_usize;
     if jobs == 1_u32 {
         nw = 1_usize;
@@ -4903,8 +4995,8 @@ pub fn analyze_program_with_jobs(
         nw = 12_usize;
     }
     if nw <= 1_usize || n_u < 16_usize {
-        var fi: u32 = 0_u32;
-        while fi < n_fns {
+        var fi: u32 = fn_start;
+        while fi < lim {
             if let f = cfg.get_fn(fi) {
                 if f.key.kind != .GenericInst && f.unsupported.len == 0_u32 {
                     try analyze_function(alloc, cfg, fi, env, interner, diags);
@@ -4915,15 +5007,22 @@ pub fn analyze_program_with_jobs(
         return;
     }
 
+    let lim_u = lim.widen.[usize]();
     var work_order = try col.DynBuf.[u32].init(alloc, n_u);
     errdefer work_order.destroy(alloc);
-    var weights = try col.DynBuf.[u32].init(alloc, n_u);
+    var weights = try col.DynBuf.[u32].init(alloc, lim_u);
     errdefer weights.destroy(alloc);
-    var fn_loc = try col.DynBuf.[u64].init(alloc, n_u);
+    var fn_loc = try col.DynBuf.[u64].init(alloc, lim_u);
     errdefer fn_loc.destroy(alloc);
 
-    var fi: u32 = 0_u32;
-    while fi < n_fns {
+    var zi: u32 = 0_u32;
+    while zi < fn_start {
+        try weights.push(alloc, 0_u32);
+        try fn_loc.push(alloc, 0_u64);
+        zi = zi +% 1_u32;
+    }
+    var fi: u32 = fn_start;
+    while fi < lim {
         var blks: u32 = 0_u32;
         if let f = cfg.get_fn(fi) {
             if f.key.kind != .GenericInst && f.unsupported.len == 0_u32 && f.blocks.len > 0_u32 {
@@ -4989,7 +5088,7 @@ pub fn analyze_program_with_jobs(
     }
 
     let locs = fn_loc.as_slice();
-    var ci: usize = 0_usize;
+    var ci: usize = fn_start.widen.[usize]();
     while ci < locs.len {
         let loc = locs[ci];
         if loc != 0_u64 {
@@ -5026,6 +5125,21 @@ pub fn analyze_program_with_jobs(
     fn_loc.destroy(alloc);
     weights.destroy(alloc);
     work_order.destroy(alloc);
+    return;
+}
+
+pub fn analyze_program_with_jobs(
+    alloc: *mut AllocCap,
+    prog: *resolve.ResolvedProgram,
+    env: *types.TypeEnv,
+    cfg: *cfg_ir.CfgProgram,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+    jobs: u32,
+) -> !OutOfMemory {
+    try analyze_fn_range_with_jobs(
+        alloc, prog, env, cfg, 0_u32, cfg.fn_count(), interner, diags, jobs,
+    );
     return;
 }
 

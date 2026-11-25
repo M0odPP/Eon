@@ -16151,6 +16151,12 @@ impl WorkerOptState {
         self.out.clear_all();
     }
 
+    fn release_pools(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        try self.scratch.release_pools(alloc);
+        try self.out.release_pools(alloc);
+        return;
+    }
+
     fn destroy(self: WorkerOptState, alloc: *mut AllocCap) {
         let WorkerOptState.{ scratch, out, copy_sc, stats, oom } = self;
         _ = stats;
@@ -16729,45 +16735,34 @@ fn overwrite_fn_from_worker_out(
     return;
 }
 
-fn merge_all_worker_fns_into_eir(
+fn release_all_opt_workers(
     alloc: *mut AllocCap,
-    eir_prog: *mut eir.EirProgram,
-    nfns: usize,
-    fn_loc: *[u64],
-    sc: *mut eir.EirCopyScratch,
-    w0: *WorkerOptState,
-    w1: *WorkerOptState,
-    w2: *WorkerOptState,
-    w3: *WorkerOptState,
-    w4: *WorkerOptState,
-    w5: *WorkerOptState,
-    w6: *WorkerOptState,
-    w7: *WorkerOptState,
-    w8: *WorkerOptState,
-    w9: *WorkerOptState,
-    w10: *WorkerOptState,
-    w11: *WorkerOptState,
+    n_workers: usize,
+    w0: *mut WorkerOptState,
+    w1: *mut WorkerOptState,
+    w2: *mut WorkerOptState,
+    w3: *mut WorkerOptState,
+    w4: *mut WorkerOptState,
+    w5: *mut WorkerOptState,
+    w6: *mut WorkerOptState,
+    w7: *mut WorkerOptState,
+    w8: *mut WorkerOptState,
+    w9: *mut WorkerOptState,
+    w10: *mut WorkerOptState,
+    w11: *mut WorkerOptState,
 ) -> !OutOfMemory {
-    var globals_tmp = try eir.EirProgram.init(alloc);
-    errdefer globals_tmp.destroy(alloc);
-    try eir.copy_program_globals(alloc, eir_prog, &mut globals_tmp);
-
-    eir_prog.clear_all();
-    try eir.copy_program_globals(alloc, &globals_tmp, eir_prog);
-
-    var fi: usize = 0_usize;
-    while fi < nfns {
-        let loc = if fi < fn_loc.len { fn_loc[fi] } else { 0_u64 };
-        let wid = ((loc >> 32_u64) -% 1_u64).trunc.[u32]();
-        let local_idx = (loc & 0xFFFFFFFF_u64).trunc.[u32]();
-        try copy_fn_from_worker_out(
-            alloc, wid, local_idx, eir_prog, sc,
-            w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11,
-        );
-        fi = fi +% 1_usize;
-    }
-
-    globals_tmp.destroy(alloc);
+    if n_workers > 0_usize { try w0.release_pools(alloc); }
+    if n_workers > 1_usize { try w1.release_pools(alloc); }
+    if n_workers > 2_usize { try w2.release_pools(alloc); }
+    if n_workers > 3_usize { try w3.release_pools(alloc); }
+    if n_workers > 4_usize { try w4.release_pools(alloc); }
+    if n_workers > 5_usize { try w5.release_pools(alloc); }
+    if n_workers > 6_usize { try w6.release_pools(alloc); }
+    if n_workers > 7_usize { try w7.release_pools(alloc); }
+    if n_workers > 8_usize { try w8.release_pools(alloc); }
+    if n_workers > 9_usize { try w9.release_pools(alloc); }
+    if n_workers > 10_usize { try w10.release_pools(alloc); }
+    if n_workers > 11_usize { try w11.release_pools(alloc); }
     return;
 }
 
@@ -16812,6 +16807,72 @@ fn commit_inline_wave_results(
         i = i +% 1_usize;
     }
     return;
+}
+
+fn run_opt_stage1_batched(
+    alloc: *mut AllocCap,
+    n_workers: usize,
+    nfns: usize,
+    eir_prog: *mut eir.EirProgram,
+    env: *types.TypeEnv,
+    weights: *[u32],
+    work_order: *mut col.DynBuf[u32],
+    fn_loc: *mut col.DynBuf[u64],
+    merge_sc: *mut eir.EirCopyScratch,
+    next_pos: *mut sync.AtomicCounter,
+    w0: *mut WorkerOptState, w1: *mut WorkerOptState, w2: *mut WorkerOptState, w3: *mut WorkerOptState,
+    w4: *mut WorkerOptState, w5: *mut WorkerOptState, w6: *mut WorkerOptState, w7: *mut WorkerOptState,
+    w8: *mut WorkerOptState, w9: *mut WorkerOptState, w10: *mut WorkerOptState, w11: *mut WorkerOptState,
+) -> bool ! OutOfMemory {
+    var failed_oom = false;
+    var s1_eir = try eir.EirProgram.init(alloc);
+    errdefer s1_eir.destroy(alloc);
+    try eir.copy_program_globals(alloc, eir_prog, &mut s1_eir);
+    let chunk_sz: usize = 256_usize;
+    var s1_c0: usize = 0_usize;
+    while s1_c0 < nfns && !failed_oom {
+        var s1_c1 = s1_c0 +% chunk_sz;
+        if s1_c1 > nfns {
+            s1_c1 = nfns;
+        }
+        work_order.clear();
+        var s1_ci = s1_c0;
+        while s1_ci < s1_c1 {
+            try work_order.push(alloc, s1_ci.trunc.[u32]());
+            s1_ci = s1_ci +% 1_usize;
+        }
+        sort_work_order_desc(work_order.as_mut_slice(), weights);
+        next_pos.store(0_u64, .Release);
+        dispatch_opt_stage1_workers(
+            n_workers, alloc, next_pos, work_order.as_slice(), fn_loc.as_mut_slice(), eir_prog, env,
+            w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11,
+        );
+        failed_oom = any_worker_oom(w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11);
+        if !failed_oom {
+            let fls = fn_loc.as_slice();
+            var mi = s1_c0;
+            while mi < s1_c1 {
+                let loc = if mi < fls.len { fls[mi] } else { 0_u64 };
+                let wid = ((loc >> 32_u64) -% 1_u64).trunc.[u32]();
+                let local_idx = (loc & 0xFFFFFFFF_u64).trunc.[u32]();
+                try copy_fn_from_worker_out(
+                    alloc, wid, local_idx, &mut s1_eir, merge_sc,
+                    w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11,
+                );
+                mi = mi +% 1_usize;
+            }
+            try release_all_opt_workers(
+                alloc, n_workers, w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11,
+            );
+        }
+        s1_c0 = s1_c1;
+    }
+    if !failed_oom {
+        eir_prog.replace_with(alloc, s1_eir);
+    } else {
+        s1_eir.destroy(alloc);
+    }
+    return failed_oom;
 }
 
 fn any_worker_oom(
@@ -16902,7 +16963,7 @@ fn optimize_program_parallel(
     var w11 = try WorkerOptState.init(alloc);
     errdefer w11.destroy(alloc);
 
-    var work_order = try col.DynBuf.[u32].init(alloc, nfns);
+    var work_order = try col.DynBuf.[u32].init(alloc, 512_usize);
     errdefer work_order.destroy(alloc);
     var weights = try col.DynBuf.[u32].init(alloc, nfns);
     errdefer weights.destroy(alloc);
@@ -16914,27 +16975,18 @@ fn optimize_program_parallel(
     var fi0: usize = 0_usize;
     while fi0 < nfns {
         let fid = fi0.trunc.[u32]();
-        try work_order.push(alloc, fid);
         try weights.push(alloc, fn_opt_work_weight(eir_prog, fid));
         try fn_loc.push(alloc, 0_u64);
         fi0 = fi0 +% 1_usize;
     }
-    sort_work_order_desc(work_order.as_mut_slice(), weights.as_slice());
 
-    // Stage 1: Parallel mem2reg_1 + devirt (compacted merge into eir_prog!)
+    // Stage 1: Batched parallel mem2reg_1 + devirt into a fresh compact EirProgram
     var next_pos = sync.AtomicCounter.init(0_u64);
-    dispatch_opt_stage1_workers(
-        n_workers, alloc, &mut next_pos, work_order.as_slice(), fn_loc.as_mut_slice(), eir_prog, env,
+    var failed_oom = try run_opt_stage1_batched(
+        alloc, n_workers, nfns, eir_prog, env, weights.as_slice(), &mut work_order, &mut fn_loc, &mut merge_sc, &mut next_pos,
         &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5,
         &mut w6, &mut w7, &mut w8, &mut w9, &mut w10, &mut w11,
     );
-    var failed_oom = any_worker_oom(&w0, &w1, &w2, &w3, &w4, &w5, &w6, &w7, &w8, &w9, &w10, &w11);
-    if !failed_oom {
-        try merge_all_worker_fns_into_eir(
-            alloc, eir_prog, nfns, fn_loc.as_slice(), &mut merge_sc,
-            &w0, &w1, &w2, &w3, &w4, &w5, &w6, &w7, &w8, &w9, &w10, &w11,
-        );
-    }
     if profile_passes { if let clk = clock_opt { try print_opt_pass_line(alloc, clk, "mt_stage1_mem2reg_devirt", t0, u0); t0 = rt.now_ns(clk); u0 = alloc.used_bytes(); } }
 
     // Pass 2B: Schedule Expansion (serial, <0.1ms)
@@ -17031,6 +17083,7 @@ fn optimize_program_parallel(
             li_z = li_z +% 1_usize;
         }
 
+        var live_insts_est = eir_prog.funcs.insts.len();
         var cur_w: u32 = 1_u32;
         while cur_w <= max_wave && !failed_oom {
             wave_fns.clear();
@@ -17044,34 +17097,57 @@ fn optimize_program_parallel(
             }
             if !wave_fns.is_empty() {
                 sort_work_order_desc(wave_fns.as_mut_slice(), fn_sizes.as_slice());
-                w0.reset_for_stage();
-                w1.reset_for_stage();
-                w2.reset_for_stage();
-                w3.reset_for_stage();
-                w4.reset_for_stage();
-                w5.reset_for_stage();
-                w6.reset_for_stage();
-                w7.reset_for_stage();
-                w8.reset_for_stage();
-                w9.reset_for_stage();
-                w10.reset_for_stage();
-                w11.reset_for_stage();
-                next_pos.store(0_u64, .Release);
-                dispatch_opt_inline_wave_workers(
-                    n_workers, alloc, &mut next_pos, wave_fns.as_slice(), fn_loc.as_mut_slice(),
-                    new_sizes.as_mut_slice(), eir_prog, &fn_sizes, &callsite_cnt, &is_rec, &has_asm, cfg.incremental_cgu, cfg.opt_size,
-                    &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5,
-                    &mut w6, &mut w7, &mut w8, &mut w9, &mut w10, &mut w11,
-                );
-                failed_oom = any_worker_oom(&w0, &w1, &w2, &w3, &w4, &w5, &w6, &w7, &w8, &w9, &w10, &w11);
-                if !failed_oom {
-                    try commit_inline_wave_results(
-                        alloc, eir_prog, wave_fns.as_slice(), fn_loc.as_mut_slice(), new_sizes.as_slice(), &mut fn_sizes, &mut merge_sc,
-                        &w0, &w1, &w2, &w3, &w4, &w5, &w6, &w7, &w8, &w9, &w10, &w11,
+                let w_total = wave_fns.len();
+                let w_chunk: usize = 256_usize;
+                var w_c0: usize = 0_usize;
+                while w_c0 < w_total && !failed_oom {
+                    var w_c1 = w_c0 +% w_chunk;
+                    if w_c1 > w_total {
+                        w_c1 = w_total;
+                    }
+                    let w_batch = wave_fns.as_slice().sub(w_c0, w_c1) catch { break; };
+                    w0.reset_for_stage();
+                    w1.reset_for_stage();
+                    w2.reset_for_stage();
+                    w3.reset_for_stage();
+                    w4.reset_for_stage();
+                    w5.reset_for_stage();
+                    w6.reset_for_stage();
+                    w7.reset_for_stage();
+                    w8.reset_for_stage();
+                    w9.reset_for_stage();
+                    w10.reset_for_stage();
+                    w11.reset_for_stage();
+                    next_pos.store(0_u64, .Release);
+                    dispatch_opt_inline_wave_workers(
+                        n_workers, alloc, &mut next_pos, w_batch, fn_loc.as_mut_slice(),
+                        new_sizes.as_mut_slice(), eir_prog, &fn_sizes, &callsite_cnt, &is_rec, &has_asm, cfg.incremental_cgu, cfg.opt_size,
+                        &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5,
+                        &mut w6, &mut w7, &mut w8, &mut w9, &mut w10, &mut w11,
                     );
+                    failed_oom = any_worker_oom(&w0, &w1, &w2, &w3, &w4, &w5, &w6, &w7, &w8, &w9, &w10, &w11);
+                    if !failed_oom {
+                        try commit_inline_wave_results(
+                            alloc, eir_prog, w_batch, fn_loc.as_mut_slice(), new_sizes.as_slice(), &mut fn_sizes, &mut merge_sc,
+                            &w0, &w1, &w2, &w3, &w4, &w5, &w6, &w7, &w8, &w9, &w10, &w11,
+                        );
+                        try release_all_opt_workers(
+                            alloc, n_workers,
+                            &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5,
+                            &mut w6, &mut w7, &mut w8, &mut w9, &mut w10, &mut w11,
+                        );
+                        if eir_prog.funcs.insts.len() > live_insts_est +% (live_insts_est >> 2_usize) +% 65536_usize {
+                            try eir_prog.compact_pools_inplace(alloc);
+                            live_insts_est = eir_prog.funcs.insts.len();
+                        }
+                    }
+                    w_c0 = w_c1;
                 }
             }
             cur_w = cur_w +% 1_u32;
+        }
+        if !failed_oom && eir_prog.funcs.insts.len() > live_insts_est +% 65536_usize {
+            try eir_prog.compact_pools_inplace(alloc);
         }
 
         wave_fns.destroy(alloc);
@@ -17085,45 +17161,66 @@ fn optimize_program_parallel(
     }
     if profile_passes { if let clk = clock_opt { try print_opt_pass_line(alloc, clk, "mt_stage2_inline_waves", t0, u0); t0 = rt.now_ns(clk); u0 = alloc.used_bytes(); } }
 
-    // Stage 3: Parallel Post-Inline Fused 10-Pass Pipeline + Full Compaction
+    // Stage 3: Batched Parallel Post-Inline Fused 10-Pass Pipeline + Fresh Compact EirProgram
     if !failed_oom {
-        w0.reset_for_stage();
-        w1.reset_for_stage();
-        w2.reset_for_stage();
-        w3.reset_for_stage();
-        w4.reset_for_stage();
-        w5.reset_for_stage();
-        w6.reset_for_stage();
-        w7.reset_for_stage();
-        w8.reset_for_stage();
-        w9.reset_for_stage();
-        w10.reset_for_stage();
-        w11.reset_for_stage();
-
         // Re-weight functions AFTER inlining so large post-inline callers run first (LPT)!
         let wm = weights.as_mut_slice();
-        let wo = work_order.as_mut_slice();
         var fi3: usize = 0_usize;
-        while fi3 < nfns && fi3 < wm.len && fi3 < wo.len {
+        while fi3 < nfns && fi3 < wm.len {
             let fid = fi3.trunc.[u32]();
-            wo[fi3] = fid;
             wm[fi3] = fn_opt_work_weight(eir_prog, fid);
             fi3 = fi3 +% 1_usize;
         }
-        sort_work_order_desc(work_order.as_mut_slice(), weights.as_slice());
 
-        next_pos.store(0_u64, .Release);
-        dispatch_opt_stage3_workers(
-            n_workers, alloc, &mut next_pos, work_order.as_slice(), fn_loc.as_mut_slice(), eir_prog, env, cfg,
-            &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5,
-            &mut w6, &mut w7, &mut w8, &mut w9, &mut w10, &mut w11,
-        );
-        failed_oom = any_worker_oom(&w0, &w1, &w2, &w3, &w4, &w5, &w6, &w7, &w8, &w9, &w10, &w11);
-        if !failed_oom {
-            try merge_all_worker_fns_into_eir(
-                alloc, eir_prog, nfns, fn_loc.as_slice(), &mut merge_sc,
-                &w0, &w1, &w2, &w3, &w4, &w5, &w6, &w7, &w8, &w9, &w10, &w11,
+        var s3_eir = try eir.EirProgram.init(alloc);
+        errdefer s3_eir.destroy(alloc);
+        try eir.copy_program_globals(alloc, eir_prog, &mut s3_eir);
+        let chunk_sz3: usize = 256_usize;
+        var c0: usize = 0_usize;
+        while c0 < nfns && !failed_oom {
+            var c1 = c0 +% chunk_sz3;
+            if c1 > nfns {
+                c1 = nfns;
+            }
+            work_order.clear();
+            var ci = c0;
+            while ci < c1 {
+                try work_order.push(alloc, ci.trunc.[u32]());
+                ci = ci +% 1_usize;
+            }
+            sort_work_order_desc(work_order.as_mut_slice(), weights.as_slice());
+            next_pos.store(0_u64, .Release);
+            dispatch_opt_stage3_workers(
+                n_workers, alloc, &mut next_pos, work_order.as_slice(), fn_loc.as_mut_slice(), eir_prog, env, cfg,
+                &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5,
+                &mut w6, &mut w7, &mut w8, &mut w9, &mut w10, &mut w11,
             );
+            failed_oom = any_worker_oom(&w0, &w1, &w2, &w3, &w4, &w5, &w6, &w7, &w8, &w9, &w10, &w11);
+            if !failed_oom {
+                let fls3 = fn_loc.as_slice();
+                var mi = c0;
+                while mi < c1 {
+                    let loc = if mi < fls3.len { fls3[mi] } else { 0_u64 };
+                    let wid = ((loc >> 32_u64) -% 1_u64).trunc.[u32]();
+                    let local_idx = (loc & 0xFFFFFFFF_u64).trunc.[u32]();
+                    try copy_fn_from_worker_out(
+                        alloc, wid, local_idx, &mut s3_eir, &mut merge_sc,
+                        &w0, &w1, &w2, &w3, &w4, &w5, &w6, &w7, &w8, &w9, &w10, &w11,
+                    );
+                    mi = mi +% 1_usize;
+                }
+                try release_all_opt_workers(
+                    alloc, n_workers,
+                    &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5,
+                    &mut w6, &mut w7, &mut w8, &mut w9, &mut w10, &mut w11,
+                );
+            }
+            c0 = c1;
+        }
+        if !failed_oom {
+            eir_prog.replace_with(alloc, s3_eir);
+        } else {
+            s3_eir.destroy(alloc);
         }
     }
     if profile_passes { if let clk = clock_opt { try print_opt_pass_line(alloc, clk, "mt_stage3_post_inline", t0, u0); } }

@@ -658,6 +658,8 @@ pub enum CfgBuiltinOpKind : u8 {
     VecReduceMax = 113,
     VecDot = 114,
     VecShuffle = 115,
+    BuildAddDep = 116,
+    BuildAddLib = 117,
 }
 
 pub struct CfgBuiltinOp {
@@ -1814,6 +1816,31 @@ impl CfgProgram {
         self.scheds.sched_systems.clear();
         self.scheds.dag_nodes.clear();
         self.scheds.dag_deps.clear();
+    }
+
+    pub fn release_body_pools(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        try self.funcs.blocks.reset_free(alloc, 32_usize);
+        try self.funcs.locals.reset_free(alloc, 64_usize);
+        try self.funcs.param_locals.reset_free(alloc, 16_usize);
+        try self.funcs.stmts.reset_free(alloc, 128_usize);
+        try self.funcs.switch_targets.reset_free(alloc, 16_usize);
+        try self.funcs.par_for_regions.reset_free(alloc, 8_usize);
+        try self.funcs.unsupported.reset_free(alloc, 8_usize);
+        try self.exprs.places.reset_free(alloc, 64_usize);
+        try self.exprs.projs.reset_free(alloc, 32_usize);
+        try self.exprs.operands.reset_free(alloc, 64_usize);
+        try self.exprs.consts.reset_free(alloc, 32_usize);
+        try self.exprs.rvalues.reset_free(alloc, 64_usize);
+        try self.exprs.calls.reset_free(alloc, 32_usize);
+        try self.exprs.args.reset_free(alloc, 64_usize);
+        try self.exprs.arg_spans.reset_free(alloc, 64_usize);
+        try self.exprs.aggregates.reset_free(alloc, 16_usize);
+        try self.exprs.asm_inputs.reset_free(alloc, 8_usize);
+        try self.aux.str_bytes.reset_free(alloc, 64_usize);
+        try self.aux.sym_list.reset_free(alloc, 16_usize);
+        try self.aux.expr_ids.reset_free(alloc, 16_usize);
+        try self.aux.loop_invariants.reset_free(alloc, 8_usize);
+        return;
     }
 
     pub fn seed_generic_insts_from(self: *mut Self, alloc: *mut AllocCap, src: *CfgProgram) -> !OutOfMemory {
@@ -3628,30 +3655,30 @@ pub fn reserve_for_bulk_append(
     dst_env_params: *mut col.DynBuf[types.ParamSig],
     totals: *CfgPoolOffsets,
 ) -> !OutOfMemory {
-    try dst.funcs.blocks.reserve_exact(alloc, totals.blocks.widen.[usize]());
-    try dst.funcs.locals.reserve_exact(alloc, totals.locals.widen.[usize]());
-    try dst.funcs.param_locals.reserve_exact(alloc, totals.param_locals.widen.[usize]());
-    try dst.funcs.stmts.reserve_exact(alloc, totals.stmts.widen.[usize]());
-    try dst.funcs.switch_targets.reserve_exact(alloc, totals.switch_targets.widen.[usize]());
-    try dst.funcs.par_for_regions.reserve_exact(alloc, totals.par_for_regions.widen.[usize]());
-    try dst.funcs.unsupported.reserve_exact(alloc, totals.unsupported.widen.[usize]());
+    try dst.funcs.blocks.reserve_slack(alloc, totals.blocks.widen.[usize]());
+    try dst.funcs.locals.reserve_slack(alloc, totals.locals.widen.[usize]());
+    try dst.funcs.param_locals.reserve_slack(alloc, totals.param_locals.widen.[usize]());
+    try dst.funcs.stmts.reserve_slack(alloc, totals.stmts.widen.[usize]());
+    try dst.funcs.switch_targets.reserve_slack(alloc, totals.switch_targets.widen.[usize]());
+    try dst.funcs.par_for_regions.reserve_slack(alloc, totals.par_for_regions.widen.[usize]());
+    try dst.funcs.unsupported.reserve_slack(alloc, totals.unsupported.widen.[usize]());
 
-    try dst.exprs.places.reserve_exact(alloc, totals.places.widen.[usize]());
-    try dst.exprs.projs.reserve_exact(alloc, totals.projs.widen.[usize]());
-    try dst.exprs.operands.reserve_exact(alloc, totals.operands.widen.[usize]());
-    try dst.exprs.consts.reserve_exact(alloc, totals.consts.widen.[usize]());
-    try dst.exprs.rvalues.reserve_exact(alloc, totals.rvalues.widen.[usize]());
-    try dst.exprs.calls.reserve_exact(alloc, totals.calls.widen.[usize]());
-    try dst.exprs.args.reserve_exact(alloc, totals.args.widen.[usize]());
-    try dst.exprs.arg_spans.reserve_exact(alloc, totals.arg_spans.widen.[usize]());
-    try dst.exprs.aggregates.reserve_exact(alloc, totals.aggregates.widen.[usize]());
-    try dst.exprs.asm_inputs.reserve_exact(alloc, totals.asm_inputs.widen.[usize]());
+    try dst.exprs.places.reserve_slack(alloc, totals.places.widen.[usize]());
+    try dst.exprs.projs.reserve_slack(alloc, totals.projs.widen.[usize]());
+    try dst.exprs.operands.reserve_slack(alloc, totals.operands.widen.[usize]());
+    try dst.exprs.consts.reserve_slack(alloc, totals.consts.widen.[usize]());
+    try dst.exprs.rvalues.reserve_slack(alloc, totals.rvalues.widen.[usize]());
+    try dst.exprs.calls.reserve_slack(alloc, totals.calls.widen.[usize]());
+    try dst.exprs.args.reserve_slack(alloc, totals.args.widen.[usize]());
+    try dst.exprs.arg_spans.reserve_slack(alloc, totals.arg_spans.widen.[usize]());
+    try dst.exprs.aggregates.reserve_slack(alloc, totals.aggregates.widen.[usize]());
+    try dst.exprs.asm_inputs.reserve_slack(alloc, totals.asm_inputs.widen.[usize]());
 
-    try dst.aux.str_bytes.reserve_exact(alloc, totals.str_bytes.widen.[usize]());
-    try dst.aux.sym_list.reserve_exact(alloc, totals.sym_list.widen.[usize]());
-    try dst.aux.expr_ids.reserve_exact(alloc, totals.expr_ids.widen.[usize]());
-    try dst.aux.loop_invariants.reserve_exact(alloc, totals.loop_invariants.widen.[usize]());
-    try dst_env_params.reserve_exact(alloc, totals.env_params.widen.[usize]());
+    try dst.aux.str_bytes.reserve_slack(alloc, totals.str_bytes.widen.[usize]());
+    try dst.aux.sym_list.reserve_slack(alloc, totals.sym_list.widen.[usize]());
+    try dst.aux.expr_ids.reserve_slack(alloc, totals.expr_ids.widen.[usize]());
+    try dst.aux.loop_invariants.reserve_slack(alloc, totals.loop_invariants.widen.[usize]());
+    try dst_env_params.reserve_slack(alloc, totals.env_params.widen.[usize]());
     return;
 }
 

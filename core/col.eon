@@ -1617,7 +1617,11 @@ impl[T] DynBuf[T] {
                 new_cap = need;
                 break;
             }
-            new_cap = new_cap *% 2_usize;
+            if new_cap >= 1024_usize {
+                new_cap = new_cap +% (new_cap >> 1_usize);
+            } else {
+                new_cap = new_cap *% 2_usize;
+            }
         }
         var new_buf = try Buf.[T].init(alloc, new_cap);
         errdefer new_buf.destroy(alloc);
@@ -1639,6 +1643,33 @@ impl[T] DynBuf[T] {
         try new_buf.push_slice(self.buf.as_slice());
         self.buf.destroy(alloc);
         self.buf = new_buf;
+        return;
+    }
+
+    pub fn reserve_slack(self: *mut Self, alloc: *mut AllocCap, total_len: usize) -> !OutOfMemory {
+        if total_len <= self.buf.cap() {
+            return;
+        }
+        if total_len > 0x3FFFFFFF_usize {
+            return .OutOfMemory;
+        }
+        var target = total_len +% (total_len >> 3_usize);
+        if target > 0x3FFFFFFF_usize || target < total_len {
+            target = total_len;
+        }
+        try self.reserve_exact(alloc, target);
+        return;
+    }
+
+    pub fn reset_free(self: *mut Self, alloc: *mut AllocCap, small_cap: usize) -> !OutOfMemory {
+        let target: usize = if small_cap < 4_usize { 4_usize } else { small_cap };
+        if self.buf.cap() > target *% 4_usize {
+            let new_buf = try Buf.[T].init(alloc, target);
+            self.buf.destroy(alloc);
+            self.buf = new_buf;
+        } else {
+            self.buf.clear();
+        }
         return;
     }
 

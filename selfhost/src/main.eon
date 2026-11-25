@@ -1694,6 +1694,10 @@ fn load_eon_sources_with_jobs(
     while fi < files.len() {
         let p_bytes = files.get(fi);
         try normalize_path(&mut env.alloc, p_bytes, &mut norm_buf);
+        if let _ = seen_paths.lookup(norm_buf.as_bytes()) {
+            fi = fi +% 1_usize;
+            continue;
+        }
         _ = try seen_paths.intern(&mut env.alloc, norm_buf.as_bytes());
         let fid = (try load_file_into_sm(&mut env.alloc, &env.fs, p_bytes, sm, err_buf)) orelse {
             init_fids.destroy(&mut env.alloc);
@@ -2449,17 +2453,20 @@ fn file_exists_regular(alloc: *mut AllocCap, fs: *FsCap, path: *str) -> bool {
     return true;
 }
 
-fn emit_unsupported_cfg_diags(
+fn emit_unsupported_cfg_diags_range(
     alloc: *mut AllocCap,
     cfg_prog: *cfg_ir.CfgProgram,
+    fn_start: u32,
+    fn_end: u32,
     diags: *mut diag.DiagBag,
     suffix: *str,
 ) -> !OutOfMemory {
     var msg = try str.StrBuf.init(alloc, 64_usize);
     errdefer msg.destroy(alloc);
     let nfns = cfg_prog.fn_count();
-    var fi: u32 = 0_u32;
-    while fi < nfns {
+    let lim = if fn_end > nfns { nfns } else { fn_end };
+    var fi: u32 = fn_start;
+    while fi < lim {
         if let cf = cfg_prog.get_fn(fi) {
             if cf.sig.generics.len == 0_u32 && !cf.sig.is_comptime {
                 let unsup = cfg_prog.fn_unsupported(fi);
@@ -2477,6 +2484,16 @@ fn emit_unsupported_cfg_diags(
         fi = fi +% 1_u32;
     }
     msg.destroy(alloc);
+    return;
+}
+
+fn emit_unsupported_cfg_diags(
+    alloc: *mut AllocCap,
+    cfg_prog: *cfg_ir.CfgProgram,
+    diags: *mut diag.DiagBag,
+    suffix: *str,
+) -> !OutOfMemory {
+    try emit_unsupported_cfg_diags_range(alloc, cfg_prog, 0_u32, cfg_prog.fn_count(), diags, suffix);
     return;
 }
 
@@ -3430,6 +3447,7 @@ fn inc_compile_partial_units(
         };
         vr.destroy(alloc);
         try eir.apply_layout_sharing(alloc, &mut eir_prog, &tenv);
+        try eir_prog.release_verify_dump_meta(alloc);
     }
 
     if !diags.has_errors() {
@@ -3825,6 +3843,161 @@ fn classify_stub_plain_fn(bytes: *[u8], sp: StubEntrySpan) -> StubFnClassify {
     return StubFnClassify.{ is_plain_fn: true, is_pub: is_pub, name_start: ns, name_end: ne };
 }
 
+struct StubImplClassify {
+    is_plain_impl: bool;
+    hdr_start: usize;
+    hdr_end: usize;
+    body_start: usize;
+    body_end: usize;
+}
+
+/// Classifies non-generic, non-interface `impl Type { ... }` blocks so item-level stub diffing
+/// can diff individual `impl` methods without invalidating unrelated importers.
+fn classify_stub_plain_impl(bytes: *[u8], sp: StubEntrySpan) -> StubImplClassify {
+    let fail = StubImplClassify.{
+        is_plain_impl: false,
+        hdr_start: 0_usize,
+        hdr_end: 0_usize,
+        body_start: 0_usize,
+        body_end: 0_usize,
+    };
+    if sp.start >= sp.end || sp.end > bytes.len || sp.end - sp.start < 8_usize {
+        return fail;
+    }
+    if bytes[sp.start] == b'@' || !stub_starts_with(bytes, sp.start, sp.end, "impl ") {
+        return fail;
+    }
+    let last_idx = sp.end - 1_usize;
+    if last_idx >= bytes.len || bytes[last_idx] != b'}' {
+        return fail;
+    }
+    var open_pos = sp.end;
+    var p = sp.start +% 5_usize;
+    while p < last_idx && p < bytes.len {
+        let ch = bytes[p];
+        if ch == b'[' {
+            // Generic impl block: fall back conservatively.
+            return fail;
+        }
+        if ch == b'{' {
+            open_pos = p;
+            break;
+        }
+        if ch == b'f' && stub_starts_with(bytes, p, last_idx, "for ") {
+            if p > sp.start && is_ws_byte_stub(bytes[p - 1_usize]) {
+                // Trait/interface impl (`impl Iface for Type`): vtable/conformance sensitive.
+                return fail;
+            }
+        }
+        p = p +% 1_usize;
+    }
+    if open_pos >= last_idx {
+        return fail;
+    }
+    var hs = sp.start +% 5_usize;
+    while hs < open_pos && hs < bytes.len && is_ws_byte_stub(bytes[hs]) {
+        hs = hs +% 1_usize;
+    }
+    var he = open_pos;
+    while he > hs {
+        let he1 = he - 1_usize;
+        if he1 >= bytes.len || !is_ws_byte_stub(bytes[he1]) {
+            break;
+        }
+        he = he1;
+    }
+    if hs >= he {
+        return fail;
+    }
+    return StubImplClassify.{
+        is_plain_impl: true,
+        hdr_start: hs,
+        hdr_end: he,
+        body_start: open_pos +% 1_usize,
+        body_end: last_idx,
+    };
+}
+
+fn stub_impl_hdr_eq(a: *[u8], ca: *StubImplClassify, b: *[u8], cb: *StubImplClassify) -> bool {
+    return stub_span_eq(
+        a,
+        StubEntrySpan.{ start: ca.hdr_start, end: ca.hdr_end },
+        b,
+        StubEntrySpan.{ start: cb.hdr_start, end: cb.hdr_end },
+    );
+}
+
+fn diff_plain_impl_methods(
+    alloc: *mut AllocCap,
+    old_body: *[u8],
+    new_body: *[u8],
+    changed_syms_nl: *mut str.StrBuf,
+    any_old_changed: *mut bool,
+) -> bool ! OutOfMemory {
+    var old_ms = try col.DynBuf.[StubEntrySpan].init(alloc, 16_usize);
+    errdefer old_ms.destroy(alloc);
+    var new_ms = try col.DynBuf.[StubEntrySpan].init(alloc, 16_usize);
+    errdefer new_ms.destroy(alloc);
+    try split_stub_entries(alloc, old_body, &mut old_ms);
+    try split_stub_entries(alloc, new_body, &mut new_ms);
+
+    let oms = old_ms.as_slice();
+    let nms = new_ms.as_slice();
+    var ok = true;
+
+    var oi: usize = 0_usize;
+    while oi < oms.len && ok {
+        var found = false;
+        var ni: usize = 0_usize;
+        while ni < nms.len {
+            if stub_span_eq(old_body, oms[oi], new_body, nms[ni]) {
+                found = true;
+                break;
+            }
+            ni = ni +% 1_usize;
+        }
+        if !found {
+            any_old_changed.* = true;
+            let info = classify_stub_plain_fn(old_body, oms[oi]);
+            if !info.is_plain_fn {
+                ok = false;
+            } else if info.is_pub && info.name_end <= old_body.len && info.name_start < info.name_end {
+                let nm = old_body.sub(info.name_start, info.name_end) catch {
+                    ok = false;
+                    break;
+                };
+                try changed_syms_nl.push_bytes_grow(alloc, nm);
+                try changed_syms_nl.push_byte_grow(alloc, b'\n');
+            }
+        }
+        oi = oi +% 1_usize;
+    }
+
+    var ni2: usize = 0_usize;
+    while ni2 < nms.len && ok {
+        var found = false;
+        var oi2: usize = 0_usize;
+        while oi2 < oms.len {
+            if stub_span_eq(new_body, nms[ni2], old_body, oms[oi2]) {
+                found = true;
+                break;
+            }
+            oi2 = oi2 +% 1_usize;
+        }
+        if !found {
+            let info = classify_stub_plain_fn(new_body, nms[ni2]);
+            if !info.is_plain_fn {
+                ok = false;
+            }
+        }
+        ni2 = ni2 +% 1_usize;
+    }
+
+    new_ms.destroy(alloc);
+    old_ms.destroy(alloc);
+    return ok;
+}
+
 fn diff_module_stubs(
     alloc: *mut AllocCap,
     old_stub: *[u8],
@@ -3840,6 +4013,14 @@ fn diff_module_stubs(
 
     let oes = old_ents.as_slice();
     let nes = new_ents.as_slice();
+    var matched_new = try col.DynBuf.[u8].init(alloc, nes.len +% 1_usize);
+    errdefer matched_new.destroy(alloc);
+    var mn_i: usize = 0_usize;
+    while mn_i < nes.len {
+        try matched_new.push(alloc, 0_u8);
+        mn_i = mn_i +% 1_usize;
+    }
+
     let start_sym_len = changed_syms_nl.len();
     var all_dirty = false;
     var any_old_changed = false;
@@ -3851,22 +4032,61 @@ fn diff_module_stubs(
         while ni < nes.len {
             if stub_span_eq(old_stub, oes[oi], new_stub, nes[ni]) {
                 found = true;
+                let mn_m = matched_new.as_mut_slice();
+                if ni < mn_m.len { mn_m[ni] = 1_u8; }
                 break;
             }
             ni = ni +% 1_usize;
         }
         if !found {
-            any_old_changed = true;
-            let info = classify_stub_plain_fn(old_stub, oes[oi]);
-            if !info.is_plain_fn {
-                all_dirty = true;
-            } else if info.is_pub && info.name_end <= old_stub.len && info.name_start < info.name_end {
-                let nm = old_stub.sub(info.name_start, info.name_end) catch {
+            let fn_info = classify_stub_plain_fn(old_stub, oes[oi]);
+            if fn_info.is_plain_fn {
+                any_old_changed = true;
+                if fn_info.is_pub && fn_info.name_end <= old_stub.len && fn_info.name_start < fn_info.name_end {
+                    let nm = old_stub.sub(fn_info.name_start, fn_info.name_end) catch {
+                        all_dirty = true;
+                        break;
+                    };
+                    try changed_syms_nl.push_bytes_grow(alloc, nm);
+                    try changed_syms_nl.push_byte_grow(alloc, b'\n');
+                }
+            } else {
+                let imp_old = classify_stub_plain_impl(old_stub, oes[oi]);
+                var paired = false;
+                if imp_old.is_plain_impl {
+                    var ni_m: usize = 0_usize;
+                    while ni_m < nes.len {
+                        let mn_ro = matched_new.as_slice();
+                        if ni_m < mn_ro.len && mn_ro[ni_m] == 0_u8 {
+                            let imp_new = classify_stub_plain_impl(new_stub, nes[ni_m]);
+                            if imp_new.is_plain_impl && stub_impl_hdr_eq(old_stub, &imp_old, new_stub, &imp_new) {
+                                let mn_m2 = matched_new.as_mut_slice();
+                                if ni_m < mn_m2.len { mn_m2[ni_m] = 1_u8; }
+                                let ob = old_stub.sub(imp_old.body_start, imp_old.body_end) catch {
+                                    all_dirty = true;
+                                    break;
+                                };
+                                let nb = new_stub.sub(imp_new.body_start, imp_new.body_end) catch {
+                                    all_dirty = true;
+                                    break;
+                                };
+                                let m_ok = try diff_plain_impl_methods(
+                                    alloc, ob, nb, changed_syms_nl, &mut any_old_changed,
+                                );
+                                if !m_ok {
+                                    all_dirty = true;
+                                }
+                                paired = true;
+                                break;
+                            }
+                        }
+                        ni_m = ni_m +% 1_usize;
+                    }
+                }
+                if !paired {
+                    any_old_changed = true;
                     all_dirty = true;
-                    break;
-                };
-                try changed_syms_nl.push_bytes_grow(alloc, nm);
-                try changed_syms_nl.push_byte_grow(alloc, b'\n');
+                }
             }
         }
         oi = oi +% 1_usize;
@@ -3874,16 +4094,9 @@ fn diff_module_stubs(
 
     var ni2: usize = 0_usize;
     while ni2 < nes.len && !all_dirty {
-        var found = false;
-        var oi2: usize = 0_usize;
-        while oi2 < oes.len {
-            if stub_span_eq(new_stub, nes[ni2], old_stub, oes[oi2]) {
-                found = true;
-                break;
-            }
-            oi2 = oi2 +% 1_usize;
-        }
-        if !found {
+        let mn_ro2 = matched_new.as_slice();
+        let already = ni2 < mn_ro2.len && mn_ro2[ni2] != 0_u8;
+        if !already {
             let info = classify_stub_plain_fn(new_stub, nes[ni2]);
             if !info.is_plain_fn {
                 all_dirty = true;
@@ -3892,6 +4105,7 @@ fn diff_module_stubs(
         ni2 = ni2 +% 1_usize;
     }
 
+    matched_new.destroy(alloc);
     new_ents.destroy(alloc);
     old_ents.destroy(alloc);
 
@@ -4585,7 +4799,7 @@ fn try_incremental_emi_build(
     return result_status;
 }
 
-fn check_and_lower_cfg_stage(
+fn stream_check_and_lower_batches(
     alloc: *mut AllocCap,
     clock: *ClockCap,
     arena: *ast.AstArena,
@@ -4597,8 +4811,12 @@ fn check_and_lower_cfg_stage(
     diags: *mut diag.DiagBag,
     profile_phases: bool,
     jobs: u32,
+    cfg_prog: *mut cfg_ir.CfgProgram,
+    eir_prog: *mut eir.EirProgram,
+    eff_stream: *mut effects.EffectsStream,
+    unsup_diags: *mut diag.DiagBag,
     out_pre_err: *mut usize,
-) -> cfg_ir.CfgProgram ! OutOfMemory {
+) -> !OutOfMemory {
     var t0 = if profile_phases { rt.now_ns(clock) } else { 0_u64 };
     var u0 = if profile_phases { alloc.used_bytes() } else { 0_usize };
     let ttable = try check.check_program_with_jobs(
@@ -4608,21 +4826,42 @@ fn check_and_lower_cfg_stage(
     if profile_phases { try print_phase_line(alloc, clock, "check", t0, u0); t0 = rt.now_ns(clock); u0 = alloc.used_bytes(); }
 
     out_pre_err.* = diags.count();
-    let cfg_prog = try cfg.lower_program_with_jobs(
-        alloc, arena, unit_ids, resolved, tenv, ct, &ttable, interner, jobs,
-    );
-    if profile_phases {
-        errdefer cfg_prog.destroy(alloc);
-        try print_phase_line(alloc, clock, "cfg", t0, u0);
+    try eir.populate_eir_extern_fns(alloc, resolved, eir_prog);
+
+    var sess = try cfg.CfgStreamSession.init(alloc, arena, resolved, tenv, cfg_prog, &ttable, jobs);
+    errdefer sess.destroy(alloc);
+    while true {
+        let br_opt = try sess.next_batch(
+            alloc, arena, resolved, tenv, cfg_prog, ct, &ttable, interner, 256_usize,
+        );
+        let br = br_opt orelse { break; };
+        try borrow.analyze_fn_range_with_jobs(
+            alloc, resolved, tenv, cfg_prog, br.start, br.end, interner, diags, jobs,
+        );
+        if out_pre_err.* == 0_usize {
+            try eff_stream.collect_range_with_jobs(
+                alloc, cfg_prog, tenv, br.start, br.end, jobs,
+            );
+        }
+        try eir.lower_cfg_fn_range_with_jobs(
+            alloc, cfg_prog, resolved, tenv, br.start, br.end, eir_prog, diags, false, jobs,
+        );
+        try emit_unsupported_cfg_diags_range(
+            alloc, cfg_prog, br.start, br.end, unsup_diags, "` to EIR/x86_64",
+        );
+        try cfg_prog.release_body_pools(alloc);
     }
+    if profile_phases { try print_phase_line(alloc, clock, "cfg+borrow+eir", t0, u0); }
+    sess.destroy(alloc);
     ttable.destroy(alloc);
-    return cfg_prog;
+    return;
 }
 
 fn build_lower_to_eir_stage(
     alloc: *mut AllocCap,
     clock: *ClockCap,
-    arena: *ast.AstArena,
+    arena: *mut ast.AstArena,
+    can_free_arena: bool,
     unit_ids: *[u32],
     resolved: *mut resolve.ResolvedProgram,
     tenv: *mut types.TypeEnv,
@@ -4633,32 +4872,38 @@ fn build_lower_to_eir_stage(
     jobs: u32,
     out_pre_err: *mut usize,
 ) -> eir.EirProgram ! OutOfMemory {
-    let cfg_prog = try check_and_lower_cfg_stage(
-        alloc, clock, arena, unit_ids, resolved, tenv, ct, interner, diags, profile_phases, jobs, out_pre_err,
-    );
+    var cfg_prog = try cfg_ir.CfgProgram.init(alloc);
     errdefer cfg_prog.destroy(alloc);
+    var eir_prog = try eir.EirProgram.init(alloc);
+    errdefer eir_prog.destroy(alloc);
+    var eff_stream = try effects.EffectsStream.init(alloc);
+    errdefer eff_stream.destroy(alloc);
+    var unsup_diags = try diag.DiagBag.init(alloc);
+    errdefer unsup_diags.destroy(alloc);
 
-    var t0 = if profile_phases { rt.now_ns(clock) } else { 0_u64 };
-    var u0 = if profile_phases { alloc.used_bytes() } else { 0_usize };
-    try borrow.analyze_program_with_jobs(alloc, resolved, tenv, &cfg_prog, interner, diags, jobs);
-    if profile_phases { try print_phase_line(alloc, clock, "borrow", t0, u0); t0 = rt.now_ns(clock); u0 = alloc.used_bytes(); }
+    try stream_check_and_lower_batches(
+        alloc, clock, arena, unit_ids, resolved, tenv, ct, interner, diags, profile_phases, jobs,
+        &mut cfg_prog, &mut eir_prog, &mut eff_stream, &mut unsup_diags, out_pre_err,
+    );
 
+    let t0 = if profile_phases { rt.now_ns(clock) } else { 0_u64 };
+    let u0 = if profile_phases { alloc.used_bytes() } else { 0_usize };
     if out_pre_err.* == 0_usize {
-        let eff_rep = try effects.check_effects_and_concurrency_with_jobs(
-            alloc, arena, unit_ids, resolved, tenv, &cfg_prog, interner, diags, jobs,
+        let eff_rep = try eff_stream.finalize(
+            alloc, arena, resolved, tenv, &cfg_prog, interner, diags, jobs,
         );
         eff_rep.destroy(alloc);
     }
-    if profile_phases { try print_phase_line(alloc, clock, "effects", t0, u0); t0 = rt.now_ns(clock); u0 = alloc.used_bytes(); }
-
-    let eir_prog = try eir.lower_cfg_to_eir_with_diags_and_jobs(
-        alloc, &cfg_prog, resolved, tenv, interner, diags, false, jobs,
-    );
-    errdefer eir_prog.destroy(alloc);
-    if !diags.has_errors() {
-        try emit_unsupported_cfg_diags(alloc, &cfg_prog, diags, "` to EIR/x86_64");
+    if can_free_arena {
+        try arena.release_non_expr_pools(alloc);
     }
-    if profile_phases { try print_phase_line(alloc, clock, "eir", t0, u0); }
+    if !diags.has_errors() && unsup_diags.count() > 0_usize {
+        try diags.append_diag_range(alloc, &unsup_diags, 0_u32, unsup_diags.count().trunc.[u32]());
+    }
+    try eir.copy_cfg_metadata_to_eir(alloc, &cfg_prog, &mut eir_prog);
+    if profile_phases { try print_phase_line(alloc, clock, "effects_final", t0, u0); }
+    unsup_diags.destroy(alloc);
+    eff_stream.destroy(alloc);
     cfg_prog.destroy(alloc);
     return eir_prog;
 }
@@ -4668,7 +4913,8 @@ fn compile_loaded_to_elf_file(
     clock: *ClockCap,
     fs: *FsCap,
     sm: *span.SourceMap,
-    arena: *ast.AstArena,
+    arena: *mut ast.AstArena,
+    can_free_arena: bool,
     unit_ids: *[u32],
     user_file_count: usize,
     interner: *mut span.SymInterner,
@@ -4698,9 +4944,12 @@ fn compile_loaded_to_elf_file(
     errdefer ct.destroy(alloc);
     var pre_err: usize = 0_usize;
     var eir_prog = try build_lower_to_eir_stage(
-        alloc, clock, arena, unit_ids, &mut resolved, &mut tenv, &mut ct, interner, diags, profile_phases, jobs, &mut pre_err,
+        alloc, clock, arena, can_free_arena, unit_ids, &mut resolved, &mut tenv, &mut ct, interner, diags, profile_phases, jobs, &mut pre_err,
     );
     errdefer eir_prog.destroy(alloc);
+    if can_free_arena && !eir_prog.has_any_contracts() {
+        try arena.release_all_pools(alloc);
+    }
     if profile_phases { t0 = rt.now_ns(clock); u0 = alloc.used_bytes(); }
 
     if pre_err == 0_usize && !diags.has_errors() {
@@ -4726,6 +4975,10 @@ fn compile_loaded_to_elf_file(
             u0 = alloc.used_bytes();
         }
         try eir.apply_layout_sharing(alloc, &mut eir_prog, &tenv);
+        try eir_prog.release_verify_dump_meta(alloc);
+    }
+    if can_free_arena {
+        try arena.release_all_pools(alloc);
     }
 
     var ok = false;
@@ -4742,6 +4995,7 @@ fn compile_loaded_to_elf_file(
             let stats = try eir_opt.optimize_program_profiled_with_jobs(
                 alloc, clock, profile_phases, &mut eir_prog, &tenv, interner, copts.opt, err_buf, jobs,
             );
+            try eir_prog.release_value_facts(alloc);
             if profile_phases { try print_phase_line(alloc, clock, "eir_opt", t0, u0); t0 = rt.now_ns(clock); u0 = alloc.used_bytes(); }
             if err_buf.len() > 0_usize {
                 lint_ok = false;
@@ -5234,12 +5488,552 @@ fn execute_build_eon_script(
     return ok;
 }
 
+struct LockDepEntry {
+    name_off: u32;
+    name_len: u32;
+    path_off: u32;
+    path_len: u32;
+    digest: tcb_audit.Sha256Digest;
+}
+
+linear struct ResolvedBuildDeps {
+    src_roots: PathList;
+    lock_entries: col.DynBuf[LockDepEntry];
+    str_bytes: col.DynBuf[u8];
+    visited: col.Interner;
+    visiting: PathList;
+}
+
+impl ResolvedBuildDeps {
+    fn init(alloc: *mut AllocCap) -> ResolvedBuildDeps ! OutOfMemory {
+        let src_roots = try PathList.init(alloc);
+        errdefer src_roots.destroy(alloc);
+        let lock_entries = try col.DynBuf.[LockDepEntry].init(alloc, 8_usize);
+        errdefer lock_entries.destroy(alloc);
+        let str_bytes = try col.DynBuf.[u8].init(alloc, 256_usize);
+        errdefer str_bytes.destroy(alloc);
+        let visited = try col.Interner.init(alloc, 16_usize);
+        errdefer visited.destroy(alloc);
+        let visiting = try PathList.init(alloc);
+        return ResolvedBuildDeps.{
+            src_roots: src_roots,
+            lock_entries: lock_entries,
+            str_bytes: str_bytes,
+            visited: visited,
+            visiting: visiting,
+        };
+    }
+
+    fn destroy(self: ResolvedBuildDeps, alloc: *mut AllocCap) {
+        let ResolvedBuildDeps.{ src_roots, lock_entries, str_bytes, visited, visiting } = self;
+        visiting.destroy(alloc);
+        visited.destroy(alloc);
+        str_bytes.destroy(alloc);
+        lock_entries.destroy(alloc);
+        src_roots.destroy(alloc);
+    }
+
+    fn push_lock_entry(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        name: *[u8],
+        path: *[u8],
+        digest: tcb_audit.Sha256Digest,
+    ) -> !OutOfMemory {
+        let noff = self.str_bytes.len().trunc.[u32]();
+        try self.str_bytes.push_slice(alloc, name);
+        let poff = self.str_bytes.len().trunc.[u32]();
+        try self.str_bytes.push_slice(alloc, path);
+        try self.lock_entries.push(
+            alloc,
+            LockDepEntry.{
+                name_off: noff,
+                name_len: name.len.trunc.[u32](),
+                path_off: poff,
+                path_len: path.len.trunc.[u32](),
+                digest: digest,
+            },
+        );
+        return;
+    }
+
+    fn is_visiting(self: *Self, norm_root: *[u8]) -> bool {
+        var i: usize = 0_usize;
+        while i < self.visiting.len() {
+            if str.bytes_eq(self.visiting.get(i), norm_root) {
+                return true;
+            }
+            i = i +% 1_usize;
+        }
+        return false;
+    }
+
+    fn pop_visiting(self: *mut Self) {
+        if self.visiting.offs.len() > 0_usize {
+            _ = self.visiting.offs.pop();
+            _ = self.visiting.lens.pop();
+        }
+    }
+}
+
+fn clone_lock_entry(e: *LockDepEntry) -> LockDepEntry {
+    return LockDepEntry.{
+        name_off: e.name_off,
+        name_len: e.name_len,
+        path_off: e.path_off,
+        path_len: e.path_len,
+        digest: tcb_audit.Sha256Digest.{ bytes: copy e.digest.bytes },
+    };
+}
+
+fn cmp_lock_entries(bytes: *[u8], a: *LockDepEntry, b: *LockDepEntry) -> i32 {
+    let a0 = a.name_off.widen.[usize]();
+    let a1 = a0 +% a.name_len.widen.[usize]();
+    let b0 = b.name_off.widen.[usize]();
+    let b1 = b0 +% b.name_len.widen.[usize]();
+    let c = cmp_bytes_range(bytes, a0, a1, bytes, b0, b1);
+    if c != 0_i32 {
+        return c;
+    }
+    let pa0 = a.path_off.widen.[usize]();
+    let pa1 = pa0 +% a.path_len.widen.[usize]();
+    let pb0 = b.path_off.widen.[usize]();
+    let pb1 = pb0 +% b.path_len.widen.[usize]();
+    return cmp_bytes_range(bytes, pa0, pa1, bytes, pb0, pb1);
+}
+
+fn sort_lock_entries(entries: *mut [LockDepEntry], bytes: *[u8]) {
+    var i: usize = 1_usize;
+    while i < entries.len {
+        let key = clone_lock_entry(&entries[i]);
+        var j = i;
+        while j > 0_usize {
+            let prev = j - 1_usize;
+            if cmp_lock_entries(bytes, &entries[prev], &key) <= 0_i32 {
+                break;
+            }
+            entries[j] = clone_lock_entry(&entries[prev]);
+            j = prev;
+        }
+        entries[j] = key;
+        i = i +% 1_usize;
+    }
+}
+
+fn compute_pkg_tree_sha256(
+    alloc: *mut AllocCap,
+    fs: *FsCap,
+    pkg_dir: *[u8],
+    out_digest: *mut tcb_audit.Sha256Digest,
+    err_buf: *mut str.StrBuf,
+) -> bool ! OutOfMemory | Utf8Error {
+    var files = try PathList.init(alloc);
+    errdefer files.destroy(alloc);
+    let p_str = try pkg_dir.as_str();
+    let ok = try collect_eon_files(alloc, fs, p_str, &mut files, err_buf);
+    if !ok {
+        files.destroy(alloc);
+        return false;
+    }
+    files.sort();
+    var hash_in = try col.DynBuf.[u8].init(alloc, 1024_usize);
+    errdefer hash_in.destroy(alloc);
+    try hash_in.push_slice(alloc, "EON_PKG_TREE_V1\n".as_bytes());
+    let prefix_len = pkg_dir.len;
+    var fi: usize = 0_usize;
+    while fi < files.len() {
+        let fp = files.get(fi);
+        var rel = fp;
+        if fp.len > prefix_len && str.starts_with(fp, pkg_dir) {
+            var r0 = prefix_len;
+            while r0 < fp.len && fp[r0] == b'/' {
+                r0 = r0 +% 1_usize;
+            }
+            rel = fp.sub(r0, fp.len) catch fp;
+        }
+        try hash_in.push_slice(alloc, rel);
+        try hash_in.push(alloc, 0_u8);
+        let f_str = try fp.as_str();
+        let fbuf = fs.read_file(alloc, f_str) catch {
+            err_buf.clear();
+            try err_buf.push_str_grow(alloc, "failed to hash dependency file `");
+            try err_buf.push_bytes_grow(alloc, fp);
+            try err_buf.push_str_grow(alloc, "`\n");
+            hash_in.destroy(alloc);
+            files.destroy(alloc);
+            return false;
+        };
+        try hash_in.push_slice(alloc, fbuf.as_slice());
+        fbuf.destroy(alloc);
+        try hash_in.push(alloc, 0_u8);
+        fi = fi +% 1_usize;
+    }
+    out_digest.* = tcb_audit.sha256(hash_in.as_slice());
+    hash_in.destroy(alloc);
+    files.destroy(alloc);
+    return true;
+}
+
+@recursive
+fn resolve_pkg_deps_rec(
+    env: *mut Env,
+    root_plan: *build_sys.BuildPlan,
+    cur_pkg_root: *[u8],
+    cur_plan: *build_sys.BuildPlan,
+    merged_libs: *mut PathList,
+    out_deps: *mut ResolvedBuildDeps,
+    err_buf: *mut str.StrBuf,
+) -> bool ! OutOfMemory | Utf8Error {
+    var raw_dep = try str.StrBuf.init(&mut env.alloc, 128_usize);
+    errdefer raw_dep.destroy(&mut env.alloc);
+    var norm_dep = try str.StrBuf.init(&mut env.alloc, 128_usize);
+    errdefer norm_dep.destroy(&mut env.alloc);
+    var sub_build = try str.StrBuf.init(&mut env.alloc, 128_usize);
+    errdefer sub_build.destroy(&mut env.alloc);
+    var sub_src = try str.StrBuf.init(&mut env.alloc, 128_usize);
+    errdefer sub_src.destroy(&mut env.alloc);
+
+    var di: usize = 0_usize;
+    while di < cur_plan.dep_count() {
+        let dname = cur_plan.dep_name(di);
+        let dpath = cur_plan.dep_path(di);
+        try join_path(&mut env.alloc, cur_pkg_root, dpath, &mut raw_dep);
+        try normalize_path(&mut env.alloc, raw_dep.as_bytes(), &mut norm_dep);
+        let dep_root = norm_dep.as_bytes();
+
+        if out_deps.is_visiting(dep_root) {
+            err_buf.clear();
+            try err_buf.push_str_grow(&mut env.alloc, "build.eon dependency cycle detected involving `");
+            try err_buf.push_bytes_grow(&mut env.alloc, dname);
+            try err_buf.push_str_grow(&mut env.alloc, "` (");
+            try err_buf.push_bytes_grow(&mut env.alloc, dep_root);
+            try err_buf.push_str_grow(&mut env.alloc, ")\n");
+            sub_src.destroy(&mut env.alloc);
+            sub_build.destroy(&mut env.alloc);
+            norm_dep.destroy(&mut env.alloc);
+            raw_dep.destroy(&mut env.alloc);
+            return false;
+        }
+        if let _ = out_deps.visited.lookup(dep_root) {
+            di = di +% 1_usize;
+            continue;
+        }
+
+        let dep_root_str = try dep_root.as_str();
+        if !env.fs.is_dir(dep_root_str) {
+            err_buf.clear();
+            try err_buf.push_str_grow(&mut env.alloc, "build.eon dependency error: directory `");
+            try err_buf.push_bytes_grow(&mut env.alloc, dep_root);
+            try err_buf.push_str_grow(&mut env.alloc, "` for `");
+            try err_buf.push_bytes_grow(&mut env.alloc, dname);
+            try err_buf.push_str_grow(&mut env.alloc, "` not found\n");
+            sub_src.destroy(&mut env.alloc);
+            sub_build.destroy(&mut env.alloc);
+            norm_dep.destroy(&mut env.alloc);
+            raw_dep.destroy(&mut env.alloc);
+            return false;
+        }
+
+        var digest = tcb_audit.sha256_zero();
+        let hash_ok = try compute_pkg_tree_sha256(&mut env.alloc, &env.fs, dep_root, &mut digest, err_buf);
+        if !hash_ok {
+            sub_src.destroy(&mut env.alloc);
+            sub_build.destroy(&mut env.alloc);
+            norm_dep.destroy(&mut env.alloc);
+            raw_dep.destroy(&mut env.alloc);
+            return false;
+        }
+        try out_deps.push_lock_entry(&mut env.alloc, dname, dpath, digest);
+        try out_deps.visiting.push(&mut env.alloc, dep_root);
+
+        try join_path(&mut env.alloc, dep_root, "build.eon".as_bytes(), &mut sub_build);
+        let sub_bstr = try sub_build.as_str();
+        if file_exists_regular(&mut env.alloc, &env.fs, sub_bstr) {
+            var dep_plan = try build_sys.BuildPlan.init(&mut env.alloc, dep_root);
+            errdefer dep_plan.destroy(&mut env.alloc);
+            let sub_ok = try execute_build_eon_script(env, dep_root, sub_build.as_bytes(), &mut dep_plan, err_buf);
+            if !sub_ok {
+                out_deps.pop_visiting();
+                dep_plan.destroy(&mut env.alloc);
+                sub_src.destroy(&mut env.alloc);
+                sub_build.destroy(&mut env.alloc);
+                norm_dep.destroy(&mut env.alloc);
+                raw_dep.destroy(&mut env.alloc);
+                return false;
+            }
+            // Per-package TCB policy: a dependency cannot escalate `@hal` unless root `build.eon` explicitly authorizes it.
+            var hi: usize = 0_usize;
+            while hi < dep_plan.allow_hal_count() {
+                let hmod = dep_plan.allow_hal_at(hi);
+                if !root_plan.allows_hal_mod(hmod) {
+                    err_buf.clear();
+                    try err_buf.push_str_grow(&mut env.alloc, "TCB audit error: dependency `");
+                    try err_buf.push_bytes_grow(&mut env.alloc, dname);
+                    try err_buf.push_str_grow(&mut env.alloc, "` requests @hal for `");
+                    try err_buf.push_bytes_grow(&mut env.alloc, hmod);
+                    try err_buf.push_str_grow(&mut env.alloc, "`, which is not authorized in root build.eon\n");
+                    out_deps.pop_visiting();
+                    dep_plan.destroy(&mut env.alloc);
+                    sub_src.destroy(&mut env.alloc);
+                    sub_build.destroy(&mut env.alloc);
+                    norm_dep.destroy(&mut env.alloc);
+                    raw_dep.destroy(&mut env.alloc);
+                    return false;
+                }
+                hi = hi +% 1_usize;
+            }
+            try merge_plan_libs_only(&mut env.alloc, &dep_plan, merged_libs);
+
+            let rec_ok = try resolve_pkg_deps_rec(
+                env, root_plan, dep_root, &dep_plan, merged_libs, out_deps, err_buf,
+            );
+            if !rec_ok {
+                out_deps.pop_visiting();
+                dep_plan.destroy(&mut env.alloc);
+                sub_src.destroy(&mut env.alloc);
+                sub_build.destroy(&mut env.alloc);
+                norm_dep.destroy(&mut env.alloc);
+                raw_dep.destroy(&mut env.alloc);
+                return false;
+            }
+
+            var added_lib = false;
+            let dts = dep_plan.targets.as_slice();
+            var dti: usize = 0_usize;
+            while dti < dts.len {
+                if dts[dti].kind == .EmiLib {
+                    try join_path(&mut env.alloc, dep_root, dep_plan.target_root(dti), &mut sub_src);
+                    try push_unique_path(&mut env.alloc, &mut out_deps.src_roots, sub_src.as_bytes());
+                    added_lib = true;
+                }
+                dti = dti +% 1_usize;
+            }
+            if !added_lib {
+                try join_path(&mut env.alloc, dep_root, "src".as_bytes(), &mut sub_src);
+                let sstr = try sub_src.as_str();
+                if env.fs.is_dir(sstr) {
+                    try push_unique_path(&mut env.alloc, &mut out_deps.src_roots, sub_src.as_bytes());
+                } else {
+                    try push_unique_path(&mut env.alloc, &mut out_deps.src_roots, dep_root);
+                }
+            }
+            dep_plan.destroy(&mut env.alloc);
+        } else {
+            try join_path(&mut env.alloc, dep_root, "src".as_bytes(), &mut sub_src);
+            let sstr = try sub_src.as_str();
+            if env.fs.is_dir(sstr) {
+                try push_unique_path(&mut env.alloc, &mut out_deps.src_roots, sub_src.as_bytes());
+            } else {
+                try push_unique_path(&mut env.alloc, &mut out_deps.src_roots, dep_root);
+            }
+        }
+
+        out_deps.pop_visiting();
+        _ = try out_deps.visited.intern(&mut env.alloc, dep_root);
+        di = di +% 1_usize;
+    }
+
+    sub_src.destroy(&mut env.alloc);
+    sub_build.destroy(&mut env.alloc);
+    norm_dep.destroy(&mut env.alloc);
+    raw_dep.destroy(&mut env.alloc);
+    return true;
+}
+
+fn write_eon_lock_file(
+    alloc: *mut AllocCap,
+    fs: *FsCap,
+    pkg_root: *[u8],
+    deps: *mut ResolvedBuildDeps,
+    err_buf: *mut str.StrBuf,
+) -> bool ! OutOfMemory | Utf8Error {
+    if deps.lock_entries.len() == 0_usize {
+        return true;
+    }
+    let sb = deps.str_bytes.as_slice();
+    sort_lock_entries(deps.lock_entries.as_mut_slice(), sb);
+
+    var lock_buf = try str.StrBuf.init(alloc, 256_usize);
+    errdefer lock_buf.destroy(alloc);
+    try lock_buf.push_str_grow(alloc, "# Eon deterministic lockfile v1\nlock_version = 1\n");
+    let es = deps.lock_entries.as_slice();
+    var i: usize = 0_usize;
+    while i < es.len {
+        let e = es[i];
+        let n0 = e.name_off.widen.[usize]();
+        let n1 = n0 +% e.name_len.widen.[usize]();
+        let p0 = e.path_off.widen.[usize]();
+        let p1 = p0 +% e.path_len.widen.[usize]();
+        let nm = sb.sub(n0, n1) catch { "".as_bytes() };
+        let pt = sb.sub(p0, p1) catch { "".as_bytes() };
+        try lock_buf.push_str_grow(alloc, "\n[[dep]]\nname = \"");
+        try lock_buf.push_bytes_grow(alloc, nm);
+        try lock_buf.push_str_grow(alloc, "\"\npath = \"");
+        try lock_buf.push_bytes_grow(alloc, pt);
+        try lock_buf.push_str_grow(alloc, "\"\nsha256 = \"");
+        try tcb_audit.sha256_hex(alloc, &e.digest, &mut lock_buf);
+        try lock_buf.push_str_grow(alloc, "\"\n");
+        i = i +% 1_usize;
+    }
+
+    var lock_path = try str.StrBuf.init(alloc, 128_usize);
+    errdefer lock_path.destroy(alloc);
+    try join_path(alloc, pkg_root, "eon.lock".as_bytes(), &mut lock_path);
+    let lstr = try lock_path.as_str();
+    var ok = true;
+    fs.write_file(lstr, lock_buf.as_bytes()) catch {
+        err_buf.clear();
+        try err_buf.push_str_grow(alloc, "failed to write `");
+        try err_buf.push_bytes_grow(alloc, lock_path.as_bytes());
+        try err_buf.push_str_grow(alloc, "`\n");
+        ok = false;
+    };
+    lock_path.destroy(alloc);
+    lock_buf.destroy(alloc);
+    return ok;
+}
+
+fn compile_loaded_to_emi_lib(
+    alloc: *mut AllocCap,
+    clock: *ClockCap,
+    fs: *FsCap,
+    sm: *span.SourceMap,
+    arena: *mut ast.AstArena,
+    unit_ids: *[u32],
+    lib_name: *[u8],
+    interner: *mut span.SymInterner,
+    diags: *mut diag.DiagBag,
+    copts: *mach_x64.CompileOptions,
+    needed_libs: *PathList,
+    out_path: *[u8],
+    profile_phases: bool,
+    jobs: u32,
+    out_byte_len: *mut usize,
+    err_buf: *mut str.StrBuf,
+) -> bool ! OutOfMemory | Utf8Error {
+    var resolved = try resolve.resolve_program(alloc, arena, unit_ids, interner, diags);
+    errdefer resolved.destroy(alloc);
+    var tenv = try types.build_type_env(alloc, arena, &mut resolved, interner, diags);
+    errdefer tenv.destroy(alloc);
+    var ct = try ctvm.CtArena.init(alloc);
+    errdefer ct.destroy(alloc);
+    var pre_err: usize = 0_usize;
+    var eir_prog = try build_lower_to_eir_stage(
+        alloc, clock, arena, false, unit_ids, &mut resolved, &mut tenv, &mut ct, interner, diags, profile_phases, jobs, &mut pre_err,
+    );
+    errdefer eir_prog.destroy(alloc);
+
+    if pre_err == 0_usize && !diags.has_errors() {
+        let vr = if copts.opt.opt_level > 0_u8 {
+            try verify.verify_program_with_facts_and_jobs(
+                alloc, arena, &resolved, &tenv, &mut eir_prog, interner, diags, jobs,
+            )
+        } else {
+            try verify.verify_program_with_jobs(
+                alloc, arena, &resolved, &tenv, &mut eir_prog, interner, diags, jobs,
+            )
+        };
+        vr.destroy(alloc);
+        try eir.apply_layout_sharing(alloc, &mut eir_prog, &tenv);
+        try eir_prog.release_verify_dump_meta(alloc);
+    }
+
+    var ok = false;
+    if diags.has_errors() {
+        err_buf.clear();
+        try diags.render_all(alloc, sm, err_buf);
+    } else {
+        err_buf.clear();
+        var lint_ok = try eir.eir_lint_with_jobs(alloc, &eir_prog, &tenv, err_buf, jobs);
+        if lint_ok && copts.opt.opt_level > 0_u8 {
+            try tenv.preintern_opt_vec_tys(alloc);
+            err_buf.clear();
+            _ = try eir_opt.optimize_program_profiled_with_jobs(
+                alloc, clock, profile_phases, &mut eir_prog, &tenv, interner, copts.opt, err_buf, jobs,
+            );
+            try eir_prog.release_value_facts(alloc);
+            if err_buf.len() > 0_usize {
+                lint_ok = false;
+            }
+        }
+        if lint_ok {
+            var lib_syms = try col.DynBuf.[u32].init(alloc, 4_usize);
+            errdefer lib_syms.destroy(alloc);
+            var li: usize = 0_usize;
+            while li < needed_libs.len() {
+                let sym = try interner.intern(alloc, needed_libs.get(li));
+                try lib_syms.push(alloc, sym);
+                li = li +% 1_usize;
+            }
+            var cap = try mach_x64.CapturedProgramBlobs.init(alloc);
+            errdefer cap.destroy(alloc);
+            let cr = try mach_x64.compile_and_link_x64_capture(
+                alloc, sm, &mut eir_prog, &resolved, &tenv, &ct, interner, copts, lib_syms.as_slice(), &mut cap,
+            );
+            errdefer cr.destroy(alloc);
+            if !cr.ok {
+                err_buf.clear();
+                try err_buf.push_bytes_grow(alloc, cr.err_msg.as_bytes());
+                if !ends_with_nl(err_buf.as_bytes()) {
+                    try err_buf.push_byte_grow(alloc, b'\n');
+                }
+            } else {
+                var all_stubs = try str.StrBuf.init(alloc, 1024_usize);
+                errdefer all_stubs.destroy(alloc);
+                var one_stub = try str.StrBuf.init(alloc, 512_usize);
+                errdefer one_stub.destroy(alloc);
+                var ui: usize = 0_usize;
+                while ui < unit_ids.len {
+                    try extract_module_stub(alloc, sm, arena, unit_ids[ui], interner, &mut one_stub);
+                    try all_stubs.push_bytes_grow(alloc, one_stub.as_bytes());
+                    ui = ui +% 1_usize;
+                }
+                let opts_hash = mach_x64.compute_opts_hash(copts);
+                let iface_d = try emi.compute_module_hash(alloc, lib_name, all_stubs.as_bytes(), &opts_hash);
+                var mc = try emi.EmiModuleCache.init(alloc, lib_name);
+                errdefer mc.destroy(alloc);
+                mc.set_interface_hash(copy iface_d.bytes);
+                mc.set_opts_hash(copy opts_hash);
+                try mc.set_stub_text(alloc, all_stubs.as_bytes());
+                let cfns = cap.fns.as_slice();
+                var ci: usize = 0_usize;
+                while ci < cfns.len {
+                    let fh = tcb_audit.sha256(cap.fn_code(ci));
+                    try mc.put_entry(alloc, cfns[ci].fn_sym, fh.bytes, cap.fn_code(ci), cap.fn_meta(ci));
+                    ci = ci +% 1_usize;
+                }
+                var ser = try col.DynBuf.[u8].init(alloc, 4096_usize);
+                errdefer ser.destroy(alloc);
+                try emi.serialize_emi_cache(alloc, &mc, interner, &mut ser);
+                out_byte_len.* = ser.len();
+                ok = try write_elf_artifact(alloc, fs, out_path, ser.as_slice(), true, err_buf);
+                ser.destroy(alloc);
+                mc.destroy(alloc);
+                one_stub.destroy(alloc);
+                all_stubs.destroy(alloc);
+            }
+            cr.destroy(alloc);
+            cap.destroy(alloc);
+            lib_syms.destroy(alloc);
+        } else if !ends_with_nl(err_buf.as_bytes()) {
+            try err_buf.push_byte_grow(alloc, b'\n');
+        }
+    }
+
+    eir_prog.destroy(alloc);
+    ct.destroy(alloc);
+    tenv.destroy(alloc);
+    resolved.destroy(alloc);
+    return ok;
+}
+
 fn build_plan_target(
     env: *mut Env,
     pkg_root: *[u8],
     out_dir_path: *[u8],
     plan: *build_sys.BuildPlan,
     ti: usize,
+    dep_src_roots: *PathList,
     args: *BuildCliArgs,
     needed_libs: *PathList,
     sanitize: bool,
@@ -5253,6 +6047,11 @@ fn build_plan_target(
     var target_inputs = try PathList.init(&mut env.alloc);
     errdefer target_inputs.destroy(&mut env.alloc);
     try target_inputs.push(&mut env.alloc, target_root.as_bytes());
+    var dri: usize = 0_usize;
+    while dri < dep_src_roots.len() {
+        try push_unique_path(&mut env.alloc, &mut target_inputs, dep_src_roots.get(dri));
+        dri = dri +% 1_usize;
+    }
 
     var sm = try span.SourceMap.init(&mut env.alloc);
     errdefer sm.destroy(&mut env.alloc);
@@ -5309,8 +6108,10 @@ fn build_plan_target(
     }
 
     let ts = plan.targets.as_slice();
-    let is_shared = if ti < ts.len { ts[ti].kind == .SharedLib } else { false };
-    let mode = if is_shared {
+    let tkind: build_sys.BuildTargetKind = if ti < ts.len { ts[ti].kind } else { .Exe };
+    let is_shared = tkind == .SharedLib;
+    let is_emi_lib = tkind == .EmiLib;
+    let mode = if is_shared || is_emi_lib {
         elf64.ElfMode.linux_shared(0_u32, 0_u32)
     } else if args.freestanding {
         elf64.ElfMode.freestanding(0x00100000_u64, true)
@@ -5334,32 +6135,69 @@ fn build_plan_target(
         try join_path(&mut env.alloc, args.out_path.as_bytes(), plan.target_name(ti), &mut out_path);
     } else {
         try join_path(&mut env.alloc, out_dir_path, plan.target_name(ti), &mut out_path);
+        if is_emi_lib && !str.ends_with(out_path.as_bytes(), ".emi".as_bytes()) {
+            try out_path.push_str_grow(&mut env.alloc, ".emi");
+        }
     }
 
     var byte_len: usize = 0_usize;
-    let built = try compile_loaded_to_elf_file(
-        &mut env.alloc,
-        &env.clock,
-        &env.fs,
-        &sm,
-        &arena,
-        unit_ids.as_slice(),
-        0_usize,
-        &mut interner,
-        &mut diags,
-        &copts,
-        needed_libs,
-        args.emi_cache.as_bytes(),
-        out_path.as_bytes(),
-        is_shared,
-        args.opt_stats,
-        args.profile_phases,
-        args.jobs,
-        &mut byte_len,
-        err_buf,
-    );
+    let built = if is_emi_lib {
+        try compile_loaded_to_emi_lib(
+            &mut env.alloc,
+            &env.clock,
+            &env.fs,
+            &sm,
+            &mut arena,
+            unit_ids.as_slice(),
+            plan.target_name(ti),
+            &mut interner,
+            &mut diags,
+            &copts,
+            needed_libs,
+            out_path.as_bytes(),
+            args.profile_phases,
+            args.jobs,
+            &mut byte_len,
+            err_buf,
+        )
+    } else {
+        try compile_loaded_to_elf_file(
+            &mut env.alloc,
+            &env.clock,
+            &env.fs,
+            &sm,
+            &mut arena,
+            !args.has_emi_cache,
+            unit_ids.as_slice(),
+            0_usize,
+            &mut interner,
+            &mut diags,
+            &copts,
+            needed_libs,
+            args.emi_cache.as_bytes(),
+            out_path.as_bytes(),
+            is_shared,
+            args.opt_stats,
+            args.profile_phases,
+            args.jobs,
+            &mut byte_len,
+            err_buf,
+        )
+    };
     if built {
-        try print_built_elf_msg(&mut env.alloc, out_path.as_bytes(), is_shared, byte_len);
+        if is_emi_lib {
+            var lmsg = try str.StrBuf.init(&mut env.alloc, 128_usize);
+            errdefer lmsg.destroy(&mut env.alloc);
+            try lmsg.push_str_grow(&mut env.alloc, "built EMI library ");
+            try lmsg.push_bytes_grow(&mut env.alloc, out_path.as_bytes());
+            try lmsg.push_str_grow(&mut env.alloc, " (");
+            try lmsg.push_u64_grow(&mut env.alloc, byte_len.widen.[u64]());
+            try lmsg.push_str_grow(&mut env.alloc, " bytes)\n");
+            rt.eprint_bytes(lmsg.as_bytes());
+            lmsg.destroy(&mut env.alloc);
+        } else {
+            try print_built_elf_msg(&mut env.alloc, out_path.as_bytes(), is_shared, byte_len);
+        }
         if audit_tcb {
             var rep_buf = try str.StrBuf.init(&mut env.alloc, 512_usize);
             errdefer rep_buf.destroy(&mut env.alloc);
@@ -5394,6 +6232,43 @@ fn print_build_summary_buf(
     rt.print_bytes(sum_buf.as_bytes());
     sum_buf.destroy(alloc);
     return;
+}
+
+fn merge_plan_libs_only(
+    alloc: *mut AllocCap,
+    plan: *build_sys.BuildPlan,
+    merged: *mut PathList,
+) -> !OutOfMemory {
+    var lib_tmp = try str.StrBuf.init(alloc, 32_usize);
+    errdefer lib_tmp.destroy(alloc);
+    var pi: usize = 0_usize;
+    while pi < plan.link_lib_count() {
+        try resolve_lib_soname(alloc, plan.link_lib_at(pi), &mut lib_tmp);
+        try push_unique_path(alloc, merged, lib_tmp.as_bytes());
+        pi = pi +% 1_usize;
+    }
+    lib_tmp.destroy(alloc);
+    return;
+}
+
+fn resolve_root_pkg_deps(
+    env: *mut Env,
+    pkg_root: *[u8],
+    plan: *build_sys.BuildPlan,
+    merged_libs: *mut PathList,
+    dep_state: *mut ResolvedBuildDeps,
+    err_buf: *mut str.StrBuf,
+) -> bool ! OutOfMemory | Utf8Error {
+    var norm_root = try str.StrBuf.init(&mut env.alloc, 128_usize);
+    errdefer norm_root.destroy(&mut env.alloc);
+    try normalize_path(&mut env.alloc, pkg_root, &mut norm_root);
+    try dep_state.visiting.push(&mut env.alloc, norm_root.as_bytes());
+    let deps_ok = try resolve_pkg_deps_rec(
+        env, plan, pkg_root, plan, merged_libs, dep_state, err_buf,
+    );
+    dep_state.pop_visiting();
+    norm_root.destroy(&mut env.alloc);
+    return deps_ok;
 }
 
 fn merge_plan_and_cli_libs(
@@ -5461,6 +6336,35 @@ fn run_build_eon_mode(
     errdefer merged_libs.destroy(&mut env.alloc);
     try merge_plan_and_cli_libs(&mut env.alloc, &plan, &args.needed_libs, &mut merged_libs);
 
+    var dep_state = try ResolvedBuildDeps.init(&mut env.alloc);
+    errdefer dep_state.destroy(&mut env.alloc);
+    if plan.dep_count() > 0_usize {
+        let deps_ok = try resolve_root_pkg_deps(
+            env, pkg_root, &plan, &mut merged_libs, &mut dep_state, err_buf,
+        );
+        if !deps_ok {
+            if err_buf.len() > 0_usize {
+                rt.eprint_bytes(err_buf.as_bytes());
+            }
+            dep_state.destroy(&mut env.alloc);
+            merged_libs.destroy(&mut env.alloc);
+            out_dir_path.destroy(&mut env.alloc);
+            plan.destroy(&mut env.alloc);
+            return 1_i32;
+        }
+        let lock_ok = try write_eon_lock_file(&mut env.alloc, &env.fs, pkg_root, &mut dep_state, err_buf);
+        if !lock_ok {
+            if err_buf.len() > 0_usize {
+                rt.eprint_bytes(err_buf.as_bytes());
+            }
+            dep_state.destroy(&mut env.alloc);
+            merged_libs.destroy(&mut env.alloc);
+            out_dir_path.destroy(&mut env.alloc);
+            plan.destroy(&mut env.alloc);
+            return 1_i32;
+        }
+    }
+
     let sanitize = args.sanitize || plan.sanitize;
     let audit_tcb = args.audit_tcb || plan.audit_tcb;
 
@@ -5473,6 +6377,7 @@ fn run_build_eon_mode(
             out_dir_path.as_bytes(),
             &plan,
             ti,
+            &dep_state.src_roots,
             args,
             &merged_libs,
             sanitize,
@@ -5486,6 +6391,7 @@ fn run_build_eon_mode(
         ti = ti +% 1_usize;
     }
 
+    dep_state.destroy(&mut env.alloc);
     merged_libs.destroy(&mut env.alloc);
     out_dir_path.destroy(&mut env.alloc);
     plan.destroy(&mut env.alloc);
@@ -5512,17 +6418,27 @@ fn maybe_run_build_eon_mode(
             try pkg_root.push_str_grow(&mut env.alloc, ".");
             try build_file.push_str_grow(&mut env.alloc, "build.eon");
         }
-    } else if args.inputs.len() == 1_usize
-        && str.bytes_eq(path_basename(args.inputs.get(0_usize)), "build.eon".as_bytes())
-    {
-        is_build_eon = true;
-        let bf = args.inputs.get(0_usize);
-        try build_file.push_bytes_grow(&mut env.alloc, bf);
-        let pdir = path_parent(bf);
-        if pdir.len == 0_usize {
-            try pkg_root.push_str_grow(&mut env.alloc, ".");
+    } else if args.inputs.len() == 1_usize {
+        let inp = args.inputs.get(0_usize);
+        if str.bytes_eq(path_basename(inp), "build.eon".as_bytes()) {
+            is_build_eon = true;
+            try build_file.push_bytes_grow(&mut env.alloc, inp);
+            let pdir = path_parent(inp);
+            if pdir.len == 0_usize {
+                try pkg_root.push_str_grow(&mut env.alloc, ".");
+            } else {
+                try pkg_root.push_bytes_grow(&mut env.alloc, pdir);
+            }
         } else {
-            try pkg_root.push_bytes_grow(&mut env.alloc, pdir);
+            let inp_str = try inp.as_str();
+            if env.fs.is_dir(inp_str) {
+                try join_path(&mut env.alloc, inp, "build.eon".as_bytes(), &mut build_file);
+                let bf_str = try build_file.as_str();
+                if file_exists_regular(&mut env.alloc, &env.fs, bf_str) {
+                    is_build_eon = true;
+                    try pkg_root.push_bytes_grow(&mut env.alloc, inp);
+                }
+            }
         }
     }
 
@@ -5693,7 +6609,8 @@ fn cmd_build(env: *mut Env) -> i32 ! OutOfMemory | Utf8Error {
         &env.clock,
         &env.fs,
         &sm,
-        &arena,
+        &mut arena,
+        !args.has_emi_cache && !args.audit_tcb,
         unit_ids.as_slice(),
         user_file_count,
         &mut interner,
@@ -6024,6 +6941,7 @@ fn run_loaded_interp(
         };
         vr.destroy(alloc);
         try eir.apply_layout_sharing(alloc, &mut eir_prog, &tenv);
+        try eir_prog.release_verify_dump_meta(alloc);
     }
     if !diags.has_errors() {
         try emit_unsupported_cfg_diags(alloc, &cfg_prog, diags, "` to EIR");
@@ -6183,7 +7101,8 @@ fn cmd_run(env: *mut Env) -> i32 ! OutOfMemory | Utf8Error {
             &env.clock,
             &env.fs,
             &sm,
-            &arena,
+            &mut arena,
+            !args.has_emi_cache,
             unit_ids.as_slice(),
             0_usize,
             &mut interner,

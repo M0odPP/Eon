@@ -4548,6 +4548,24 @@ impl Interp {
                     try self.plan.add_shared(self.alloc, s1.as_bytes(), s2.as_bytes());
                 }
             }
+            .BuildAddLib => {
+                let a1 = self.eir_val_at(args_r, 1_usize);
+                let a2 = self.eir_val_at(args_r, 2_usize);
+                if (try self.read_build_str(frame.get_val(a1), &mut s1))
+                    && (try self.read_build_str(frame.get_val(a2), &mut s2))
+                {
+                    try self.plan.add_lib(self.alloc, s1.as_bytes(), s2.as_bytes());
+                }
+            }
+            .BuildAddDep => {
+                let a1 = self.eir_val_at(args_r, 1_usize);
+                let a2 = self.eir_val_at(args_r, 2_usize);
+                if (try self.read_build_str(frame.get_val(a1), &mut s1))
+                    && (try self.read_build_str(frame.get_val(a2), &mut s2))
+                {
+                    try self.plan.add_dep(self.alloc, s1.as_bytes(), s2.as_bytes());
+                }
+            }
             .BuildSetOutDir => {
                 let a1 = self.eir_val_at(args_r, 1_usize);
                 if try self.read_build_str(frame.get_val(a1), &mut s1) {
@@ -6823,6 +6841,8 @@ impl Interp {
             .BuildAddModule => { return try self.exec_builtin_build(fn_id, op, args_r, slots_r, frame); }
             .BuildAddExe => { return try self.exec_builtin_build(fn_id, op, args_r, slots_r, frame); }
             .BuildAddSharedLib => { return try self.exec_builtin_build(fn_id, op, args_r, slots_r, frame); }
+            .BuildAddLib => { return try self.exec_builtin_build(fn_id, op, args_r, slots_r, frame); }
+            .BuildAddDep => { return try self.exec_builtin_build(fn_id, op, args_r, slots_r, frame); }
             .BuildSetOutDir => { return try self.exec_builtin_build(fn_id, op, args_r, slots_r, frame); }
             .BuildSetSanitize => { return try self.exec_builtin_build(fn_id, op, args_r, slots_r, frame); }
             .BuildSetAuditTcb => { return try self.exec_builtin_build(fn_id, op, args_r, slots_r, frame); }

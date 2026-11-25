@@ -13680,7 +13680,8 @@ fn compile_and_link_impl(
         }
     }
 
-    // 6. Link-time function dead-stripping (GC) + Safe ICF, then emit ELF64 image
+    // 6. Release EIR pools before link-time GC+ICF & ELF64 emission to minimize Peak RSS
+    try eir_prog.release_pools(alloc);
     try elf64.gc_and_icf_link_input(alloc, &mut input, interner, opts.opt.opt_level >= 2_u8 || opts.opt.opt_size);
     let link_res = try elf64.link_elf64(alloc, &input, interner);
     stk_err.destroy(alloc);

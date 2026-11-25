@@ -534,6 +534,31 @@ pub fn value_fact_unknown() -> EirValueFact {
     };
 }
 
+pub fn pack_value_fact(f: *EirValueFact) -> u8 {
+    var b: u8 = 0_u8;
+    if f.non_neg { b = b | 1_u8; }
+    if f.non_zero { b = b | 2_u8; }
+    if f.fits_u32 { b = b | 4_u8; }
+    if f.fits_i32 { b = b | 8_u8; }
+    if f.is_const { b = b | 16_u8; }
+    if f.has_range { b = b | 32_u8; }
+    return b;
+}
+
+pub fn unpack_value_fact(b: u8) -> EirValueFact {
+    return EirValueFact.{
+        has_range: (b & 32_u8) != 0_u8,
+        lo_i64: 0_i64,
+        hi_i64: 0_i64,
+        non_neg: (b & 1_u8) != 0_u8,
+        non_zero: (b & 2_u8) != 0_u8,
+        fits_u32: (b & 4_u8) != 0_u8,
+        fits_i32: (b & 8_u8) != 0_u8,
+        is_const: (b & 16_u8) != 0_u8,
+        const_u64: 0_u64,
+    };
+}
+
 pub struct EirFunction {
     pub key: cfg_ir.CfgFnKey;
     pub mod_id: u32;
@@ -955,7 +980,7 @@ pub linear struct EirProgram {
     pub meta: EirMetaPools;
     pub aux: EirAuxPools;
     pub scheds: EirSchedPools;
-    pub value_facts: col.DynBuf[EirValueFact];
+    pub value_facts: col.DynBuf[u8];
     pub proven_safe_insts: col.DynBuf[u8];
     pub block_loop_depth: col.DynBuf[u8];
     pub fn_ipra_gpr_clobbers: col.DynBuf[u16];
@@ -976,7 +1001,7 @@ impl EirProgram {
         errdefer aux.destroy(alloc);
         let scheds = try EirSchedPools.init(alloc);
         errdefer scheds.destroy(alloc);
-        let value_facts = try col.DynBuf.[EirValueFact].init(alloc, 16_usize);
+        let value_facts = try col.DynBuf.[u8].init(alloc, 16_usize);
         errdefer value_facts.destroy(alloc);
         let proven_safe_insts = try col.DynBuf.[u8].init(alloc, 16_usize);
         errdefer proven_safe_insts.destroy(alloc);
@@ -1048,6 +1073,338 @@ impl EirProgram {
         self.fn_ipra_xmm_clobbers.clear();
         self.fn_ipra_valid.clear();
         self.fn_is_opt_eligible.clear();
+    }
+
+    pub fn release_value_facts(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        try self.value_facts.reset_free(alloc, 16_usize);
+        return;
+    }
+
+    pub fn release_pools(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        try self.funcs.fns.reset_free(alloc, 16_usize);
+        self.funcs.by_key.clear();
+        try self.funcs.blocks.reset_free(alloc, 32_usize);
+        try self.funcs.phis.reset_free(alloc, 16_usize);
+        try self.funcs.phi_in.reset_free(alloc, 32_usize);
+        try self.funcs.insts.reset_free(alloc, 64_usize);
+        try self.funcs.slots.reset_free(alloc, 32_usize);
+        try self.funcs.value_tys.reset_free(alloc, 64_usize);
+        try self.funcs.param_vals.reset_free(alloc, 16_usize);
+        try self.funcs.switch_targets.reset_free(alloc, 16_usize);
+        try self.exprs.places.reset_free(alloc, 32_usize);
+        try self.exprs.projs.reset_free(alloc, 32_usize);
+        try self.exprs.consts.reset_free(alloc, 32_usize);
+        try self.exprs.vals.reset_free(alloc, 64_usize);
+        try self.exprs.arg_slots.reset_free(alloc, 16_usize);
+        try self.exprs.aggregates.reset_free(alloc, 16_usize);
+        try self.exprs.pool_col_ops.reset_free(alloc, 8_usize);
+        try self.exprs.calls.reset_free(alloc, 32_usize);
+        try self.exprs.builtin_calls.reset_free(alloc, 16_usize);
+        try self.exprs.asms.reset_free(alloc, 8_usize);
+        try self.meta.rpo.reset_free(alloc, 32_usize);
+        try self.meta.preds.reset_free(alloc, 32_usize);
+        try self.meta.val_names.reset_free(alloc, 32_usize);
+        try self.meta.noalias_params.reset_free(alloc, 16_usize);
+        try self.meta.value_ranges.reset_free(alloc, 16_usize);
+        try self.meta.proven_safe_insts.reset_free(alloc, 16_usize);
+        try self.meta.par_for_regions.reset_free(alloc, 8_usize);
+        try self.meta.layout_shared_groups.reset_free(alloc, 8_usize);
+        try self.meta.layout_members.reset_free(alloc, 8_usize);
+        try self.meta.asm_inputs.reset_free(alloc, 8_usize);
+        try self.aux.str_bytes.reset_free(alloc, 32_usize);
+        try self.aux.sym_list.reset_free(alloc, 16_usize);
+        try self.aux.expr_ids.reset_free(alloc, 16_usize);
+        try self.aux.loop_invariants.reset_free(alloc, 8_usize);
+        try self.aux.gvals.reset_free(alloc, 16_usize);
+        try self.aux.extern_fns.reset_free(alloc, 8_usize);
+        try self.aux.dyn_impl_pairs.reset_free(alloc, 8_usize);
+        self.scheds.clear_all();
+        try self.value_facts.reset_free(alloc, 16_usize);
+        try self.proven_safe_insts.reset_free(alloc, 16_usize);
+        try self.block_loop_depth.reset_free(alloc, 16_usize);
+        try self.fn_ipra_gpr_clobbers.reset_free(alloc, 16_usize);
+        try self.fn_ipra_xmm_clobbers.reset_free(alloc, 16_usize);
+        try self.fn_ipra_valid.reset_free(alloc, 16_usize);
+        try self.fn_is_opt_eligible.reset_free(alloc, 16_usize);
+        return;
+    }
+
+    pub fn release_verify_dump_meta(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        try self.meta.value_ranges.reset_free(alloc, 16_usize);
+        try self.meta.proven_safe_insts.reset_free(alloc, 16_usize);
+        let fs = self.funcs.fns.as_mut_slice();
+        var i: usize = 0_usize;
+        while i < fs.len {
+            fs[i].value_ranges = ast.range_empty();
+            fs[i].proven_safe_insts = ast.range_empty();
+            i = i +% 1_usize;
+        }
+        return;
+    }
+
+    fn compact_insts_and_flags_inplace(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        var total: usize = 0_usize;
+        let fns_ro = self.funcs.fns.as_slice();
+        let blks_ro = self.funcs.blocks.as_slice();
+        var fi: usize = 0_usize;
+        while fi < fns_ro.len {
+            let br = fns_ro[fi].blocks;
+            var bi: u32 = 0_u32;
+            while bi < br.len {
+                let bidx = (br.start +% bi).widen.[usize]();
+                if bidx < blks_ro.len {
+                    total = total +% blks_ro[bidx].insts.len.widen.[usize]();
+                }
+                bi = bi +% 1_u32;
+            }
+            fi = fi +% 1_usize;
+        }
+        var new_insts = try col.DynBuf.[EirInst].init(alloc, if total < 16_usize { 16_usize } else { total });
+        errdefer new_insts.destroy(alloc);
+        let has_flags = self.proven_safe_insts.len() > 0_usize;
+        var new_flags = try col.DynBuf.[u8].init(alloc, if has_flags && total > 16_usize { total } else { 16_usize });
+        errdefer new_flags.destroy(alloc);
+
+        let old_insts = self.funcs.insts.as_slice();
+        let old_flags = self.proven_safe_insts.as_slice();
+        let blks_mut = self.funcs.blocks.as_mut_slice();
+        fi = 0_usize;
+        while fi < fns_ro.len {
+            let br = fns_ro[fi].blocks;
+            var bi: u32 = 0_u32;
+            while bi < br.len {
+                let bidx = (br.start +% bi).widen.[usize]();
+                if bidx < blks_mut.len {
+                    let ir = blks_mut[bidx].insts;
+                    let dst_start = new_insts.len().trunc.[u32]();
+                    blks_mut[bidx].insts = ast.range_new(dst_start, ir.len);
+                    if ir.len > 0_u32 {
+                        let sl = slice_id_range.[EirInst](old_insts, ir);
+                        try new_insts.push_slice(alloc, sl);
+                        if has_flags {
+                            var ii: u32 = 0_u32;
+                            while ii < ir.len {
+                                let oid = (ir.start +% ii).widen.[usize]();
+                                let fl: u8 = if oid < old_flags.len { old_flags[oid] } else { 0_u8 };
+                                try new_flags.push(alloc, fl);
+                                ii = ii +% 1_u32;
+                            }
+                        }
+                    }
+                }
+                bi = bi +% 1_u32;
+            }
+            fi = fi +% 1_usize;
+        }
+        self.funcs.insts.destroy(alloc);
+        self.funcs.insts = new_insts;
+        self.proven_safe_insts.destroy(alloc);
+        self.proven_safe_insts = new_flags;
+        return;
+    }
+
+    fn compact_phis_inplace(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        var new_phi_in = try col.DynBuf.[EirPhiIn].init(alloc, 64_usize);
+        errdefer new_phi_in.destroy(alloc);
+        var new_phis = try col.DynBuf.[EirPhi].init(alloc, 64_usize);
+        errdefer new_phis.destroy(alloc);
+
+        let fns_ro = self.funcs.fns.as_slice();
+        let blks_mut = self.funcs.blocks.as_mut_slice();
+        let old_phis = self.funcs.phis.as_slice();
+        let old_pin = self.funcs.phi_in.as_slice();
+        var fi: usize = 0_usize;
+        while fi < fns_ro.len {
+            let br = fns_ro[fi].blocks;
+            var bi: u32 = 0_u32;
+            while bi < br.len {
+                let bidx = (br.start +% bi).widen.[usize]();
+                if bidx < blks_mut.len {
+                    let pr = blks_mut[bidx].phis;
+                    let p_dst = new_phis.len().trunc.[u32]();
+                    blks_mut[bidx].phis = ast.range_new(p_dst, pr.len);
+                    if pr.len > 0_u32 {
+                        var pi: u32 = 0_u32;
+                        while pi < pr.len {
+                            let pidx = (pr.start +% pi).widen.[usize]();
+                            if pidx < old_phis.len {
+                                var phi = old_phis[pidx];
+                                let in_dst = new_phi_in.len().trunc.[u32]();
+                                let in_sl = slice_id_range.[EirPhiIn](old_pin, phi.incoming);
+                                try new_phi_in.push_slice(alloc, in_sl);
+                                phi.incoming = ast.range_new(in_dst, in_sl.len.trunc.[u32]());
+                                try new_phis.push(alloc, phi);
+                            }
+                            pi = pi +% 1_u32;
+                        }
+                    }
+                }
+                bi = bi +% 1_u32;
+            }
+            fi = fi +% 1_usize;
+        }
+        self.funcs.phi_in.destroy(alloc);
+        self.funcs.phi_in = new_phi_in;
+        self.funcs.phis.destroy(alloc);
+        self.funcs.phis = new_phis;
+        return;
+    }
+
+    fn compact_blocks_inplace(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        var total: usize = 0_usize;
+        let fns_ro = self.funcs.fns.as_slice();
+        var fi: usize = 0_usize;
+        while fi < fns_ro.len {
+            total = total +% fns_ro[fi].blocks.len.widen.[usize]();
+            fi = fi +% 1_usize;
+        }
+        var new_blks = try col.DynBuf.[EirBlock].init(alloc, if total < 16_usize { 16_usize } else { total });
+        errdefer new_blks.destroy(alloc);
+        let old_blks = self.funcs.blocks.as_slice();
+        let fns_mut = self.funcs.fns.as_mut_slice();
+        fi = 0_usize;
+        while fi < fns_mut.len {
+            let br = fns_mut[fi].blocks;
+            let dst_start = new_blks.len().trunc.[u32]();
+            if br.len > 0_u32 {
+                let sl = slice_id_range.[EirBlock](old_blks, br);
+                try new_blks.push_slice(alloc, sl);
+            }
+            fns_mut[fi].blocks = ast.range_new(dst_start, br.len);
+            fi = fi +% 1_usize;
+        }
+        self.funcs.blocks.destroy(alloc);
+        self.funcs.blocks = new_blks;
+        return;
+    }
+
+    fn compact_fn_side_pools_inplace(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        var new_vtys = try col.DynBuf.[types.TyId].init(alloc, 256_usize);
+        errdefer new_vtys.destroy(alloc);
+        var new_slots = try col.DynBuf.[EirSlotInfo].init(alloc, 64_usize);
+        errdefer new_slots.destroy(alloc);
+        var new_rpo = try col.DynBuf.[BlockId].init(alloc, 128_usize);
+        errdefer new_rpo.destroy(alloc);
+        var new_preds = try col.DynBuf.[BlockId].init(alloc, 128_usize);
+        errdefer new_preds.destroy(alloc);
+        var new_vfacts = try col.DynBuf.[u8].init(alloc, 128_usize);
+        errdefer new_vfacts.destroy(alloc);
+
+        let old_vtys = self.funcs.value_tys.as_slice();
+        let old_slots = self.funcs.slots.as_slice();
+        let old_rpo = self.meta.rpo.as_slice();
+        let old_preds = self.meta.preds.as_slice();
+        let old_vfacts = self.value_facts.as_slice();
+        let fns_mut = self.funcs.fns.as_mut_slice();
+        let blks_mut = self.funcs.blocks.as_mut_slice();
+        var fi: usize = 0_usize;
+        while fi < fns_mut.len {
+            let vr = fns_mut[fi].value_tys;
+            let v_dst = new_vtys.len().trunc.[u32]();
+            if vr.len > 0_u32 {
+                try new_vtys.push_slice(alloc, slice_id_range.[types.TyId](old_vtys, vr));
+            }
+            fns_mut[fi].value_tys = ast.range_new(v_dst, vr.len);
+
+            let sr = fns_mut[fi].slots;
+            let s_dst = new_slots.len().trunc.[u32]();
+            if sr.len > 0_u32 {
+                try new_slots.push_slice(alloc, slice_id_range.[EirSlotInfo](old_slots, sr));
+            }
+            fns_mut[fi].slots = ast.range_new(s_dst, sr.len);
+
+            let rr = fns_mut[fi].rpo;
+            let r_dst = new_rpo.len().trunc.[u32]();
+            if rr.len > 0_u32 {
+                try new_rpo.push_slice(alloc, slice_id_range.[BlockId](old_rpo, rr));
+            }
+            fns_mut[fi].rpo = ast.range_new(r_dst, rr.len);
+
+            let fr = fns_mut[fi].value_facts;
+            let f_dst = new_vfacts.len().trunc.[u32]();
+            if fr.len > 0_u32 {
+                try new_vfacts.push_slice(alloc, slice_id_range.[u8](old_vfacts, fr));
+            }
+            fns_mut[fi].value_facts = ast.range_new(f_dst, fr.len);
+
+            let br = fns_mut[fi].blocks;
+            var bi: u32 = 0_u32;
+            while bi < br.len {
+                let bidx = (br.start +% bi).widen.[usize]();
+                if bidx < blks_mut.len {
+                    let pr = blks_mut[bidx].preds;
+                    let p_dst = new_preds.len().trunc.[u32]();
+                    if pr.len > 0_u32 {
+                        try new_preds.push_slice(alloc, slice_id_range.[BlockId](old_preds, pr));
+                    }
+                    blks_mut[bidx].preds = ast.range_new(p_dst, pr.len);
+                }
+                bi = bi +% 1_u32;
+            }
+            fi = fi +% 1_usize;
+        }
+        self.funcs.value_tys.destroy(alloc);
+        self.funcs.value_tys = new_vtys;
+        self.funcs.slots.destroy(alloc);
+        self.funcs.slots = new_slots;
+        self.meta.rpo.destroy(alloc);
+        self.meta.rpo = new_rpo;
+        self.meta.preds.destroy(alloc);
+        self.meta.preds = new_preds;
+        self.value_facts.destroy(alloc);
+        self.value_facts = new_vfacts;
+        return;
+    }
+
+    /// Compacts dead function/block/instruction pools one pool at a time so Peak RSS
+    /// never doubles the entire `EirProgram` during multi-wave inlining.
+    pub fn compact_pools_inplace(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        try self.compact_insts_and_flags_inplace(alloc);
+        try self.compact_phis_inplace(alloc);
+        try self.compact_blocks_inplace(alloc);
+        try self.compact_fn_side_pools_inplace(alloc);
+        return;
+    }
+
+    pub fn replace_with(self: *mut Self, alloc: *mut AllocCap, fresh: EirProgram) {
+        let EirProgram.{
+            funcs,
+            exprs,
+            meta,
+            aux,
+            scheds,
+            value_facts,
+            proven_safe_insts,
+            block_loop_depth,
+            fn_ipra_gpr_clobbers,
+            fn_ipra_xmm_clobbers,
+            fn_ipra_valid,
+            fn_is_opt_eligible,
+        } = fresh;
+        self.funcs.destroy(alloc);
+        self.funcs = funcs;
+        self.exprs.destroy(alloc);
+        self.exprs = exprs;
+        self.meta.destroy(alloc);
+        self.meta = meta;
+        self.aux.destroy(alloc);
+        self.aux = aux;
+        self.scheds.destroy(alloc);
+        self.scheds = scheds;
+        self.value_facts.destroy(alloc);
+        self.value_facts = value_facts;
+        self.proven_safe_insts.destroy(alloc);
+        self.proven_safe_insts = proven_safe_insts;
+        self.block_loop_depth.destroy(alloc);
+        self.block_loop_depth = block_loop_depth;
+        self.fn_ipra_gpr_clobbers.destroy(alloc);
+        self.fn_ipra_gpr_clobbers = fn_ipra_gpr_clobbers;
+        self.fn_ipra_xmm_clobbers.destroy(alloc);
+        self.fn_ipra_xmm_clobbers = fn_ipra_xmm_clobbers;
+        self.fn_ipra_valid.destroy(alloc);
+        self.fn_ipra_valid = fn_ipra_valid;
+        self.fn_is_opt_eligible.destroy(alloc);
+        self.fn_is_opt_eligible = fn_is_opt_eligible;
     }
 
     // --- Pool Builders ---
@@ -1220,6 +1577,21 @@ impl EirProgram {
 
     pub fn fn_count(self: *Self) -> u32 {
         return self.funcs.fns.len().trunc.[u32]();
+    }
+
+    pub fn has_any_contracts(self: *Self) -> bool {
+        let fs = self.funcs.fns.as_slice();
+        var i: usize = 0_usize;
+        while i < fs.len {
+            if fs[i].where_clauses.len > 0_u32
+                || fs[i].ensures_clauses.len > 0_u32
+                || fs[i].loop_invariants.len > 0_u32
+            {
+                return true;
+            }
+            i = i +% 1_usize;
+        }
+        return false;
     }
 
     pub fn block_count(self: *Self) -> u32 {
@@ -1663,8 +2035,28 @@ impl EirProgram {
         facts: *[EirValueFact],
     ) -> !OutOfMemory {
         let start = self.value_facts.len().trunc.[u32]();
-        try self.value_facts.push_slice(alloc, facts);
+        try self.value_facts.reserve(alloc, facts.len);
+        var i: usize = 0_usize;
+        while i < facts.len {
+            try self.value_facts.push(alloc, pack_value_fact(&facts[i]));
+            i = i +% 1_usize;
+        }
         let r = ast.range_new(start, facts.len.trunc.[u32]());
+        if let f = self.funcs.fns.get_mut(fn_id.widen.[usize]()) {
+            f.value_facts = r;
+        }
+        return;
+    }
+
+    pub fn set_fn_value_fact_bytes(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        fn_id: u32,
+        facts_u8: *[u8],
+    ) -> !OutOfMemory {
+        let start = self.value_facts.len().trunc.[u32]();
+        try self.value_facts.push_slice(alloc, facts_u8);
+        let r = ast.range_new(start, facts_u8.len.trunc.[u32]());
         if let f = self.funcs.fns.get_mut(fn_id.widen.[usize]()) {
             f.value_facts = r;
         }
@@ -1694,11 +2086,10 @@ impl EirProgram {
             base = old_start;
         } else if old_len > 0_usize && old_start +% old_len == self.value_facts.len() {
             let need = new_nvals - old_len;
-            let cur_len = self.value_facts.len();
-            try self.value_facts.reserve(alloc, cur_len +% need);
+            try self.value_facts.reserve(alloc, need);
             var k: usize = 0_usize;
             while k < need {
-                try self.value_facts.push(alloc, value_fact_unknown());
+                try self.value_facts.push(alloc, 0_u8);
                 k = k +% 1_usize;
             }
             if let fm = self.funcs.fns.get_mut(fn_id.widen.[usize]()) {
@@ -1706,15 +2097,15 @@ impl EirProgram {
             }
         } else {
             let new_start = self.value_facts.len();
-            try self.value_facts.reserve(alloc, new_start +% new_nvals);
+            try self.value_facts.reserve(alloc, new_nvals);
             var i: usize = 0_usize;
             while i < old_len && i < new_nvals {
-                let fv = if let fp = self.value_facts.get(old_start +% i) { fp.* } else { value_fact_unknown() };
+                let fv = if let fp = self.value_facts.get(old_start +% i) { fp.* } else { 0_u8 };
                 try self.value_facts.push(alloc, fv);
                 i = i +% 1_usize;
             }
             while i < new_nvals {
-                try self.value_facts.push(alloc, value_fact_unknown());
+                try self.value_facts.push(alloc, 0_u8);
                 i = i +% 1_usize;
             }
             base = new_start;
@@ -1728,7 +2119,7 @@ impl EirProgram {
             let du = dsts[j].widen.[usize]();
             let idx = base +% du;
             if du < new_nvals && idx < vfs.len {
-                vfs[idx] = facts[j];
+                vfs[idx] = pack_value_fact(&facts[j]);
             }
             j = j +% 1_usize;
         }
@@ -1856,19 +2247,19 @@ impl EirProgram {
         return;
     }
 
-    pub view fn fn_value_facts(self: *Self, fn_id: u32) -> *[EirValueFact] {
+    pub view fn fn_value_fact_bytes(self: *Self, fn_id: u32) -> *[u8] {
         let all = self.value_facts.as_slice();
         if let f = self.get_fn(fn_id) {
-            return slice_id_range.[EirValueFact](all, f.value_facts);
+            return slice_id_range.[u8](all, f.value_facts);
         }
-        return empty_slice.[EirValueFact](all);
+        return empty_slice.[u8](all);
     }
 
     pub fn fn_val_fact(self: *Self, fn_id: u32, v: EirValue) -> EirValueFact {
-        let facts = self.fn_value_facts(fn_id);
+        let facts = self.fn_value_fact_bytes(fn_id);
         let idx = v.widen.[usize]();
         if idx < facts.len {
-            return facts[idx];
+            return unpack_value_fact(facts[idx]);
         }
         return value_fact_unknown();
     }
@@ -1882,7 +2273,7 @@ impl EirProgram {
             let gid = (r.start +% v).widen.[usize]();
             let s = self.value_facts.as_mut_slice();
             if gid < s.len {
-                s[gid] = fact;
+                s[gid] = pack_value_fact(&fact);
             }
         }
     }
@@ -3148,7 +3539,7 @@ fn copy_fn_body_into_eir_scratch(
     f.value_ranges = ast.range_new(vr_start, src_vr.len.trunc.[u32]());
 
     let vf_start = dst.value_facts.len().trunc.[u32]();
-    let src_vf = src.fn_value_facts(src_fi);
+    let src_vf = src.fn_value_fact_bytes(src_fi);
     try dst.value_facts.push_slice(alloc, src_vf);
     f.value_facts = ast.range_new(vf_start, src_vf.len.trunc.[u32]());
 
@@ -6430,7 +6821,7 @@ fn lower_cfg_function(
     return;
 }
 
-fn copy_cfg_metadata_to_eir(
+pub fn copy_cfg_metadata_to_eir(
     alloc: *mut AllocCap,
     cfg: *cfg_ir.CfgProgram,
     eir: *mut EirProgram,
@@ -6441,6 +6832,24 @@ fn copy_cfg_metadata_to_eir(
     try eir.scheds.sched_systems.push_slice(alloc, cfg.scheds.sched_systems.as_slice());
     try eir.scheds.dag_nodes.push_slice(alloc, cfg.scheds.dag_nodes.as_slice());
     try eir.scheds.dag_deps.push_slice(alloc, cfg.scheds.dag_deps.as_slice());
+    return;
+}
+
+pub fn populate_eir_extern_fns(
+    alloc: *mut AllocCap,
+    prog: *resolve.ResolvedProgram,
+    eir: *mut EirProgram,
+) -> !OutOfMemory {
+    let ndefs = prog.def_count();
+    var di: u32 = 0_u32;
+    while di < ndefs {
+        if let d = prog.get_def(di) {
+            if d.kind == .ExternFn {
+                try eir.aux.extern_fns.push(alloc, di);
+            }
+        }
+        di = di +% 1_u32;
+    }
     return;
 }
 
@@ -6669,41 +7078,33 @@ fn copy_lowered_from_worker(
     return;
 }
 
-/// Parallel CFG -> SSA EIR lowering (up to 12 workers, deterministic item-order merge).
-pub fn lower_cfg_to_eir_with_diags_and_jobs(
+/// Lowers CFG functions in `[fn_start..fn_end)` into an existing `EirProgram` in parallel.
+pub fn lower_cfg_fn_range_with_jobs(
     alloc: *mut AllocCap,
     cfg: *cfg_ir.CfgProgram,
     prog: *resolve.ResolvedProgram,
     env: *types.TypeEnv,
-    interner: *span.SymInterner,
+    fn_start: u32,
+    fn_end: u32,
+    eir: *mut EirProgram,
     diags: *mut diag.DiagBag,
     strict_unsupported: bool,
     jobs: u32,
-) -> EirProgram ! OutOfMemory {
-    _ = interner;
-    var eir = try EirProgram.init(alloc);
-    errdefer eir.destroy(alloc);
-    try copy_cfg_metadata_to_eir(alloc, cfg, &mut eir);
-
-    let ndefs = prog.def_count();
-    var di: u32 = 0_u32;
-    while di < ndefs {
-        if let d = prog.get_def(di) {
-            if d.kind == .ExternFn {
-                try eir.aux.extern_fns.push(alloc, di);
-            }
-        }
-        di = di +% 1_u32;
-    }
-
+) -> !OutOfMemory {
     var msg = try str.StrBuf.init(alloc, 64_usize);
     errdefer msg.destroy(alloc);
     let n_fns = cfg.fn_count();
-    var items = try col.DynBuf.[EirLowerItem].init(alloc, if n_fns < 8_u32 { 8_usize } else { n_fns.widen.[usize]() });
+    let lim = if fn_end > n_fns { n_fns } else { fn_end };
+    if fn_start >= lim {
+        msg.destroy(alloc);
+        return;
+    }
+    let est = (lim - fn_start).widen.[usize]();
+    var items = try col.DynBuf.[EirLowerItem].init(alloc, if est < 8_usize { 8_usize } else { est });
     errdefer items.destroy(alloc);
 
-    var fi: u32 = 0_u32;
-    while fi < n_fns {
+    var fi: u32 = fn_start;
+    while fi < lim {
         if let cf = cfg.get_fn(fi) {
             if cf.sig.generics.len > 0_u32
                 || cf.sig.is_comptime
@@ -6777,30 +7178,28 @@ pub fn lower_cfg_to_eir_with_diags_and_jobs(
             n_workers = 12_usize;
         }
     }
-    if n_items < 32_usize {
+    if n_items < 32_usize || n_workers <= 1_usize {
         let its = items.as_slice();
         var ii: usize = 0_usize;
         while ii < its.len {
             let it = its[ii];
-            try lower_cfg_function(alloc, cfg, it.cfg_fi, env, &mut eir, it.mod_name, it.impl_decl_idx);
+            try lower_cfg_function(alloc, cfg, it.cfg_fi, env, eir, it.mod_name, it.impl_decl_idx);
             ii = ii +% 1_usize;
         }
         items.destroy(alloc);
         msg.destroy(alloc);
-        return eir;
+        return;
     }
 
-    var work_order = try col.DynBuf.[u32].init(alloc, n_items);
+    var work_order = try col.DynBuf.[u32].init(alloc, 512_usize);
     errdefer work_order.destroy(alloc);
     var item_loc = try col.DynBuf.[u64].init(alloc, n_items);
     errdefer item_loc.destroy(alloc);
     var wi_i: usize = 0_usize;
     while wi_i < n_items {
-        try work_order.push(alloc, wi_i.trunc.[u32]());
         try item_loc.push(alloc, 0_u64);
         wi_i = wi_i +% 1_usize;
     }
-    sort_eir_lower_order_desc(work_order.as_mut_slice(), items.as_slice());
 
     var next_pos = sync.AtomicCounter.init(0_u64);
     var w0 = try WorkerEirLowerOut.init(alloc);
@@ -6828,30 +7227,58 @@ pub fn lower_cfg_to_eir_with_diags_and_jobs(
     var w11 = try WorkerEirLowerOut.init(alloc);
     errdefer w11.destroy(alloc);
 
-    dispatch_eir_lower_workers(
-        n_workers, alloc, &mut next_pos, work_order.as_slice(), items.as_slice(), item_loc.as_mut_slice(), cfg, env,
-        &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5,
-        &mut w6, &mut w7, &mut w8, &mut w9, &mut w10, &mut w11,
-    );
-
-    let any_oom = w0.oom || w1.oom || w2.oom || w3.oom || w4.oom || w5.oom
-        || w6.oom || w7.oom || w8.oom || w9.oom || w10.oom || w11.oom;
-
     var merge_sc = try EirCopyScratch.init(alloc);
     errdefer merge_sc.destroy(alloc);
-    if !any_oom {
-        let locs = item_loc.as_slice();
-        var mi: usize = 0_usize;
-        while mi < n_items && mi < locs.len {
-            let loc = locs[mi];
-            let wid = ((loc >> 32_u64) -% 1_u64).trunc.[u32]();
-            let local_idx = (loc & 0xFFFFFFFF_u64).trunc.[u32]();
-            try copy_lowered_from_worker(
-                alloc, wid, local_idx, &mut eir, &mut merge_sc,
-                &w0, &w1, &w2, &w3, &w4, &w5, &w6, &w7, &w8, &w9, &w10, &w11,
-            );
-            mi = mi +% 1_usize;
+    var any_oom = false;
+    let batch_sz: usize = 512_usize;
+    var b0: usize = 0_usize;
+    while b0 < n_items && !any_oom {
+        var b1 = b0 +% batch_sz;
+        if b1 > n_items {
+            b1 = n_items;
         }
+        work_order.clear();
+        var bi = b0;
+        while bi < b1 {
+            try work_order.push(alloc, bi.trunc.[u32]());
+            bi = bi +% 1_usize;
+        }
+        sort_eir_lower_order_desc(work_order.as_mut_slice(), items.as_slice());
+        next_pos.store(0_u64, .Release);
+        dispatch_eir_lower_workers(
+            n_workers, alloc, &mut next_pos, work_order.as_slice(), items.as_slice(), item_loc.as_mut_slice(), cfg, env,
+            &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5,
+            &mut w6, &mut w7, &mut w8, &mut w9, &mut w10, &mut w11,
+        );
+        any_oom = w0.oom || w1.oom || w2.oom || w3.oom || w4.oom || w5.oom
+            || w6.oom || w7.oom || w8.oom || w9.oom || w10.oom || w11.oom;
+        if !any_oom {
+            let locs = item_loc.as_slice();
+            var mi = b0;
+            while mi < b1 && mi < locs.len {
+                let loc = locs[mi];
+                let wid = ((loc >> 32_u64) -% 1_u64).trunc.[u32]();
+                let local_idx = (loc & 0xFFFFFFFF_u64).trunc.[u32]();
+                try copy_lowered_from_worker(
+                    alloc, wid, local_idx, eir, &mut merge_sc,
+                    &w0, &w1, &w2, &w3, &w4, &w5, &w6, &w7, &w8, &w9, &w10, &w11,
+                );
+                mi = mi +% 1_usize;
+            }
+            try w0.out.release_pools(alloc);
+            try w1.out.release_pools(alloc);
+            if n_workers > 2_usize { try w2.out.release_pools(alloc); }
+            if n_workers > 3_usize { try w3.out.release_pools(alloc); }
+            if n_workers > 4_usize { try w4.out.release_pools(alloc); }
+            if n_workers > 5_usize { try w5.out.release_pools(alloc); }
+            if n_workers > 6_usize { try w6.out.release_pools(alloc); }
+            if n_workers > 7_usize { try w7.out.release_pools(alloc); }
+            if n_workers > 8_usize { try w8.out.release_pools(alloc); }
+            if n_workers > 9_usize { try w9.out.release_pools(alloc); }
+            if n_workers > 10_usize { try w10.out.release_pools(alloc); }
+            if n_workers > 11_usize { try w11.out.release_pools(alloc); }
+        }
+        b0 = b1;
     }
 
     merge_sc.destroy(alloc);
@@ -6872,9 +7299,30 @@ pub fn lower_cfg_to_eir_with_diags_and_jobs(
     items.destroy(alloc);
     msg.destroy(alloc);
     if any_oom {
-        eir.destroy(alloc);
         return OutOfMemory;
     }
+    return;
+}
+
+/// Parallel CFG -> SSA EIR lowering (up to 12 workers, deterministic item-order merge).
+pub fn lower_cfg_to_eir_with_diags_and_jobs(
+    alloc: *mut AllocCap,
+    cfg: *cfg_ir.CfgProgram,
+    prog: *resolve.ResolvedProgram,
+    env: *types.TypeEnv,
+    interner: *span.SymInterner,
+    diags: *mut diag.DiagBag,
+    strict_unsupported: bool,
+    jobs: u32,
+) -> EirProgram ! OutOfMemory {
+    _ = interner;
+    var eir = try EirProgram.init(alloc);
+    errdefer eir.destroy(alloc);
+    try copy_cfg_metadata_to_eir(alloc, cfg, &mut eir);
+    try populate_eir_extern_fns(alloc, prog, &mut eir);
+    try lower_cfg_fn_range_with_jobs(
+        alloc, cfg, prog, env, 0_u32, cfg.fn_count(), &mut eir, diags, strict_unsupported, jobs,
+    );
     return eir;
 }
 
@@ -9191,6 +9639,8 @@ fn write_builtin_name(
         .BuildAddModule => { try out.push_str_grow(alloc, "BuildAddModule"); }
         .BuildAddExe => { try out.push_str_grow(alloc, "BuildAddExe"); }
         .BuildAddSharedLib => { try out.push_str_grow(alloc, "BuildAddSharedLib"); }
+        .BuildAddDep => { try out.push_str_grow(alloc, "BuildAddDep"); }
+        .BuildAddLib => { try out.push_str_grow(alloc, "BuildAddLib"); }
         .BuildSetOutDir => { try out.push_str_grow(alloc, "BuildSetOutDir"); }
         .BuildSetSanitize => { try out.push_str_grow(alloc, "BuildSetSanitize"); }
         .BuildSetAuditTcb => { try out.push_str_grow(alloc, "BuildSetAuditTcb"); }

@@ -5819,6 +5819,8 @@ impl CfgBuilder {
                 if str.bytes_eq(mname, "add_shared_lib".as_bytes()) || str.bytes_eq(mname, "add_shared".as_bytes()) {
                     return mk_bmatch(cfg_ir.builtin_op_simple(.BuildAddSharedLib), true, false);
                 }
+                if str.bytes_eq(mname, "add_dep".as_bytes()) { return mk_bmatch(cfg_ir.builtin_op_simple(.BuildAddDep), true, false); }
+                if str.bytes_eq(mname, "add_lib".as_bytes()) { return mk_bmatch(cfg_ir.builtin_op_simple(.BuildAddLib), true, false); }
                 if str.bytes_eq(mname, "set_out_dir".as_bytes()) { return mk_bmatch(cfg_ir.builtin_op_simple(.BuildSetOutDir), true, false); }
                 if str.bytes_eq(mname, "set_sanitize".as_bytes()) { return mk_bmatch(cfg_ir.builtin_op_simple(.BuildSetSanitize), true, false); }
                 if str.bytes_eq(mname, "set_audit_tcb".as_bytes()) { return mk_bmatch(cfg_ir.builtin_op_simple(.BuildSetAuditTcb), true, false); }
@@ -9615,6 +9617,20 @@ fn run_cfg_wave(
         mi = mi +% 1_usize;
     }
 
+    // Release worker body pools immediately after committing the wave to keep Peak RSS bounded
+    if n_workers > 0_usize { try w0.cfg.release_body_pools(alloc); }
+    if n_workers > 1_usize { try w1.cfg.release_body_pools(alloc); }
+    if n_workers > 2_usize { try w2.cfg.release_body_pools(alloc); }
+    if n_workers > 3_usize { try w3.cfg.release_body_pools(alloc); }
+    if n_workers > 4_usize { try w4.cfg.release_body_pools(alloc); }
+    if n_workers > 5_usize { try w5.cfg.release_body_pools(alloc); }
+    if n_workers > 6_usize { try w6.cfg.release_body_pools(alloc); }
+    if n_workers > 7_usize { try w7.cfg.release_body_pools(alloc); }
+    if n_workers > 8_usize { try w8.cfg.release_body_pools(alloc); }
+    if n_workers > 9_usize { try w9.cfg.release_body_pools(alloc); }
+    if n_workers > 10_usize { try w10.cfg.release_body_pools(alloc); }
+    if n_workers > 11_usize { try w11.cfg.release_body_pools(alloc); }
+
     results.destroy(alloc);
     order.destroy(alloc);
     return;
@@ -9660,12 +9676,23 @@ fn lower_program_parallel_waves(
 
     let empty_g_arr: [1]types.GenericVal = [types.gval_ty(types.TY_VOID)];
     let empty_g = empty_g_arr[0_usize..0_usize];
-    try run_cfg_wave(
-        alloc, n_workers, false, wave0_items, empty_g,
-        arena, prog, env, cfg, lstate, ct, table, interner,
-        &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5,
-        &mut w6, &mut w7, &mut w8, &mut w9, &mut w10, &mut w11,
-    );
+    // Process wave0 in deterministic chunks of 512 items so worker CFG pools stay small (~20 MiB vs ~350 MiB)
+    let chunk_sz: usize = 512_usize;
+    var w0_pos: usize = 0_usize;
+    while w0_pos < wave0_items.len {
+        var w0_end = w0_pos +% chunk_sz;
+        if w0_end > wave0_items.len {
+            w0_end = wave0_items.len;
+        }
+        let batch = wave0_items.sub(w0_pos, w0_end) catch { break; };
+        try run_cfg_wave(
+            alloc, n_workers, w0_pos > 0_usize, batch, empty_g,
+            arena, prog, env, cfg, lstate, ct, table, interner,
+            &mut w0, &mut w1, &mut w2, &mut w3, &mut w4, &mut w5,
+            &mut w6, &mut w7, &mut w8, &mut w9, &mut w10, &mut w11,
+        );
+        w0_pos = w0_end;
+    }
 
     var g_items = try col.DynBuf.[CfgWorkItem].init(alloc, 32_usize);
     errdefer g_items.destroy(alloc);
@@ -9781,4 +9808,277 @@ pub fn lower_program_with_jobs(
     wave0_items.destroy(alloc);
     lstate.destroy(alloc);
     return cfg;
+}
+
+pub struct CfgBatchRange {
+    pub start: u32;
+    pub end: u32;
+}
+
+fn lower_items_seq(
+    alloc: *mut AllocCap,
+    items: *[CfgWorkItem],
+    wave_gvals: *[types.GenericVal],
+    arena: *ast.AstArena,
+    prog: *resolve.ResolvedProgram,
+    env: *mut types.TypeEnv,
+    cfg: *mut cfg_ir.CfgProgram,
+    lstate: *mut LowerState,
+    ct: *ctvm.CtArena,
+    table: *check.TypeTable,
+    interner: *span.SymInterner,
+) -> !OutOfMemory {
+    let empty_g_arr: [1]types.GenericVal = [types.gval_ty(types.TY_VOID)];
+    let empty_g = empty_g_arr[0_usize..0_usize];
+    var lctx = LowerCtx.{
+        alloc: alloc,
+        arena: arena,
+        prog: prog,
+        env: env,
+        ct: ct,
+        table: table,
+        interner: interner,
+        cfg: cfg,
+        lstate: lstate,
+    };
+    var i: usize = 0_usize;
+    while i < items.len {
+        let it = items[i];
+        if it.is_stub {
+            let stub_fn = cfg_ir.fn_new(
+                it.spec.key, it.spec.module_id, it.spec.sig.name, it.stub_span, it.spec.sig, it.spec.is_sys,
+            );
+            _ = try cfg.add_fn(alloc, stub_fn);
+        } else {
+            let gargs_slice = if it.gargs_len > 0_u32 {
+                let gs = it.gargs_start.widen.[usize]();
+                let ge = gs +% it.gargs_len.widen.[usize]();
+                wave_gvals.sub(gs, ge) catch empty_g
+            } else {
+                empty_g
+            };
+            let func = try lower_fn_body(&mut lctx, &it.spec, gargs_slice);
+            _ = try cfg.add_fn(alloc, func);
+        }
+        i = i +% 1_usize;
+    }
+    return;
+}
+
+/// Streaming AST -> CFG session that emits bounded batches of lowered functions
+/// so callers can borrow-check, collect effects, lower to EIR, and release CFG body pools
+/// after each batch to keep Peak RSS bounded.
+pub linear struct CfgStreamSession {
+    lstate: LowerState;
+    wave0_items: col.DynBuf[CfgWorkItem];
+    wave0_pos: usize;
+    gen_items: col.DynBuf[CfgWorkItem];
+    gen_vals: col.DynBuf[types.GenericVal];
+    gen_pos: usize;
+    gen_cursor: u32;
+    n_workers: usize;
+    has_run_wave: bool;
+    w0: WorkerCfgState;
+    w1: WorkerCfgState;
+    w2: WorkerCfgState;
+    w3: WorkerCfgState;
+    w4: WorkerCfgState;
+    w5: WorkerCfgState;
+    w6: WorkerCfgState;
+    w7: WorkerCfgState;
+    w8: WorkerCfgState;
+    w9: WorkerCfgState;
+    w10: WorkerCfgState;
+    w11: WorkerCfgState;
+}
+
+impl CfgStreamSession {
+    pub fn init(
+        alloc: *mut AllocCap,
+        arena: *ast.AstArena,
+        prog: *resolve.ResolvedProgram,
+        env: *types.TypeEnv,
+        cfg: *mut cfg_ir.CfgProgram,
+        table: *check.TypeTable,
+        jobs: u32,
+    ) -> CfgStreamSession ! OutOfMemory {
+        try seed_dyn_pairs_and_generic_insts(alloc, table, cfg);
+        let lstate = try LowerState.init(alloc);
+        errdefer lstate.destroy(alloc);
+        var wave0_items = try col.DynBuf.[CfgWorkItem].init(alloc, 64_usize);
+        errdefer wave0_items.destroy(alloc);
+        let non_stub = try collect_wave0_work_items(alloc, arena, prog, env, &mut wave0_items);
+        let gen_items = try col.DynBuf.[CfgWorkItem].init(alloc, 32_usize);
+        errdefer gen_items.destroy(alloc);
+        let gen_vals = try col.DynBuf.[types.GenericVal].init(alloc, 64_usize);
+        errdefer gen_vals.destroy(alloc);
+
+        var n_workers: usize = 1_usize;
+        if jobs == 1_u32 || non_stub < 32_usize {
+            n_workers = 1_usize;
+        } else if jobs > 1_u32 {
+            n_workers = jobs.widen.[usize]();
+            if n_workers > 12_usize { n_workers = 12_usize; }
+        } else {
+            if non_stub < 192_usize {
+                n_workers = 4_usize;
+            } else if non_stub < 480_usize {
+                n_workers = 8_usize;
+            } else {
+                n_workers = 12_usize;
+            }
+        }
+
+        let par_on = n_workers > 1_usize;
+        let w0 = try WorkerCfgState.init(alloc, env, cfg, par_on && 0_usize < n_workers); errdefer w0.destroy(alloc);
+        let w1 = try WorkerCfgState.init(alloc, env, cfg, par_on && 1_usize < n_workers); errdefer w1.destroy(alloc);
+        let w2 = try WorkerCfgState.init(alloc, env, cfg, par_on && 2_usize < n_workers); errdefer w2.destroy(alloc);
+        let w3 = try WorkerCfgState.init(alloc, env, cfg, par_on && 3_usize < n_workers); errdefer w3.destroy(alloc);
+        let w4 = try WorkerCfgState.init(alloc, env, cfg, par_on && 4_usize < n_workers); errdefer w4.destroy(alloc);
+        let w5 = try WorkerCfgState.init(alloc, env, cfg, par_on && 5_usize < n_workers); errdefer w5.destroy(alloc);
+        let w6 = try WorkerCfgState.init(alloc, env, cfg, par_on && 6_usize < n_workers); errdefer w6.destroy(alloc);
+        let w7 = try WorkerCfgState.init(alloc, env, cfg, par_on && 7_usize < n_workers); errdefer w7.destroy(alloc);
+        let w8 = try WorkerCfgState.init(alloc, env, cfg, par_on && 8_usize < n_workers); errdefer w8.destroy(alloc);
+        let w9 = try WorkerCfgState.init(alloc, env, cfg, par_on && 9_usize < n_workers); errdefer w9.destroy(alloc);
+        let w10 = try WorkerCfgState.init(alloc, env, cfg, par_on && 10_usize < n_workers); errdefer w10.destroy(alloc);
+        let w11 = try WorkerCfgState.init(alloc, env, cfg, par_on && 11_usize < n_workers); errdefer w11.destroy(alloc);
+
+        return CfgStreamSession.{
+            lstate: lstate,
+            wave0_items: wave0_items,
+            wave0_pos: 0_usize,
+            gen_items: gen_items,
+            gen_vals: gen_vals,
+            gen_pos: 0_usize,
+            gen_cursor: 0_u32,
+            n_workers: n_workers,
+            has_run_wave: false,
+            w0: w0,
+            w1: w1,
+            w2: w2,
+            w3: w3,
+            w4: w4,
+            w5: w5,
+            w6: w6,
+            w7: w7,
+            w8: w8,
+            w9: w9,
+            w10: w10,
+            w11: w11,
+        };
+    }
+
+    pub fn destroy(self: CfgStreamSession, alloc: *mut AllocCap) {
+        let CfgStreamSession.{
+            lstate,
+            wave0_items,
+            wave0_pos: _,
+            gen_items,
+            gen_vals,
+            gen_pos: _,
+            gen_cursor: _,
+            n_workers: _,
+            has_run_wave: _,
+            w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11,
+        } = self;
+        w11.destroy(alloc); w10.destroy(alloc); w9.destroy(alloc); w8.destroy(alloc);
+        w7.destroy(alloc); w6.destroy(alloc); w5.destroy(alloc); w4.destroy(alloc);
+        w3.destroy(alloc); w2.destroy(alloc); w1.destroy(alloc); w0.destroy(alloc);
+        gen_vals.destroy(alloc);
+        gen_items.destroy(alloc);
+        wave0_items.destroy(alloc);
+        lstate.destroy(alloc);
+    }
+
+    pub fn next_batch(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        arena: *ast.AstArena,
+        prog: *resolve.ResolvedProgram,
+        env: *mut types.TypeEnv,
+        cfg: *mut cfg_ir.CfgProgram,
+        ct: *ctvm.CtArena,
+        table: *check.TypeTable,
+        interner: *span.SymInterner,
+        batch_sz: usize,
+    ) -> ?CfgBatchRange ! OutOfMemory {
+        let step = if batch_sz == 0_usize { 512_usize } else { batch_sz };
+        let empty_g_arr: [1]types.GenericVal = [types.gval_ty(types.TY_VOID)];
+        let empty_g = empty_g_arr[0_usize..0_usize];
+        let start_fn = cfg.fn_count();
+
+        if self.wave0_pos < self.wave0_items.len() {
+            let w0_len = self.wave0_items.len();
+            var w0_end = self.wave0_pos +% step;
+            if w0_end > w0_len {
+                w0_end = w0_len;
+            }
+            let b_start = self.wave0_pos;
+            self.wave0_pos = w0_end;
+            let batch = self.wave0_items.as_slice().sub(b_start, w0_end) catch {
+                return null;
+            };
+            if self.n_workers <= 1_usize || batch.len < 32_usize {
+                try lower_items_seq(
+                    alloc, batch, empty_g, arena, prog, env, cfg, &mut self.lstate, ct, table, interner,
+                );
+            } else {
+                try run_cfg_wave(
+                    alloc, self.n_workers, self.has_run_wave, batch, empty_g,
+                    arena, prog, env, cfg, &mut self.lstate, ct, table, interner,
+                    &mut self.w0, &mut self.w1, &mut self.w2, &mut self.w3, &mut self.w4, &mut self.w5,
+                    &mut self.w6, &mut self.w7, &mut self.w8, &mut self.w9, &mut self.w10, &mut self.w11,
+                );
+            }
+            self.has_run_wave = true;
+        } else {
+            while self.gen_pos >= self.gen_items.len() && self.gen_cursor < cfg.generic_inst_count() {
+                let g_end = cfg.generic_inst_count();
+                self.gen_items.clear();
+                self.gen_vals.clear();
+                self.gen_pos = 0_usize;
+                try collect_generic_wave_items(
+                    alloc, arena, prog, env, cfg, self.gen_cursor, g_end, &mut self.gen_items, &mut self.gen_vals,
+                );
+                self.gen_cursor = g_end;
+            }
+            if self.gen_pos >= self.gen_items.len() {
+                return null;
+            }
+            let g_len = self.gen_items.len();
+            var g_end = self.gen_pos +% step;
+            if g_end > g_len {
+                g_end = g_len;
+            }
+            let g_start = self.gen_pos;
+            self.gen_pos = g_end;
+            let batch = self.gen_items.as_slice().sub(g_start, g_end) catch {
+                return null;
+            };
+            let gvals = self.gen_vals.as_slice();
+            if self.n_workers <= 1_usize || batch.len < 32_usize {
+                try lower_items_seq(
+                    alloc, batch, gvals, arena, prog, env, cfg, &mut self.lstate, ct, table, interner,
+                );
+            } else {
+                try run_cfg_wave(
+                    alloc, self.n_workers, true, batch, gvals,
+                    arena, prog, env, cfg, &mut self.lstate, ct, table, interner,
+                    &mut self.w0, &mut self.w1, &mut self.w2, &mut self.w3, &mut self.w4, &mut self.w5,
+                    &mut self.w6, &mut self.w7, &mut self.w8, &mut self.w9, &mut self.w10, &mut self.w11,
+                );
+            }
+            self.has_run_wave = true;
+        }
+
+        let cls = self.lstate.out_closures.as_slice();
+        var ci: usize = 0_usize;
+        while ci < cls.len {
+            _ = try cfg.add_fn(alloc, cls[ci]);
+            ci = ci +% 1_usize;
+        }
+        self.lstate.out_closures.clear();
+        let end_fn = cfg.fn_count();
+        return CfgBatchRange.{ start: start_fn, end: end_fn };
+    }
 }

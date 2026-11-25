@@ -775,6 +775,21 @@ impl AstMetaPools {
         sys_params.destroy(alloc);
         fields.destroy(alloc);
     }
+
+    pub fn release_pools(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        try self.units.reset_free(alloc, 4_usize);
+        try self.imports.reset_free(alloc, 4_usize);
+        try self.import_items.reset_free(alloc, 4_usize);
+        try self.attrs.reset_free(alloc, 4_usize);
+        try self.attr_args.reset_free(alloc, 4_usize);
+        try self.idents.reset_free(alloc, 4_usize);
+        try self.generic_params.reset_free(alloc, 4_usize);
+        try self.generic_args.reset_free(alloc, 4_usize);
+        try self.params.reset_free(alloc, 4_usize);
+        try self.sys_params.reset_free(alloc, 4_usize);
+        try self.fields.reset_free(alloc, 4_usize);
+        return;
+    }
 }
 
 pub linear struct AstDeclCorePools {
@@ -844,6 +859,19 @@ impl AstDeclCorePools {
         const_decls.destroy(alloc);
         extern_decls.destroy(alloc);
     }
+
+    pub fn release_pools(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        try self.decls.reset_free(alloc, 4_usize);
+        try self.decl_lists.reset_free(alloc, 4_usize);
+        try self.fn_decls.reset_free(alloc, 4_usize);
+        try self.sys_decls.reset_free(alloc, 4_usize);
+        try self.struct_decls.reset_free(alloc, 4_usize);
+        try self.impl_decls.reset_free(alloc, 4_usize);
+        try self.type_decls.reset_free(alloc, 4_usize);
+        try self.const_decls.reset_free(alloc, 4_usize);
+        try self.extern_decls.reset_free(alloc, 4_usize);
+        return;
+    }
 }
 
 pub linear struct AstDeclTypePools {
@@ -912,6 +940,19 @@ impl AstDeclTypePools {
         iface_decls.destroy(alloc);
         iface_methods.destroy(alloc);
         error_decls.destroy(alloc);
+    }
+
+    pub fn release_pools(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        try self.enum_decls.reset_free(alloc, 4_usize);
+        try self.enum_variants.reset_free(alloc, 4_usize);
+        try self.union_decls.reset_free(alloc, 4_usize);
+        try self.union_variants.reset_free(alloc, 4_usize);
+        try self.bitfield_decls.reset_free(alloc, 4_usize);
+        try self.bitfield_members.reset_free(alloc, 4_usize);
+        try self.iface_decls.reset_free(alloc, 4_usize);
+        try self.iface_methods.reset_free(alloc, 4_usize);
+        try self.error_decls.reset_free(alloc, 4_usize);
+        return;
     }
 }
 
@@ -994,6 +1035,21 @@ impl AstStmtPatPools {
         if_nodes.destroy(alloc);
         match_arms.destroy(alloc);
     }
+
+    pub fn release_pools(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        try self.types.reset_free(alloc, 4_usize);
+        try self.type_lists.reset_free(alloc, 4_usize);
+        try self.pats.reset_free(alloc, 4_usize);
+        try self.pat_lists.reset_free(alloc, 4_usize);
+        try self.pat_fields.reset_free(alloc, 4_usize);
+        try self.stmts.reset_free(alloc, 4_usize);
+        try self.stmt_lists.reset_free(alloc, 4_usize);
+        try self.blocks.reset_free(alloc, 4_usize);
+        try self.jumps.reset_free(alloc, 4_usize);
+        try self.if_nodes.reset_free(alloc, 4_usize);
+        try self.match_arms.reset_free(alloc, 4_usize);
+        return;
+    }
 }
 
 pub linear struct AstExprPools {
@@ -1044,6 +1100,16 @@ impl AstExprPools {
         asm_ops.destroy(alloc);
         str_bytes.destroy(alloc);
         byte_bytes.destroy(alloc);
+    }
+
+    pub fn release_pools(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        try self.exprs.reset_free(alloc, 4_usize);
+        try self.expr_lists.reset_free(alloc, 4_usize);
+        try self.field_inits.reset_free(alloc, 4_usize);
+        try self.asm_ops.reset_free(alloc, 4_usize);
+        try self.str_bytes.reset_free(alloc, 4_usize);
+        try self.byte_bytes.reset_free(alloc, 4_usize);
+        return;
     }
 }
 
@@ -1098,6 +1164,20 @@ impl AstArena {
         decl_types.destroy(alloc);
         stmt_pat.destroy(alloc);
         expr_pools.destroy(alloc);
+    }
+
+    pub fn release_non_expr_pools(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        try self.meta.release_pools(alloc);
+        try self.decl_core.release_pools(alloc);
+        try self.decl_types.release_pools(alloc);
+        try self.stmt_pat.release_pools(alloc);
+        return;
+    }
+
+    pub fn release_all_pools(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        try self.release_non_expr_pools(alloc);
+        try self.expr_pools.release_pools(alloc);
+        return;
     }
 
     // --- Single-node builders ---
