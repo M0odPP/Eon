@@ -1,0 +1,458 @@
+module core.fmt;
+
+import core.math;
+
+// ---------------------------------------------------------------------------
+// Allocation-free fixed-buffer formatter (`core/`, 100% freestanding)
+// ---------------------------------------------------------------------------
+
+pub struct FmtCursor {
+    pub pos: usize;
+    pub overflowed: bool;
+}
+
+impl FmtCursor {
+    @inline
+    pub fn new() -> FmtCursor {
+        return FmtCursor.{ pos: 0_usize, overflowed: false };
+    }
+
+    @inline
+    pub fn len(self: Self) -> usize {
+        return self.pos;
+    }
+
+    pub fn write_byte(self: *mut Self, dst: *mut [u8], b: u8) {
+        if self.pos < dst.len {
+            dst[self.pos] = b;
+            self.pos = self.pos +% 1_usize;
+        } else {
+            self.overflowed = true;
+        }
+    }
+
+    pub fn write_bytes(self: *mut Self, dst: *mut [u8], src: *[u8]) {
+        var i: usize = 0_usize;
+        while i < src.len {
+            if self.pos < dst.len {
+                dst[self.pos] = src[i];
+                self.pos = self.pos +% 1_usize;
+            } else {
+                self.overflowed = true;
+                return;
+            }
+            i = i + 1_usize;
+        }
+    }
+
+    pub fn write_str(self: *mut Self, dst: *mut [u8], s: *str) {
+        self.write_bytes(dst, s.as_bytes());
+    }
+
+    pub fn write_repeat(self: *mut Self, dst: *mut [u8], b: u8, count: usize) {
+        var i: usize = 0_usize;
+        while i < count {
+            self.write_byte(dst, b);
+            i = i +% 1_usize;
+        }
+    }
+
+    pub fn write_u64(self: *mut Self, dst: *mut [u8], val: u64) {
+        if val == 0_u64 {
+            self.write_byte(dst, b'0');
+            return;
+        }
+        var digits: [24]u8 = [0_u8; 24];
+        var count: usize = 0_usize;
+        var cur = val;
+        while cur > 0_u64 && count < 24_usize {
+            let rem = (cur % 10_u64).trunc.[u8]();
+            digits[count] = b'0' +% rem;
+            cur = cur / 10_u64;
+            count = count +% 1_usize;
+        }
+        var idx = count;
+        while idx > 0_usize {
+            idx = idx - 1_usize;
+            if idx < 24_usize {
+                self.write_byte(dst, digits[idx]);
+            }
+        }
+    }
+
+    pub fn write_i64(self: *mut Self, dst: *mut [u8], val: i64) {
+        if val < 0_i64 {
+            self.write_byte(dst, b'-');
+            let mag = 0_u64 -% val.bitcast.[u64]();
+            self.write_u64(dst, mag);
+            return;
+        }
+        self.write_u64(dst, val.bitcast.[u64]());
+    }
+
+    pub fn write_u64_hex(self: *mut Self, dst: *mut [u8], val: u64, upper: bool, min_width: usize) {
+        var digits: [16]u8 = [0_u8; 16];
+        var count: usize = 0_usize;
+        var cur = val;
+        if cur == 0_u64 {
+            digits[0_usize] = b'0';
+            count = 1_usize;
+        } else {
+            let base_alpha: u8 = if upper { b'A' } else { b'a' };
+            while cur > 0_u64 && count < 16_usize {
+                let nib = (cur & 15_u64).trunc.[u8]();
+                digits[count] = if nib < 10_u8 {
+                    b'0' +% nib
+                } else {
+                    base_alpha +% (nib -% 10_u8)
+                };
+                cur = cur >> 4_u64;
+                count = count +% 1_usize;
+            }
+        }
+        if min_width > count {
+            self.write_repeat(dst, b'0', min_width - count);
+        }
+        var idx = count;
+        while idx > 0_usize {
+            idx = idx - 1_usize;
+            if idx < 16_usize {
+                self.write_byte(dst, digits[idx]);
+            }
+        }
+    }
+
+    pub fn write_u64_oct(self: *mut Self, dst: *mut [u8], val: u64, min_width: usize) {
+        var digits: [24]u8 = [0_u8; 24];
+        var count: usize = 0_usize;
+        var cur = val;
+        if cur == 0_u64 {
+            digits[0_usize] = b'0';
+            count = 1_usize;
+        } else {
+            while cur > 0_u64 && count < 24_usize {
+                let d = (cur & 7_u64).trunc.[u8]();
+                digits[count] = b'0' +% d;
+                cur = cur >> 3_u64;
+                count = count +% 1_usize;
+            }
+        }
+        if min_width > count {
+            self.write_repeat(dst, b'0', min_width - count);
+        }
+        var idx = count;
+        while idx > 0_usize {
+            idx = idx - 1_usize;
+            if idx < 24_usize {
+                self.write_byte(dst, digits[idx]);
+            }
+        }
+    }
+
+    /// Write `val` in binary; if `group4` is true, inserts spaces every 4 bits (e.g. `1010 0101`).
+    pub fn write_u64_bin(self: *mut Self, dst: *mut [u8], val: u64, min_width: usize, group4: bool) {
+        var bits: [64]u8 = [0_u8; 64];
+        var count: usize = 0_usize;
+        var cur = val;
+        if cur == 0_u64 {
+            bits[0_usize] = b'0';
+            count = 1_usize;
+        } else {
+            while cur > 0_u64 && count < 64_usize {
+                bits[count] = if (cur & 1_u64) != 0_u64 { b'1' } else { b'0' };
+                cur = cur >> 1_u64;
+                count = count +% 1_usize;
+            }
+        }
+        let total = if min_width > count { min_width } else { count };
+        var pos_from_msb: usize = 0_usize;
+        while pos_from_msb < total {
+            let bit_idx = total - 1_usize - pos_from_msb;
+            if group4 && pos_from_msb > 0_usize && ((total - pos_from_msb) & 3_usize) == 0_usize {
+                self.write_byte(dst, b' ');
+            }
+            if bit_idx < count && bit_idx < 64_usize {
+                self.write_byte(dst, bits[bit_idx]);
+            } else {
+                self.write_byte(dst, b'0');
+            }
+            pos_from_msb = pos_from_msb +% 1_usize;
+        }
+    }
+
+    /// Format finite `f64` with fixed `frac_digits` (`0..=12`), falling back to scientific notation for `|x| >= 1e15`.
+    pub fn write_f64_fixed(self: *mut Self, dst: *mut [u8], val: f64, frac_digits: usize) {
+        if math.is_nan_f64(val) {
+            self.write_str(dst, "NaN");
+            return;
+        }
+        let bits = math.f64_to_bits(val);
+        let is_neg = (bits >> 63_u64) != 0_u64;
+        if math.is_inf_f64(val) {
+            if is_neg {
+                self.write_str(dst, "-Inf");
+            } else {
+                self.write_str(dst, "Inf");
+            }
+            return;
+        }
+        let ax = math.abs_f64(val);
+        if ax == 0.0_f64 {
+            if is_neg {
+                self.write_byte(dst, b'-');
+            }
+            self.write_byte(dst, b'0');
+            if frac_digits > 0_usize {
+                self.write_byte(dst, b'.');
+                let fd = if frac_digits > 12_usize { 12_usize } else { frac_digits };
+                self.write_repeat(dst, b'0', fd);
+            }
+            return;
+        }
+        if ax >= 1.0e15_f64 {
+            self.write_f64_sci(dst, val, if frac_digits > 12_usize { 12_usize } else { frac_digits }, false);
+            return;
+        }
+
+        if is_neg {
+            self.write_byte(dst, b'-');
+        }
+        let fd = if frac_digits > 12_usize { 12_usize } else { frac_digits };
+        var scale_u64: u64 = 1_u64;
+        var si: usize = 0_usize;
+        while si < fd {
+            scale_u64 = scale_u64 *% 10_u64;
+            si = si +% 1_usize;
+        }
+        let scale_f = scale_u64.to_float.[f64]();
+        let whole_f = math.floor_f64(ax);
+        var whole_u = whole_f.trunc_to_int.[u64]();
+        let frac_f = (ax - whole_f) * scale_f + 0.5_f64;
+        var frac_u = frac_f.trunc_to_int.[u64]();
+        if frac_u >= scale_u64 {
+            frac_u = frac_u -% scale_u64;
+            whole_u = whole_u +% 1_u64;
+        }
+        self.write_u64(dst, whole_u);
+        if fd > 0_usize {
+            self.write_byte(dst, b'.');
+            var fbuf: [16]u8 = [b'0'; 16];
+            var cur = frac_u;
+            var k = fd;
+            while k > 0_usize {
+                k = k - 1_usize;
+                fbuf[k] = b'0' +% (cur % 10_u64).trunc.[u8]();
+                cur = cur / 10_u64;
+            }
+            var j: usize = 0_usize;
+            while j < fd {
+                self.write_byte(dst, fbuf[j]);
+                j = j +% 1_usize;
+            }
+        }
+    }
+
+    /// Format `f64` in scientific notation (`d.ddddde+NN`), optionally trimming trailing fractional zeros.
+    pub fn write_f64_sci(self: *mut Self, dst: *mut [u8], val: f64, frac_digits: usize, trim_zeros: bool) {
+        if math.is_nan_f64(val) {
+            self.write_str(dst, "NaN");
+            return;
+        }
+        let bits = math.f64_to_bits(val);
+        let is_neg = (bits >> 63_u64) != 0_u64;
+        if math.is_inf_f64(val) {
+            if is_neg {
+                self.write_str(dst, "-Inf");
+            } else {
+                self.write_str(dst, "Inf");
+            }
+            return;
+        }
+        var ax = math.abs_f64(val);
+        if is_neg && ax != 0.0_f64 {
+            self.write_byte(dst, b'-');
+        }
+        var exp10: i32 = 0_i32;
+        if ax != 0.0_f64 {
+            while ax >= 10.0_f64 && exp10 < 310_i32 {
+                ax = ax * 0.1_f64;
+                exp10 = exp10 +% 1_i32;
+            }
+            while ax < 1.0_f64 && exp10 > -330_i32 {
+                ax = ax * 10.0_f64;
+                exp10 = exp10 -% 1_i32;
+            }
+        }
+        let fd = if frac_digits > 12_usize { 12_usize } else { frac_digits };
+        var scale_u64: u64 = 1_u64;
+        var si: usize = 0_usize;
+        while si < fd {
+            scale_u64 = scale_u64 *% 10_u64;
+            si = si +% 1_usize;
+        }
+        if scale_u64 == 0_u64 {
+            scale_u64 = 1_u64;
+        }
+        var scaled = (ax * scale_u64.to_float.[f64]() + 0.5_f64).trunc_to_int.[u64]();
+        let ten_scale = scale_u64 *% 10_u64;
+        if scaled >= ten_scale && ax != 0.0_f64 {
+            scaled = scaled / 10_u64;
+            exp10 = exp10 +% 1_i32;
+        }
+        let lead = scaled / scale_u64;
+        let rem = scaled % scale_u64;
+        self.write_u64(dst, lead);
+        if fd > 0_usize {
+            var fbuf: [16]u8 = [b'0'; 16];
+            var cur = rem;
+            var k = fd;
+            while k > 0_usize {
+                k = k - 1_usize;
+                fbuf[k] = b'0' +% (cur % 10_u64).trunc.[u8]();
+                cur = cur / 10_u64;
+            }
+            var end = fd;
+            if trim_zeros {
+                while end > 0_usize {
+                    let prev = end - 1_usize;
+                    if fbuf[prev] == b'0' {
+                        end = prev;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if end > 0_usize {
+                self.write_byte(dst, b'.');
+                var j: usize = 0_usize;
+                while j < end {
+                    self.write_byte(dst, fbuf[j]);
+                    j = j +% 1_usize;
+                }
+            }
+        }
+        self.write_byte(dst, b'e');
+        if exp10 >= 0_i32 {
+            self.write_byte(dst, b'+');
+            self.write_u64(dst, exp10.widen.[i64]().bitcast.[u64]());
+        } else {
+            self.write_byte(dst, b'-');
+            let mag = (0_i64 -% exp10.widen.[i64]()).bitcast.[u64]();
+            self.write_u64(dst, mag);
+        }
+    }
+
+    /// Compact human-readable `f64` formatting (trims trailing fractional zeros; switches to sci outside `[1e-5, 1e12)`).
+    pub fn write_f64_compact(self: *mut Self, dst: *mut [u8], val: f64, max_frac: usize) {
+        if math.is_nan_f64(val) {
+            self.write_str(dst, "NaN");
+            return;
+        }
+        let bits = math.f64_to_bits(val);
+        let is_neg = (bits >> 63_u64) != 0_u64;
+        if math.is_inf_f64(val) {
+            if is_neg {
+                self.write_str(dst, "-Inf");
+            } else {
+                self.write_str(dst, "Inf");
+            }
+            return;
+        }
+        let ax = math.abs_f64(val);
+        if ax == 0.0_f64 {
+            self.write_byte(dst, b'0');
+            return;
+        }
+        let fd = if max_frac > 10_usize { 10_usize } else { max_frac };
+        if ax >= 1.0e12_f64 || ax < 1.0e-5_f64 {
+            self.write_f64_sci(dst, val, fd, true);
+            return;
+        }
+        let start_pos = self.pos;
+        self.write_f64_fixed(dst, val, fd);
+        if fd > 0_usize && !self.overflowed {
+            // Trim trailing fractional zeros and trailing '.'
+            var dot_pos: usize = self.pos;
+            var scan = start_pos;
+            while scan < self.pos && scan < dst.len {
+                if dst[scan] == b'.' {
+                    dot_pos = scan;
+                    break;
+                }
+                scan = scan +% 1_usize;
+            }
+            if dot_pos < self.pos {
+                while self.pos > dot_pos +% 1_usize {
+                    let last = self.pos - 1_usize;
+                    if last < dst.len && dst[last] == b'0' {
+                        self.pos = last;
+                    } else {
+                        break;
+                    }
+                }
+                if self.pos == dot_pos +% 1_usize {
+                    let last = self.pos - 1_usize;
+                    if last < dst.len && dst[last] == b'.' {
+                        self.pos = last;
+                    }
+                }
+            }
+        }
+    }
+
+    @inline
+    pub fn write_f32_fixed(self: *mut Self, dst: *mut [u8], val: f32, frac_digits: usize) {
+        self.write_f64_fixed(dst, val.widen.[f64](), frac_digits);
+    }
+
+    @inline
+    pub fn write_f32_compact(self: *mut Self, dst: *mut [u8], val: f32, max_frac: usize) {
+        self.write_f64_compact(dst, val.widen.[f64](), max_frac);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One-shot allocation-free convenience formatters returning bytes written
+// ---------------------------------------------------------------------------
+
+pub fn format_u64(dst: *mut [u8], val: u64) -> usize {
+    var c = FmtCursor.new();
+    c.write_u64(dst, val);
+    return c.pos;
+}
+
+pub fn format_i64(dst: *mut [u8], val: i64) -> usize {
+    var c = FmtCursor.new();
+    c.write_i64(dst, val);
+    return c.pos;
+}
+
+pub fn format_hex_u64(dst: *mut [u8], val: u64, upper: bool, min_width: usize) -> usize {
+    var c = FmtCursor.new();
+    c.write_u64_hex(dst, val, upper, min_width);
+    return c.pos;
+}
+
+pub fn format_oct_u64(dst: *mut [u8], val: u64, min_width: usize) -> usize {
+    var c = FmtCursor.new();
+    c.write_u64_oct(dst, val, min_width);
+    return c.pos;
+}
+
+pub fn format_bin_u64(dst: *mut [u8], val: u64, min_width: usize, group4: bool) -> usize {
+    var c = FmtCursor.new();
+    c.write_u64_bin(dst, val, min_width, group4);
+    return c.pos;
+}
+
+pub fn format_f64_fixed(dst: *mut [u8], val: f64, frac_digits: usize) -> usize {
+    var c = FmtCursor.new();
+    c.write_f64_fixed(dst, val, frac_digits);
+    return c.pos;
+}
+
+pub fn format_f64_compact(dst: *mut [u8], val: f64, max_frac: usize) -> usize {
+    var c = FmtCursor.new();
+    c.write_f64_compact(dst, val, max_frac);
+    return c.pos;
+}

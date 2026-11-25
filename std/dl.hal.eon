@@ -1,0 +1,190 @@
+module std.dl @hal;
+
+// ---------------------------------------------------------------------------
+// Dynamic library loading (`std.dl`) + SysV C-ABI indirect call trampolines
+// ---------------------------------------------------------------------------
+
+const RTLD_LAZY: i32 = 1_i32;
+const RTLD_NOW: i32 = 2_i32;
+
+extern "C" fn dlopen(filename: rawptr[u8], flags: i32) -> u64;
+extern "C" fn dlsym(handle: u64, symbol: rawptr[u8]) -> u64;
+extern "C" fn dlclose(handle: u64) -> i32;
+
+@naked
+fn slice_ptr(_s: *[u8]) -> u64 {
+    raw {
+        asm("mov rax, rdi; ret", options(noreturn));
+    }
+    return 0_u64;
+}
+
+fn copy_cstr(src: *[u8], dst: *mut [u8]) -> bool {
+    if dst.len == 0_usize || src.len >= dst.len {
+        return false;
+    }
+    var i: usize = 0_usize;
+    while i < src.len {
+        let ch = src[i];
+        if ch == 0_u8 {
+            return false;
+        }
+        dst[i] = ch;
+        i = i + 1_usize;
+    }
+    dst[src.len] = 0_u8;
+    return true;
+}
+
+/// Linear handle to a dynamically loaded shared library (must be closed via `.close()`).
+pub linear struct DynLib {
+    handle: u64;
+}
+
+impl DynLib {
+    /// Open a shared library (`RTLD_LAZY | RTLD_LOCAL`). Returns `.NotFound` if absent.
+    pub fn open(path: *str) -> DynLib ! IoError {
+        var cpath: [512]u8 = [0_u8; 512];
+        if !copy_cstr(path.as_bytes(), &mut cpath) {
+            return .InvalidInput;
+        }
+        var h: u64 = 0_u64;
+        raw {
+            let ptr = rawptr.[u8].from_usize(slice_ptr(&cpath).trunc.[usize]());
+            h = dlopen(ptr, RTLD_LAZY);
+        }
+        if h == 0_u64 {
+            return .NotFound;
+        }
+        return DynLib.{ handle: h };
+    }
+
+    /// Open a shared library resolving all symbols eagerly (`RTLD_NOW | RTLD_LOCAL`).
+    pub fn open_now(path: *str) -> DynLib ! IoError {
+        var cpath: [512]u8 = [0_u8; 512];
+        if !copy_cstr(path.as_bytes(), &mut cpath) {
+            return .InvalidInput;
+        }
+        var h: u64 = 0_u64;
+        raw {
+            let ptr = rawptr.[u8].from_usize(slice_ptr(&cpath).trunc.[usize]());
+            h = dlopen(ptr, RTLD_NOW);
+        }
+        if h == 0_u64 {
+            return .NotFound;
+        }
+        return DynLib.{ handle: h };
+    }
+
+    /// Open the main program handle (`dlopen(NULL, RTLD_LAZY)`).
+    pub fn open_self() -> DynLib ! IoError {
+        var h: u64 = 0_u64;
+        raw {
+            let ptr = rawptr.[u8].from_usize(0_usize);
+            h = dlopen(ptr, RTLD_LAZY);
+        }
+        if h == 0_u64 {
+            return .Other;
+        }
+        return DynLib.{ handle: h };
+    }
+
+    /// Look up a symbol address by name; returns `null` if not found.
+    pub fn sym(self: *Self, name: *str) -> ?u64 {
+        var cname: [256]u8 = [0_u8; 256];
+        if !copy_cstr(name.as_bytes(), &mut cname) {
+            return null;
+        }
+        var addr: u64 = 0_u64;
+        raw {
+            let ptr = rawptr.[u8].from_usize(slice_ptr(&cname).trunc.[usize]());
+            addr = dlsym(self.handle, ptr);
+        }
+        if addr == 0_u64 {
+            return null;
+        }
+        return addr;
+    }
+
+    pub fn sym_raw(self: *Self, name: *str) -> ?rawptr[u8] {
+        if let addr = self.sym(name) {
+            return rawptr.[u8].from_usize(addr.trunc.[usize]());
+        }
+        return null;
+    }
+
+    pub fn raw_handle(self: *Self) -> u64 {
+        return self.handle;
+    }
+
+    pub fn close(self: DynLib) {
+        let DynLib.{ handle } = self;
+        if handle != 0_u64 {
+            raw {
+                _ = dlclose(handle);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Zero-overhead SysV x86_64 C-ABI indirect call trampolines (0..6 integer args)
+// EonCall passes (fp, a0..a5) in (rdi, rsi, rdx, rcx, r8, r9, r10);
+// tail-jumping to `rax` preserves exact 16-byte SysV stack alignment.
+// ---------------------------------------------------------------------------
+
+@naked
+pub fn call_c0(_fp: u64) -> u64 {
+    raw {
+        asm("mov rax, rdi; jmp rax", options(noreturn));
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call_c1(_fp: u64, _a0: u64) -> u64 {
+    raw {
+        asm("mov rax, rdi; mov rdi, rsi; jmp rax", options(noreturn));
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call_c2(_fp: u64, _a0: u64, _a1: u64) -> u64 {
+    raw {
+        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; jmp rax", options(noreturn));
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call_c3(_fp: u64, _a0: u64, _a1: u64, _a2: u64) -> u64 {
+    raw {
+        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; jmp rax", options(noreturn));
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call_c4(_fp: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64) -> u64 {
+    raw {
+        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; jmp rax", options(noreturn));
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call_c5(_fp: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
+    raw {
+        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; mov r8, r9; jmp rax", options(noreturn));
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn call_c6(_fp: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
+    raw {
+        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov rcx, r8; mov r8, r9; mov r9, r10; jmp rax", options(noreturn));
+    }
+    return 0_u64;
+}

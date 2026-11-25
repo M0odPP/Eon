@@ -1,0 +1,221 @@
+module std.time @hal;
+
+// ---------------------------------------------------------------------------
+// Monotonic & wall-clock time + OS sleep (`std.time`, Linux x86_64 syscalls)
+// ---------------------------------------------------------------------------
+
+const SYS_NANOSLEEP: u64 = 35_u64;
+const SYS_CLOCK_GETTIME: u64 = 228_u64;
+
+const CLOCK_REALTIME: u64 = 0_u64;
+const CLOCK_MONOTONIC: u64 = 1_u64;
+const EINTR: i64 = -4_i64;
+
+extern "C" struct Timespec {
+    tv_sec: i64;
+    tv_nsec: i64;
+}
+
+@naked
+fn syscall2(_nr: u64, _a1: u64, _a2: u64) -> i64 {
+    raw {
+        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; syscall; ret", options(noreturn));
+    }
+    return 0_i64;
+}
+
+@naked
+fn timespec_mut_addr(_p: *mut Timespec) -> u64 {
+    raw {
+        asm("mov rax, rdi; ret", options(noreturn));
+    }
+    return 0_u64;
+}
+
+@naked
+fn timespec_addr(_p: *Timespec) -> u64 {
+    raw {
+        asm("mov rax, rdi; ret", options(noreturn));
+    }
+    return 0_u64;
+}
+
+pub struct Duration {
+    pub nanos: u64;
+}
+
+impl Duration {
+    @inline
+    pub fn zero() -> Duration {
+        return Duration.{ nanos: 0_u64 };
+    }
+
+    @inline
+    pub fn from_nanos(ns: u64) -> Duration {
+        return Duration.{ nanos: ns };
+    }
+
+    @inline
+    pub fn from_micros(us: u64) -> Duration {
+        return Duration.{ nanos: us *% 1000_u64 };
+    }
+
+    @inline
+    pub fn from_millis(ms: u64) -> Duration {
+        return Duration.{ nanos: ms *% 1000000_u64 };
+    }
+
+    @inline
+    pub fn from_secs(s: u64) -> Duration {
+        return Duration.{ nanos: s *% 1000000000_u64 };
+    }
+
+    @inline
+    pub fn from_secs_f64(s: f64) -> Duration {
+        if s <= 0.0_f64 {
+            return Duration.zero();
+        }
+        return Duration.{ nanos: (s * 1.0e9_f64).trunc_to_int.[u64]() };
+    }
+
+    @inline
+    pub fn as_nanos(self: Self) -> u64 {
+        return self.nanos;
+    }
+
+    @inline
+    pub fn as_micros(self: Self) -> u64 {
+        return self.nanos / 1000_u64;
+    }
+
+    @inline
+    pub fn as_millis(self: Self) -> u64 {
+        return self.nanos / 1000000_u64;
+    }
+
+    @inline
+    pub fn as_secs(self: Self) -> u64 {
+        return self.nanos / 1000000000_u64;
+    }
+
+    @inline
+    pub fn as_secs_f64(self: Self) -> f64 {
+        return self.nanos.to_float.[f64]() * 1.0e-9_f64;
+    }
+
+    @inline
+    pub fn is_zero(self: Self) -> bool {
+        return self.nanos == 0_u64;
+    }
+
+    @inline
+    pub fn add(self: Self, o: Duration) -> Duration {
+        return Duration.{ nanos: self.nanos +% o.nanos };
+    }
+
+    @inline
+    pub fn sub_sat(self: Self, o: Duration) -> Duration {
+        if self.nanos >= o.nanos {
+            return Duration.{ nanos: self.nanos - o.nanos };
+        }
+        return Duration.zero();
+    }
+}
+
+pub struct Instant {
+    pub nanos: u64;
+}
+
+impl Instant {
+    /// Read monotonic timestamp via the capability clock (vDSO fast path).
+    @inline
+    pub fn now(clock: *ClockCap) -> Instant {
+        return Instant.{ nanos: clock.now_ns() };
+    }
+
+    /// Read monotonic timestamp directly from the OS clock without a capability handle.
+    pub fn now_monotonic() -> Instant {
+        var ts = Timespec.{ tv_sec: 0_i64, tv_nsec: 0_i64 };
+        let rc = syscall2(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, timespec_mut_addr(&mut ts));
+        if rc != 0_i64 || ts.tv_sec < 0_i64 || ts.tv_nsec < 0_i64 {
+            return Instant.{ nanos: 0_u64 };
+        }
+        let ns = ts.tv_sec.bitcast.[u64]() *% 1000000000_u64 +% ts.tv_nsec.bitcast.[u64]();
+        return Instant.{ nanos: ns };
+    }
+
+    @inline
+    pub fn duration_since(self: Self, earlier: Instant) -> Duration {
+        if self.nanos >= earlier.nanos {
+            return Duration.{ nanos: self.nanos - earlier.nanos };
+        }
+        return Duration.zero();
+    }
+
+    @inline
+    pub fn elapsed(self: Self, clock: *ClockCap) -> Duration {
+        return Instant.now(clock).duration_since(self);
+    }
+
+    @inline
+    pub fn elapsed_monotonic(self: Self) -> Duration {
+        return Instant.now_monotonic().duration_since(self);
+    }
+}
+
+pub struct WallTime {
+    pub secs: i64;
+    pub nanos: u32;
+}
+
+impl WallTime {
+    pub fn now_utc() -> WallTime {
+        var ts = Timespec.{ tv_sec: 0_i64, tv_nsec: 0_i64 };
+        let rc = syscall2(SYS_CLOCK_GETTIME, CLOCK_REALTIME, timespec_mut_addr(&mut ts));
+        if rc != 0_i64 {
+            return WallTime.{ secs: 0_i64, nanos: 0_u32 };
+        }
+        let n = if ts.tv_nsec >= 0_i64 { ts.tv_nsec.bitcast.[u64]().trunc.[u32]() } else { 0_u32 };
+        return WallTime.{ secs: ts.tv_sec, nanos: n };
+    }
+
+    @inline
+    pub fn unix_secs(self: Self) -> i64 {
+        return self.secs;
+    }
+
+    @inline
+    pub fn unix_millis(self: Self) -> i64 {
+        return self.secs *% 1000_i64 +% (self.nanos / 1000000_u32).widen.[i64]();
+    }
+}
+
+/// Sleep the current OS thread for `d`, automatically retrying on `EINTR`.
+pub fn sleep(d: Duration) {
+    if d.nanos == 0_u64 {
+        return;
+    }
+    var req = Timespec.{
+        tv_sec: (d.nanos / 1000000000_u64).bitcast.[i64](),
+        tv_nsec: (d.nanos % 1000000000_u64).bitcast.[i64](),
+    };
+    var rem = Timespec.{ tv_sec: 0_i64, tv_nsec: 0_i64 };
+    var retries: u32 = 0_u32;
+    while retries < 64_u32 {
+        let rc = syscall2(SYS_NANOSLEEP, timespec_addr(&req), timespec_mut_addr(&mut rem));
+        if rc == 0_i64 || rc != EINTR {
+            return;
+        }
+        req.tv_sec = rem.tv_sec;
+        req.tv_nsec = rem.tv_nsec;
+        retries = retries +% 1_u32;
+    }
+}
+
+pub fn sleep_ms(ms: u64) {
+    sleep(Duration.from_millis(ms));
+}
+
+pub fn sleep_us(us: u64) {
+    sleep(Duration.from_micros(us));
+}

@@ -706,6 +706,16 @@ impl X64Buf {
         return;
     }
 
+    pub fn load_gs_disp(self: *mut Self, alloc: *mut AllocCap, dst: Reg, disp32: i32) -> !OutOfMemory {
+        try self.emit_u8(alloc, 0x65_u8);
+        try self.emit_rex(alloc, true, dst.hi(), false, false, true);
+        try self.emit_u8(alloc, 0x8B_u8);
+        try self.emit_u8(alloc, modrm_byte(0_u8, dst.low(), 4_u8));
+        try self.emit_u8(alloc, 0x25_u8);
+        try self.emit_i32(alloc, disp32);
+        return;
+    }
+
     pub fn store_fs_disp(self: *mut Self, alloc: *mut AllocCap, disp32: i32, src: Reg) -> !OutOfMemory {
         try self.emit_u8(alloc, 0x64_u8);
         try self.emit_rex(alloc, true, src.hi(), false, false, true);
@@ -4262,7 +4272,7 @@ const TCB_CAP_BATCH_BYTES: i32 = 262144_i32;
 const SCHED_MAX_WORKERS_I32: i32 = 16_i32;
 const SCHED_MAX_INLINE_DAG_I32: i32 = 176_i32;
 const WORKER_STACK_BYTES: u64 = 8388608_u64;
-const CLONE_WORKER_FLAGS: u64 = 0x000D0F00_u64;
+const CLONE_WORKER_FLAGS: u64 = 0x00050F00_u64; // CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM (preserve glibc %fs; worker sets %gs)
 
 fn emit_spin_lock(
     alloc: *mut AllocCap,
@@ -4318,11 +4328,11 @@ fn emit_load_tcb(
     try b.store_mem(alloc, .Rax, 0_i32, .Rax, 8_usize);
     try b.store_imm64_sext_mem(alloc, .Rax, TCB_OFF_ST_FAST, 1_i32);
     try b.mov_rr(alloc, .Rsi, .Rax);
-    try b.mov_ri64(alloc, .Rdi, 0x1002_u64);
+    try b.mov_ri64(alloc, .Rdi, 0x1001_u64); // ARCH_SET_GS (keeps glibc %fs TLS intact)
     try b.mov_ri64(alloc, .Rax, 158_u64);
     try b.syscall(alloc);
     b.bind_label(l_fs_ok);
-    try b.load_fs_disp(alloc, dst, 0_i32);
+    try b.load_gs_disp(alloc, dst, 0_i32);
     try b.test_rr(alloc, dst, dst);
     try b.jcc_label(alloc, .Ne, l_have_tcb);
     try b.lea_rip_sym(alloc, dst, s_fb, 0_i64);
@@ -4729,7 +4739,7 @@ fn emit_alloc_raw_slab_refill(
     try b.load_mem(alloc, .R10, .Rdx, 0_i32, 8_usize, false);
     try b.xor_rr32(alloc, .Rax, .Rax);
     try b.store_mem(alloc, .Rdx, 0_i32, .Rax, 8_usize);
-    try b.load_fs_disp(alloc, .R9, 0_i32);
+    try b.load_gs_disp(alloc, .R9, 0_i32);
     try b.test_rr(alloc, .R9, .R9);
     let l_refill_tcb = try b.new_label(alloc);
     try b.jcc_label(alloc, .Ne, l_refill_tcb);
@@ -5838,7 +5848,7 @@ fn emit_rt_tls_init(
     try b.store_mem(alloc, .Rsi, 0_i32, .Rsi, 8_usize);
     try b.xor_rr32(alloc, .Rax, .Rax);
     try b.store_mem(alloc, .Rsi, 8_i32, .Rax, 8_usize);
-    try b.mov_ri64(alloc, .Rdi, 0x1002_u64);
+    try b.mov_ri64(alloc, .Rdi, 0x1001_u64); // ARCH_SET_GS (keeps glibc %fs TLS intact)
     try b.mov_ri64(alloc, .Rax, 158_u64);
     try b.syscall(alloc);
     try b.ret(alloc);
@@ -7400,7 +7410,12 @@ fn emit_sched_worker_entry(
     interner: *mut span.SymInterner,
 ) -> !OutOfMemory {
     let s_sched = try interner.intern_str(alloc, "__eon_sched_state");
-    try b.load_fs_disp(alloc, .Rbx, 0_i32);
+    // R15 carries this worker's TCB pointer from `emit_sched_spawn_workers`; bind %gs to it.
+    try b.mov_rr(alloc, .Rbx, .R15);
+    try b.mov_rr(alloc, .Rsi, .R15);
+    try b.mov_ri64(alloc, .Rdi, 0x1001_u64); // ARCH_SET_GS
+    try b.mov_ri64(alloc, .Rax, 158_u64);    // SYS_arch_prctl
+    try b.syscall(alloc);
     try b.sub_ri32(alloc, .Rsp, 128_i32);
     try b.mov_rr(alloc, .Rdi, .Rsp);
     try b.xor_rr32(alloc, .Rax, .Rax);

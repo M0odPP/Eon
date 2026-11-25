@@ -1,0 +1,372 @@
+module core.color;
+
+import core.math;
+import core.math_vec;
+
+// ---------------------------------------------------------------------------
+// 100% freestanding color types (Rgba, Hsla, Srgb8) — all <= 16 bytes (Copy)
+// ---------------------------------------------------------------------------
+
+pub struct Srgb8 {
+    pub r: u8;
+    pub g: u8;
+    pub b: u8;
+    pub a: u8;
+}
+
+impl Srgb8 {
+    @inline
+    pub fn new(r: u8, g: u8, b: u8, a: u8) -> Srgb8 {
+        return Srgb8.{ r: r, g: g, b: b, a: a };
+    }
+
+    @inline
+    pub fn to_rgba(self: Self) -> Rgba {
+        let inv = 1.0_f32 / 255.0_f32;
+        return Rgba.{
+            r: self.r.to_float.[f32]() * inv,
+            g: self.g.to_float.[f32]() * inv,
+            b: self.b.to_float.[f32]() * inv,
+            a: self.a.to_float.[f32]() * inv,
+        };
+    }
+
+    @inline
+    pub fn pack_rgba_u32(self: Self) -> u32 {
+        return self.r.widen.[u32]()
+            | (self.g.widen.[u32]() <<% 8_u32)
+            | (self.b.widen.[u32]() <<% 16_u32)
+            | (self.a.widen.[u32]() <<% 24_u32);
+    }
+
+    @inline
+    pub fn pack_bgra_u32(self: Self) -> u32 {
+        return self.b.widen.[u32]()
+            | (self.g.widen.[u32]() <<% 8_u32)
+            | (self.r.widen.[u32]() <<% 16_u32)
+            | (self.a.widen.[u32]() <<% 24_u32);
+    }
+}
+
+@inline
+fn f32_to_u8_clamped(c: f32) -> u8 {
+    let clamped = math_vec.clamp_f32(c, 0.0_f32, 1.0_f32);
+    let scaled = clamped * 255.0_f32 + 0.5_f32;
+    let iv = scaled.trunc_to_int.[i32]();
+    if iv <= 0_i32 {
+        return 0_u8;
+    }
+    if iv >= 255_i32 {
+        return 255_u8;
+    }
+    return iv.trunc.[u8]();
+}
+
+pub fn srgb_channel_to_linear(c: f32) -> f32 {
+    let x = math_vec.clamp_f32(c, 0.0_f32, 1.0_f32);
+    if x <= 0.04045_f32 {
+        return x / 12.92_f32;
+    }
+    let base = (x.widen.[f64]() + 0.055_f64) / 1.055_f64;
+    return math.pow(base, 2.4_f64).trunc.[f32]();
+}
+
+pub fn linear_channel_to_srgb(c: f32) -> f32 {
+    let x = math_vec.clamp_f32(c, 0.0_f32, 1.0_f32);
+    if x <= 0.0031308_f32 {
+        return x * 12.92_f32;
+    }
+    let p = math.pow(x.widen.[f64](), 1.0_f64 / 2.4_f64);
+    return (1.055_f64 * p - 0.055_f64).trunc.[f32]();
+}
+
+pub struct Rgba {
+    pub r: f32;
+    pub g: f32;
+    pub b: f32;
+    pub a: f32;
+}
+
+impl Rgba {
+    @inline
+    pub fn new(r: f32, g: f32, b: f32, a: f32) -> Rgba {
+        return Rgba.{ r: r, g: g, b: b, a: a };
+    }
+
+    @inline
+    pub fn rgb(r: f32, g: f32, b: f32) -> Rgba {
+        return Rgba.{ r: r, g: g, b: b, a: 1.0_f32 };
+    }
+
+    @inline
+    pub fn transparent() -> Rgba {
+        return Rgba.{ r: 0.0_f32, g: 0.0_f32, b: 0.0_f32, a: 0.0_f32 };
+    }
+
+    @inline
+    pub fn black() -> Rgba {
+        return Rgba.{ r: 0.0_f32, g: 0.0_f32, b: 0.0_f32, a: 1.0_f32 };
+    }
+
+    @inline
+    pub fn white() -> Rgba {
+        return Rgba.{ r: 1.0_f32, g: 1.0_f32, b: 1.0_f32, a: 1.0_f32 };
+    }
+
+    @inline
+    pub fn from_u8(r: u8, g: u8, b: u8, a: u8) -> Rgba {
+        return Srgb8.new(r, g, b, a).to_rgba();
+    }
+
+    /// Construct an opaque color from `0xRRGGBB`.
+    @inline
+    pub fn from_hex_rgb(hex: u32) -> Rgba {
+        let r = ((hex >> 16_u32) & 0xFF_u32).trunc.[u8]();
+        let g = ((hex >> 8_u32) & 0xFF_u32).trunc.[u8]();
+        let b = (hex & 0xFF_u32).trunc.[u8]();
+        return Rgba.from_u8(r, g, b, 255_u8);
+    }
+
+    /// Construct a color from `0xRRGGBBAA`.
+    @inline
+    pub fn from_hex_rgba(hex: u32) -> Rgba {
+        let r = ((hex >> 24_u32) & 0xFF_u32).trunc.[u8]();
+        let g = ((hex >> 16_u32) & 0xFF_u32).trunc.[u8]();
+        let b = ((hex >> 8_u32) & 0xFF_u32).trunc.[u8]();
+        let a = (hex & 0xFF_u32).trunc.[u8]();
+        return Rgba.from_u8(r, g, b, a);
+    }
+
+    @inline
+    pub fn with_alpha(self: Self, a: f32) -> Rgba {
+        return Rgba.{ r: self.r, g: self.g, b: self.b, a: math_vec.clamp_f32(a, 0.0_f32, 1.0_f32) };
+    }
+
+    @inline
+    pub fn premultiply(self: Self) -> Rgba {
+        return Rgba.{
+            r: self.r * self.a,
+            g: self.g * self.a,
+            b: self.b * self.a,
+            a: self.a,
+        };
+    }
+
+    @inline
+    pub fn unpremultiply(self: Self) -> Rgba {
+        if self.a <= 1.0e-6_f32 {
+            return Rgba.transparent();
+        }
+        let inv = 1.0_f32 / self.a;
+        return Rgba.{
+            r: math_vec.clamp_f32(self.r * inv, 0.0_f32, 1.0_f32),
+            g: math_vec.clamp_f32(self.g * inv, 0.0_f32, 1.0_f32),
+            b: math_vec.clamp_f32(self.b * inv, 0.0_f32, 1.0_f32),
+            a: self.a,
+        };
+    }
+
+    @inline
+    pub fn to_f32x4(self: Self) -> f32x4 {
+        return .{ self.r, self.g, self.b, self.a };
+    }
+
+    @inline
+    pub fn to_premul_f32x4(self: Self) -> f32x4 {
+        let p = self.premultiply();
+        return .{ p.r, p.g, p.b, p.a };
+    }
+
+    @inline
+    pub fn to_srgb8(self: Self) -> Srgb8 {
+        return Srgb8.{
+            r: f32_to_u8_clamped(self.r),
+            g: f32_to_u8_clamped(self.g),
+            b: f32_to_u8_clamped(self.b),
+            a: f32_to_u8_clamped(self.a),
+        };
+    }
+
+    @inline
+    pub fn to_rgba8_u32(self: Self) -> u32 {
+        return self.to_srgb8().pack_rgba_u32();
+    }
+
+    @inline
+    pub fn to_bgra8_u32(self: Self) -> u32 {
+        return self.to_srgb8().pack_bgra_u32();
+    }
+
+    @inline
+    pub fn lerp(self: Self, o: Rgba, t: f32) -> Rgba {
+        return Rgba.{
+            r: math_vec.lerp_f32(self.r, o.r, t),
+            g: math_vec.lerp_f32(self.g, o.g, t),
+            b: math_vec.lerp_f32(self.b, o.b, t),
+            a: math_vec.lerp_f32(self.a, o.a, t),
+        };
+    }
+
+    /// Porter-Duff SrcOver blend of straight-alpha `self` over straight-alpha `dst`.
+    @inline
+    pub fn blend_over(self: Self, dst: Rgba) -> Rgba {
+        let inv_a = 1.0_f32 - self.a;
+        let out_a = self.a + dst.a * inv_a;
+        if out_a <= 1.0e-6_f32 {
+            return Rgba.transparent();
+        }
+        let inv_out = 1.0_f32 / out_a;
+        let pr = @fma(dst.r * dst.a, inv_a, self.r * self.a);
+        let pg = @fma(dst.g * dst.a, inv_a, self.g * self.a);
+        let pb = @fma(dst.b * dst.a, inv_a, self.b * self.a);
+        return Rgba.{
+            r: math_vec.clamp_f32(pr * inv_out, 0.0_f32, 1.0_f32),
+            g: math_vec.clamp_f32(pg * inv_out, 0.0_f32, 1.0_f32),
+            b: math_vec.clamp_f32(pb * inv_out, 0.0_f32, 1.0_f32),
+            a: math_vec.clamp_f32(out_a, 0.0_f32, 1.0_f32),
+        };
+    }
+
+    pub fn to_linear(self: Self) -> Rgba {
+        return Rgba.{
+            r: srgb_channel_to_linear(self.r),
+            g: srgb_channel_to_linear(self.g),
+            b: srgb_channel_to_linear(self.b),
+            a: self.a,
+        };
+    }
+
+    pub fn from_linear(self: Self) -> Rgba {
+        return Rgba.{
+            r: linear_channel_to_srgb(self.r),
+            g: linear_channel_to_srgb(self.g),
+            b: linear_channel_to_srgb(self.b),
+            a: self.a,
+        };
+    }
+
+    pub fn to_hsla(self: Self) -> Hsla {
+        let r = math_vec.clamp_f32(self.r, 0.0_f32, 1.0_f32);
+        let g = math_vec.clamp_f32(self.g, 0.0_f32, 1.0_f32);
+        let b = math_vec.clamp_f32(self.b, 0.0_f32, 1.0_f32);
+        let mx = math_vec.max_f32(r, math_vec.max_f32(g, b));
+        let mn = math_vec.min_f32(r, math_vec.min_f32(g, b));
+        let l = (mx + mn) * 0.5_f32;
+        let d = mx - mn;
+        if d <= 1.0e-6_f32 {
+            return Hsla.{ h: 0.0_f32, s: 0.0_f32, l: l, a: self.a };
+        }
+        let s = if l > 0.5_f32 {
+            d / (2.0_f32 - mx - mn)
+        } else {
+            d / (mx + mn)
+        };
+        var h: f32 = 0.0_f32;
+        if mx == r {
+            h = (g - b) / d + (if g < b { 6.0_f32 } else { 0.0_f32 });
+        } else if mx == g {
+            h = (b - r) / d + 2.0_f32;
+        } else {
+            h = (r - g) / d + 4.0_f32;
+        }
+        h = h / 6.0_f32;
+        return Hsla.{ h: h, s: s, l: l, a: self.a };
+    }
+}
+
+pub struct Hsla {
+    pub h: f32;
+    pub s: f32;
+    pub l: f32;
+    pub a: f32;
+}
+
+fn hue_to_rgb(p: f32, q: f32, t_in: f32) -> f32 {
+    var t = t_in;
+    if t < 0.0_f32 { t = t + 1.0_f32; }
+    if t > 1.0_f32 { t = t - 1.0_f32; }
+    if t < (1.0_f32 / 6.0_f32) {
+        return p + (q - p) * 6.0_f32 * t;
+    }
+    if t < 0.5_f32 {
+        return q;
+    }
+    if t < (2.0_f32 / 3.0_f32) {
+        return p + (q - p) * ((2.0_f32 / 3.0_f32) - t) * 6.0_f32;
+    }
+    return p;
+}
+
+impl Hsla {
+    @inline
+    pub fn new(h: f32, s: f32, l: f32, a: f32) -> Hsla {
+        var hn = math_vec.fract_f32(h);
+        if hn < 0.0_f32 {
+            hn = hn + 1.0_f32;
+        }
+        return Hsla.{
+            h: hn,
+            s: math_vec.clamp_f32(s, 0.0_f32, 1.0_f32),
+            l: math_vec.clamp_f32(l, 0.0_f32, 1.0_f32),
+            a: math_vec.clamp_f32(a, 0.0_f32, 1.0_f32),
+        };
+    }
+
+    @inline
+    pub fn from_deg(deg: f32, s: f32, l: f32, a: f32) -> Hsla {
+        return Hsla.new(deg / 360.0_f32, s, l, a);
+    }
+
+    pub fn to_rgba(self: Self) -> Rgba {
+        if self.s <= 1.0e-6_f32 {
+            return Rgba.{ r: self.l, g: self.l, b: self.l, a: self.a };
+        }
+        let q = if self.l < 0.5_f32 {
+            self.l * (1.0_f32 + self.s)
+        } else {
+            self.l + self.s - self.l * self.s
+        };
+        let p = 2.0_f32 * self.l - q;
+        return Rgba.{
+            r: hue_to_rgb(p, q, self.h + (1.0_f32 / 3.0_f32)),
+            g: hue_to_rgb(p, q, self.h),
+            b: hue_to_rgb(p, q, self.h - (1.0_f32 / 3.0_f32)),
+            a: self.a,
+        };
+    }
+
+    @inline
+    pub fn with_alpha(self: Self, a: f32) -> Hsla {
+        return Hsla.{ h: self.h, s: self.s, l: self.l, a: math_vec.clamp_f32(a, 0.0_f32, 1.0_f32) };
+    }
+
+    @inline
+    pub fn lighten(self: Self, amount: f32) -> Hsla {
+        return Hsla.{
+            h: self.h,
+            s: self.s,
+            l: math_vec.clamp_f32(self.l + amount, 0.0_f32, 1.0_f32),
+            a: self.a,
+        };
+    }
+
+    @inline
+    pub fn darken(self: Self, amount: f32) -> Hsla {
+        return Hsla.{
+            h: self.h,
+            s: self.s,
+            l: math_vec.clamp_f32(self.l - amount, 0.0_f32, 1.0_f32),
+            a: self.a,
+        };
+    }
+
+    @inline
+    pub fn lerp(self: Self, o: Hsla, t: f32) -> Hsla {
+        return Hsla.new(
+            math_vec.lerp_f32(self.h, o.h, t),
+            math_vec.lerp_f32(self.s, o.s, t),
+            math_vec.lerp_f32(self.l, o.l, t),
+            math_vec.lerp_f32(self.a, o.a, t),
+        );
+    }
+}

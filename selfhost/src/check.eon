@@ -6456,7 +6456,10 @@ impl Checker {
             return to_ty;
         }
         if self.sym_eq(kind_sym, "trunc") || self.sym_eq(kind_sym, "clamp") {
-            if !self.env.is_integer(from_ty) || !self.env.is_integer(to_ty) {
+            let is_trunc = self.sym_eq(kind_sym, "trunc");
+            let both_int = self.env.is_integer(from_ty) && self.env.is_integer(to_ty);
+            let both_float_trunc = is_trunc && self.env.is_float(from_ty) && self.env.is_float(to_ty);
+            if !both_int && !both_float_trunc {
                 var msg = try str.StrBuf.init(self.alloc, 96_usize);
                 errdefer msg.destroy(self.alloc);
                 try msg.push_str_grow(self.alloc, "`.");

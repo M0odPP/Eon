@@ -1,0 +1,890 @@
+module core.math_vec;
+
+import core.math;
+
+// ---------------------------------------------------------------------------
+// Scalar f32 helpers (100% freestanding, no heap allocation)
+// ---------------------------------------------------------------------------
+
+@inline
+pub fn min_f32(a: f32, b: f32) -> f32 {
+    return if a < b { a } else { b };
+}
+
+@inline
+pub fn max_f32(a: f32, b: f32) -> f32 {
+    return if a > b { a } else { b };
+}
+
+@inline
+pub fn clamp_f32(x: f32, lo: f32, hi: f32) -> f32 {
+    return min_f32(max_f32(x, lo), hi);
+}
+
+@inline
+pub fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
+    return @fma(b - a, t, a);
+}
+
+@inline
+pub fn smoothstep_f32(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let denom = edge1 - edge0;
+    if math.abs_f32(denom) <= 1.0e-12_f32 {
+        return if x < edge0 { 0.0_f32 } else { 1.0_f32 };
+    }
+    let t = clamp_f32((x - edge0) / denom, 0.0_f32, 1.0_f32);
+    return t * t * (3.0_f32 - 2.0_f32 * t);
+}
+
+@inline
+pub fn floor_f32(x: f32) -> f32 {
+    return math.floor_f64(x.widen.[f64]()).trunc.[f32]();
+}
+
+@inline
+pub fn ceil_f32(x: f32) -> f32 {
+    return math.ceil_f64(x.widen.[f64]()).trunc.[f32]();
+}
+
+@inline
+pub fn round_f32(x: f32) -> f32 {
+    return math.round_even_f64(x.widen.[f64]()).trunc.[f32]();
+}
+
+@inline
+pub fn fract_f32(x: f32) -> f32 {
+    return x - floor_f32(x);
+}
+
+// ---------------------------------------------------------------------------
+// Vec2 / Vec3 / Vec4 (all <= 16 bytes -> implicitly Copy in Eon)
+// ---------------------------------------------------------------------------
+
+pub struct Vec2 {
+    pub x: f32;
+    pub y: f32;
+}
+
+impl Vec2 {
+    @inline
+    pub fn new(x: f32, y: f32) -> Vec2 {
+        return Vec2.{ x: x, y: y };
+    }
+
+    @inline
+    pub fn zero() -> Vec2 {
+        return Vec2.{ x: 0.0_f32, y: 0.0_f32 };
+    }
+
+    @inline
+    pub fn splat(v: f32) -> Vec2 {
+        return Vec2.{ x: v, y: v };
+    }
+
+    @inline
+    pub fn add(self: Self, o: Vec2) -> Vec2 {
+        return Vec2.{ x: self.x + o.x, y: self.y + o.y };
+    }
+
+    @inline
+    pub fn sub(self: Self, o: Vec2) -> Vec2 {
+        return Vec2.{ x: self.x - o.x, y: self.y - o.y };
+    }
+
+    @inline
+    pub fn mul(self: Self, o: Vec2) -> Vec2 {
+        return Vec2.{ x: self.x * o.x, y: self.y * o.y };
+    }
+
+    @inline
+    pub fn scale(self: Self, s: f32) -> Vec2 {
+        return Vec2.{ x: self.x * s, y: self.y * s };
+    }
+
+    @inline
+    pub fn neg(self: Self) -> Vec2 {
+        return Vec2.{ x: -self.x, y: -self.y };
+    }
+
+    @inline
+    pub fn dot(self: Self, o: Vec2) -> f32 {
+        return @fma(self.x, o.x, self.y * o.y);
+    }
+
+    @inline
+    pub fn cross(self: Self, o: Vec2) -> f32 {
+        return self.x * o.y - self.y * o.x;
+    }
+
+    @inline
+    pub fn len_sq(self: Self) -> f32 {
+        return self.dot(self);
+    }
+
+    @inline
+    pub fn len(self: Self) -> f32 {
+        return @sqrt(self.len_sq());
+    }
+
+    @inline
+    pub fn normalize(self: Self) -> Vec2 {
+        let l = self.len();
+        if l <= 1.0e-12_f32 {
+            return Vec2.zero();
+        }
+        let inv = 1.0_f32 / l;
+        return Vec2.{ x: self.x * inv, y: self.y * inv };
+    }
+
+    @inline
+    pub fn min(self: Self, o: Vec2) -> Vec2 {
+        return Vec2.{ x: min_f32(self.x, o.x), y: min_f32(self.y, o.y) };
+    }
+
+    @inline
+    pub fn max(self: Self, o: Vec2) -> Vec2 {
+        return Vec2.{ x: max_f32(self.x, o.x), y: max_f32(self.y, o.y) };
+    }
+
+    @inline
+    pub fn clamp(self: Self, lo: Vec2, hi: Vec2) -> Vec2 {
+        return Vec2.{
+            x: clamp_f32(self.x, lo.x, hi.x),
+            y: clamp_f32(self.y, lo.y, hi.y),
+        };
+    }
+
+    @inline
+    pub fn lerp(self: Self, o: Vec2, t: f32) -> Vec2 {
+        return Vec2.{
+            x: lerp_f32(self.x, o.x, t),
+            y: lerp_f32(self.y, o.y, t),
+        };
+    }
+
+    @inline
+    pub fn dist(self: Self, o: Vec2) -> f32 {
+        return self.sub(o).len();
+    }
+}
+
+pub struct Vec3 {
+    pub x: f32;
+    pub y: f32;
+    pub z: f32;
+}
+
+impl Vec3 {
+    @inline
+    pub fn new(x: f32, y: f32, z: f32) -> Vec3 {
+        return Vec3.{ x: x, y: y, z: z };
+    }
+
+    @inline
+    pub fn zero() -> Vec3 {
+        return Vec3.{ x: 0.0_f32, y: 0.0_f32, z: 0.0_f32 };
+    }
+
+    @inline
+    pub fn splat(v: f32) -> Vec3 {
+        return Vec3.{ x: v, y: v, z: v };
+    }
+
+    @inline
+    pub fn add(self: Self, o: Vec3) -> Vec3 {
+        return Vec3.{ x: self.x + o.x, y: self.y + o.y, z: self.z + o.z };
+    }
+
+    @inline
+    pub fn sub(self: Self, o: Vec3) -> Vec3 {
+        return Vec3.{ x: self.x - o.x, y: self.y - o.y, z: self.z - o.z };
+    }
+
+    @inline
+    pub fn mul(self: Self, o: Vec3) -> Vec3 {
+        return Vec3.{ x: self.x * o.x, y: self.y * o.y, z: self.z * o.z };
+    }
+
+    @inline
+    pub fn scale(self: Self, s: f32) -> Vec3 {
+        return Vec3.{ x: self.x * s, y: self.y * s, z: self.z * s };
+    }
+
+    @inline
+    pub fn neg(self: Self) -> Vec3 {
+        return Vec3.{ x: -self.x, y: -self.y, z: -self.z };
+    }
+
+    @inline
+    pub fn dot(self: Self, o: Vec3) -> f32 {
+        return @fma(self.x, o.x, @fma(self.y, o.y, self.z * o.z));
+    }
+
+    @inline
+    pub fn cross(self: Self, o: Vec3) -> Vec3 {
+        return Vec3.{
+            x: self.y * o.z - self.z * o.y,
+            y: self.z * o.x - self.x * o.z,
+            z: self.x * o.y - self.y * o.x,
+        };
+    }
+
+    @inline
+    pub fn len_sq(self: Self) -> f32 {
+        return self.dot(self);
+    }
+
+    @inline
+    pub fn len(self: Self) -> f32 {
+        return @sqrt(self.len_sq());
+    }
+
+    @inline
+    pub fn normalize(self: Self) -> Vec3 {
+        let l = self.len();
+        if l <= 1.0e-12_f32 {
+            return Vec3.zero();
+        }
+        let inv = 1.0_f32 / l;
+        return self.scale(inv);
+    }
+
+    @inline
+    pub fn min(self: Self, o: Vec3) -> Vec3 {
+        return Vec3.{
+            x: min_f32(self.x, o.x),
+            y: min_f32(self.y, o.y),
+            z: min_f32(self.z, o.z),
+        };
+    }
+
+    @inline
+    pub fn max(self: Self, o: Vec3) -> Vec3 {
+        return Vec3.{
+            x: max_f32(self.x, o.x),
+            y: max_f32(self.y, o.y),
+            z: max_f32(self.z, o.z),
+        };
+    }
+
+    @inline
+    pub fn clamp(self: Self, lo: Vec3, hi: Vec3) -> Vec3 {
+        return Vec3.{
+            x: clamp_f32(self.x, lo.x, hi.x),
+            y: clamp_f32(self.y, lo.y, hi.y),
+            z: clamp_f32(self.z, lo.z, hi.z),
+        };
+    }
+
+    @inline
+    pub fn lerp(self: Self, o: Vec3, t: f32) -> Vec3 {
+        return Vec3.{
+            x: lerp_f32(self.x, o.x, t),
+            y: lerp_f32(self.y, o.y, t),
+            z: lerp_f32(self.z, o.z, t),
+        };
+    }
+}
+
+pub struct Vec4 {
+    pub x: f32;
+    pub y: f32;
+    pub z: f32;
+    pub w: f32;
+}
+
+impl Vec4 {
+    @inline
+    pub fn new(x: f32, y: f32, z: f32, w: f32) -> Vec4 {
+        return Vec4.{ x: x, y: y, z: z, w: w };
+    }
+
+    @inline
+    pub fn zero() -> Vec4 {
+        return Vec4.{ x: 0.0_f32, y: 0.0_f32, z: 0.0_f32, w: 0.0_f32 };
+    }
+
+    @inline
+    pub fn splat(v: f32) -> Vec4 {
+        return Vec4.{ x: v, y: v, z: v, w: v };
+    }
+
+    @inline
+    pub fn to_f32x4(self: Self) -> f32x4 {
+        return .{ self.x, self.y, self.z, self.w };
+    }
+
+    @inline
+    pub fn from_f32x4(v: f32x4) -> Vec4 {
+        return Vec4.{ x: v[0_usize], y: v[1_usize], z: v[2_usize], w: v[3_usize] };
+    }
+
+    @inline
+    pub fn add(self: Self, o: Vec4) -> Vec4 {
+        return Vec4.{
+            x: self.x + o.x,
+            y: self.y + o.y,
+            z: self.z + o.z,
+            w: self.w + o.w,
+        };
+    }
+
+    @inline
+    pub fn sub(self: Self, o: Vec4) -> Vec4 {
+        return Vec4.{
+            x: self.x - o.x,
+            y: self.y - o.y,
+            z: self.z - o.z,
+            w: self.w - o.w,
+        };
+    }
+
+    @inline
+    pub fn mul(self: Self, o: Vec4) -> Vec4 {
+        return Vec4.{
+            x: self.x * o.x,
+            y: self.y * o.y,
+            z: self.z * o.z,
+            w: self.w * o.w,
+        };
+    }
+
+    @inline
+    pub fn scale(self: Self, s: f32) -> Vec4 {
+        return Vec4.{ x: self.x * s, y: self.y * s, z: self.z * s, w: self.w * s };
+    }
+
+    @inline
+    pub fn dot(self: Self, o: Vec4) -> f32 {
+        return @fma(self.x, o.x, @fma(self.y, o.y, @fma(self.z, o.z, self.w * o.w)));
+    }
+
+    @inline
+    pub fn len_sq(self: Self) -> f32 {
+        return self.dot(self);
+    }
+
+    @inline
+    pub fn len(self: Self) -> f32 {
+        return @sqrt(self.len_sq());
+    }
+
+    @inline
+    pub fn normalize(self: Self) -> Vec4 {
+        let l = self.len();
+        if l <= 1.0e-12_f32 {
+            return Vec4.zero();
+        }
+        return self.scale(1.0_f32 / l);
+    }
+
+    @inline
+    pub fn min(self: Self, o: Vec4) -> Vec4 {
+        return Vec4.{
+            x: min_f32(self.x, o.x),
+            y: min_f32(self.y, o.y),
+            z: min_f32(self.z, o.z),
+            w: min_f32(self.w, o.w),
+        };
+    }
+
+    @inline
+    pub fn max(self: Self, o: Vec4) -> Vec4 {
+        return Vec4.{
+            x: max_f32(self.x, o.x),
+            y: max_f32(self.y, o.y),
+            z: max_f32(self.z, o.z),
+            w: max_f32(self.w, o.w),
+        };
+    }
+
+    @inline
+    pub fn clamp(self: Self, lo: Vec4, hi: Vec4) -> Vec4 {
+        return Vec4.{
+            x: clamp_f32(self.x, lo.x, hi.x),
+            y: clamp_f32(self.y, lo.y, hi.y),
+            z: clamp_f32(self.z, lo.z, hi.z),
+            w: clamp_f32(self.w, lo.w, hi.w),
+        };
+    }
+
+    @inline
+    pub fn lerp(self: Self, o: Vec4, t: f32) -> Vec4 {
+        return Vec4.{
+            x: lerp_f32(self.x, o.x, t),
+            y: lerp_f32(self.y, o.y, t),
+            z: lerp_f32(self.z, o.z, t),
+            w: lerp_f32(self.w, o.w, t),
+        };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UI 2D Geometry Primitives (Point, Size, Edges, Corners, Bounds)
+// ---------------------------------------------------------------------------
+
+pub struct Point {
+    pub x: f32;
+    pub y: f32;
+}
+
+impl Point {
+    @inline
+    pub fn new(x: f32, y: f32) -> Point {
+        return Point.{ x: x, y: y };
+    }
+
+    @inline
+    pub fn zero() -> Point {
+        return Point.{ x: 0.0_f32, y: 0.0_f32 };
+    }
+
+    @inline
+    pub fn add(self: Self, o: Point) -> Point {
+        return Point.{ x: self.x + o.x, y: self.y + o.y };
+    }
+
+    @inline
+    pub fn sub(self: Self, o: Point) -> Point {
+        return Point.{ x: self.x - o.x, y: self.y - o.y };
+    }
+
+    @inline
+    pub fn scale(self: Self, s: f32) -> Point {
+        return Point.{ x: self.x * s, y: self.y * s };
+    }
+
+    @inline
+    pub fn min(self: Self, o: Point) -> Point {
+        return Point.{ x: min_f32(self.x, o.x), y: min_f32(self.y, o.y) };
+    }
+
+    @inline
+    pub fn max(self: Self, o: Point) -> Point {
+        return Point.{ x: max_f32(self.x, o.x), y: max_f32(self.y, o.y) };
+    }
+
+    @inline
+    pub fn dist(self: Self, o: Point) -> f32 {
+        let dx = self.x - o.x;
+        let dy = self.y - o.y;
+        return @sqrt(@fma(dx, dx, dy * dy));
+    }
+
+    @inline
+    pub fn to_vec2(self: Self) -> Vec2 {
+        return Vec2.{ x: self.x, y: self.y };
+    }
+}
+
+pub struct Size {
+    pub width: f32;
+    pub height: f32;
+}
+
+impl Size {
+    @inline
+    pub fn new(width: f32, height: f32) -> Size {
+        return Size.{ width: width, height: height };
+    }
+
+    @inline
+    pub fn zero() -> Size {
+        return Size.{ width: 0.0_f32, height: 0.0_f32 };
+    }
+
+    @inline
+    pub fn splat(v: f32) -> Size {
+        return Size.{ width: v, height: v };
+    }
+
+    @inline
+    pub fn is_empty(self: Self) -> bool {
+        return self.width <= 0.0_f32 || self.height <= 0.0_f32;
+    }
+
+    @inline
+    pub fn area(self: Self) -> f32 {
+        if self.is_empty() {
+            return 0.0_f32;
+        }
+        return self.width * self.height;
+    }
+
+    @inline
+    pub fn scale(self: Self, s: f32) -> Size {
+        return Size.{ width: self.width * s, height: self.height * s };
+    }
+
+    @inline
+    pub fn min(self: Self, o: Size) -> Size {
+        return Size.{
+            width: min_f32(self.width, o.width),
+            height: min_f32(self.height, o.height),
+        };
+    }
+
+    @inline
+    pub fn max(self: Self, o: Size) -> Size {
+        return Size.{
+            width: max_f32(self.width, o.width),
+            height: max_f32(self.height, o.height),
+        };
+    }
+
+    @inline
+    pub fn clamp(self: Self, lo: Size, hi: Size) -> Size {
+        return Size.{
+            width: clamp_f32(self.width, lo.width, hi.width),
+            height: clamp_f32(self.height, lo.height, hi.height),
+        };
+    }
+}
+
+pub struct Edges {
+    pub top: f32;
+    pub right: f32;
+    pub bottom: f32;
+    pub left: f32;
+}
+
+impl Edges {
+    @inline
+    pub fn new(top: f32, right: f32, bottom: f32, left: f32) -> Edges {
+        return Edges.{ top: top, right: right, bottom: bottom, left: left };
+    }
+
+    @inline
+    pub fn zero() -> Edges {
+        return Edges.{ top: 0.0_f32, right: 0.0_f32, bottom: 0.0_f32, left: 0.0_f32 };
+    }
+
+    @inline
+    pub fn all(v: f32) -> Edges {
+        return Edges.{ top: v, right: v, bottom: v, left: v };
+    }
+
+    @inline
+    pub fn vh(vertical: f32, horizontal: f32) -> Edges {
+        return Edges.{ top: vertical, right: horizontal, bottom: vertical, left: horizontal };
+    }
+
+    @inline
+    pub fn horizontal(self: Self) -> f32 {
+        return self.left + self.right;
+    }
+
+    @inline
+    pub fn vertical(self: Self) -> f32 {
+        return self.top + self.bottom;
+    }
+
+    @inline
+    pub fn to_f32x4(self: Self) -> f32x4 {
+        return .{ self.top, self.right, self.bottom, self.left };
+    }
+}
+
+pub struct Corners {
+    pub top_left: f32;
+    pub top_right: f32;
+    pub bottom_right: f32;
+    pub bottom_left: f32;
+}
+
+impl Corners {
+    @inline
+    pub fn new(tl: f32, tr: f32, br: f32, bl: f32) -> Corners {
+        return Corners.{ top_left: tl, top_right: tr, bottom_right: br, bottom_left: bl };
+    }
+
+    @inline
+    pub fn zero() -> Corners {
+        return Corners.{ top_left: 0.0_f32, top_right: 0.0_f32, bottom_right: 0.0_f32, bottom_left: 0.0_f32 };
+    }
+
+    @inline
+    pub fn all(r: f32) -> Corners {
+        return Corners.{ top_left: r, top_right: r, bottom_right: r, bottom_left: r };
+    }
+
+    @inline
+    pub fn clamp_max(self: Self, max_r: f32) -> Corners {
+        let m = max_f32(max_r, 0.0_f32);
+        return Corners.{
+            top_left: clamp_f32(self.top_left, 0.0_f32, m),
+            top_right: clamp_f32(self.top_right, 0.0_f32, m),
+            bottom_right: clamp_f32(self.bottom_right, 0.0_f32, m),
+            bottom_left: clamp_f32(self.bottom_left, 0.0_f32, m),
+        };
+    }
+
+    @inline
+    pub fn to_f32x4(self: Self) -> f32x4 {
+        return .{ self.top_left, self.top_right, self.bottom_right, self.bottom_left };
+    }
+}
+
+pub struct Bounds {
+    pub origin: Point;
+    pub size: Size;
+}
+
+impl Bounds {
+    @inline
+    pub fn new(origin: Point, size: Size) -> Bounds {
+        return Bounds.{ origin: origin, size: size };
+    }
+
+    @inline
+    pub fn from_xywh(x: f32, y: f32, w: f32, h: f32) -> Bounds {
+        return Bounds.{
+            origin: Point.{ x: x, y: y },
+            size: Size.{ width: w, height: h },
+        };
+    }
+
+    @inline
+    pub fn from_ltrb(left: f32, top: f32, right: f32, bottom: f32) -> Bounds {
+        return Bounds.{
+            origin: Point.{ x: left, y: top },
+            size: Size.{
+                width: max_f32(right - left, 0.0_f32),
+                height: max_f32(bottom - top, 0.0_f32),
+            },
+        };
+    }
+
+    @inline
+    pub fn zero() -> Bounds {
+        return Bounds.{ origin: Point.zero(), size: Size.zero() };
+    }
+
+    @inline
+    pub fn left(self: Self) -> f32 {
+        return self.origin.x;
+    }
+
+    @inline
+    pub fn top(self: Self) -> f32 {
+        return self.origin.y;
+    }
+
+    @inline
+    pub fn right(self: Self) -> f32 {
+        return self.origin.x + self.size.width;
+    }
+
+    @inline
+    pub fn bottom(self: Self) -> f32 {
+        return self.origin.y + self.size.height;
+    }
+
+    @inline
+    pub fn center(self: Self) -> Point {
+        return Point.{
+            x: self.origin.x + self.size.width * 0.5_f32,
+            y: self.origin.y + self.size.height * 0.5_f32,
+        };
+    }
+
+    @inline
+    pub fn is_empty(self: Self) -> bool {
+        return self.size.is_empty();
+    }
+
+    @inline
+    pub fn contains(self: Self, p: Point) -> bool {
+        return p.x >= self.left()
+            && p.x < self.right()
+            && p.y >= self.top()
+            && p.y < self.bottom();
+    }
+
+    @inline
+    pub fn intersects(self: Self, o: Bounds) -> bool {
+        return !self.is_empty()
+            && !o.is_empty()
+            && self.left() < o.right()
+            && self.right() > o.left()
+            && self.top() < o.bottom()
+            && self.bottom() > o.top();
+    }
+
+    @inline
+    pub fn intersect(self: Self, o: Bounds) -> Bounds {
+        let l = max_f32(self.left(), o.left());
+        let t = max_f32(self.top(), o.top());
+        let r = min_f32(self.right(), o.right());
+        let b = min_f32(self.bottom(), o.bottom());
+        return Bounds.from_ltrb(l, t, r, b);
+    }
+
+    @inline
+    pub fn union_bounds(self: Self, o: Bounds) -> Bounds {
+        if self.is_empty() {
+            return o;
+        }
+        if o.is_empty() {
+            return self;
+        }
+        let l = min_f32(self.left(), o.left());
+        let t = min_f32(self.top(), o.top());
+        let r = max_f32(self.right(), o.right());
+        let b = max_f32(self.bottom(), o.bottom());
+        return Bounds.from_ltrb(l, t, r, b);
+    }
+
+    @inline
+    pub fn inset(self: Self, e: Edges) -> Bounds {
+        let l = self.left() + e.left;
+        let t = self.top() + e.top;
+        let r = self.right() - e.right;
+        let b = self.bottom() - e.bottom;
+        return Bounds.from_ltrb(l, t, r, b);
+    }
+
+    @inline
+    pub fn expand(self: Self, amount: f32) -> Bounds {
+        return Bounds.from_xywh(
+            self.origin.x - amount,
+            self.origin.y - amount,
+            max_f32(self.size.width + amount * 2.0_f32, 0.0_f32),
+            max_f32(self.size.height + amount * 2.0_f32, 0.0_f32),
+        );
+    }
+
+    @inline
+    pub fn translate(self: Self, dx: f32, dy: f32) -> Bounds {
+        return Bounds.{
+            origin: Point.{ x: self.origin.x + dx, y: self.origin.y + dy },
+            size: self.size,
+        };
+    }
+
+    @inline
+    pub fn to_f32x4(self: Self) -> f32x4 {
+        return .{ self.origin.x, self.origin.y, self.size.width, self.size.height };
+    }
+
+    @inline
+    pub fn to_clip_f32x4(self: Self) -> f32x4 {
+        return .{ self.left(), self.top(), self.right(), self.bottom() };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mat4 (column-major 4x4 transformation matrix, 64 bytes -> borrow by pointer)
+// ---------------------------------------------------------------------------
+
+pub struct Mat4 {
+    pub m: [16]f32;
+}
+
+impl Mat4 {
+    pub fn zero() -> Mat4 {
+        return Mat4.{ m: [0.0_f32; 16] };
+    }
+
+    pub fn identity() -> Mat4 {
+        var r = Mat4.{ m: [0.0_f32; 16] };
+        r.m[0_usize] = 1.0_f32;
+        r.m[5_usize] = 1.0_f32;
+        r.m[10_usize] = 1.0_f32;
+        r.m[15_usize] = 1.0_f32;
+        return r;
+    }
+
+    /// Column-major orthographic projection mapping [left..right] x [top..bottom] to Vulkan/Metal NDC.
+    pub fn ortho(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) -> Mat4 {
+        var r = Mat4.zero();
+        let rl = right - left;
+        let tb = top - bottom;
+        let fn_d = far - near;
+        if math.abs_f32(rl) > 1.0e-12_f32 {
+            r.m[0_usize] = 2.0_f32 / rl;
+            r.m[12_usize] = -(right + left) / rl;
+        }
+        if math.abs_f32(tb) > 1.0e-12_f32 {
+            r.m[5_usize] = 2.0_f32 / tb;
+            r.m[13_usize] = -(top + bottom) / tb;
+        }
+        if math.abs_f32(fn_d) > 1.0e-12_f32 {
+            r.m[10_usize] = -1.0_f32 / fn_d;
+            r.m[14_usize] = -near / fn_d;
+        }
+        r.m[15_usize] = 1.0_f32;
+        return r;
+    }
+
+    pub fn translate(tx: f32, ty: f32, tz: f32) -> Mat4 {
+        var r = Mat4.identity();
+        r.m[12_usize] = tx;
+        r.m[13_usize] = ty;
+        r.m[14_usize] = tz;
+        return r;
+    }
+
+    pub fn scale(sx: f32, sy: f32, sz: f32) -> Mat4 {
+        var r = Mat4.zero();
+        r.m[0_usize] = sx;
+        r.m[5_usize] = sy;
+        r.m[10_usize] = sz;
+        r.m[15_usize] = 1.0_f32;
+        return r;
+    }
+
+    pub fn rotate_z(radians: f32) -> Mat4 {
+        let rad64 = radians.widen.[f64]();
+        let c = math.cos(rad64).trunc.[f32]();
+        let s = math.sin(rad64).trunc.[f32]();
+        var r = Mat4.identity();
+        r.m[0_usize] = c;
+        r.m[1_usize] = s;
+        r.m[4_usize] = -s;
+        r.m[5_usize] = c;
+        return r;
+    }
+
+    pub fn mul(self: *Self, o: *Mat4) -> Mat4 {
+        var r = Mat4.zero();
+        var row: usize = 0_usize;
+        while row < 4_usize {
+            let a0 = self.m[row];
+            let a1 = self.m[row + 4_usize];
+            let a2 = self.m[row + 8_usize];
+            let a3 = self.m[row + 12_usize];
+            r.m[row] = @fma(a3, o.m[3_usize], @fma(a2, o.m[2_usize], @fma(a1, o.m[1_usize], a0 * o.m[0_usize])));
+            r.m[row + 4_usize] = @fma(a3, o.m[7_usize], @fma(a2, o.m[6_usize], @fma(a1, o.m[5_usize], a0 * o.m[4_usize])));
+            r.m[row + 8_usize] = @fma(a3, o.m[11_usize], @fma(a2, o.m[10_usize], @fma(a1, o.m[9_usize], a0 * o.m[8_usize])));
+            r.m[row + 12_usize] = @fma(a3, o.m[15_usize], @fma(a2, o.m[14_usize], @fma(a1, o.m[13_usize], a0 * o.m[12_usize])));
+            row = row + 1_usize;
+        }
+        return r;
+    }
+
+    pub fn mul_vec4(self: *Self, v: Vec4) -> Vec4 {
+        let x = @fma(self.m[0_usize], v.x, @fma(self.m[4_usize], v.y, @fma(self.m[8_usize], v.z, self.m[12_usize] * v.w)));
+        let y = @fma(self.m[1_usize], v.x, @fma(self.m[5_usize], v.y, @fma(self.m[9_usize], v.z, self.m[13_usize] * v.w)));
+        let z = @fma(self.m[2_usize], v.x, @fma(self.m[6_usize], v.y, @fma(self.m[10_usize], v.z, self.m[14_usize] * v.w)));
+        let w = @fma(self.m[3_usize], v.x, @fma(self.m[7_usize], v.y, @fma(self.m[11_usize], v.z, self.m[15_usize] * v.w)));
+        return Vec4.{ x: x, y: y, z: z, w: w };
+    }
+
+    pub fn mul_point2d(self: *Self, p: Point) -> Point {
+        let x = @fma(self.m[0_usize], p.x, @fma(self.m[4_usize], p.y, self.m[12_usize]));
+        let y = @fma(self.m[1_usize], p.x, @fma(self.m[5_usize], p.y, self.m[13_usize]));
+        return Point.{ x: x, y: y };
+    }
+
+    pub fn transpose(self: *Self) -> Mat4 {
+        return Mat4.{
+            m: [
+                self.m[0_usize],  self.m[4_usize],  self.m[8_usize],  self.m[12_usize],
+                self.m[1_usize],  self.m[5_usize],  self.m[9_usize],  self.m[13_usize],
+                self.m[2_usize],  self.m[6_usize],  self.m[10_usize], self.m[14_usize],
+                self.m[3_usize],  self.m[7_usize],  self.m[11_usize], self.m[15_usize],
+            ],
+        };
+    }
+}

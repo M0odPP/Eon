@@ -1,0 +1,407 @@
+module std.sync @hal;
+
+import core.sync;
+
+// ---------------------------------------------------------------------------
+// OS blocking synchronization primitives over Linux futex (`std.sync`)
+//   - Mutex + linear MutexGuard
+//   - Condvar (wait / notify_one / notify_all)
+//   - RwLock + linear RwReadGuard / RwWriteGuard
+//   - Channel[T] (bounded heap-backed MPMC ring channel)
+// ---------------------------------------------------------------------------
+
+const SYS_FUTEX: u64 = 202_u64;
+const FUTEX_WAIT_PRIVATE: u64 = 128_u64;
+const FUTEX_WAKE_PRIVATE: u64 = 129_u64;
+
+@naked
+fn syscall6(
+    _nr: u64,
+    _a1: u64,
+    _a2: u64,
+    _a3: u64,
+    _a4: u64,
+    _a5: u64,
+    _a6: u64,
+) -> i64 {
+    raw {
+        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r11, r10; mov r10, r8; mov r8, r9; mov r9, r11; syscall; ret", options(noreturn));
+    }
+    return 0_i64;
+}
+
+@naked
+fn atomic_u32_addr(_a: *Atomic[u32]) -> u64 {
+    raw {
+        asm("mov rax, rdi; ret", options(noreturn));
+    }
+    return 0_u64;
+}
+
+/// Block the calling thread in the kernel while `word.* == expected`.
+pub fn futex_wait(word: *Atomic[u32], expected: u32) {
+    _ = syscall6(
+        SYS_FUTEX,
+        atomic_u32_addr(word),
+        FUTEX_WAIT_PRIVATE,
+        expected.widen.[u64](),
+        0_u64,
+        0_u64,
+        0_u64,
+    );
+}
+
+/// Wake at most `count` threads waiting on `word`.
+pub fn futex_wake(word: *Atomic[u32], count: u32) -> i64 {
+    return syscall6(
+        SYS_FUTEX,
+        atomic_u32_addr(word),
+        FUTEX_WAKE_PRIVATE,
+        count.widen.[u64](),
+        0_u64,
+        0_u64,
+        0_u64,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3-state futex Mutex (0 = unlocked, 1 = locked uncontended, 2 = contended)
+// ---------------------------------------------------------------------------
+
+pub linear struct MutexGuard {
+    _tag: u8;
+}
+
+pub struct Mutex {
+    state: Atomic[u32];
+}
+
+impl Mutex {
+    pub fn new() -> Mutex {
+        return Mutex.{ state: Atomic.[u32].new(0_u32) };
+    }
+
+    pub fn try_lock(self: *mut Self) -> ?MutexGuard {
+        if self.state.compare_exchange(0_u32, 1_u32, .Acquire, .Relaxed) {
+            return MutexGuard.{ _tag: 1_u8 };
+        }
+        return null;
+    }
+
+    pub fn lock(self: *mut Self) -> MutexGuard {
+        // Fast path: uncontended acquire.
+        if self.state.compare_exchange(0_u32, 1_u32, .Acquire, .Relaxed) {
+            return MutexGuard.{ _tag: 1_u8 };
+        }
+        // Brief adaptive spin before parking in kernel futex.
+        var spins: u32 = 0_u32;
+        while spins < 40_u32 {
+            if self.state.load(.Relaxed) == 0_u32 {
+                if self.state.compare_exchange(0_u32, 1_u32, .Acquire, .Relaxed) {
+                    return MutexGuard.{ _tag: 1_u8 };
+                }
+            }
+            sync.cpu_relax();
+            spins = spins +% 1_u32;
+        }
+        // Contended slow path: mark state = 2 and sleep in futex.
+        loop {
+            let cur = self.state.load(.Relaxed);
+            if cur == 0_u32 {
+                if self.state.compare_exchange(0_u32, 2_u32, .Acquire, .Relaxed) {
+                    return MutexGuard.{ _tag: 2_u8 };
+                }
+                continue;
+            }
+            if cur == 1_u32 {
+                _ = self.state.compare_exchange(1_u32, 2_u32, .Relaxed, .Relaxed);
+            }
+            futex_wait(&self.state, 2_u32);
+        }
+    }
+
+    pub fn unlock_raw(self: *mut Self) {
+        let prev = self.state.fetch_sub(1_u32, .Release);
+        if prev != 1_u32 {
+            self.state.store(0_u32, .Release);
+            _ = futex_wake(&self.state, 1_u32);
+        }
+    }
+}
+
+impl MutexGuard {
+    pub fn unlock(self: MutexGuard, m: *mut Mutex) {
+        let MutexGuard.{ _tag } = self;
+        m.unlock_raw();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Condvar (generation-counter futex condition variable)
+// ---------------------------------------------------------------------------
+
+pub struct Condvar {
+    seq: Atomic[u32];
+}
+
+impl Condvar {
+    pub fn new() -> Condvar {
+        return Condvar.{ seq: Atomic.[u32].new(0_u32) };
+    }
+
+    pub fn wait(self: *mut Self, guard: MutexGuard, m: *mut Mutex) -> MutexGuard {
+        let s = self.seq.load(.Relaxed);
+        guard.unlock(m);
+        futex_wait(&self.seq, s);
+        return m.lock();
+    }
+
+    pub fn notify_one(self: *mut Self) {
+        _ = self.seq.fetch_add(1_u32, .Release);
+        _ = futex_wake(&self.seq, 1_u32);
+    }
+
+    pub fn notify_all(self: *mut Self) {
+        _ = self.seq.fetch_add(1_u32, .Release);
+        _ = futex_wake(&self.seq, 0x7FFFFFFF_u32);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RwLock (0 = unlocked, 1..0x7FFFFFFE = readers, 0xFFFFFFFF = writer)
+// ---------------------------------------------------------------------------
+
+const RW_WRITER: u32 = 0xFFFFFFFF_u32;
+
+pub linear struct RwReadGuard {
+    _tag: u8;
+}
+
+pub linear struct RwWriteGuard {
+    _tag: u8;
+}
+
+pub struct RwLock {
+    state: Atomic[u32];
+    writer_wake: Atomic[u32];
+}
+
+impl RwLock {
+    pub fn new() -> RwLock {
+        return RwLock.{
+            state: Atomic.[u32].new(0_u32),
+            writer_wake: Atomic.[u32].new(0_u32),
+        };
+    }
+
+    pub fn read_lock(self: *mut Self) -> RwReadGuard {
+        loop {
+            let cur = self.state.load(.Relaxed);
+            if cur < 0x7FFFFFFE_u32 {
+                if self.state.compare_exchange(cur, cur +% 1_u32, .Acquire, .Relaxed) {
+                    return RwReadGuard.{ _tag: 1_u8 };
+                }
+            } else {
+                futex_wait(&self.state, cur);
+            }
+        }
+    }
+
+    pub fn try_read_lock(self: *mut Self) -> ?RwReadGuard {
+        let cur = self.state.load(.Relaxed);
+        if cur < 0x7FFFFFFE_u32 {
+            if self.state.compare_exchange(cur, cur +% 1_u32, .Acquire, .Relaxed) {
+                return RwReadGuard.{ _tag: 1_u8 };
+            }
+        }
+        return null;
+    }
+
+    pub fn write_lock(self: *mut Self) -> RwWriteGuard {
+        loop {
+            if self.state.compare_exchange(0_u32, RW_WRITER, .Acquire, .Relaxed) {
+                return RwWriteGuard.{ _tag: 1_u8 };
+            }
+            let seq = self.writer_wake.load(.Acquire);
+            if self.state.load(.Relaxed) != 0_u32 {
+                futex_wait(&self.writer_wake, seq);
+            }
+        }
+    }
+
+    pub fn try_write_lock(self: *mut Self) -> ?RwWriteGuard {
+        if self.state.compare_exchange(0_u32, RW_WRITER, .Acquire, .Relaxed) {
+            return RwWriteGuard.{ _tag: 1_u8 };
+        }
+        return null;
+    }
+}
+
+impl RwReadGuard {
+    pub fn unlock(self: RwReadGuard, rw: *mut RwLock) {
+        let RwReadGuard.{ _tag } = self;
+        let prev = rw.state.fetch_sub(1_u32, .Release);
+        if prev == 1_u32 {
+            _ = rw.writer_wake.fetch_add(1_u32, .Release);
+            _ = futex_wake(&rw.writer_wake, 1_u32);
+        }
+    }
+}
+
+impl RwWriteGuard {
+    pub fn unlock(self: RwWriteGuard, rw: *mut RwLock) {
+        let RwWriteGuard.{ _tag } = self;
+        rw.state.store(0_u32, .Release);
+        _ = rw.writer_wake.fetch_add(1_u32, .Release);
+        _ = futex_wake(&rw.state, 0x7FFFFFFF_u32);
+        _ = futex_wake(&rw.writer_wake, 1_u32);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded MPMC Channel[T] (linear, zero leaks, Mutex + Condvar)
+// ---------------------------------------------------------------------------
+
+pub linear struct Channel[T] {
+    buf: Buf[T];
+    cap: usize;
+    head: usize;
+    tail: usize;
+    count: usize;
+    closed: bool;
+    mu: Mutex;
+    not_empty: Condvar;
+    not_full: Condvar;
+}
+
+impl[T] Channel[T] {
+    pub fn init(alloc: *mut AllocCap, capacity: usize, filler: T) -> Channel[T] ! OutOfMemory {
+        let cap = if capacity == 0_usize { 1_usize } else { capacity };
+        var buf = try Buf.[T].init(alloc, cap);
+        errdefer buf.destroy(alloc);
+        var i: usize = 0_usize;
+        while i < cap {
+            try buf.push(filler);
+            i = i +% 1_usize;
+        }
+        return Channel.[T].{
+            buf: buf,
+            cap: cap,
+            head: 0_usize,
+            tail: 0_usize,
+            count: 0_usize,
+            closed: false,
+            mu: Mutex.new(),
+            not_empty: Condvar.new(),
+            not_full: Condvar.new(),
+        };
+    }
+
+    pub fn try_send(self: *mut Self, val: T) -> bool {
+        let g = self.mu.lock();
+        if self.closed || self.count >= self.cap {
+            g.unlock(&mut self.mu);
+            return false;
+        }
+        let s = self.buf.as_mut_slice();
+        if self.tail < s.len {
+            s[self.tail] = val;
+            let nxt = self.tail +% 1_usize;
+            self.tail = if nxt >= self.cap { 0_usize } else { nxt };
+            self.count = self.count +% 1_usize;
+        }
+        g.unlock(&mut self.mu);
+        self.not_empty.notify_one();
+        return true;
+    }
+
+    pub fn send(self: *mut Self, val: T) -> bool {
+        var g = self.mu.lock();
+        while !self.closed && self.count >= self.cap {
+            g = self.not_full.wait(g, &mut self.mu);
+        }
+        if self.closed {
+            g.unlock(&mut self.mu);
+            return false;
+        }
+        let s = self.buf.as_mut_slice();
+        if self.tail < s.len {
+            s[self.tail] = val;
+            let nxt = self.tail +% 1_usize;
+            self.tail = if nxt >= self.cap { 0_usize } else { nxt };
+            self.count = self.count +% 1_usize;
+        }
+        g.unlock(&mut self.mu);
+        self.not_empty.notify_one();
+        return true;
+    }
+
+    pub fn try_recv(self: *mut Self) -> ?T {
+        let g = self.mu.lock();
+        if self.count == 0_usize {
+            g.unlock(&mut self.mu);
+            return null;
+        }
+        let s = self.buf.as_slice();
+        var out: ?T = null;
+        if self.head < s.len {
+            out = s[self.head];
+            let nxt = self.head +% 1_usize;
+            self.head = if nxt >= self.cap { 0_usize } else { nxt };
+            self.count = self.count - 1_usize;
+        }
+        g.unlock(&mut self.mu);
+        self.not_full.notify_one();
+        return out;
+    }
+
+    pub fn recv(self: *mut Self) -> ?T {
+        var g = self.mu.lock();
+        while self.count == 0_usize && !self.closed {
+            g = self.not_empty.wait(g, &mut self.mu);
+        }
+        if self.count == 0_usize {
+            g.unlock(&mut self.mu);
+            return null;
+        }
+        let s = self.buf.as_slice();
+        var out: ?T = null;
+        if self.head < s.len {
+            out = s[self.head];
+            let nxt = self.head +% 1_usize;
+            self.head = if nxt >= self.cap { 0_usize } else { nxt };
+            self.count = self.count - 1_usize;
+        }
+        g.unlock(&mut self.mu);
+        self.not_full.notify_one();
+        return out;
+    }
+
+    pub fn close(self: *mut Self) {
+        let g = self.mu.lock();
+        self.closed = true;
+        g.unlock(&mut self.mu);
+        self.not_empty.notify_all();
+        self.not_full.notify_all();
+    }
+
+    pub fn len(self: *mut Self) -> usize {
+        let g = self.mu.lock();
+        let n = self.count;
+        g.unlock(&mut self.mu);
+        return n;
+    }
+
+    pub fn destroy(self: Channel[T], alloc: *mut AllocCap) {
+        let Channel.{ buf, cap, head, tail, count, closed, mu, not_empty, not_full } = self;
+        let _ = cap;
+        let _ = head;
+        let _ = tail;
+        let _ = count;
+        let _ = closed;
+        let _ = mu;
+        let _ = not_empty;
+        let _ = not_full;
+        buf.destroy(alloc);
+    }
+}

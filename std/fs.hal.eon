@@ -1,0 +1,364 @@
+module std.fs @hal;
+
+// ---------------------------------------------------------------------------
+// Capability-first + linear-FD OS filesystem layer (`std.fs`)
+// ---------------------------------------------------------------------------
+
+const SYS_READ: u64 = 0_u64;
+const SYS_WRITE: u64 = 1_u64;
+const SYS_CLOSE: u64 = 3_u64;
+const SYS_FSTAT: u64 = 5_u64;
+const SYS_LSEEK: u64 = 8_u64;
+const SYS_FSYNC: u64 = 74_u64;
+const SYS_OPENAT: u64 = 257_u64;
+const SYS_NEWFSTATAT: u64 = 262_u64;
+const SYS_UNLINKAT: u64 = 263_u64;
+const SYS_RENAMEAT: u64 = 264_u64;
+
+const AT_FDCWD: u64 = 0xFFFFFFFFFFFFFF9C_u64; // -100
+const AT_REMOVEDIR: u64 = 0x200_u64;
+
+const O_RDONLY: u64 = 0_u64;
+const O_WRONLY: u64 = 1_u64;
+const O_CREAT: u64 = 0x40_u64;
+const O_TRUNC: u64 = 0x200_u64;
+const O_APPEND: u64 = 0x400_u64;
+const O_CLOEXEC: u64 = 0x80000_u64;
+
+const S_IFMT: u32 = 0xF000_u32;
+const S_IFDIR: u32 = 0x4000_u32;
+const S_IFREG: u32 = 0x8000_u32;
+
+const EINTR: i64 = -4_i64;
+
+pub const SEEK_SET: i32 = 0_i32;
+pub const SEEK_CUR: i32 = 1_i32;
+pub const SEEK_END: i32 = 2_i32;
+
+@naked
+fn syscall1(_nr: u64, _a1: u64) -> i64 {
+    raw {
+        asm("mov rax, rdi; mov rdi, rsi; syscall; ret", options(noreturn));
+    }
+    return 0_i64;
+}
+
+@naked
+fn syscall2(_nr: u64, _a1: u64, _a2: u64) -> i64 {
+    raw {
+        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; syscall; ret", options(noreturn));
+    }
+    return 0_i64;
+}
+
+@naked
+fn syscall3(_nr: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    raw {
+        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; syscall; ret", options(noreturn));
+    }
+    return 0_i64;
+}
+
+@naked
+fn syscall4(_nr: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64) -> i64 {
+    raw {
+        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r10, r8; syscall; ret", options(noreturn));
+    }
+    return 0_i64;
+}
+
+@naked
+fn slice_ptr(_s: *[u8]) -> u64 {
+    raw {
+        asm("mov rax, rdi; ret", options(noreturn));
+    }
+    return 0_u64;
+}
+
+@naked
+fn slice_mut_ptr(_s: *mut [u8]) -> u64 {
+    raw {
+        asm("mov rax, rdi; ret", options(noreturn));
+    }
+    return 0_u64;
+}
+
+fn check_errno(rc: i64) -> !IoError {
+    if rc >= 0_i64 {
+        return;
+    }
+    if rc == -2_i64 {
+        return .NotFound;
+    }
+    if rc == -13_i64 || rc == -1_i64 {
+        return .PermissionDenied;
+    }
+    if rc == -17_i64 {
+        return .AlreadyExists;
+    }
+    if rc == -22_i64 {
+        return .InvalidInput;
+    }
+    return .Other;
+}
+
+fn copy_cstr(src: *[u8], dst: *mut [u8]) -> bool {
+    if dst.len == 0_usize || src.len >= dst.len {
+        return false;
+    }
+    var i: usize = 0_usize;
+    while i < src.len {
+        let ch = src[i];
+        if ch == 0_u8 {
+            return false;
+        }
+        dst[i] = ch;
+        i = i + 1_usize;
+    }
+    dst[src.len] = 0_u8;
+    return true;
+}
+
+fn read_le_u32(buf: *[u8], off: usize) -> u32 {
+    if buf.len < 4_usize || off > buf.len - 4_usize {
+        return 0_u32;
+    }
+    return buf[off].widen.[u32]()
+        | (buf[off + 1_usize].widen.[u32]() <<% 8_u32)
+        | (buf[off + 2_usize].widen.[u32]() <<% 16_u32)
+        | (buf[off + 3_usize].widen.[u32]() <<% 24_u32);
+}
+
+fn read_le_i64(buf: *[u8], off: usize) -> i64 {
+    if buf.len < 8_usize || off > buf.len - 8_usize {
+        return 0_i64;
+    }
+    let lo = read_le_u32(buf, off).widen.[u64]();
+    let hi = read_le_u32(buf, off + 4_usize).widen.[u64]();
+    return (lo | (hi <<% 32_u64)).bitcast.[i64]();
+}
+
+pub struct FileStat {
+    pub size: u64;
+    pub mode: u32;
+    pub is_file: bool;
+    pub is_dir: bool;
+    pub mtime_sec: i64;
+}
+
+fn parse_linux_x64_stat(buf: *[u8]) -> FileStat {
+    // Linux x86_64 `struct stat` (144 bytes):
+    //   +24: st_mode (u32), +48: st_size (i64), +88: st_mtime (i64)
+    let mode = read_le_u32(buf, 24_usize);
+    let sz_i = read_le_i64(buf, 48_usize);
+    let mt = read_le_i64(buf, 88_usize);
+    let ftype = mode & S_IFMT;
+    return FileStat.{
+        size: if sz_i >= 0_i64 { sz_i.bitcast.[u64]() } else { 0_u64 },
+        mode: mode,
+        is_file: ftype == S_IFREG,
+        is_dir: ftype == S_IFDIR,
+        mtime_sec: mt,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// High-level capability wrappers
+// ---------------------------------------------------------------------------
+
+pub fn read_to_buf(fs: *FsCap, alloc: *mut AllocCap, path: *str) -> Buf[u8] ! OutOfMemory | IoError {
+    return try fs.read_file(alloc, path);
+}
+
+pub fn write_all(fs: *FsCap, path: *str, data: *[u8]) -> !IoError {
+    try fs.write_file(path, data);
+    return;
+}
+
+pub fn mkdir_all(fs: *FsCap, path: *str) -> !IoError {
+    try fs.mkdir_all(path);
+    return;
+}
+
+pub fn is_dir(fs: *FsCap, path: *str) -> bool {
+    return fs.is_dir(path);
+}
+
+pub fn stat_path(_fs: *FsCap, path: *str) -> FileStat ! IoError {
+    var cpath: [1024]u8 = [0_u8; 1024];
+    if !copy_cstr(path.as_bytes(), &mut cpath) {
+        return .InvalidInput;
+    }
+    var st_raw: [144]u8 = [0_u8; 144];
+    let rc = syscall4(
+        SYS_NEWFSTATAT,
+        AT_FDCWD,
+        slice_ptr(&cpath),
+        slice_mut_ptr(&mut st_raw),
+        0_u64,
+    );
+    try check_errno(rc);
+    return parse_linux_x64_stat(&st_raw);
+}
+
+pub fn exists(fs: *FsCap, path: *str) -> bool {
+    let _ = stat_path(fs, path) catch {
+        return false;
+    };
+    return true;
+}
+
+pub fn remove_file(_fs: *FsCap, path: *str) -> !IoError {
+    var cpath: [1024]u8 = [0_u8; 1024];
+    if !copy_cstr(path.as_bytes(), &mut cpath) {
+        return .InvalidInput;
+    }
+    let rc = syscall3(SYS_UNLINKAT, AT_FDCWD, slice_ptr(&cpath), 0_u64);
+    try check_errno(rc);
+    return;
+}
+
+pub fn remove_dir(_fs: *FsCap, path: *str) -> !IoError {
+    var cpath: [1024]u8 = [0_u8; 1024];
+    if !copy_cstr(path.as_bytes(), &mut cpath) {
+        return .InvalidInput;
+    }
+    let rc = syscall3(SYS_UNLINKAT, AT_FDCWD, slice_ptr(&cpath), AT_REMOVEDIR);
+    try check_errno(rc);
+    return;
+}
+
+pub fn rename_path(_fs: *FsCap, old_path: *str, new_path: *str) -> !IoError {
+    var old_c: [1024]u8 = [0_u8; 1024];
+    var new_c: [1024]u8 = [0_u8; 1024];
+    if !copy_cstr(old_path.as_bytes(), &mut old_c) || !copy_cstr(new_path.as_bytes(), &mut new_c) {
+        return .InvalidInput;
+    }
+    let rc = syscall4(SYS_RENAMEAT, AT_FDCWD, slice_ptr(&old_c), AT_FDCWD, slice_ptr(&new_c));
+    try check_errno(rc);
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// Linear streaming File handle (cannot be leaked — must call `.close()`)
+// ---------------------------------------------------------------------------
+
+pub linear struct File {
+    fd: i32;
+}
+
+impl File {
+    fn open_flags(path: *str, flags: u64, mode: u64) -> File ! IoError {
+        var cpath: [1024]u8 = [0_u8; 1024];
+        if !copy_cstr(path.as_bytes(), &mut cpath) {
+            return .InvalidInput;
+        }
+        let rc = syscall4(SYS_OPENAT, AT_FDCWD, slice_ptr(&cpath), flags, mode);
+        try check_errno(rc);
+        return File.{ fd: rc.trunc.[i32]() };
+    }
+
+    pub fn open_read(_fs: *FsCap, path: *str) -> File ! IoError {
+        return try File.open_flags(path, O_RDONLY | O_CLOEXEC, 0_u64);
+    }
+
+    pub fn create_write(_fs: *FsCap, path: *str) -> File ! IoError {
+        return try File.open_flags(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0x1A4_u64); // 0644
+    }
+
+    pub fn open_append(_fs: *FsCap, path: *str) -> File ! IoError {
+        return try File.open_flags(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0x1A4_u64);
+    }
+
+    pub fn raw_fd(self: *Self) -> i32 {
+        return self.fd;
+    }
+
+    pub fn read(self: *mut Self, buf: *mut [u8]) -> usize ! IoError {
+        if buf.len == 0_usize {
+            return 0_usize;
+        }
+        loop {
+            let rc = syscall3(
+                SYS_READ,
+                self.fd.widen.[i64]().bitcast.[u64](),
+                slice_mut_ptr(buf),
+                buf.len.widen.[u64](),
+            );
+            if rc == EINTR {
+                continue;
+            }
+            try check_errno(rc);
+            return rc.bitcast.[u64]().trunc.[usize]();
+        }
+    }
+
+    pub fn write(self: *mut Self, data: *[u8]) -> usize ! IoError {
+        if data.len == 0_usize {
+            return 0_usize;
+        }
+        loop {
+            let rc = syscall3(
+                SYS_WRITE,
+                self.fd.widen.[i64]().bitcast.[u64](),
+                slice_ptr(data),
+                data.len.widen.[u64](),
+            );
+            if rc == EINTR {
+                continue;
+            }
+            try check_errno(rc);
+            return rc.bitcast.[u64]().trunc.[usize]();
+        }
+    }
+
+    pub fn write_all(self: *mut Self, data: *[u8]) -> !IoError {
+        var off: usize = 0_usize;
+        while off < data.len {
+            let rem = data.sub(off, data.len) catch {
+                return .Other;
+            };
+            let n = try self.write(rem);
+            if n == 0_usize {
+                return .Other;
+            }
+            off = off +% n;
+        }
+        return;
+    }
+
+    pub fn sync_all(self: *Self) -> !IoError {
+        let rc = syscall1(SYS_FSYNC, self.fd.widen.[i64]().bitcast.[u64]());
+        try check_errno(rc);
+        return;
+    }
+
+    pub fn seek(self: *mut Self, offset: i64, whence: i32) -> u64 ! IoError {
+        let rc = syscall3(
+            SYS_LSEEK,
+            self.fd.widen.[i64]().bitcast.[u64](),
+            offset.bitcast.[u64](),
+            whence.widen.[i64]().bitcast.[u64](),
+        );
+        try check_errno(rc);
+        return rc.bitcast.[u64]();
+    }
+
+    pub fn stat(self: *Self) -> FileStat ! IoError {
+        var st_raw: [144]u8 = [0_u8; 144];
+        let rc = syscall2(
+            SYS_FSTAT,
+            self.fd.widen.[i64]().bitcast.[u64](),
+            slice_mut_ptr(&mut st_raw),
+        );
+        try check_errno(rc);
+        return parse_linux_x64_stat(&st_raw);
+    }
+
+    pub fn close(self: File) {
+        let File.{ fd } = self;
+        if fd >= 0_i32 {
+            _ = syscall1(SYS_CLOSE, fd.widen.[i64]().bitcast.[u64]());
+        }
+    }
+}
