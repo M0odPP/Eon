@@ -1,0 +1,200 @@
+module std.os.darwin @hal;
+
+// ============================================================================
+// Darwin (macOS / iOS) OS Runtime HAL via `/usr/lib/libSystem.B.dylib` and
+// `/usr/lib/libobjc.A.dylib` — Zero C Toolchain!
+// ============================================================================
+
+pub const PROT_READ: i32 = 1_i32;
+pub const PROT_WRITE: i32 = 2_i32;
+pub const MAP_PRIVATE: i32 = 0x0002_i32;
+pub const MAP_ANON: i32 = 0x1000_i32;
+pub const CLOCK_UPTIME_RAW: i32 = 8_i32;
+pub const CLOCK_MONOTONIC: i32 = 6_i32;
+pub const RTLD_LAZY: i32 = 1_i32;
+pub const RTLD_NOW: i32 = 2_i32;
+
+@layout(c)
+pub struct Timespec {
+    pub tv_sec: i64;
+    pub tv_nsec: i64;
+}
+
+@layout(c)
+pub struct OsUnfairLock {
+    pub opaque: u32;
+}
+
+@naked
+fn slice_ptr(_s: *[u8]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw {
+            asm("ret", options(noreturn));
+        }
+    } else {
+        raw {
+            asm("mov rax, rdi; ret", options(noreturn));
+        }
+    }
+    return 0_u64;
+}
+
+extern "C" fn mmap(addr: u64, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> u64;
+extern "C" fn munmap(addr: u64, len: usize) -> i32;
+extern "C" fn write(fd: i32, buf: u64, count: usize) -> isize;
+extern "C" fn read(fd: i32, buf: u64, count: usize) -> isize;
+extern "C" fn close(fd: i32) -> i32;
+extern "C" fn _exit(status: i32);
+extern "C" fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
+extern "C" fn nanosleep(req: *Timespec, rem: u64) -> i32;
+extern "C" fn pthread_create(tid: *mut u64, attr: u64, start: u64, arg: u64) -> i32;
+extern "C" fn pthread_join(tid: u64, ret_out: u64) -> i32;
+extern "C" fn os_unfair_lock_lock(lock: *mut OsUnfairLock);
+extern "C" fn os_unfair_lock_unlock(lock: *mut OsUnfairLock);
+extern "C" fn kqueue() -> i32;
+extern "C" fn dlopen(path: u64, mode: i32) -> u64;
+extern "C" fn dlsym(handle: u64, sym: u64) -> u64;
+extern "C" fn dlclose(handle: u64) -> i32;
+extern "C" fn objc_getClass(name: u64) -> u64;
+extern "C" fn sel_registerName(name: u64) -> u64;
+extern "C" fn objc_msgSend(obj: u64, sel: u64) -> u64;
+
+pub fn page_alloc(size: usize) -> u64 {
+    raw {
+        return mmap(0_u64, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1_i32, 0_i64);
+    }
+}
+
+pub fn page_free(ptr: u64, size: usize) -> i32 {
+    raw {
+        return munmap(ptr, size);
+    }
+}
+
+pub fn write_fd(fd: i32, data: *[u8]) -> isize {
+    if data.len == 0_usize {
+        return 0_isize;
+    }
+    raw {
+        return write(fd, slice_ptr(data), data.len);
+    }
+}
+
+pub fn read_fd(fd: i32, buf: u64, count: usize) -> isize {
+    raw {
+        return read(fd, buf, count);
+    }
+}
+
+pub fn close_fd(fd: i32) -> i32 {
+    raw {
+        return close(fd);
+    }
+}
+
+pub fn monotonic_now_ns() -> u64 {
+    var ts = Timespec.{ tv_sec: 0_i64, tv_nsec: 0_i64 };
+    raw {
+        _ = clock_gettime(CLOCK_UPTIME_RAW, &mut ts);
+    }
+    if ts.tv_sec < 0_i64 {
+        return 0_u64;
+    }
+    return ts.tv_sec.bitcast.[u64]() *% 1000000000_u64 +% ts.tv_nsec.bitcast.[u64]();
+}
+
+pub fn sleep_ns(ns: u64) {
+    let ts = Timespec.{
+        tv_sec: (ns / 1000000000_u64).bitcast.[i64](),
+        tv_nsec: (ns % 1000000000_u64).bitcast.[i64](),
+    };
+    raw {
+        _ = nanosleep(&ts, 0_u64);
+    }
+}
+
+pub fn lock_acquire(lk: *mut OsUnfairLock) {
+    raw {
+        os_unfair_lock_lock(lk);
+    }
+}
+
+pub fn lock_release(lk: *mut OsUnfairLock) {
+    raw {
+        os_unfair_lock_unlock(lk);
+    }
+}
+
+pub fn thread_spawn(start: u64, arg: u64) -> u64 {
+    var tid: u64 = 0_u64;
+    raw {
+        _ = pthread_create(&mut tid, 0_u64, start, arg);
+    }
+    return tid;
+}
+
+pub fn thread_join(tid: u64) -> i32 {
+    raw {
+        return pthread_join(tid, 0_u64);
+    }
+}
+
+pub fn create_kqueue() -> i32 {
+    raw {
+        return kqueue();
+    }
+}
+
+pub fn objc_class(name_z: *[u8]) -> u64 {
+    if name_z.len == 0_usize {
+        return 0_u64;
+    }
+    raw {
+        return objc_getClass(slice_ptr(name_z));
+    }
+}
+
+pub fn objc_sel(name_z: *[u8]) -> u64 {
+    if name_z.len == 0_usize {
+        return 0_u64;
+    }
+    raw {
+        return sel_registerName(slice_ptr(name_z));
+    }
+}
+
+pub fn objc_send0(obj: u64, sel: u64) -> u64 {
+    raw {
+        return objc_msgSend(obj, sel);
+    }
+}
+
+pub fn dylib_open(path_z: *[u8]) -> u64 {
+    if path_z.len == 0_usize {
+        return 0_u64;
+    }
+    raw {
+        return dlopen(slice_ptr(path_z), RTLD_NOW);
+    }
+}
+
+pub fn dylib_sym(handle: u64, sym_z: *[u8]) -> u64 {
+    if handle == 0_u64 || sym_z.len == 0_usize {
+        return 0_u64;
+    }
+    raw {
+        return dlsym(handle, slice_ptr(sym_z));
+    }
+}
+
+pub fn dylib_close(handle: u64) -> i32 {
+    raw {
+        return dlclose(handle);
+    }
+}
+
+pub fn exit_proc(code: i32) {
+    raw {
+        _exit(code);
+    }
+}

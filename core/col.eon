@@ -1617,7 +1617,9 @@ impl[T] DynBuf[T] {
                 new_cap = need;
                 break;
             }
-            if new_cap >= 1024_usize {
+            if new_cap >= 65536_usize {
+                new_cap = new_cap +% (new_cap >> 2_usize);
+            } else if new_cap >= 1024_usize {
                 new_cap = new_cap +% (new_cap >> 1_usize);
             } else {
                 new_cap = new_cap *% 2_usize;

@@ -11,6 +11,8 @@ import eonc.ctvm;
 import eonc.cfg_ir;
 import eonc.x64_asm;
 import eonc.elf64;
+import eonc.pe_coff;
+import eonc.macho;
 import eonc.tcb_audit;
 import eonc.emi;
 import eonc.eir;
@@ -30,6 +32,7 @@ pub struct CompileOptions {
     pub sanitize: bool;
     pub emit_debug_line: bool;
     pub has_emi_cache: bool;
+    pub win_gui: bool;
     pub opt: eir.EirOptConfig;
     pub jobs: u32;
 }
@@ -41,6 +44,7 @@ pub fn compile_options_default() -> CompileOptions {
         sanitize: false,
         emit_debug_line: true,
         has_emi_cache: false,
+        win_gui: false,
         opt: eir.opt_config_dev(),
         jobs: 0_u32,
     };
@@ -156,6 +160,19 @@ impl CompiledFnBlob {
 }
 
 // --- EonCall & SysV C ABI Register Tables ---
+
+fn gp_arg_reg_abi(is_c: bool, is_win64: bool, idx: usize) -> ?x64_asm.Reg {
+    if is_c && is_win64 {
+        match idx {
+            0_usize => { return .Rcx; }
+            1_usize => { return .Rdx; }
+            2_usize => { return .R8; }
+            3_usize => { return .R9; }
+            _ => { return null; }
+        }
+    }
+    return gp_arg_reg(is_c, idx);
+}
 
 fn gp_arg_reg(is_c: bool, idx: usize) -> ?x64_asm.Reg {
     let limit: usize = if is_c { 6_usize } else { 8_usize };
@@ -1675,6 +1692,7 @@ fn build_frame_plan(
     eir_prog: *eir.EirProgram,
     fn_id: u32,
     env: *types.TypeEnv,
+    is_win64: bool,
 ) -> FnFramePlan ! OutOfMemory {
     let f = eir_prog.get_fn(fn_id) orelse {
         let empty_slots = try col.DynBuf.[i32].init(alloc, 1_usize);
@@ -1804,7 +1822,7 @@ fn build_frame_plan(
         active.destroy(alloc);
     }
 
-    var saved_regs = try col.DynBuf.[x64_asm.Reg].init(alloc, 4_usize);
+    var saved_regs = try col.DynBuf.[x64_asm.Reg].init(alloc, 8_usize);
     errdefer saved_regs.destroy(alloc);
     var rk: usize = 0_usize;
     while rk < LINEAR_SCAN_REG_COUNT {
@@ -1812,6 +1830,12 @@ fn build_frame_plan(
             try saved_regs.push(alloc, linear_scan_reg(rk));
         }
         rk = rk +% 1_usize;
+    }
+    if is_win64 && f.sig.effects.is_export_c {
+        // Win64 ABI requires callee preservation of Rdi, Rsi, and R15 across C callbacks (e.g. WndProc).
+        try saved_regs.push(alloc, .Rdi);
+        try saved_regs.push(alloc, .Rsi);
+        try saved_regs.push(alloc, .R15);
     }
 
     // Reserve space below callee-saved pushes from rbp.
@@ -1999,6 +2023,7 @@ linear struct FnCodegen {
     emit_debug_line: bool;
     is_linux: bool;
     is_shared: bool;
+    is_win64: bool;
     buf: x64_asm.X64Buf;
     frame: FnFramePlan;
     block_labels: col.DynBuf[u32];
@@ -2036,7 +2061,8 @@ impl FnCodegen {
         env: *types.TypeEnv,
         opts: *CompileOptions,
     ) -> FnCodegen ! OutOfMemory {
-        let frame = try build_frame_plan(alloc, eir_prog, fn_id, env);
+        let is_win64 = opts.target_spec.abi == .Win64;
+        let frame = try build_frame_plan(alloc, eir_prog, fn_id, env, is_win64);
         errdefer frame.destroy(alloc);
         let buf = try x64_asm.X64Buf.init(alloc);
         errdefer buf.destroy(alloc);
@@ -2084,8 +2110,8 @@ impl FnCodegen {
             is_naked = f.sig.effects.is_naked;
         }
         let ret_class = classify_ret(ret_ty, env);
-        let is_linux = opts.mode.kind != .Freestanding;
-        let is_shared = opts.mode.kind == .LinuxShared;
+        let is_linux = opts.mode.kind != .Freestanding && opts.target_spec.fmt == .Elf64;
+        let is_shared = opts.mode.kind == .LinuxShared || opts.target_spec.is_shared;
 
         return FnCodegen.{
             fn_id: fn_id,
@@ -2100,6 +2126,7 @@ impl FnCodegen {
             emit_debug_line: opts.emit_debug_line,
             is_linux: is_linux,
             is_shared: is_shared,
+            is_win64: is_win64,
             buf: buf,
             frame: frame,
             block_labels: block_labels,
@@ -2143,6 +2170,7 @@ impl FnCodegen {
             emit_debug_line: _,
             is_linux: _,
             is_shared: _,
+            is_win64: _,
             buf,
             frame,
             block_labels,
@@ -3414,14 +3442,16 @@ fn cg_receive_params(
         return;
     }
     let is_c = cg.is_export_c;
+    let is_w64 = is_c && cg.is_win64;
     var gp_i: usize = 0_usize;
     var flt_i: usize = 0_usize;
-    var stk_off: i32 = 16_i32;
+    var stk_off: i32 = if is_w64 { 48_i32 } else { 16_i32 };
 
     if cg.frame.has_sret {
-        if let r = gp_arg_reg(is_c, gp_i) {
+        if let r = gp_arg_reg_abi(is_c, cg.is_win64, gp_i) {
             try cg.buf.store_mem(alloc, .Rbp, cg.frame.sret_off, r, 8_usize);
             gp_i = gp_i +% 1_usize;
+            if is_w64 { flt_i = gp_i; }
         }
     }
 
@@ -3435,9 +3465,10 @@ fn cg_receive_params(
         match cls {
             .Zst => {}
             .IntReg => {
-                if let r = gp_arg_reg(is_c, gp_i) {
+                if let r = gp_arg_reg_abi(is_c, cg.is_win64, gp_i) {
                     try cg_store_scalar_val(alloc, cg, eir_prog, env, pv, r);
                     gp_i = gp_i +% 1_usize;
+                    if is_w64 { flt_i = gp_i; }
                 } else {
                     try cg.buf.load_mem(alloc, .Rax, .Rbp, stk_off, lay.size, env.is_signed_int(ty));
                     try cg_store_scalar_val(alloc, cg, eir_prog, env, pv, .Rax);
@@ -3447,8 +3478,8 @@ fn cg_receive_params(
             .TwoIntRegs => {
                 let dst_off = cg_val_stack_off(cg, pv);
                 let hi_sz = if lay.size > 8_usize { lay.size - 8_usize } else { 0_usize };
-                let r0_opt = gp_arg_reg(is_c, gp_i);
-                let r1_opt = gp_arg_reg(is_c, gp_i +% 1_usize);
+                let r0_opt = gp_arg_reg_abi(is_c, cg.is_win64, gp_i);
+                let r1_opt = gp_arg_reg_abi(is_c, cg.is_win64, gp_i +% 1_usize);
                 var have_both = false;
                 var r0_val: x64_asm.Reg = .Rax;
                 var r1_val: x64_asm.Reg = .Rax;
@@ -3465,6 +3496,7 @@ fn cg_receive_params(
                         try cg.buf.store_mem(alloc, .Rbp, dst_off +% 8_i32, r1_val, hi_sz);
                     }
                     gp_i = gp_i +% 2_usize;
+                    if is_w64 { flt_i = gp_i; }
                 } else {
                     try cg_emit_copy_mem(alloc, cg, .Rbp, dst_off, .Rbp, stk_off, lay.size);
                     stk_off = stk_off +% 16_i32;
@@ -3473,13 +3505,16 @@ fn cg_receive_params(
             .FloatReg => {
                 let dst_off = cg_val_stack_off(cg, pv);
                 let is_f64 = env.get(ty).u8_val == 64_u8;
-                if let xr = float_arg_reg(flt_i) {
+                let max_flt: usize = if is_w64 { 4_usize } else { 8_usize };
+                let xr_opt = if flt_i < max_flt { float_arg_reg(flt_i) } else { null };
+                if let xr = xr_opt {
                     if is_f64 {
                         try cg.buf.movsd_store(alloc, .Rbp, dst_off, xr);
                     } else {
                         try cg.buf.movss_store(alloc, .Rbp, dst_off, xr);
                     }
                     flt_i = flt_i +% 1_usize;
+                    if is_w64 { gp_i = flt_i; }
                 } else {
                     let b = if is_f64 { 8_usize } else { 4_usize };
                     try cg_emit_copy_mem(alloc, cg, .Rbp, dst_off, .Rbp, stk_off, b);
@@ -3488,7 +3523,7 @@ fn cg_receive_params(
             }
             .ByPtr => {
                 let dst_off = cg_val_stack_off(cg, pv);
-                if let r = gp_arg_reg(is_c, gp_i) {
+                if let r = gp_arg_reg_abi(is_c, cg.is_win64, gp_i) {
                     if lay.size <= 16_usize {
                         try cg_emit_copy_mem(alloc, cg, .Rbp, dst_off, r, 0_i32, lay.size);
                     } else {
@@ -3511,6 +3546,7 @@ fn cg_receive_params(
                         try cg.buf.pop(alloc, .Rdi);
                     }
                     gp_i = gp_i +% 1_usize;
+                    if is_w64 { flt_i = gp_i; }
                 } else {
                     if lay.size <= 16_usize {
                         try cg.buf.load_mem(alloc, .Rdi, .Rbp, stk_off, 8_usize, false);
@@ -5134,7 +5170,9 @@ fn cg_emit_call(
 
     var is_c = false;
     if callee.kind == .ExternFn {
-        is_c = true;
+        // Internal Eon runtime helpers use EonCall/SysV register layout on all OSes;
+        // external OS/C libraries use the target's native C ABI (Win64 on Windows, SysV on POSIX).
+        is_c = !is_builtin_rt_helper(interner.get(callee.b));
     } else if callee.kind == .DirectFn {
         if let fid = eir_prog.find_fn_by_key(cfg_ir.fn_key_top_def(callee.a)) {
             if let f = eir_prog.get_fn(fid) {
@@ -5142,15 +5180,17 @@ fn cg_emit_call(
             }
         }
     }
+    let is_w64 = is_c && cg.is_win64;
 
     var gp_i: usize = 0_usize;
     var flt_i: usize = 0_usize;
-    var stk_bytes: usize = 0_usize;
+    var stk_bytes: usize = if is_w64 { 32_usize } else { 0_usize };
 
     var sret_gp_idx: usize = 0_usize;
     if uses_sret {
         sret_gp_idx = gp_i;
         gp_i = gp_i +% 1_usize;
+        if is_w64 { flt_i = gp_i; }
     }
 
     var env_gp_idx: usize = 99_usize;
@@ -5175,38 +5215,44 @@ fn cg_emit_call(
         match cls {
             .Zst => {}
             .IntReg => {
-                if let _ = gp_arg_reg(is_c, gp_i) {
+                if let _ = gp_arg_reg_abi(is_c, cg.is_win64, gp_i) {
                     try plan.push(alloc, CallArgSlot.{ val: av, ty: aty, cls: cls, is_reg: true, gp_idx: gp_i, flt_idx: 0_usize, stk_off: 0_i32 });
                     gp_i = gp_i +% 1_usize;
+                    if is_w64 { flt_i = gp_i; }
                 } else {
                     try plan.push(alloc, CallArgSlot.{ val: av, ty: aty, cls: cls, is_reg: false, gp_idx: 0_usize, flt_idx: 0_usize, stk_off: stk_bytes.trunc.[i32]() });
                     stk_bytes = stk_bytes +% 8_usize;
                 }
             }
             .TwoIntRegs => {
-                let r0 = gp_arg_reg(is_c, gp_i);
-                let r1 = gp_arg_reg(is_c, gp_i +% 1_usize);
+                let r0 = gp_arg_reg_abi(is_c, cg.is_win64, gp_i);
+                let r1 = gp_arg_reg_abi(is_c, cg.is_win64, gp_i +% 1_usize);
                 if r0 != null && r1 != null {
                     try plan.push(alloc, CallArgSlot.{ val: av, ty: aty, cls: cls, is_reg: true, gp_idx: gp_i, flt_idx: 0_usize, stk_off: 0_i32 });
                     gp_i = gp_i +% 2_usize;
+                    if is_w64 { flt_i = gp_i; }
                 } else {
                     try plan.push(alloc, CallArgSlot.{ val: av, ty: aty, cls: cls, is_reg: false, gp_idx: 0_usize, flt_idx: 0_usize, stk_off: stk_bytes.trunc.[i32]() });
                     stk_bytes = stk_bytes +% 16_usize;
                 }
             }
             .FloatReg => {
-                if let _ = float_arg_reg(flt_i) {
+                let max_flt: usize = if is_w64 { 4_usize } else { 8_usize };
+                let fx = if flt_i < max_flt { float_arg_reg(flt_i) } else { null };
+                if fx != null {
                     try plan.push(alloc, CallArgSlot.{ val: av, ty: aty, cls: cls, is_reg: true, gp_idx: 0_usize, flt_idx: flt_i, stk_off: 0_i32 });
                     flt_i = flt_i +% 1_usize;
+                    if is_w64 { gp_i = flt_i; }
                 } else {
                     try plan.push(alloc, CallArgSlot.{ val: av, ty: aty, cls: cls, is_reg: false, gp_idx: 0_usize, flt_idx: 0_usize, stk_off: stk_bytes.trunc.[i32]() });
                     stk_bytes = stk_bytes +% 8_usize;
                 }
             }
             .ByPtr => {
-                if let _ = gp_arg_reg(is_c, gp_i) {
+                if let _ = gp_arg_reg_abi(is_c, cg.is_win64, gp_i) {
                     try plan.push(alloc, CallArgSlot.{ val: av, ty: aty, cls: cls, is_reg: true, gp_idx: gp_i, flt_idx: 0_usize, stk_off: 0_i32 });
                     gp_i = gp_i +% 1_usize;
+                    if is_w64 { flt_i = gp_i; }
                 } else {
                     try plan.push(alloc, CallArgSlot.{ val: av, ty: aty, cls: cls, is_reg: false, gp_idx: 0_usize, flt_idx: 0_usize, stk_off: stk_bytes.trunc.[i32]() });
                     stk_bytes = stk_bytes +% 8_usize;
@@ -5264,15 +5310,15 @@ fn cg_emit_call(
         if slot.is_reg {
             let lay = env.x64_layout(slot.ty);
             if slot.cls == .IntReg {
-                if let r = gp_arg_reg(is_c, slot.gp_idx) {
+                if let r = gp_arg_reg_abi(is_c, cg.is_win64, slot.gp_idx) {
                     try cg_load_scalar_val(alloc, cg, eir_prog, env, slot.val, r);
                 }
             } else if slot.cls == .TwoIntRegs {
                 let soff = cg_val_stack_off(cg, slot.val);
-                if let r0 = gp_arg_reg(is_c, slot.gp_idx) {
+                if let r0 = gp_arg_reg_abi(is_c, cg.is_win64, slot.gp_idx) {
                     try cg.buf.load_mem(alloc, r0, .Rbp, soff, 8_usize, false);
                 }
-                if let r1 = gp_arg_reg(is_c, slot.gp_idx +% 1_usize) {
+                if let r1 = gp_arg_reg_abi(is_c, cg.is_win64, slot.gp_idx +% 1_usize) {
                     if lay.size > 8_usize {
                         try cg.buf.load_mem(alloc, r1, .Rbp, soff +% 8_i32, lay.size - 8_usize, false);
                     } else {
@@ -5289,7 +5335,7 @@ fn cg_emit_call(
                     }
                 }
             } else if slot.cls == .ByPtr {
-                if let r = gp_arg_reg(is_c, slot.gp_idx) {
+                if let r = gp_arg_reg_abi(is_c, cg.is_win64, slot.gp_idx) {
                     try cg_val_addr_into(alloc, cg, slot.val, r);
                 }
             }
@@ -5299,7 +5345,7 @@ fn cg_emit_call(
 
     // 3. Populate hidden sret, closure env, or dyn data_ptr + indirect target in Rax
     if uses_sret {
-        if let sr = gp_arg_reg(is_c, sret_gp_idx) {
+        if let sr = gp_arg_reg_abi(is_c, cg.is_win64, sret_gp_idx) {
             if dst == eir.EIR_NONE {
                 try cg.buf.lea_mem(alloc, sr, .Rsp, stk_bytes.trunc.[i32]());
             } else {
@@ -10920,6 +10966,108 @@ fn emit_linux_start_into(
     return out_buf.finish();
 }
 
+/// Emit Win64 PE32+ entry point (`mainCRTStartup`) setting up `Env`/`AllocCap`, calling Eon `main`, and calling `ExitProcess`.
+fn emit_win64_start_into(
+    alloc: *mut AllocCap,
+    main_fid: u32,
+    eir_prog: *eir.EirProgram,
+    env: *types.TypeEnv,
+    interner: *mut span.SymInterner,
+    out_buf: *mut x64_asm.X64Buf,
+) -> bool ! OutOfMemory {
+    out_buf.clear();
+    let mf = eir_prog.get_fn(main_fid) orelse { return false; };
+    // At entry to PE32+ entry point, RSP is 8 mod 16; `push rbp` aligns RSP to 0 mod 16.
+    try out_buf.push(alloc, .Rbp);
+    try out_buf.mov_rr(alloc, .Rbp, .Rsp);
+    try out_buf.sub_ri32(alloc, .Rsp, 128_i32); // 32B shadow space + 96B Env/AllocCap
+    try out_buf.xor_rr32(alloc, .Rax, .Rax);
+    var off: i32 = 32_i32;
+    while off < 128_i32 {
+        try out_buf.store_mem(alloc, .Rsp, off, .Rax, 8_usize);
+        off = off +% 8_i32;
+    }
+    let sig_ps = env.params_range(mf.sig.params);
+    if mf.params.len == 1_u32 && sig_ps.len >= 1_usize {
+        try out_buf.lea_mem(alloc, .Rdi, .Rsp, 32_i32);
+    }
+    let main_sym = try fn_sym_name_id(alloc, mf.key, eir_prog, interner);
+    try out_buf.call_sym(alloc, main_sym);
+
+    let rn = env.get(mf.sig.ret);
+    if rn.kind == .Int {
+        try out_buf.mov_rr(alloc, .Rcx, .Rax);
+    } else if rn.kind == .ErrorUnion {
+        let l_err = try out_buf.new_label(alloc);
+        let l_done = try out_buf.new_label(alloc);
+        try out_buf.jcc_label(alloc, .B, l_err);
+        if rn.primary == types.TY_VOID || rn.primary == types.TY_NEVER {
+            try out_buf.xor_rr32(alloc, .Rcx, .Rcx);
+        } else {
+            try out_buf.mov_rr(alloc, .Rcx, .Rax);
+        }
+        try out_buf.jmp_label(alloc, l_done);
+        out_buf.bind_label(l_err);
+        try out_buf.mov_rr(alloc, .Rcx, .R15);
+        out_buf.bind_label(l_done);
+    } else {
+        try out_buf.xor_rr32(alloc, .Rcx, .Rcx);
+    }
+    let s_exit = try interner.intern_str(alloc, "ExitProcess");
+    try out_buf.call_sym(alloc, s_exit);
+    try out_buf.ud2(alloc);
+    return out_buf.finish();
+}
+
+/// Emit Darwin x86_64 `_main(argc=rdi, argv=rsi) -> exit_code=rax` entry point.
+fn emit_darwin_x64_start_into(
+    alloc: *mut AllocCap,
+    main_fid: u32,
+    eir_prog: *eir.EirProgram,
+    env: *types.TypeEnv,
+    interner: *mut span.SymInterner,
+    out_buf: *mut x64_asm.X64Buf,
+) -> bool ! OutOfMemory {
+    out_buf.clear();
+    let mf = eir_prog.get_fn(main_fid) orelse { return false; };
+    try out_buf.push(alloc, .Rbp);
+    try out_buf.mov_rr(alloc, .Rbp, .Rsp);
+    try out_buf.sub_ri32(alloc, .Rsp, 96_i32);
+    try out_buf.xor_rr32(alloc, .Rax, .Rax);
+    var off: i32 = 0_i32;
+    while off < 96_i32 {
+        try out_buf.store_mem(alloc, .Rsp, off, .Rax, 8_usize);
+        off = off +% 8_i32;
+    }
+    try out_buf.store_mem(alloc, .Rsp, 72_i32, .Rdi, 8_usize);
+    try out_buf.store_mem(alloc, .Rsp, 80_i32, .Rsi, 8_usize);
+    let sig_ps = env.params_range(mf.sig.params);
+    if mf.params.len == 1_u32 && sig_ps.len >= 1_usize {
+        try out_buf.mov_rr(alloc, .Rdi, .Rsp);
+    }
+    let main_sym = try fn_sym_name_id(alloc, mf.key, eir_prog, interner);
+    try out_buf.call_sym(alloc, main_sym);
+    let rn = env.get(mf.sig.ret);
+    if rn.kind == .ErrorUnion {
+        let l_err = try out_buf.new_label(alloc);
+        let l_done = try out_buf.new_label(alloc);
+        try out_buf.jcc_label(alloc, .B, l_err);
+        if rn.primary == types.TY_VOID || rn.primary == types.TY_NEVER {
+            try out_buf.xor_rr32(alloc, .Rax, .Rax);
+        }
+        try out_buf.jmp_label(alloc, l_done);
+        out_buf.bind_label(l_err);
+        try out_buf.mov_rr(alloc, .Rax, .R15);
+        out_buf.bind_label(l_done);
+    } else if rn.kind != .Int {
+        try out_buf.xor_rr32(alloc, .Rax, .Rax);
+    }
+    try out_buf.add_ri32(alloc, .Rsp, 96_i32);
+    try out_buf.pop(alloc, .Rbp);
+    try out_buf.ret(alloc);
+    return out_buf.finish();
+}
+
 fn emit_dyn_vtables_x64(
     alloc: *mut AllocCap,
     eir_prog: *eir.EirProgram,
@@ -11337,6 +11485,7 @@ fn expand_rt_helper_deps(
 fn emit_rt_helpers_and_bss(
     alloc: *mut AllocCap,
     interner: *mut span.SymInterner,
+    target_os: target.TargetOs,
     helper_queue: *mut col.DynBuf[u32],
     helper_seen: *mut col.HashMap[u32],
     input: *mut elf64.ElfLinkInput,
@@ -11346,12 +11495,20 @@ fn emit_rt_helpers_and_bss(
 
     var hbuf = try x64_asm.X64Buf.init(alloc);
     errdefer hbuf.destroy(alloc);
-    let hq = helper_queue.as_slice();
     var hi: usize = 0_usize;
-    while hi < hq.len {
+    while hi < helper_queue.len() {
+        let hq = helper_queue.as_slice();
+        if hi >= hq.len { break; }
         let hsym = hq[hi];
+        hi = hi +% 1_usize;
         let hname = interner.get(hsym);
-        let ok = try x64_asm.emit_rt_helper_by_name(alloc, hname, interner, &mut hbuf);
+        let ok = if target_os == .Windows {
+            try x64_asm.emit_win64_rt_helper_by_name(alloc, hname, interner, &mut hbuf)
+        } else if target_os == .MacOS || target_os == .IOS {
+            try x64_asm.emit_darwin_x64_rt_helper_by_name(alloc, hname, interner, &mut hbuf)
+        } else {
+            try x64_asm.emit_rt_helper_by_name(alloc, hname, interner, &mut hbuf)
+        };
         if ok {
             try pad_dyn_u8(alloc, &mut input.text, 16_usize);
             let hoff = input.text.len().widen.[u64]();
@@ -11366,18 +11523,25 @@ fn emit_rt_helpers_and_bss(
             let hrels = hbuf.relocs.as_slice();
             var ri: usize = 0_usize;
             while ri < hrels.len {
+                let r = hrels[ri];
                 try input.relocs.push(alloc, elf64.ElfReloc.{
                     section: .Text,
-                    offset: hoff +% hrels[ri].offset.widen.[u64](),
-                    kind: x64_reloc_to_elf(hrels[ri].kind),
-                    target_sym: hrels[ri].sym_id,
-                    addend: hrels[ri].addend,
+                    offset: hoff +% r.offset.widen.[u64](),
+                    kind: x64_reloc_to_elf(r.kind),
+                    target_sym: r.sym_id,
+                    addend: r.addend,
                 });
+                if is_builtin_rt_helper(interner.get(r.sym_id)) {
+                    let dk = r.sym_id.widen.[u64]();
+                    if !helper_seen.contains(dk) {
+                        try helper_seen.insert(alloc, dk, 1_u32);
+                        try helper_queue.push(alloc, r.sym_id);
+                    }
+                }
                 ri = ri +% 1_usize;
             }
             try input.text.push_slice(alloc, hbuf.code.as_slice());
         }
-        hi = hi +% 1_usize;
     }
     hbuf.destroy(alloc);
     return;
@@ -11592,13 +11756,7 @@ fn auto_cg_workers(jobs: u32, n_fns: usize) -> usize {
     if n_fns < 32_usize {
         return 1_usize;
     }
-    if n_fns < 192_usize {
-        return 4_usize;
-    }
-    if n_fns < 480_usize {
-        return 8_usize;
-    }
-    return 12_usize;
+    return 4_usize;
 }
 
 /// Builds deterministic bottom-up topological waves of compilable EIR functions.
@@ -11874,6 +12032,37 @@ fn try_compile_fn_optimized_core(
     out_has_ipra.* = false;
     out_ipra_gprs.* = 0xFFFFFFFF_u32;
     out_ipra_xmms.* = 0xFFFFFFFF_u32;
+
+    if opts.target_spec.abi == .Win64 {
+        // Route Win64 C ABI callbacks and Win32 API callers through the exact Win64 C ABI codegen path.
+        if let f = eir_prog.get_fn(fn_id) {
+            if f.sig.effects.is_export_c { return false; }
+            let blks = eir_prog.fn_blocks(fn_id);
+            var bi: usize = 0_usize;
+            while bi < blks.len {
+                let insts = eir_prog.insts_slice(blks[bi].insts);
+                var ii: usize = 0_usize;
+                while ii < insts.len {
+                    if insts[ii].kind == .Call {
+                        if let cd = eir_prog.get_call(insts[ii].aux0) {
+                            if cd.callee.kind == .ExternFn && !is_builtin_rt_helper(interner.get(cd.callee.b)) {
+                                return false;
+                            }
+                            if cd.callee.kind == .DirectFn {
+                                if let cfid = eir_prog.find_fn_by_key(cfg_ir.fn_key_top_def(cd.callee.a)) {
+                                    if let cf = eir_prog.get_fn(cfid) {
+                                        if cf.sig.effects.is_export_c { return false; }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ii = ii +% 1_usize;
+                }
+                bi = bi +% 1_usize;
+            }
+        }
+    }
 
     var mf = try mach_ir.MachFunc.init_for_target(alloc, fn_sym, fn_id, opts.target_spec);
     errdefer mf.destroy(alloc);
@@ -13628,10 +13817,96 @@ fn compile_and_link_impl(
         return CompileResult.{ ok: false, elf: empty_elf, err_msg: stk_err };
     }
 
-    // 2. Emit Linux `_start` entry wrapper for `LinuxPie` or set entry symbol for `Freestanding`
+    let is_windows = opts.target_spec.os == .Windows;
+    let is_darwin = opts.target_spec.is_darwin();
+    let is_android = opts.target_spec.os == .Android;
+    if is_android {
+        input.mode = elf64.ElfMode.linux_shared(0_u32, 0_u32).with_arch(.X86_64);
+        try input.set_soname(alloc, "libmain.so".as_bytes());
+        var bli: usize = 0_usize;
+        while bli < 4_usize {
+            let lname: *str = if bli == 0_usize { "libc.so" } else if bli == 1_usize { "libandroid.so" } else if bli == 2_usize { "liblog.so" } else { "libvulkan.so" };
+            let lsym = try interner.intern_str(alloc, lname);
+            var dup = false;
+            let nl = input.needed_libs.as_slice();
+            var nli: usize = 0_usize;
+            while nli < nl.len {
+                if nl[nli] == lsym { dup = true; break; }
+                nli = nli +% 1_usize;
+            }
+            if !dup { try input.needed_libs.push(alloc, lsym); }
+            bli = bli +% 1_usize;
+        }
+    }
+
+    // 2. Emit OS entry wrapper (`_start` LinuxPie, `mainCRTStartup` Win64, `_main` Darwin) or Freestanding entry
     var captured_start = false;
     if let entry_fid = find_entry_fn_id(eir_prog, prog, interner, opts.mode) {
-        if opts.mode.kind == .LinuxPie {
+        if is_windows && !opts.target_spec.is_shared && opts.mode.kind != .LinuxShared {
+            var sbuf = try x64_asm.X64Buf.init(alloc);
+            errdefer sbuf.destroy(alloc);
+            let s_ok = try emit_win64_start_into(alloc, entry_fid, eir_prog, env, interner, &mut sbuf);
+            if s_ok {
+                try pad_dyn_u8(alloc, &mut input.text, 16_usize);
+                let soff = input.text.len().widen.[u64]();
+                let start_sym = try interner.intern_str(alloc, "mainCRTStartup");
+                input.entry_sym = start_sym;
+                try input.symbols.push(alloc, elf64.ElfSymbol.{
+                    name_sym: start_sym,
+                    section: .Text,
+                    offset: soff,
+                    size: sbuf.code.len().widen.[u64](),
+                    is_global: true,
+                    is_func: true,
+                });
+                let srels = sbuf.relocs.as_slice();
+                var sri: usize = 0_usize;
+                while sri < srels.len {
+                    try input.relocs.push(alloc, elf64.ElfReloc.{
+                        section: .Text,
+                        offset: soff +% srels[sri].offset.widen.[u64](),
+                        kind: x64_reloc_to_elf(srels[sri].kind),
+                        target_sym: srels[sri].sym_id,
+                        addend: srels[sri].addend,
+                    });
+                    sri = sri +% 1_usize;
+                }
+                try input.text.push_slice(alloc, sbuf.code.as_slice());
+            }
+            sbuf.destroy(alloc);
+        } else if is_darwin && !opts.target_spec.is_shared && opts.mode.kind != .LinuxShared {
+            var sbuf = try x64_asm.X64Buf.init(alloc);
+            errdefer sbuf.destroy(alloc);
+            let s_ok = try emit_darwin_x64_start_into(alloc, entry_fid, eir_prog, env, interner, &mut sbuf);
+            if s_ok {
+                try pad_dyn_u8(alloc, &mut input.text, 16_usize);
+                let soff = input.text.len().widen.[u64]();
+                let start_sym = try interner.intern_str(alloc, "_main");
+                input.entry_sym = start_sym;
+                try input.symbols.push(alloc, elf64.ElfSymbol.{
+                    name_sym: start_sym,
+                    section: .Text,
+                    offset: soff,
+                    size: sbuf.code.len().widen.[u64](),
+                    is_global: true,
+                    is_func: true,
+                });
+                let srels = sbuf.relocs.as_slice();
+                var sri: usize = 0_usize;
+                while sri < srels.len {
+                    try input.relocs.push(alloc, elf64.ElfReloc.{
+                        section: .Text,
+                        offset: soff +% srels[sri].offset.widen.[u64](),
+                        kind: x64_reloc_to_elf(srels[sri].kind),
+                        target_sym: srels[sri].sym_id,
+                        addend: srels[sri].addend,
+                    });
+                    sri = sri +% 1_usize;
+                }
+                try input.text.push_slice(alloc, sbuf.code.as_slice());
+            }
+            sbuf.destroy(alloc);
+        } else if opts.mode.kind == .LinuxPie {
             var sbuf = try x64_asm.X64Buf.init(alloc);
             errdefer sbuf.destroy(alloc);
             var start_helpers = try col.DynBuf.[u32].init(alloc, 8_usize);
@@ -13699,13 +13974,13 @@ fn compile_and_link_impl(
 
     // 3. Emit dynamic vtables & FnRef thunks
     try emit_dyn_vtables_x64(alloc, eir_prog, env, interner, &mut input);
-    try emit_fnref_thunks_x64(alloc, eir_prog, env, interner, opts.mode.kind != .Freestanding, all_fnref_thunks.as_slice(), &mut input);
+    try emit_fnref_thunks_x64(alloc, eir_prog, env, interner, opts.mode.kind != .Freestanding && !is_windows && !is_darwin, all_fnref_thunks.as_slice(), &mut input);
 
     // 4. Emit runtime `.bss` symbols and tree-shaken runtime helpers
-    try emit_rt_helpers_and_bss(alloc, interner, &mut helper_queue, &mut helper_seen, &mut input);
+    try emit_rt_helpers_and_bss(alloc, interner, opts.target_spec.os, &mut helper_queue, &mut helper_seen, &mut input);
 
     // 5. Collect LinuxShared exports & external dynamic PLT/GOT symbols
-    try populate_shared_exports_and_externals(alloc, eir_prog, interner, opts.mode, &mut input);
+    try populate_shared_exports_and_externals(alloc, eir_prog, interner, input.mode, &mut input);
 
     if let cap = capture_opt {
         if !cap_ok || !captured_start || all_fnref_thunks.len() > 0_usize || input.external_syms.len() > 0_usize || has_sched {
@@ -13713,10 +13988,16 @@ fn compile_and_link_impl(
         }
     }
 
-    // 6. Release EIR pools before link-time GC+ICF & ELF64 emission to minimize Peak RSS
+    // 6. Release EIR pools before link-time GC+ICF & native executable emission to minimize Peak RSS
     try eir_prog.release_pools(alloc);
     try elf64.gc_and_icf_link_input(alloc, &mut input, interner, opts.opt.opt_level >= 2_u8 || opts.opt.opt_size);
-    let link_res = try elf64.link_elf64(alloc, &input, interner);
+    let link_res = if is_windows {
+        try pe_coff.link_pe64(alloc, &input, interner, opts.target_spec, opts.win_gui)
+    } else if is_darwin {
+        try macho.link_macho64(alloc, &input, interner, opts.target_spec)
+    } else {
+        try elf64.link_elf64(alloc, &input, interner)
+    };
     stk_err.destroy(alloc);
     wave_ranges.destroy(alloc);
     fn_order.destroy(alloc);
@@ -13948,7 +14229,7 @@ impl IncLinkSession {
             &mut helper_seen,
             &mut all_fnref_thunks,
         );
-        try emit_rt_helpers_and_bss(alloc, interner, &mut helper_queue, &mut helper_seen, &mut input);
+        try emit_rt_helpers_and_bss(alloc, interner, .Linux, &mut helper_queue, &mut helper_seen, &mut input);
         try elf64.gc_and_icf_link_input(alloc, &mut input, interner, enable_icf);
         let link_res = try elf64.link_elf64(alloc, &input, interner);
 

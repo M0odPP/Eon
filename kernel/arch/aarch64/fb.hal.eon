@@ -1,0 +1,223 @@
+module kernel.arch.aarch64.fb @hal;
+
+// ============================================================================
+// AArch64 Freestanding Linear Framebuffer (QEMU `virt` `fw_cfg` + `etc/ramfb`)
+// + PL011 UART + PSCI SYSTEM_OFF + Static Bump Allocator for `nostd` UI
+// ============================================================================
+
+const PL011_UART_BASE: u64 = 0x09000000_u64;
+const FW_CFG_BASE: u64 = 0x09020000_u64;
+const FW_CFG_DMA_REG: u64 = FW_CFG_BASE +% 0x10_u64;
+const RAMFB_PHYS_ADDR: u64 = 0x44000000_u64; // 64 MiB into virt RAM (well above kernel)
+const DMA_SCRATCH_ADDR: u64 = 0x43F00000_u64;
+const FW_DIR_BUF_ADDR: u64 = 0x43F01000_u64;
+
+const FW_CFG_DMA_CTL_READ: u32 = 0x02_u32;
+const FW_CFG_DMA_CTL_SELECT: u32 = 0x08_u32;
+const FW_CFG_DMA_CTL_WRITE: u32 = 0x10_u32;
+const FW_CFG_FILE_DIR_SEL: u32 = 0x0019_u32;
+
+pub struct LinearFbInfo {
+    pub base_addr: u64;
+    pub width: u32;
+    pub height: u32;
+    pub pitch_bytes: u32;
+    pub bpp: u8;
+    pub is_bgr: bool;
+}
+
+@inline
+fn bswap32(v: u32) -> u32 {
+    return ((v & 0x000000FF_u32) << 24_u32)
+        | ((v & 0x0000FF00_u32) << 8_u32)
+        | ((v & 0x00FF0000_u32) >> 8_u32)
+        | ((v & 0xFF000000_u32) >> 24_u32);
+}
+
+@inline
+fn bswap64(v: u64) -> u64 {
+    let lo = bswap32((v & 0xFFFFFFFF_u64).trunc.[u32]()).widen.[u64]();
+    let hi = bswap32(((v >> 32_u64) & 0xFFFFFFFF_u64).trunc.[u32]()).widen.[u64]();
+    return (lo << 32_u64) | hi;
+}
+
+@inline
+fn bswap16(v: u16) -> u16 {
+    return ((v & 0xFF_u16) << 8_u16) | ((v >> 8_u16) & 0xFF_u16);
+}
+
+fn mmio_write32(addr: u64, val: u32) {
+    raw {
+        let p = rawptr_mut.[u32].from_usize(addr.trunc.[usize]());
+        p.* = val;
+        asm("dmb sy");
+    }
+}
+
+fn mmio_read32(addr: u64) -> u32 {
+    raw {
+        let p = rawptr.[u32].from_usize(addr.trunc.[usize]());
+        let v = p.*;
+        asm("dmb sy");
+        return v;
+    }
+}
+
+fn mmio_write64(addr: u64, val: u64) {
+    raw {
+        let p = rawptr_mut.[u64].from_usize(addr.trunc.[usize]());
+        p.* = val;
+        asm("dmb sy");
+    }
+}
+
+fn fw_cfg_dma(control: u32, length: u32, data_phys: u64) {
+    // FWCfgDmaAccess { control: be32, length: be32, address: be64 } at DMA_SCRATCH_ADDR
+    mmio_write32(DMA_SCRATCH_ADDR, bswap32(control));
+    mmio_write32(DMA_SCRATCH_ADDR +% 4_u64, bswap32(length));
+    mmio_write64(DMA_SCRATCH_ADDR +% 8_u64, bswap64(data_phys));
+    mmio_write64(FW_CFG_DMA_REG, bswap64(DMA_SCRATCH_ADDR));
+    var spin: u32 = 0_u32;
+    while mmio_read32(DMA_SCRATCH_ADDR) != 0_u32 && spin < 1000000_u32 {
+        spin = spin +% 1_u32;
+    }
+}
+
+fn mem_read8(addr: u64) -> u8 {
+    raw {
+        return rawptr.[u8].from_usize(addr.trunc.[usize]()).*;
+    }
+}
+
+fn mem_read16(addr: u64) -> u16 {
+    raw {
+        return rawptr.[u16].from_usize(addr.trunc.[usize]()).*;
+    }
+}
+
+fn find_ramfb_selector() -> u16 {
+    // Read file count (4 bytes BE)
+    fw_cfg_dma(FW_CFG_DMA_CTL_SELECT | FW_CFG_DMA_CTL_READ | (FW_CFG_FILE_DIR_SEL << 16_u32), 4_u32, FW_DIR_BUF_ADDR);
+    let count = bswap32(mmio_read32(FW_DIR_BUF_ADDR));
+    if count == 0_u32 || count > 128_u32 {
+        return 0_u16;
+    }
+    let total_bytes = 4_u32 +% count *% 64_u32;
+    fw_cfg_dma(FW_CFG_DMA_CTL_SELECT | FW_CFG_DMA_CTL_READ | (FW_CFG_FILE_DIR_SEL << 16_u32), total_bytes, FW_DIR_BUF_ADDR);
+    let target = "etc/ramfb".as_bytes();
+    var i: u32 = 0_u32;
+    while i < count {
+        let entry = FW_DIR_BUF_ADDR +% 4_u64 +% i.widen.[u64]() *% 64_u64;
+        var match_ok = true;
+        var k: usize = 0_usize;
+        while k < target.len {
+            let b = mem_read8(entry +% 8_u64 +% k.widen.[u64]());
+            if b != target[k] {
+                match_ok = false;
+                break;
+            }
+            k = k +% 1_usize;
+        }
+        let nul_b = mem_read8(entry +% 8_u64 +% target.len.widen.[u64]());
+        if match_ok && nul_b == 0_u8 {
+            let sel_be = mem_read16(entry +% 4_u64);
+            return bswap16(sel_be);
+        }
+        i = i +% 1_u32;
+    }
+    return 0_u16;
+}
+
+/// Configure QEMU `virt` `etc/ramfb` linear framebuffer (`width x height x 32bpp` XRGB8888).
+pub fn init_framebuffer(width: u32, height: u32) -> LinearFbInfo {
+    let sel = find_ramfb_selector();
+    let cfg_addr = DMA_SCRATCH_ADDR +% 64_u64;
+    let pitch = width *% 4_u32;
+    if sel != 0_u16 {
+        // RamfbCfg { addr: be64, fourcc: be32('XR24'=0x34325258), flags: be32(0), width: be32, height: be32, stride: be32 }
+        mmio_write64(cfg_addr, bswap64(RAMFB_PHYS_ADDR));
+        mmio_write32(cfg_addr +% 8_u64, bswap32(0x34325258_u32));
+        mmio_write32(cfg_addr +% 12_u64, 0_u32);
+        mmio_write32(cfg_addr +% 16_u64, bswap32(width));
+        mmio_write32(cfg_addr +% 20_u64, bswap32(height));
+        mmio_write32(cfg_addr +% 24_u64, bswap32(pitch));
+        fw_cfg_dma(FW_CFG_DMA_CTL_SELECT | FW_CFG_DMA_CTL_WRITE | (sel.widen.[u32]() << 16_u32), 28_u32, cfg_addr);
+    }
+    return LinearFbInfo.{
+        base_addr: RAMFB_PHYS_ADDR,
+        width: width,
+        height: height,
+        pitch_bytes: pitch,
+        bpp: 32_u8,
+        is_bgr: true,
+    };
+}
+
+pub fn put_pixel(fb: *LinearFbInfo, x: u32, y: u32, argb: u32) {
+    if x >= fb.width || y >= fb.height || fb.base_addr == 0_u64 { return; }
+    let off = y.widen.[u64]() *% fb.pitch_bytes.widen.[u64]() +% x.widen.[u64]() *% 4_u64;
+    raw {
+        let ptr = rawptr_mut.[u32].from_usize((fb.base_addr +% off).trunc.[usize]());
+        ptr.* = argb;
+    }
+}
+
+pub fn read_pixel(fb: *LinearFbInfo, x: u32, y: u32) -> u32 {
+    if x >= fb.width || y >= fb.height || fb.base_addr == 0_u64 { return 0_u32; }
+    let off = y.widen.[u64]() *% fb.pitch_bytes.widen.[u64]() +% x.widen.[u64]() *% 4_u64;
+    raw {
+        let ptr = rawptr.[u32].from_usize((fb.base_addr +% off).trunc.[usize]());
+        return ptr.*;
+    }
+}
+
+pub fn serial_write(s: *str) {
+    let bs = s.as_bytes();
+    var i: usize = 0_usize;
+    while i < bs.len {
+        var spin: u32 = 0_u32;
+        while (mmio_read32(PL011_UART_BASE +% 0x18_u64) & 0x20_u32) != 0_u32 && spin < 100000_u32 {
+            spin = spin +% 1_u32;
+        }
+        mmio_write32(PL011_UART_BASE, bs[i].widen.[u32]());
+        i = i +% 1_usize;
+    }
+}
+
+@naked
+fn psci_hvc0(_fn_id: u64) {
+    raw {
+        asm("hvc #0; ret", options(noreturn));
+    }
+}
+
+pub fn qemu_exit() {
+    // PSCI_0_2_FN_SYSTEM_OFF = 0x84000008
+    psci_hvc0(0x84000008_u64);
+    loop { raw { asm("wfe"); } }
+}
+
+/// Static bump allocator over fixed physical RAM for `nostd` UI / software rasterizer.
+pub struct StaticHeap {
+    pub cursor: u64;
+    pub limit: u64;
+    pub used: u64;
+}
+
+impl StaticHeap {
+    pub fn init(base_phys: u64, size_bytes: u64) -> StaticHeap {
+        return StaticHeap.{ cursor: base_phys, limit: base_phys +% size_bytes, used: 0_u64 };
+    }
+
+    pub fn alloc_aligned(self: *mut Self, size: u64, align: u64) -> u64 {
+        let a: u64 = if align < 16_u64 { 16_u64 } else { align };
+        let rem = self.cursor % a;
+        let aligned = if rem == 0_u64 { self.cursor } else { self.cursor +% (a - rem) };
+        if aligned +% size > self.limit {
+            return 0_u64;
+        }
+        self.cursor = aligned +% size;
+        self.used = self.used +% size;
+        return aligned;
+    }
+}

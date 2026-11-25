@@ -8,9 +8,11 @@ import eonc.types;
 import eonc.ctvm;
 import eonc.cfg_ir;
 import eonc.eir;
+import eonc.target;
 import eonc.x64_asm;
 import eonc.a64_asm;
 import eonc.elf64;
+import eonc.macho;
 import eonc.mach_ir;
 import eonc.mach_regalloc;
 import eonc.mach_opt_a64;
@@ -502,6 +504,7 @@ fn append_a64_blob_to_link(
 fn emit_a64_rt_helpers_and_bss(
     alloc: *mut AllocCap,
     interner: *mut span.SymInterner,
+    target_os: target.TargetOs,
     helper_queue: *mut col.DynBuf[u32],
     helper_seen: *mut col.HashMap[u32],
     input: *mut elf64.ElfLinkInput,
@@ -529,7 +532,8 @@ fn emit_a64_rt_helpers_and_bss(
         bi = bi +% 1_usize;
     }
 
-    // Emit all needed AArch64 runtime helpers (expanding transitive helper calls like print_f32 -> print_i64)
+    let is_darwin = target_os == .MacOS || target_os == .IOS;
+    // Emit all needed AArch64 runtime helpers (expanding transitive helper calls)
     var hbuf = try a64_asm.A64Buf.init(alloc);
     errdefer hbuf.destroy(alloc);
     var hi: usize = 0_usize;
@@ -539,7 +543,11 @@ fn emit_a64_rt_helpers_and_bss(
         let hsym = hqs[hi];
         hi = hi +% 1_usize;
         hbuf.clear();
-        let ok = try a64_asm.emit_a64_rt_helper_by_name(alloc, interner.get(hsym), interner, &mut hbuf);
+        let ok = if is_darwin {
+            try a64_asm.emit_a64_darwin_rt_helper_by_name(alloc, interner.get(hsym), interner, &mut hbuf)
+        } else {
+            try a64_asm.emit_a64_rt_helper_by_name(alloc, interner.get(hsym), interner, &mut hbuf)
+        };
         if ok {
             try pad_dyn_u8(alloc, &mut input.text, 4_usize);
             let hoff = input.text.len().widen.[u64]();
@@ -562,7 +570,7 @@ fn emit_a64_rt_helpers_and_bss(
                     target_sym: r.sym_id,
                     addend: r.addend,
                 });
-                if r.kind == .A64Call26 && mach_isel_a64.a64_is_builtin_rt_helper(interner.get(r.sym_id)) {
+                if (r.kind == .A64Call26 || r.kind == .A64Jump26) && mach_isel_a64.a64_is_builtin_rt_helper(interner.get(r.sym_id)) {
                     let dk = r.sym_id.widen.[u64]();
                     if !helper_seen.contains(dk) {
                         try helper_seen.insert(alloc, dk, 1_u32);
@@ -577,6 +585,54 @@ fn emit_a64_rt_helpers_and_bss(
     hbuf.destroy(alloc);
     bss_syms.destroy(alloc);
     return;
+}
+
+/// Emit Darwin AArch64 `_main(argc=x0, argv=x1) -> exit_code=x0` entry wrapper.
+fn emit_a64_darwin_main(
+    alloc: *mut AllocCap,
+    main_fid: u32,
+    eir_prog: *eir.EirProgram,
+    env: *types.TypeEnv,
+    interner: *mut span.SymInterner,
+    out: *mut a64_asm.A64Buf,
+) -> bool ! OutOfMemory {
+    out.clear();
+    let mf = eir_prog.get_fn(main_fid) orelse { return false; };
+    try out.stp64_pre(alloc, a64_asm.X29_FP, a64_asm.X30_LR, a64_asm.SP, -112_i32);
+    try out.mov_rr(alloc, a64_asm.X29_FP, a64_asm.SP);
+    // Zero Env/AllocCap buffer at [sp + 16..112)
+    var off: i32 = 16_i32;
+    while off < 112_i32 {
+        try out.store_mem(alloc, a64_asm.SP, off, a64_asm.XZR, 8_u8, a64_asm.X16);
+        off = off +% 8_i32;
+    }
+    // Store argc/argv into Env (offsets 72/80)
+    try out.store_mem(alloc, a64_asm.SP, 16_i32 +% 72_i32, a64_asm.X0, 8_u8, a64_asm.X16);
+    try out.store_mem(alloc, a64_asm.SP, 16_i32 +% 80_i32, a64_asm.X1, 8_u8, a64_asm.X16);
+    let sig_ps = env.params_range(mf.sig.params);
+    if mf.params.len == 1_u32 && sig_ps.len >= 1_usize {
+        try out.add_imm(alloc, true, false, a64_asm.X0, a64_asm.SP, 16_u16, false);
+    }
+    let main_sym = try mach_isel_a64.a64_fn_sym_name_id(alloc, mf.key, eir_prog, interner);
+    try out.bl_sym(alloc, main_sym);
+    let rn = env.get(mf.sig.ret);
+    if rn.kind == .ErrorUnion {
+        let l_ok = try out.new_label(alloc);
+        try out.cbz_label(alloc, true, a64_asm.X8, l_ok);
+        try out.mov_rr(alloc, a64_asm.X0, a64_asm.X8);
+        out.bind_label(l_ok);
+        if rn.primary == types.TY_VOID || rn.primary == types.TY_NEVER {
+            let l_nz = try out.new_label(alloc);
+            try out.cbnz_label(alloc, true, a64_asm.X8, l_nz);
+            try out.mov_imm64(alloc, a64_asm.X0, 0_u64);
+            out.bind_label(l_nz);
+        }
+    } else if rn.kind != .Int {
+        try out.mov_imm64(alloc, a64_asm.X0, 0_u64);
+    }
+    try out.ldp64_post(alloc, a64_asm.X29_FP, a64_asm.X30_LR, a64_asm.SP, 112_i32);
+    try out.ret(alloc);
+    return out.finish();
 }
 
 fn populate_a64_exports_and_externals(
@@ -738,9 +794,62 @@ pub fn compile_and_link_a64(
         return mach_x64.CompileResult.{ ok: false, elf: empty_elf, err_msg: err_msg };
     }
 
-    // Emit `_start` for LinuxPie or set entry symbol for Freestanding
+    let is_darwin = opts.target_spec.is_darwin();
+    let is_android = opts.target_spec.os == .Android;
+    if is_android {
+        input.mode = elf64.ElfMode.linux_shared(0_u32, 0_u32).with_arch(.AArch64);
+        try input.set_soname(alloc, "libmain.so".as_bytes());
+        var bli: usize = 0_usize;
+        while bli < 4_usize {
+            let lname: *str = if bli == 0_usize { "libc.so" } else if bli == 1_usize { "libandroid.so" } else if bli == 2_usize { "liblog.so" } else { "libvulkan.so" };
+            let lsym = try interner.intern_str(alloc, lname);
+            var dup = false;
+            let nl = input.needed_libs.as_slice();
+            var nli: usize = 0_usize;
+            while nli < nl.len {
+                if nl[nli] == lsym { dup = true; break; }
+                nli = nli +% 1_usize;
+            }
+            if !dup { try input.needed_libs.push(alloc, lsym); }
+            bli = bli +% 1_usize;
+        }
+    }
+
+    // Emit `_start` for LinuxPie, `_main` for Darwin, or set entry symbol for Freestanding
     if let entry_fid = find_entry_fn_id(eir_prog, prog, interner, input.mode) {
-        if input.mode.kind == .LinuxPie {
+        if is_darwin && !opts.target_spec.is_shared && input.mode.kind != .LinuxShared {
+            var sbuf = try a64_asm.A64Buf.init(alloc);
+            errdefer sbuf.destroy(alloc);
+            let s_ok = try emit_a64_darwin_main(alloc, entry_fid, eir_prog, env, interner, &mut sbuf);
+            if s_ok {
+                try pad_dyn_u8(alloc, &mut input.text, 4_usize);
+                let soff = input.text.len().widen.[u64]();
+                let main_sym = try interner.intern_str(alloc, "_main");
+                input.entry_sym = main_sym;
+                try input.symbols.push(alloc, elf64.ElfSymbol.{
+                    name_sym: main_sym,
+                    section: .Text,
+                    offset: soff,
+                    size: sbuf.code.len().widen.[u64](),
+                    is_global: true,
+                    is_func: true,
+                });
+                let srels = sbuf.relocs.as_slice();
+                var sri: usize = 0_usize;
+                while sri < srels.len {
+                    try input.relocs.push(alloc, elf64.ElfReloc.{
+                        section: .Text,
+                        offset: soff +% srels[sri].offset.widen.[u64](),
+                        kind: srels[sri].kind,
+                        target_sym: srels[sri].sym_id,
+                        addend: srels[sri].addend,
+                    });
+                    sri = sri +% 1_usize;
+                }
+                try input.text.push_slice(alloc, sbuf.code.as_slice());
+            }
+            sbuf.destroy(alloc);
+        } else if input.mode.kind == .LinuxPie {
             var sbuf = try a64_asm.A64Buf.init(alloc);
             errdefer sbuf.destroy(alloc);
             var start_helpers = try col.DynBuf.[u32].init(alloc, 8_usize);
@@ -787,19 +896,65 @@ pub fn compile_and_link_a64(
             sbuf.destroy(alloc);
         } else if input.mode.kind == .Freestanding {
             if let ef = eir_prog.get_fn(entry_fid) {
-                input.entry_sym = try mach_isel_a64.a64_fn_sym_name_id(alloc, ef.key, eir_prog, interner);
+                let ef_sym = try mach_isel_a64.a64_fn_sym_name_id(alloc, ef.key, eir_prog, interner);
+                if str.bytes_eq(interner.get(ef.name), "_start".as_bytes()) {
+                    input.entry_sym = ef_sym;
+                } else {
+                    // Bare-metal AArch64 boot trampoline: initialize SP in QEMU virt RAM + enable EL1 FP/NEON.
+                    var sbuf = try a64_asm.A64Buf.init(alloc);
+                    errdefer sbuf.destroy(alloc);
+                    try sbuf.mov_imm64(alloc, a64_asm.X0, 0x43E00000_u64);
+                    try sbuf.emit32(alloc, 0x9100001F_u32); // mov sp, x0
+                    try sbuf.mov_imm64(alloc, a64_asm.X0, 0x00300000_u64); // CPACR_EL1.FPEN = 0b11
+                    try sbuf.emit32(alloc, 0xD5181040_u32); // msr cpacr_el1, x0
+                    try sbuf.isb(alloc);
+                    try sbuf.bl_sym(alloc, ef_sym);
+                    try sbuf.emit32(alloc, 0xD503205F_u32); // wfe
+                    try sbuf.emit32(alloc, 0x17FFFFFF_u32); // b -4
+                    _ = sbuf.finish();
+                    try pad_dyn_u8(alloc, &mut input.text, 4_usize);
+                    let soff = input.text.len().widen.[u64]();
+                    let start_sym = try interner.intern_str(alloc, "_start");
+                    input.entry_sym = start_sym;
+                    try input.symbols.push(alloc, elf64.ElfSymbol.{
+                        name_sym: start_sym,
+                        section: .Text,
+                        offset: soff,
+                        size: sbuf.code.len().widen.[u64](),
+                        is_global: true,
+                        is_func: true,
+                    });
+                    let srels = sbuf.relocs.as_slice();
+                    var sri: usize = 0_usize;
+                    while sri < srels.len {
+                        try input.relocs.push(alloc, elf64.ElfReloc.{
+                            section: .Text,
+                            offset: soff +% srels[sri].offset.widen.[u64](),
+                            kind: srels[sri].kind,
+                            target_sym: srels[sri].sym_id,
+                            addend: srels[sri].addend,
+                        });
+                        sri = sri +% 1_usize;
+                    }
+                    try input.text.push_slice(alloc, sbuf.code.as_slice());
+                    sbuf.destroy(alloc);
+                }
             }
         }
     }
 
     try emit_a64_dyn_vtables(alloc, eir_prog, env, interner, &mut input);
     try emit_a64_fnref_thunks(alloc, eir_prog, env, interner, all_fnref_thunks.as_slice(), &mut input);
-    try emit_a64_rt_helpers_and_bss(alloc, interner, &mut helper_queue, &mut helper_seen, &mut input);
+    try emit_a64_rt_helpers_and_bss(alloc, interner, opts.target_spec.os, &mut helper_queue, &mut helper_seen, &mut input);
     try populate_a64_exports_and_externals(alloc, eir_prog, interner, input.mode, &mut input);
 
     try eir_prog.release_pools(alloc);
     try elf64.gc_and_icf_link_input(alloc, &mut input, interner, opts.opt.opt_level >= 2_u8 || opts.opt.opt_size);
-    let link_res = try elf64.link_elf64(alloc, &input, interner);
+    let link_res = if is_darwin {
+        try macho.link_macho64(alloc, &input, interner, opts.target_spec)
+    } else {
+        try elf64.link_elf64(alloc, &input, interner)
+    };
 
     err_msg.destroy(alloc);
     all_fnref_thunks.destroy(alloc);

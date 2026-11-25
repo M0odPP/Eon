@@ -2185,6 +2185,186 @@ fn emit_gpr_inst(
     return;
 }
 
+fn emit_sse2_load_mem(
+    alloc: *mut AllocCap,
+    buf: *mut x64_asm.X64Buf,
+    op: mach_ir.MachOp,
+    dst: x64_asm.Xmm,
+    mem: *mach_ir.MemAddr,
+) -> !OutOfMemory {
+    var base = mem_base_reg(mem);
+    var disp = mem.disp;
+    if mem.kind == .RipSym {
+        try buf.lea_rip_sym(alloc, .R10, mem.sym, mem.disp.widen.[i64]());
+        base = .R10;
+        disp = 0_i32;
+    } else if mem.kind == .Sib {
+        let idx = mach_ir.phys_to_reg(mem.idx_phys);
+        try buf.lea_sib(alloc, .R10, base, idx, mem.scale, mem.disp);
+        base = .R10;
+        disp = 0_i32;
+    }
+    match op {
+        .VMovSSLoad => {
+            try buf.emit_u8(alloc, 0xF3_u8);
+            try buf.movups_load(alloc, dst, base, disp);
+        }
+        .VMovSDLoad => {
+            try buf.emit_u8(alloc, 0xF2_u8);
+            try buf.movups_load(alloc, dst, base, disp);
+        }
+        .VMovDquLoad => {
+            try buf.movdqu_load_n(alloc, dst.id(), base, disp);
+        }
+        _ => {
+            try buf.movups_load(alloc, dst, base, disp);
+        }
+    }
+    return;
+}
+
+fn emit_sse2_store_mem(
+    alloc: *mut AllocCap,
+    buf: *mut x64_asm.X64Buf,
+    op: mach_ir.MachOp,
+    mem: *mach_ir.MemAddr,
+    src: x64_asm.Xmm,
+) -> !OutOfMemory {
+    var base = mem_base_reg(mem);
+    var disp = mem.disp;
+    if mem.kind == .Sib {
+        let idx = mach_ir.phys_to_reg(mem.idx_phys);
+        try buf.lea_sib(alloc, .R10, base, idx, mem.scale, mem.disp);
+        base = .R10;
+        disp = 0_i32;
+    }
+    match op {
+        .VMovSSStore => {
+            try buf.emit_u8(alloc, 0xF3_u8);
+            try buf.movups_store(alloc, base, disp, src);
+        }
+        .VMovSDStore => {
+            try buf.emit_u8(alloc, 0xF2_u8);
+            try buf.movups_store(alloc, base, disp, src);
+        }
+        .VMovDquStore => {
+            try buf.movdqu_store_n(alloc, base, disp, src.id());
+        }
+        _ => {
+            try buf.movups_store(alloc, base, disp, src);
+        }
+    }
+    return;
+}
+
+fn emit_sse2_bin3(
+    alloc: *mut AllocCap,
+    buf: *mut x64_asm.X64Buf,
+    is_f64: bool,
+    opcode: u8,
+    xd: x64_asm.Xmm,
+    xs0: x64_asm.Xmm,
+    xs1: x64_asm.Xmm,
+) -> !OutOfMemory {
+    if xd.id() == xs0.id() {
+        try buf.sse_bin(alloc, is_f64, opcode, xd, xs1);
+        return;
+    }
+    if xd.id() == xs1.id() {
+        try buf.sse_ps_bin(alloc, 0x28_u8, .Xmm15, xs1);
+        try buf.sse_ps_bin(alloc, 0x28_u8, xd, xs0);
+        try buf.sse_bin(alloc, is_f64, opcode, xd, .Xmm15);
+        return;
+    }
+    try buf.sse_ps_bin(alloc, 0x28_u8, xd, xs0);
+    try buf.sse_bin(alloc, is_f64, opcode, xd, xs1);
+    return;
+}
+
+fn emit_sse2_xor(
+    alloc: *mut AllocCap,
+    buf: *mut x64_asm.X64Buf,
+    use_66: bool,
+    opcode: u8,
+    xd: x64_asm.Xmm,
+    xs0: x64_asm.Xmm,
+    xs1: x64_asm.Xmm,
+) -> !OutOfMemory {
+    var rhs = xs1;
+    if xd.id() == xs1.id() && xd.id() != xs0.id() {
+        rhs = xs0;
+    } else if xd.id() != xs0.id() {
+        try buf.sse_ps_bin(alloc, 0x28_u8, xd, xs0);
+    }
+    if use_66 {
+        try buf.sse_66_bin(alloc, opcode, xd, rhs);
+    } else {
+        try buf.sse_ps_bin(alloc, opcode, xd, rhs);
+    }
+    return;
+}
+
+fn emit_sse2_vec_inst(
+    alloc: *mut AllocCap,
+    buf: *mut x64_asm.X64Buf,
+    inst: *mach_ir.MachInst,
+) -> !OutOfMemory {
+    let xd = mach_ir.phys_to_xmm(inst.dst_phys);
+    let xs0 = mach_ir.phys_to_xmm(inst.src0_phys);
+    let xs1 = mach_ir.phys_to_xmm(inst.src1_phys);
+    let gd = mach_ir.phys_to_reg(inst.dst_phys);
+    let gs0 = mach_ir.phys_to_reg(inst.src0_phys);
+    match inst.op {
+        .VMovSSLoad => { try emit_sse2_load_mem(alloc, buf, .VMovSSLoad, xd, &inst.mem); }
+        .VMovSDLoad => { try emit_sse2_load_mem(alloc, buf, .VMovSDLoad, xd, &inst.mem); }
+        .VMovUpsLoad => { try emit_sse2_load_mem(alloc, buf, .VMovUpsLoad, xd, &inst.mem); }
+        .VMovApsLoad => { try emit_sse2_load_mem(alloc, buf, .VMovApsLoad, xd, &inst.mem); }
+        .VMovDquLoad => { try emit_sse2_load_mem(alloc, buf, .VMovDquLoad, xd, &inst.mem); }
+        .VMovSSStore => { try emit_sse2_store_mem(alloc, buf, .VMovSSStore, &inst.mem, xs0); }
+        .VMovSDStore => { try emit_sse2_store_mem(alloc, buf, .VMovSDStore, &inst.mem, xs0); }
+        .VMovUpsStore => { try emit_sse2_store_mem(alloc, buf, .VMovUpsStore, &inst.mem, xs0); }
+        .VMovApsStore => { try emit_sse2_store_mem(alloc, buf, .VMovApsStore, &inst.mem, xs0); }
+        .VMovDquStore => { try emit_sse2_store_mem(alloc, buf, .VMovDquStore, &inst.mem, xs0); }
+        .VMovVecReg => { try buf.sse_ps_bin(alloc, 0x28_u8, xd, xs0); }
+        .VAddSS => { try emit_sse2_bin3(alloc, buf, false, 0x58_u8, xd, xs0, xs1); }
+        .VSubSS => { try emit_sse2_bin3(alloc, buf, false, 0x5C_u8, xd, xs0, xs1); }
+        .VMulSS => { try emit_sse2_bin3(alloc, buf, false, 0x59_u8, xd, xs0, xs1); }
+        .VDivSS => { try emit_sse2_bin3(alloc, buf, false, 0x5E_u8, xd, xs0, xs1); }
+        .VMinSS => { try emit_sse2_bin3(alloc, buf, false, 0x5D_u8, xd, xs0, xs1); }
+        .VMaxSS => { try emit_sse2_bin3(alloc, buf, false, 0x5F_u8, xd, xs0, xs1); }
+        .VSqrtSS => { try buf.sqrt_f(alloc, false, xd, xs0); }
+        .VAddSD => { try emit_sse2_bin3(alloc, buf, true, 0x58_u8, xd, xs0, xs1); }
+        .VSubSD => { try emit_sse2_bin3(alloc, buf, true, 0x5C_u8, xd, xs0, xs1); }
+        .VMulSD => { try emit_sse2_bin3(alloc, buf, true, 0x59_u8, xd, xs0, xs1); }
+        .VDivSD => { try emit_sse2_bin3(alloc, buf, true, 0x5E_u8, xd, xs0, xs1); }
+        .VMinSD => { try emit_sse2_bin3(alloc, buf, true, 0x5D_u8, xd, xs0, xs1); }
+        .VMaxSD => { try emit_sse2_bin3(alloc, buf, true, 0x5F_u8, xd, xs0, xs1); }
+        .VSqrtSD => { try buf.sqrt_f(alloc, true, xd, xs0); }
+        .VUcomiSS => { try buf.ucomi(alloc, false, xs0, xs1); }
+        .VUcomiSD => { try buf.ucomi(alloc, true, xs0, xs1); }
+        .VCvtSI2SS => {
+            try buf.sse_ps_bin(alloc, 0x57_u8, xd, xd);
+            try buf.cvtsi2f(alloc, false, xd, gs0);
+        }
+        .VCvtSI2SD => {
+            try buf.sse_ps_bin(alloc, 0x57_u8, xd, xd);
+            try buf.cvtsi2f(alloc, true, xd, gs0);
+        }
+        .VCvtTTSS2SI => { try buf.cvttf2si(alloc, false, gd, xs0); }
+        .VCvtTTSD2SI => { try buf.cvttf2si(alloc, true, gd, xs0); }
+        .VCvtSS2SD => { try buf.cvtss2sd(alloc, xd, xs0); }
+        .VCvtSD2SS => { try buf.cvtsd2ss(alloc, xd, xs0); }
+        .VMovDToXmm => { try buf.movd_xmm_r32(alloc, xd, gs0); }
+        .VMovDFromXmm => { try buf.movd_r32_xmm(alloc, gd, xs0); }
+        .VMovQToXmm => { try buf.movq_xmm_r64(alloc, xd, gs0); }
+        .VMovQFromXmm => { try buf.movq_r64_xmm(alloc, gd, xs0); }
+        .VXorPS => { try emit_sse2_xor(alloc, buf, false, 0x57_u8, xd, xs0, xs1); }
+        .VXorPD => { try emit_sse2_xor(alloc, buf, true, 0x57_u8, xd, xs0, xs1); }
+        _ => { try emit_vec_inst(alloc, buf, inst); }
+    }
+    return;
+}
+
 fn emit_vec_inst(
     alloc: *mut AllocCap,
     buf: *mut x64_asm.X64Buf,
@@ -2628,7 +2808,11 @@ pub fn emit_mach_func_x64(
                 try record_debug_line(alloc, sm, &buf, inst.span, &mut line_tr, &mut out.line_entries);
             }
             if op_is_vec_family(inst.op) {
-                try emit_vec_inst(alloc, &mut buf, &inst);
+                if !mf.target_avx2 {
+                    try emit_sse2_vec_inst(alloc, &mut buf, &inst);
+                } else {
+                    try emit_vec_inst(alloc, &mut buf, &inst);
+                }
             } else {
                 try emit_gpr_inst(alloc, &mut buf, mf, &fl, lm_ro, jtl_ro, &inst);
             }

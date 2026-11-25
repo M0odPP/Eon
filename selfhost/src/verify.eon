@@ -12070,14 +12070,8 @@ fn resolve_verify_workers(jobs: u32, n_fns: u32) -> usize {
         let j = jobs.widen.[usize]();
         return if j > 12_usize { 12_usize } else { j };
     }
-    // Auto mode: bounded workers scaling gently with function count.
-    if n_fns < 192_u32 {
-        return 4_usize;
-    }
-    if n_fns < 480_u32 {
-        return 8_usize;
-    }
-    return 12_usize;
+    // Auto mode: 4 workers balances throughput with low per-thread arena RSS.
+    return 4_usize;
 }
 
 fn verify_program_core(

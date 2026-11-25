@@ -1,0 +1,328 @@
+module std.os.windows @hal;
+
+// ============================================================================
+// Windows Win64 OS Runtime HAL (`kernel32.dll`, `user32.dll`, `gdi32.dll`,
+// `API-MS-Win-Core-Synch-l1-2-0.dll`, `ws2_32.dll`) — Zero C Toolchain!
+// ============================================================================
+
+pub const MEM_COMMIT: u32 = 0x00001000_u32;
+pub const MEM_RESERVE: u32 = 0x00002000_u32;
+pub const MEM_RELEASE: u32 = 0x00008000_u32;
+pub const PAGE_READWRITE: u32 = 0x00000004_u32;
+
+pub const STD_INPUT_HANDLE: u32 = 0xFFFFFFF6_u32;  // -10
+pub const STD_OUTPUT_HANDLE: u32 = 0xFFFFFFF5_u32; // -11
+pub const STD_ERROR_HANDLE: u32 = 0xFFFFFFF4_u32;  // -12
+
+pub const GENERIC_READ: u32 = 0x80000000_u32;
+pub const GENERIC_WRITE: u32 = 0x40000000_u32;
+pub const FILE_SHARE_READ: u32 = 0x00000001_u32;
+pub const CREATE_ALWAYS: u32 = 2_u32;
+pub const OPEN_EXISTING: u32 = 3_u32;
+pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x00000080_u32;
+pub const INVALID_HANDLE_VALUE: u64 = 0xFFFFFFFFFFFFFFFF_u64;
+pub const INFINITE: u32 = 0xFFFFFFFF_u32;
+
+@naked
+fn slice_ptr(_s: *[u8]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw {
+            asm("ret", options(noreturn));
+        }
+    } else {
+        raw {
+            asm("mov rax, rdi; ret", options(noreturn));
+        }
+    }
+    return 0_u64;
+}
+
+@naked
+fn mut_slice_ptr(_s: *mut [u8]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw {
+            asm("ret", options(noreturn));
+        }
+    } else {
+        raw {
+            asm("mov rax, rdi; ret", options(noreturn));
+        }
+    }
+    return 0_u64;
+}
+
+@naked
+fn u32_ref_addr(_p: *u32) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw {
+            asm("ret", options(noreturn));
+        }
+    } else {
+        raw {
+            asm("mov rax, rdi; ret", options(noreturn));
+        }
+    }
+    return 0_u64;
+}
+
+// Kernel32 memory, process, thread, time, filesystem, DLL imports
+extern "C" fn ExitProcess(exit_code: u32);
+extern "C" fn VirtualAlloc(addr: u64, size: usize, alloc_type: u32, protect: u32) -> u64;
+extern "C" fn VirtualFree(addr: u64, size: usize, free_type: u32) -> i32;
+extern "C" fn GetStdHandle(std_handle: u32) -> u64;
+extern "C" fn WriteFile(handle: u64, buf: u64, len: u32, written: *mut u32, overlapped: u64) -> i32;
+extern "C" fn ReadFile(handle: u64, buf: u64, len: u32, read_out: *mut u32, overlapped: u64) -> i32;
+extern "C" fn CloseHandle(handle: u64) -> i32;
+extern "C" fn CreateFileA(
+    path: u64,
+    access: u32,
+    share: u32,
+    sec: u64,
+    disp: u32,
+    flags: u32,
+    tmpl: u64,
+) -> u64;
+extern "C" fn CreateFileW(
+    path: u64,
+    access: u32,
+    share: u32,
+    sec: u64,
+    disp: u32,
+    flags: u32,
+    tmpl: u64,
+) -> u64;
+extern "C" fn GetFileSizeEx(handle: u64, size_out: *mut i64) -> i32;
+extern "C" fn GetCommandLineW() -> u64;
+extern "C" fn GetCommandLineA() -> u64;
+extern "C" fn GetModuleHandleW(name: u64) -> u64;
+extern "C" fn LoadLibraryA(name: u64) -> u64;
+extern "C" fn GetProcAddress(hmod: u64, name: u64) -> u64;
+extern "C" fn FreeLibrary(hmod: u64) -> i32;
+extern "C" fn QueryPerformanceCounter(counter: *mut i64) -> i32;
+extern "C" fn QueryPerformanceFrequency(freq: *mut i64) -> i32;
+extern "C" fn Sleep(ms: u32);
+extern "C" fn CreateThread(
+    sec: u64,
+    stack_size: usize,
+    start_fn: u64,
+    param: u64,
+    flags: u32,
+    tid_out: *mut u32,
+) -> u64;
+extern "C" fn WaitForSingleObject(handle: u64, ms: u32) -> u32;
+extern "C" fn GetLastError() -> u32;
+extern "C" fn WaitOnAddress(addr: u64, cmp: u64, size: usize, ms: u32) -> i32;
+extern "C" fn WakeByAddressSingle(addr: u64);
+extern "C" fn WakeByAddressAll(addr: u64);
+
+pub fn virtual_alloc(size: usize) -> u64 {
+    raw {
+        return VirtualAlloc(0_u64, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    }
+}
+
+pub fn virtual_free(ptr: u64) -> bool {
+    raw {
+        return VirtualFree(ptr, 0_usize, MEM_RELEASE) != 0_i32;
+    }
+}
+
+pub fn write_stdout(data: *[u8]) -> u32 {
+    if data.len == 0_usize {
+        return 0_u32;
+    }
+    var written: u32 = 0_u32;
+    raw {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        _ = WriteFile(h, slice_ptr(data), data.len.trunc.[u32](), &mut written, 0_u64);
+    }
+    return written;
+}
+
+pub fn write_stderr(data: *[u8]) -> u32 {
+    if data.len == 0_usize {
+        return 0_u32;
+    }
+    var written: u32 = 0_u32;
+    raw {
+        let h = GetStdHandle(STD_ERROR_HANDLE);
+        _ = WriteFile(h, slice_ptr(data), data.len.trunc.[u32](), &mut written, 0_u64);
+    }
+    return written;
+}
+
+pub fn qpc_now() -> u64 {
+    var cnt: i64 = 0_i64;
+    raw {
+        _ = QueryPerformanceCounter(&mut cnt);
+    }
+    if cnt <= 0_i64 { return 0_u64; }
+    return cnt.bitcast.[u64]();
+}
+
+pub fn qpc_freq() -> u64 {
+    var freq: i64 = 0_i64;
+    raw {
+        _ = QueryPerformanceFrequency(&mut freq);
+    }
+    if freq <= 0_i64 { return 0_u64; }
+    return freq.bitcast.[u64]();
+}
+
+pub fn monotonic_now_ns() -> u64 {
+    let c = qpc_now();
+    let f = qpc_freq();
+    if f == 0_u64 || c == 0_u64 {
+        return 0_u64;
+    }
+    let sec = c / f;
+    let rem = c % f;
+    return sec *% 1000000000_u64 +% (rem *% 1000000000_u64) / f;
+}
+
+pub fn sleep_ms(ms: u32) {
+    raw {
+        Sleep(ms);
+    }
+}
+
+pub fn load_library(name_z: *[u8]) -> u64 {
+    if name_z.len == 0_usize {
+        return 0_u64;
+    }
+    raw {
+        return LoadLibraryA(slice_ptr(name_z));
+    }
+}
+
+pub fn get_proc_address(hmod: u64, sym_z: *[u8]) -> u64 {
+    if hmod == 0_u64 || sym_z.len == 0_usize {
+        return 0_u64;
+    }
+    raw {
+        return GetProcAddress(hmod, slice_ptr(sym_z));
+    }
+}
+
+pub fn free_library(hmod: u64) -> bool {
+    if hmod == 0_u64 {
+        return false;
+    }
+    raw {
+        return FreeLibrary(hmod) != 0_i32;
+    }
+}
+
+pub fn wait_on_u32(addr: *u32, expected: *u32, timeout_ms: u32) -> bool {
+    raw {
+        return WaitOnAddress(u32_ref_addr(addr), u32_ref_addr(expected), 4_usize, timeout_ms) != 0_i32;
+    }
+}
+
+pub fn wake_one(addr: *u32) {
+    raw {
+        WakeByAddressSingle(u32_ref_addr(addr));
+    }
+}
+
+pub fn wake_all(addr: *u32) {
+    raw {
+        WakeByAddressAll(u32_ref_addr(addr));
+    }
+}
+
+pub fn spawn_thread(entry: u64, param: u64) -> u64 {
+    var tid: u32 = 0_u32;
+    raw {
+        return CreateThread(0_u64, 0_usize, entry, param, 0_u32, &mut tid);
+    }
+}
+
+pub fn join_thread(handle: u64) {
+    if handle == 0_u64 {
+        return;
+    }
+    raw {
+        _ = WaitForSingleObject(handle, INFINITE);
+        _ = CloseHandle(handle);
+    }
+}
+
+pub fn get_command_line_w() -> u64 {
+    raw {
+        return GetCommandLineW();
+    }
+}
+
+pub fn get_command_line_a() -> u64 {
+    raw {
+        return GetCommandLineA();
+    }
+}
+
+pub fn get_module_handle() -> u64 {
+    raw {
+        return GetModuleHandleW(0_u64);
+    }
+}
+
+pub fn create_file_w(path_w: u64, access: u32, disp: u32) -> u64 {
+    raw {
+        return CreateFileW(path_w, access, FILE_SHARE_READ, 0_u64, disp, FILE_ATTRIBUTE_NORMAL, 0_u64);
+    }
+}
+
+pub fn create_file_a(path_z: *[u8], access: u32, disp: u32) -> u64 {
+    if path_z.len == 0_usize { return INVALID_HANDLE_VALUE; }
+    raw {
+        return CreateFileA(slice_ptr(path_z), access, FILE_SHARE_READ, 0_u64, disp, FILE_ATTRIBUTE_NORMAL, 0_u64);
+    }
+}
+
+pub fn file_size(handle: u64) -> i64 {
+    var sz: i64 = 0_i64;
+    raw {
+        _ = GetFileSizeEx(handle, &mut sz);
+    }
+    return sz;
+}
+
+pub fn last_error() -> u32 {
+    raw {
+        return GetLastError();
+    }
+}
+
+pub fn read_file(handle: u64, dst: *mut [u8]) -> u32 {
+    if dst.len == 0_usize {
+        return 0_u32;
+    }
+    var n: u32 = 0_u32;
+    raw {
+        _ = ReadFile(handle, mut_slice_ptr(dst), dst.len.trunc.[u32](), &mut n, 0_u64);
+    }
+    return n;
+}
+
+pub fn write_file(handle: u64, src: *[u8]) -> u32 {
+    if src.len == 0_usize {
+        return 0_u32;
+    }
+    var n: u32 = 0_u32;
+    raw {
+        _ = WriteFile(handle, slice_ptr(src), src.len.trunc.[u32](), &mut n, 0_u64);
+    }
+    return n;
+}
+
+pub fn close_handle(handle: u64) -> bool {
+    raw {
+        return CloseHandle(handle) != 0_i32;
+    }
+}
+
+pub fn exit_process(code: u32) {
+    raw {
+        ExitProcess(code);
+    }
+}

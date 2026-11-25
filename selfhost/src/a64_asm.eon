@@ -1511,6 +1511,8 @@ fn encode_a64_asm_line(alloc: *mut AllocCap, line_raw: *[u8], out: *mut A64Buf) 
     if str.bytes_eq(line, "nop".as_bytes()) { try out.nop(alloc); return true; }
     if str.bytes_eq(line, "ret".as_bytes()) { try out.ret(alloc); return true; }
     if str.bytes_eq(line, "svc #0".as_bytes()) || str.bytes_eq(line, "svc 0".as_bytes()) { try out.svc0(alloc); return true; }
+    if str.bytes_eq(line, "hvc #0".as_bytes()) || str.bytes_eq(line, "hvc 0".as_bytes()) { try out.emit32(alloc, 0xD4000002_u32); return true; }
+    if str.bytes_eq(line, "dmb sy".as_bytes()) { try out.emit32(alloc, 0xD5033FBF_u32); return true; }
     if str.bytes_eq(line, "dmb ish".as_bytes()) { try out.dmb_ish(alloc); return true; }
     if str.bytes_eq(line, "dsb sy".as_bytes()) { try out.dsb_sy(alloc); return true; }
     if str.bytes_eq(line, "isb".as_bytes()) { try out.isb(alloc); return true; }
@@ -2454,4 +2456,109 @@ pub fn emit_a64_rt_helper_by_name(
         return out.finish();
     }
     return false;
+}
+
+/// Darwin AArch64 runtime helper emitter (bridges OS primitives to `/usr/lib/libSystem.B.dylib`).
+pub fn emit_a64_darwin_rt_helper_by_name(
+    alloc: *mut AllocCap,
+    name: *[u8],
+    interner: *mut span.SymInterner,
+    out: *mut A64Buf,
+) -> bool ! OutOfMemory {
+    out.clear();
+    if str.bytes_eq(name, "eon_rt_write_fd".as_bytes()) {
+        let s_w = try interner.intern_str(alloc, "write");
+        try out.b_sym(alloc, s_w);
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_print_str".as_bytes())
+        || str.bytes_eq(name, "eon_rt_print_bytes".as_bytes())
+    {
+        let s_w = try interner.intern_str(alloc, "write");
+        try out.mov_rr(alloc, X2, X1);
+        try out.mov_rr(alloc, X1, X0);
+        try out.mov_imm64(alloc, X0, 1_u64);
+        try out.b_sym(alloc, s_w);
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_eprint_str".as_bytes())
+        || str.bytes_eq(name, "eon_rt_eprint_bytes".as_bytes())
+    {
+        let s_w = try interner.intern_str(alloc, "write");
+        try out.mov_rr(alloc, X2, X1);
+        try out.mov_rr(alloc, X1, X0);
+        try out.mov_imm64(alloc, X0, 2_u64);
+        try out.b_sym(alloc, s_w);
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_alloc_raw".as_bytes())
+        || str.bytes_eq(name, "eon_alloc_raw_uninit".as_bytes())
+        || str.bytes_eq(name, "eon_alloc_raw_san".as_bytes())
+    {
+        let s_mm = try interner.intern_str(alloc, "mmap");
+        try out.stp64_pre(alloc, X29_FP, X30_LR, SP, -48_i32);
+        try out.mov_rr(alloc, X29_FP, SP);
+        try out.stp64(alloc, X19, X20, SP, 16_i32);
+        try out.stp64(alloc, X21, X22, SP, 32_i32);
+        try out.mov_rr(alloc, X19, X0); // alloc
+        try out.mov_rr(alloc, X20, X1); // req_bytes
+        try out.mov_rr(alloc, X21, X2); // align
+        try out.mov_imm64(alloc, X16, 16_u64);
+        let l_al = try out.new_label(alloc);
+        try out.cmp_rr(alloc, true, X21, X16);
+        try out.b_cond_label(alloc, .Cs, l_al);
+        try out.mov_rr(alloc, X21, X16);
+        out.bind_label(l_al);
+        try out.add_rr(alloc, true, false, X22, X20, X21);
+        try out.add_imm(alloc, true, false, X22, X22, 4095_u16, false);
+        try out.add_imm(alloc, true, false, X22, X22, 32_u16, false);
+        try out.mov_imm64(alloc, X16, 0xFFFFFFFFFFFFF000_u64);
+        try out.and_rr(alloc, true, false, X22, X22, X16);
+        try out.mov_imm64(alloc, X0, 0_u64);
+        try out.mov_rr(alloc, X1, X22);
+        try out.mov_imm64(alloc, X2, 3_u64);
+        try out.mov_imm64(alloc, X3, 0x1002_u64);
+        try out.mov_imm64(alloc, X4, 0xFFFFFFFFFFFFFFFF_u64);
+        try out.mov_imm64(alloc, X5, 0_u64);
+        try out.bl_sym(alloc, s_mm);
+        try out.add_imm(alloc, true, false, X9, X0, 24_u16, false);
+        try out.sub_imm(alloc, true, false, X10, X21, 1_u16, false);
+        try out.add_rr(alloc, true, false, X9, X9, X10);
+        try out.mvn_rr(alloc, true, X10, X10);
+        try out.and_rr(alloc, true, false, X9, X9, X10);
+        try out.store_mem(alloc, X9, -24_i32, X0, 8_u8, X16);
+        try out.store_mem(alloc, X9, -16_i32, X22, 8_u8, X16);
+        try out.store_mem(alloc, X9, -8_i32, X20, 8_u8, X16);
+        try out.mov_rr(alloc, X0, X9);
+        try out.mov_imm64(alloc, X8, 0_u64);
+        try out.ldp64(alloc, X21, X22, SP, 32_i32);
+        try out.ldp64(alloc, X19, X20, SP, 16_i32);
+        try out.ldp64_post(alloc, X29_FP, X30_LR, SP, 48_i32);
+        try out.ret(alloc);
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_free_raw".as_bytes())
+        || str.bytes_eq(name, "eon_free_raw_san".as_bytes())
+    {
+        let s_mu = try interner.intern_str(alloc, "munmap");
+        let l_ret = try out.new_label(alloc);
+        try out.cbz_label(alloc, true, X1, l_ret);
+        try out.load_mem(alloc, X0, X1, -24_i32, 8_u8, false, X16);
+        try out.load_mem(alloc, X1, X1, -16_i32, 8_u8, false, X16);
+        try out.b_sym(alloc, s_mu);
+        out.bind_label(l_ret);
+        try out.ret(alloc);
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_tls_init".as_bytes())
+        || str.bytes_eq(name, "eon_rt_parse_vdso".as_bytes())
+        || str.bytes_eq(name, "eon_rt_install_san_handler".as_bytes())
+        || str.bytes_eq(name, "eon_rt_arena_reset_san".as_bytes())
+        || str.bytes_eq(name, "eon_sched_init".as_bytes())
+        || str.bytes_eq(name, "eon_sched_shutdown".as_bytes())
+    {
+        try out.ret(alloc);
+        return out.finish();
+    }
+    return try emit_a64_rt_helper_by_name(alloc, name, interner, out);
 }

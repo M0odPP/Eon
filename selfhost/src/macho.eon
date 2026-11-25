@@ -1,0 +1,1294 @@
+module eonc.macho;
+
+import core.col;
+import core.str;
+import eonc.span;
+import eonc.target;
+import eonc.elf64;
+
+// ============================================================================
+// Direct Zero-C Mach-O 64-bit Linker (`aarch64-macos`, `x86_64-macos`, `aarch64-ios`)
+// Includes:
+//   - Built-in FIPS 180-4 SHA-256 (`sha256_bytes`) shared with `apk_pkg.eon`
+//   - __PAGEZERO, __TEXT, __DATA_CONST, __DATA, __LINKEDIT segments
+//   - LC_DYLD_CHAINED_FIXUPS, LC_DYLD_EXPORTS_TRIE, LC_SYMTAB, LC_DYSYMTAB,
+//     LC_LOAD_DYLINKER, LC_UUID (deterministic), LC_BUILD_VERSION, LC_MAIN,
+//     LC_LOAD_DYLIB (libSystem + Apple frameworks)
+//   - Built-in ad-hoc LC_CODE_SIGNATURE (Apple SuperBlob + CodeDirectory SHA-256
+//     4 KiB page hashes required by Apple Silicon & iOS!)
+// ============================================================================
+
+const MH_MAGIC_64: u32 = 0xFEEDFACF_u32;
+const CPU_TYPE_X86_64: u32 = 0x01000007_u32;
+const CPU_TYPE_ARM64: u32 = 0x0100000C_u32;
+const CPU_SUBTYPE_X86_64_ALL: u32 = 3_u32;
+const CPU_SUBTYPE_ARM64_ALL: u32 = 0_u32;
+
+const MH_EXECUTE: u32 = 2_u32;
+const MH_DYLIB: u32 = 6_u32;
+const MH_FLAGS_EXEC: u32 = 0x00200085_u32; // NOUNDEFS | DYLDLINK | TWOLEVEL | PIE
+const MH_FLAGS_DYLIB: u32 = 0x00000085_u32;
+
+const LC_SEGMENT_64: u32 = 0x19_u32;
+const LC_SYMTAB: u32 = 0x02_u32;
+const LC_DYSYMTAB: u32 = 0x0B_u32;
+const LC_LOAD_DYLIB: u32 = 0x0C_u32;
+const LC_ID_DYLIB: u32 = 0x0D_u32;
+const LC_LOAD_DYLINKER: u32 = 0x0E_u32;
+const LC_UUID: u32 = 0x1B_u32;
+const LC_CODE_SIGNATURE: u32 = 0x1D_u32;
+const LC_MAIN: u32 = 0x80000028_u32;
+const LC_BUILD_VERSION: u32 = 0x32_u32;
+const LC_DYLD_EXPORTS_TRIE: u32 = 0x80000033_u32;
+const LC_DYLD_CHAINED_FIXUPS: u32 = 0x80000034_u32;
+
+const PLATFORM_MACOS: u32 = 1_u32;
+const PLATFORM_IOS: u32 = 2_u32;
+
+const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xFADE0CC0_u32;
+const CSMAGIC_CODEDIRECTORY: u32 = 0xFADE0C02_u32;
+const CSSLOT_CODEDIRECTORY: u32 = 0_u32;
+
+// ============================================================================
+// Pure-Eon SHA-256 (FIPS 180-4) — Zero C / OpenSSL Dependencies
+// ============================================================================
+
+const SHA256_K: [64]u32 = [
+    0x428a2f98_u32, 0x71374491_u32, 0xb5c0fbcf_u32, 0xe9b5dba5_u32,
+    0x3956c25b_u32, 0x59f111f1_u32, 0x923f82a4_u32, 0xab1c5ed5_u32,
+    0xd807aa98_u32, 0x12835b01_u32, 0x243185be_u32, 0x550c7dc3_u32,
+    0x72be5d74_u32, 0x80deb1fe_u32, 0x9bdc06a7_u32, 0xc19bf174_u32,
+    0xe49b69c1_u32, 0xefbe4786_u32, 0x0fc19dc6_u32, 0x240ca1cc_u32,
+    0x2de92c6f_u32, 0x4a7484aa_u32, 0x5cb0a9dc_u32, 0x76f988da_u32,
+    0x983e5152_u32, 0xa831c66d_u32, 0xb00327c8_u32, 0xbf597fc7_u32,
+    0xc6e00bf3_u32, 0xd5a79147_u32, 0x06ca6351_u32, 0x14292967_u32,
+    0x27b70a85_u32, 0x2e1b2138_u32, 0x4d2c6dfc_u32, 0x53380d13_u32,
+    0x650a7354_u32, 0x766a0abb_u32, 0x81c2c92e_u32, 0x92722c85_u32,
+    0xa2bfe8a1_u32, 0xa81a664b_u32, 0xc24b8b70_u32, 0xc76c51a3_u32,
+    0xd192e819_u32, 0xd6990624_u32, 0xf40e3585_u32, 0x106aa070_u32,
+    0x19a4c116_u32, 0x1e376c08_u32, 0x2748774c_u32, 0x34b0bcb5_u32,
+    0x391c0cb3_u32, 0x4ed8aa4a_u32, 0x5b9cca4f_u32, 0x682e6ff3_u32,
+    0x748f82ee_u32, 0x78a5636f_u32, 0x84c87814_u32, 0x8cc70208_u32,
+    0x90befffa_u32, 0xa4506ceb_u32, 0xbef9a3f7_u32, 0xc67178f2_u32,
+];
+
+@inline
+fn rotr32(x: u32, n: u32) -> u32 {
+    let m = n & 31_u32;
+    let inv = (32_u32 - m) & 31_u32;
+    return (x >> m) | (x << inv);
+}
+
+pub struct Sha256Ctx {
+    h: [8]u32;
+    buf: [64]u8;
+    buf_len: usize;
+    total_bytes: u64;
+}
+
+impl Sha256Ctx {
+    pub fn init() -> Sha256Ctx {
+        return Sha256Ctx.{
+            h: [
+                0x6a09e667_u32, 0xbb67ae85_u32, 0x3c6ef372_u32, 0xa54ff53a_u32,
+                0x510e527f_u32, 0x9b05688c_u32, 0x1f83d9ab_u32, 0x5be0cd19_u32,
+            ],
+            buf: [0_u8; 64],
+            buf_len: 0_usize,
+            total_bytes: 0_u64,
+        };
+    }
+
+    fn compress(self: *mut Self, blk: *[u8]) {
+        var w: [64]u32 = [0_u32; 64];
+        var i: usize = 0_usize;
+        while i < 16_usize {
+            let b = i *% 4_usize;
+            if blk.len >= 4_usize && b <= blk.len - 4_usize {
+                w[i] = (blk[b].widen.[u32]() << 24_u32)
+                    | (blk[b + 1_usize].widen.[u32]() << 16_u32)
+                    | (blk[b + 2_usize].widen.[u32]() << 8_u32)
+                    | blk[b + 3_usize].widen.[u32]();
+            }
+            i = i +% 1_usize;
+        }
+        while i < 64_usize {
+            let s0 = rotr32(w[i - 15_usize], 7_u32) ^ rotr32(w[i - 15_usize], 18_u32) ^ (w[i - 15_usize] >> 3_u32);
+            let s1 = rotr32(w[i - 2_usize], 17_u32) ^ rotr32(w[i - 2_usize], 19_u32) ^ (w[i - 2_usize] >> 10_u32);
+            w[i] = w[i - 16_usize] +% s0 +% w[i - 7_usize] +% s1;
+            i = i +% 1_usize;
+        }
+        var a = self.h[0_usize];
+        var b = self.h[1_usize];
+        var c = self.h[2_usize];
+        var d = self.h[3_usize];
+        var e = self.h[4_usize];
+        var f = self.h[5_usize];
+        var g = self.h[6_usize];
+        var hh = self.h[7_usize];
+        i = 0_usize;
+        while i < 64_usize {
+            let S1 = rotr32(e, 6_u32) ^ rotr32(e, 11_u32) ^ rotr32(e, 25_u32);
+            let ch = (e & f) ^ ((~e) & g);
+            let t1 = hh +% S1 +% ch +% SHA256_K[i] +% w[i];
+            let S0 = rotr32(a, 2_u32) ^ rotr32(a, 13_u32) ^ rotr32(a, 22_u32);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = S0 +% maj;
+            hh = g;
+            g = f;
+            f = e;
+            e = d +% t1;
+            d = c;
+            c = b;
+            b = a;
+            a = t1 +% t2;
+            i = i +% 1_usize;
+        }
+        self.h[0_usize] = self.h[0_usize] +% a;
+        self.h[1_usize] = self.h[1_usize] +% b;
+        self.h[2_usize] = self.h[2_usize] +% c;
+        self.h[3_usize] = self.h[3_usize] +% d;
+        self.h[4_usize] = self.h[4_usize] +% e;
+        self.h[5_usize] = self.h[5_usize] +% f;
+        self.h[6_usize] = self.h[6_usize] +% g;
+        self.h[7_usize] = self.h[7_usize] +% hh;
+    }
+
+    pub fn update(self: *mut Self, data: *[u8]) {
+        self.total_bytes = self.total_bytes +% data.len.widen.[u64]();
+        var pos: usize = 0_usize;
+        if self.buf_len > 0_usize {
+            while pos < data.len && self.buf_len < 64_usize {
+                self.buf[self.buf_len] = data[pos];
+                self.buf_len = self.buf_len +% 1_usize;
+                pos = pos +% 1_usize;
+            }
+            if self.buf_len == 64_usize {
+                let blk_copy = self.buf;
+                self.compress(blk_copy[0_usize..64_usize]);
+                self.buf_len = 0_usize;
+            }
+        }
+        while pos +% 64_usize <= data.len {
+            let chunk = data.sub(pos, pos +% 64_usize) catch "".as_bytes();
+            self.compress(chunk);
+            pos = pos +% 64_usize;
+        }
+        while pos < data.len {
+            if self.buf_len < 64_usize {
+                self.buf[self.buf_len] = data[pos];
+                self.buf_len = self.buf_len +% 1_usize;
+            }
+            pos = pos +% 1_usize;
+        }
+    }
+
+    pub fn update_u8(self: *mut Self, b: u8) {
+        let arr: [1]u8 = [b];
+        self.update(arr[0_usize..1_usize]);
+    }
+
+    pub fn update_u32_le(self: *mut Self, v: u32) {
+        let arr: [4]u8 = [
+            (v & 0xFF_u32).trunc.[u8](),
+            ((v >> 8_u32) & 0xFF_u32).trunc.[u8](),
+            ((v >> 16_u32) & 0xFF_u32).trunc.[u8](),
+            ((v >> 24_u32) & 0xFF_u32).trunc.[u8](),
+        ];
+        self.update(arr[0_usize..4_usize]);
+    }
+
+    pub fn finish(self: *mut Self) -> [32]u8 {
+        let total_bits = self.total_bytes *% 8_u64;
+        self.update_u8(0x80_u8);
+        while self.buf_len != 56_usize {
+            self.update_u8(0_u8);
+        }
+        let len_be: [8]u8 = [
+            ((total_bits >> 56_u64) & 0xFF_u64).trunc.[u8](),
+            ((total_bits >> 48_u64) & 0xFF_u64).trunc.[u8](),
+            ((total_bits >> 40_u64) & 0xFF_u64).trunc.[u8](),
+            ((total_bits >> 32_u64) & 0xFF_u64).trunc.[u8](),
+            ((total_bits >> 24_u64) & 0xFF_u64).trunc.[u8](),
+            ((total_bits >> 16_u64) & 0xFF_u64).trunc.[u8](),
+            ((total_bits >> 8_u64) & 0xFF_u64).trunc.[u8](),
+            (total_bits & 0xFF_u64).trunc.[u8](),
+        ];
+        self.update(len_be[0_usize..8_usize]);
+        var out: [32]u8 = [0_u8; 32];
+        var i: usize = 0_usize;
+        while i < 8_usize {
+            let v = self.h[i];
+            let b = i *% 4_usize;
+            if b <= 28_usize {
+                out[b] = ((v >> 24_u32) & 0xFF_u32).trunc.[u8]();
+                out[b + 1_usize] = ((v >> 16_u32) & 0xFF_u32).trunc.[u8]();
+                out[b + 2_usize] = ((v >> 8_u32) & 0xFF_u32).trunc.[u8]();
+                out[b + 3_usize] = (v & 0xFF_u32).trunc.[u8]();
+            }
+            i = i +% 1_usize;
+        }
+        return out;
+    }
+}
+
+pub fn sha256_bytes(data: *[u8]) -> [32]u8 {
+    var ctx = Sha256Ctx.init();
+    ctx.update(data);
+    return ctx.finish();
+}
+
+// ============================================================================
+// Sticky-OOM Mach-O Writer
+// ============================================================================
+
+linear struct MachBuf {
+    bytes: col.DynBuf[u8];
+    oom: bool;
+}
+
+impl MachBuf {
+    fn init(alloc: *mut AllocCap, cap: usize) -> MachBuf ! OutOfMemory {
+        let bs = try col.DynBuf.[u8].init(alloc, cap);
+        return MachBuf.{ bytes: bs, oom: false };
+    }
+
+    fn destroy(self: MachBuf, alloc: *mut AllocCap) {
+        let MachBuf.{ bytes, oom: _ } = self;
+        bytes.destroy(alloc);
+    }
+
+    fn len(self: *Self) -> usize {
+        return self.bytes.len();
+    }
+
+    fn pu8(self: *mut Self, alloc: *mut AllocCap, v: u8) {
+        if self.oom { return; }
+        self.bytes.push(alloc, v) catch { self.oom = true; return; };
+    }
+
+    fn pu16(self: *mut Self, alloc: *mut AllocCap, v: u16) {
+        self.pu8(alloc, (v & 0xFF_u16).trunc.[u8]());
+        self.pu8(alloc, ((v >> 8_u16) & 0xFF_u16).trunc.[u8]());
+    }
+
+    fn pu32(self: *mut Self, alloc: *mut AllocCap, v: u32) {
+        self.pu8(alloc, (v & 0xFF_u32).trunc.[u8]());
+        self.pu8(alloc, ((v >> 8_u32) & 0xFF_u32).trunc.[u8]());
+        self.pu8(alloc, ((v >> 16_u32) & 0xFF_u32).trunc.[u8]());
+        self.pu8(alloc, ((v >> 24_u32) & 0xFF_u32).trunc.[u8]());
+    }
+
+    fn pu32_be(self: *mut Self, alloc: *mut AllocCap, v: u32) {
+        self.pu8(alloc, ((v >> 24_u32) & 0xFF_u32).trunc.[u8]());
+        self.pu8(alloc, ((v >> 16_u32) & 0xFF_u32).trunc.[u8]());
+        self.pu8(alloc, ((v >> 8_u32) & 0xFF_u32).trunc.[u8]());
+        self.pu8(alloc, (v & 0xFF_u32).trunc.[u8]());
+    }
+
+    fn pu64(self: *mut Self, alloc: *mut AllocCap, v: u64) {
+        self.pu32(alloc, (v & 0xFFFFFFFF_u64).trunc.[u32]());
+        self.pu32(alloc, ((v >> 32_u64) & 0xFFFFFFFF_u64).trunc.[u32]());
+    }
+
+    fn pu64_be(self: *mut Self, alloc: *mut AllocCap, v: u64) {
+        self.pu32_be(alloc, ((v >> 32_u64) & 0xFFFFFFFF_u64).trunc.[u32]());
+        self.pu32_be(alloc, (v & 0xFFFFFFFF_u64).trunc.[u32]());
+    }
+
+    fn puleb(self: *mut Self, alloc: *mut AllocCap, v0: u64) {
+        var v = v0;
+        loop {
+            var b = (v & 0x7F_u64).trunc.[u8]();
+            v = v >> 7_u64;
+            if v != 0_u64 { b = b | 0x80_u8; }
+            self.pu8(alloc, b);
+            if v == 0_u64 { break; }
+        }
+    }
+
+    fn pbytes(self: *mut Self, alloc: *mut AllocCap, src: *[u8]) {
+        if self.oom || src.len == 0_usize { return; }
+        self.bytes.push_slice(alloc, src) catch { self.oom = true; return; };
+    }
+
+    fn pzeros(self: *mut Self, alloc: *mut AllocCap, n: usize) {
+        var i: usize = 0_usize;
+        while i < n && !self.oom {
+            self.pu8(alloc, 0_u8);
+            i = i +% 1_usize;
+        }
+    }
+
+    fn pfixed16(self: *mut Self, alloc: *mut AllocCap, s: *str) {
+        let bs = s.as_bytes();
+        var i: usize = 0_usize;
+        while i < 16_usize {
+            if i < bs.len { self.pu8(alloc, bs[i]); }
+            else { self.pu8(alloc, 0_u8); }
+            i = i +% 1_usize;
+        }
+    }
+
+    fn align_to(self: *mut Self, alloc: *mut AllocCap, align: usize) {
+        if align <= 1_usize { return; }
+        let rem = self.bytes.len() % align;
+        if rem != 0_usize {
+            self.pzeros(alloc, align - rem);
+        }
+    }
+
+    fn patch_u32(self: *mut Self, off: usize, v: u32) {
+        let s = self.bytes.as_mut_slice();
+        if s.len >= 4_usize && off <= s.len - 4_usize {
+            s[off] = (v & 0xFF_u32).trunc.[u8]();
+            s[off + 1_usize] = ((v >> 8_u32) & 0xFF_u32).trunc.[u8]();
+            s[off + 2_usize] = ((v >> 16_u32) & 0xFF_u32).trunc.[u8]();
+            s[off + 3_usize] = ((v >> 24_u32) & 0xFF_u32).trunc.[u8]();
+        }
+    }
+
+    fn patch_u64(self: *mut Self, off: usize, v: u64) {
+        self.patch_u32(off, (v & 0xFFFFFFFF_u64).trunc.[u32]());
+        self.patch_u32(off +% 4_usize, ((v >> 32_u64) & 0xFFFFFFFF_u64).trunc.[u32]());
+    }
+}
+
+fn align_u64_m(v: u64, a: u64) -> u64 {
+    if a <= 1_u64 { return v; }
+    let r = v % a;
+    if r == 0_u64 { return v; }
+    return v +% (a - r);
+}
+
+fn align_u32_m(v: u32, a: u32) -> u32 {
+    if a <= 1_u32 { return v; }
+    let r = v % a;
+    if r == 0_u32 { return v; }
+    return v +% (a - r);
+}
+
+fn check_macho_oom(oom: bool) -> !OutOfMemory {
+    if oom { return OutOfMemory; }
+    return;
+}
+
+fn resolve_darwin_dylib_kind(lib: *[u8], is_ios: bool) -> u8 {
+    if str.starts_with(lib, "/".as_bytes()) { return 0_u8; }
+    if str.bytes_eq(lib, "System".as_bytes()) || str.bytes_eq(lib, "libSystem".as_bytes()) { return 1_u8; }
+    if str.bytes_eq(lib, "objc".as_bytes()) { return 2_u8; }
+    if str.bytes_eq(lib, "Metal".as_bytes()) { return 3_u8; }
+    if str.bytes_eq(lib, "QuartzCore".as_bytes()) { return 4_u8; }
+    if str.bytes_eq(lib, "Foundation".as_bytes()) { return 5_u8; }
+    if str.bytes_eq(lib, "CoreFoundation".as_bytes()) { return 6_u8; }
+    if str.bytes_eq(lib, "CoreGraphics".as_bytes()) { return 7_u8; }
+    if str.bytes_eq(lib, "AppKit".as_bytes()) && !is_ios { return 8_u8; }
+    if str.bytes_eq(lib, "UIKit".as_bytes()) || (str.bytes_eq(lib, "AppKit".as_bytes()) && is_ios) { return 9_u8; }
+    return 1_u8;
+}
+
+struct MachExtSym {
+    sym_id: u32;
+    stub_text_off: u32;
+    got_dc_off: u32;
+    lib_ordinal: u32; // 1 = libSystem.B.dylib, 2..N = extra dylibs
+}
+
+struct MachDylibEntry {
+    path_off: u32;
+    path_len: u32;
+}
+
+fn push_dylib_unique(
+    alloc: *mut AllocCap,
+    path_pool: *mut col.DynBuf[u8],
+    dylibs: *mut col.DynBuf[MachDylibEntry],
+    path: *[u8],
+) -> u32 ! OutOfMemory {
+    let ds = dylibs.as_slice();
+    let ps = path_pool.as_slice();
+    var i: usize = 0_usize;
+    while i < ds.len {
+        let s = ds[i].path_off.widen.[usize]();
+        let e = s +% ds[i].path_len.widen.[usize]();
+        if e <= ps.len {
+            let sl = ps.sub(s, e) catch "".as_bytes();
+            if str.bytes_eq(sl, path) { return (i +% 1_usize).trunc.[u32](); }
+        }
+        i = i +% 1_usize;
+    }
+    let off = path_pool.len().trunc.[u32]();
+    try path_pool.push_slice(alloc, path);
+    try dylibs.push(alloc, MachDylibEntry.{ path_off: off, path_len: path.len.trunc.[u32]() });
+    return dylibs.len().trunc.[u32]();
+}
+
+fn write_lc_segment64(
+    out: *mut MachBuf,
+    alloc: *mut AllocCap,
+    segname: *str,
+    vmaddr: u64,
+    vmsize: u64,
+    fileoff: u64,
+    filesize: u64,
+    maxprot: u32,
+    initprot: u32,
+    nsects: u32,
+    flags: u32,
+) {
+    let cmdsize = 72_u32 +% nsects *% 80_u32;
+    out.pu32(alloc, LC_SEGMENT_64);
+    out.pu32(alloc, cmdsize);
+    out.pfixed16(alloc, segname);
+    out.pu64(alloc, vmaddr);
+    out.pu64(alloc, vmsize);
+    out.pu64(alloc, fileoff);
+    out.pu64(alloc, filesize);
+    out.pu32(alloc, maxprot);
+    out.pu32(alloc, initprot);
+    out.pu32(alloc, nsects);
+    out.pu32(alloc, flags);
+}
+
+fn write_sect64(
+    out: *mut MachBuf,
+    alloc: *mut AllocCap,
+    sectname: *str,
+    segname: *str,
+    addr: u64,
+    size: u64,
+    offset: u32,
+    align_log2: u32,
+    flags: u32,
+    reserved1: u32,
+    reserved2: u32,
+) {
+    out.pfixed16(alloc, sectname);
+    out.pfixed16(alloc, segname);
+    out.pu64(alloc, addr);
+    out.pu64(alloc, size);
+    out.pu32(alloc, offset);
+    out.pu32(alloc, align_log2);
+    out.pu32(alloc, 0_u32); // reloff
+    out.pu32(alloc, 0_u32); // nreloc
+    out.pu32(alloc, flags);
+    out.pu32(alloc, reserved1);
+    out.pu32(alloc, reserved2);
+    out.pu32(alloc, 0_u32); // reserved3
+}
+
+fn write_lc_load_dylib(out: *mut MachBuf, alloc: *mut AllocCap, cmd: u32, path: *[u8]) {
+    let cmdsize = align_u32_m((24_usize +% path.len +% 1_usize).trunc.[u32](), 8_u32);
+    out.pu32(alloc, cmd);
+    out.pu32(alloc, cmdsize);
+    out.pu32(alloc, 24_u32);          // name offset
+    out.pu32(alloc, 2_u32);           // timestamp
+    out.pu32(alloc, 0x00010000_u32);  // current_version 1.0.0
+    out.pu32(alloc, 0x00010000_u32);  // compatibility_version 1.0.0
+    out.pbytes(alloc, path);
+    out.pu8(alloc, 0_u8);
+    let pad = cmdsize.widen.[usize]() -% (24_usize +% path.len +% 1_usize);
+    out.pzeros(alloc, pad);
+}
+
+/// Build an Apple ad-hoc `LC_CODE_SIGNATURE` SuperBlob containing a CodeDirectory
+/// with real SHA-256 hashes of every 4 KiB page from `0..codesig_off`.
+fn build_adhoc_code_signature(
+    alloc: *mut AllocCap,
+    image_prefix: *[u8],
+    ident: *[u8],
+    text_file_size: u64,
+    is_exec: bool,
+) -> MachBuf ! OutOfMemory {
+    let page_sz: usize = 4096_usize;
+    let code_limit: u32 = image_prefix.len.trunc.[u32]();
+    let n_code_slots: u32 = ((image_prefix.len +% page_sz -% 1_usize) / page_sz).trunc.[u32]();
+    let cd_hdr_size: u32 = 88_u32; // CodeDirectory v0x20400 header with execSeg fields
+    let ident_off: u32 = cd_hdr_size;
+    let hash_off: u32 = ident_off +% ident.len.trunc.[u32]() +% 1_u32;
+    let cd_len: u32 = hash_off +% n_code_slots *% 32_u32;
+    let super_hdr: u32 = 20_u32; // magic(4) + len(4) + count=1(4) + BlobIndex(type=4, offset=4)
+    let total_len: u32 = super_hdr +% cd_len;
+
+    var sb = try MachBuf.init(alloc, total_len.widen.[usize]() +% 16_usize);
+    // SuperBlob header (Big-Endian!)
+    sb.pu32_be(alloc, CSMAGIC_EMBEDDED_SIGNATURE);
+    sb.pu32_be(alloc, total_len);
+    sb.pu32_be(alloc, 1_u32); // count = 1 (CodeDirectory)
+    sb.pu32_be(alloc, CSSLOT_CODEDIRECTORY);
+    sb.pu32_be(alloc, super_hdr);
+
+    // CodeDirectory v0x20400 (Big-Endian!)
+    sb.pu32_be(alloc, CSMAGIC_CODEDIRECTORY);
+    sb.pu32_be(alloc, cd_len);
+    sb.pu32_be(alloc, 0x00020400_u32); // version 2.4 (execSeg support)
+    sb.pu32_be(alloc, 0x00020002_u32); // CS_ADHOC (0x2) | CS_LINKER_SIGNED (0x20000)
+    sb.pu32_be(alloc, hash_off);       // hashOffset
+    sb.pu32_be(alloc, ident_off);      // identOffset
+    sb.pu32_be(alloc, 0_u32);          // nSpecialSlots = 0
+    sb.pu32_be(alloc, n_code_slots);   // nCodeSlots
+    sb.pu32_be(alloc, code_limit);     // codeLimit
+    sb.pu8(alloc, 32_u8);              // hashSize = 32 (SHA-256)
+    sb.pu8(alloc, 2_u8);               // hashType = 2 (CS_HASHTYPE_SHA256)
+    sb.pu8(alloc, 0_u8);               // platform = 0
+    sb.pu8(alloc, 12_u8);              // pageSize = log2(4096) = 12
+    sb.pu32_be(alloc, 0_u32);          // spare2
+    sb.pu32_be(alloc, 0_u32);          // scatterOffset
+    sb.pu32_be(alloc, 0_u32);          // teamOffset
+    sb.pu32_be(alloc, 0_u32);          // spare3
+    sb.pu64_be(alloc, 0_u64);          // codeLimit64
+    sb.pu64_be(alloc, 0_u64);          // execSegBase
+    sb.pu64_be(alloc, text_file_size); // execSegLimit
+    sb.pu64_be(alloc, if is_exec { 1_u64 } else { 0_u64 }); // CS_EXECSEG_MAIN_BINARY
+
+    // Identifier NUL-terminated
+    sb.pbytes(alloc, ident);
+    sb.pu8(alloc, 0_u8);
+
+    // Per-4KiB-page SHA-256 hashes over `image_prefix`
+    var pg: usize = 0_usize;
+    while pg < image_prefix.len {
+        var end = pg +% page_sz;
+        if end > image_prefix.len { end = image_prefix.len; }
+        let slice = image_prefix.sub(pg, end) catch "".as_bytes();
+        let digest = sha256_bytes(slice);
+        sb.pbytes(alloc, digest[0_usize..32_usize]);
+        pg = end;
+    }
+    sb.align_to(alloc, 16_usize);
+    return sb;
+}
+
+/// Emit a valid macOS/iOS `Info.plist` XML manifest for `.app` bundles.
+pub fn emit_app_info_plist(
+    alloc: *mut AllocCap,
+    app_name: *[u8],
+    bundle_id: *[u8],
+    is_ios: bool,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    try out.push_str_grow(alloc, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    try out.push_str_grow(alloc, "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n");
+    try out.push_str_grow(alloc, "<plist version=\"1.0\">\n<dict>\n");
+    try out.push_str_grow(alloc, "  <key>CFBundleExecutable</key>\n  <string>");
+    try out.push_bytes_grow(alloc, app_name);
+    try out.push_str_grow(alloc, "</string>\n  <key>CFBundleIdentifier</key>\n  <string>");
+    try out.push_bytes_grow(alloc, bundle_id);
+    try out.push_str_grow(alloc, "</string>\n  <key>CFBundleName</key>\n  <string>");
+    try out.push_bytes_grow(alloc, app_name);
+    try out.push_str_grow(alloc, "</string>\n  <key>CFBundlePackageType</key>\n  <string>APPL</string>\n");
+    try out.push_str_grow(alloc, "  <key>CFBundleShortVersionString</key>\n  <string>1.0</string>\n");
+    try out.push_str_grow(alloc, "  <key>CFBundleVersion</key>\n  <string>1</string>\n");
+    try out.push_str_grow(alloc, "  <key>NSHighResolutionCapable</key>\n  <true/>\n");
+    if is_ios {
+        try out.push_str_grow(alloc, "  <key>LSRequiresIPhoneOS</key>\n  <true/>\n");
+        try out.push_str_grow(alloc, "  <key>MinimumOSVersion</key>\n  <string>16.0</string>\n");
+    } else {
+        try out.push_str_grow(alloc, "  <key>LSMinimumSystemVersion</key>\n  <string>13.0</string>\n");
+    }
+    try out.push_str_grow(alloc, "</dict>\n</plist>\n");
+    return;
+}
+
+/// Link `ElfLinkInput` directly into a Mach-O 64-bit binary with ad-hoc SHA-256 `LC_CODE_SIGNATURE`.
+pub fn link_macho64(
+    alloc: *mut AllocCap,
+    input: *elf64.ElfLinkInput,
+    interner: *span.SymInterner,
+    spec: target.TargetSpec,
+) -> elf64.LinkResult ! OutOfMemory {
+    let is_arm64 = spec.arch == .AArch64;
+    let is_ios = spec.os == .IOS;
+    let is_dylib = spec.is_shared || input.mode.kind == .LinuxShared;
+    let page_sz: u64 = if is_arm64 { 0x4000_u64 } else { 0x1000_u64 };
+    let text_vm_base: u64 = if is_dylib { 0_u64 } else { 0x100000000_u64 };
+
+    // 1. Collect defined symbols and external dylib imports.
+    var def_map = try col.HashMap.[u32].init(alloc, input.symbols.len() *% 2_usize +% 16_usize);
+    errdefer def_map.destroy(alloc);
+    let syms = input.symbols.as_slice();
+    var si: usize = 0_usize;
+    while si < syms.len {
+        try def_map.insert(alloc, syms[si].name_sym.widen.[u64](), si.trunc.[u32]());
+        si = si +% 1_usize;
+    }
+
+    var dylib_pool = try col.DynBuf.[u8].init(alloc, 128_usize);
+    errdefer dylib_pool.destroy(alloc);
+    var dylibs = try col.DynBuf.[MachDylibEntry].init(alloc, 8_usize);
+    errdefer dylibs.destroy(alloc);
+    _ = try push_dylib_unique(alloc, &mut dylib_pool, &mut dylibs, "/usr/lib/libSystem.B.dylib".as_bytes());
+    let nlibs = input.needed_libs.as_slice();
+    var li: usize = 0_usize;
+    while li < nlibs.len {
+        let raw_lib = interner.get(nlibs[li]);
+        let dk = resolve_darwin_dylib_kind(raw_lib, is_ios);
+        let lp: *[u8] = if dk == 0_u8 {
+            raw_lib
+        } else if dk == 2_u8 {
+            "/usr/lib/libobjc.A.dylib".as_bytes()
+        } else if dk == 3_u8 {
+            "/System/Library/Frameworks/Metal.framework/Versions/A/Metal".as_bytes()
+        } else if dk == 4_u8 {
+            "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore".as_bytes()
+        } else if dk == 5_u8 {
+            "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation".as_bytes()
+        } else if dk == 6_u8 {
+            "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation".as_bytes()
+        } else if dk == 7_u8 {
+            "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics".as_bytes()
+        } else if dk == 8_u8 {
+            "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit".as_bytes()
+        } else if dk == 9_u8 {
+            "/System/Library/Frameworks/UIKit.framework/UIKit".as_bytes()
+        } else {
+            "/usr/lib/libSystem.B.dylib".as_bytes()
+        };
+        _ = try push_dylib_unique(alloc, &mut dylib_pool, &mut dylibs, lp);
+        li = li +% 1_usize;
+    }
+
+    var ext_syms = try col.DynBuf.[MachExtSym].init(alloc, 16_usize);
+    errdefer ext_syms.destroy(alloc);
+    var ext_map = try col.HashMap.[u32].init(alloc, 32_usize);
+    errdefer ext_map.destroy(alloc);
+
+    let exts = input.external_syms.as_slice();
+    var ei: usize = 0_usize;
+    while ei < exts.len {
+        let ek = exts[ei].widen.[u64]();
+        if !def_map.contains(ek) && !ext_map.contains(ek) {
+            try ext_map.insert(alloc, ek, ext_syms.len().trunc.[u32]());
+            try ext_syms.push(alloc, MachExtSym.{ sym_id: exts[ei], stub_text_off: 0_u32, got_dc_off: 0_u32, lib_ordinal: 1_u32 });
+        }
+        ei = ei +% 1_usize;
+    }
+    let rels = input.relocs.as_slice();
+    var ri: usize = 0_usize;
+    while ri < rels.len {
+        let tk = rels[ri].target_sym.widen.[u64]();
+        if !def_map.contains(tk) && !ext_map.contains(tk) {
+            let tsym = rels[ri].target_sym;
+            let nb = interner.get(tsym);
+            let is_synth = str.bytes_eq(nb, "__eon_ehdr_start".as_bytes())
+                || str.bytes_eq(nb, "__eon_rela_dyn_start".as_bytes())
+                || str.bytes_eq(nb, "__eon_rela_dyn_end".as_bytes())
+                || str.bytes_eq(nb, "__eon_tdata_start".as_bytes())
+                || str.bytes_eq(nb, "__eon_tdata_end".as_bytes());
+            if !is_synth {
+                try ext_map.insert(alloc, tk, ext_syms.len().trunc.[u32]());
+                var ord: u32 = 1_u32;
+                if str.starts_with(nb, "objc_".as_bytes()) || str.starts_with(nb, "sel_".as_bytes()) {
+                    ord = try push_dylib_unique(alloc, &mut dylib_pool, &mut dylibs, "/usr/lib/libobjc.A.dylib".as_bytes());
+                } else if str.starts_with(nb, "MTL".as_bytes()) {
+                    ord = try push_dylib_unique(alloc, &mut dylib_pool, &mut dylibs, "/System/Library/Frameworks/Metal.framework/Versions/A/Metal".as_bytes());
+                }
+                try ext_syms.push(alloc, MachExtSym.{ sym_id: tsym, stub_text_off: 0_u32, got_dc_off: 0_u32, lib_ordinal: ord });
+            }
+        }
+        ri = ri +% 1_usize;
+    }
+
+    // 2. Compute exact Load Commands size so `__text` starts immediately after headers!
+    // Load commands:
+    //   [__PAGEZERO if exec] (72)
+    //   __TEXT (72 + 3*80 = 312: __text, __stubs, __const)
+    //   __DATA_CONST (72 + 2*80 = 232: __got, __const)
+    //   __DATA (72 + 2*80 = 232: __data, __bss)
+    //   __LINKEDIT (72)
+    //   LC_DYLD_CHAINED_FIXUPS (16)
+    //   LC_DYLD_EXPORTS_TRIE (16)
+    //   LC_SYMTAB (24)
+    //   LC_DYSYMTAB (80)
+    //   [LC_LOAD_DYLINKER "/usr/lib/dyld" (32) if exec]
+    //   [LC_ID_DYLIB if dylib]
+    //   LC_UUID (24)
+    //   LC_BUILD_VERSION (24)
+    //   [LC_MAIN (24) if exec]
+    //   LC_LOAD_DYLIB * ndylibs
+    //   LC_CODE_SIGNATURE (16)
+    let id_dylib_path = "@rpath/libeon.dylib".as_bytes();
+    var ncmds: u32 = 11_u32 +% dylibs.len().trunc.[u32]();
+    var sizeofcmds: u32 = 312_u32 +% 232_u32 +% 232_u32 +% 72_u32
+        +% 16_u32 +% 16_u32 +% 24_u32 +% 80_u32 +% 24_u32 +% 24_u32 +% 16_u32;
+    if is_dylib {
+        ncmds = ncmds +% 1_u32;
+        sizeofcmds = sizeofcmds +% align_u32_m((24_usize +% id_dylib_path.len +% 1_usize).trunc.[u32](), 8_u32);
+    } else {
+        ncmds = ncmds +% 3_u32; // __PAGEZERO + LC_LOAD_DYLINKER + LC_MAIN
+        sizeofcmds = sizeofcmds +% 72_u32 +% 32_u32 +% 24_u32;
+    }
+    let dls = dylibs.as_slice();
+    var di: usize = 0_usize;
+    while di < dls.len {
+        sizeofcmds = sizeofcmds +% align_u32_m((24_u32 +% dls[di].path_len +% 1_u32), 8_u32);
+        di = di +% 1_usize;
+    }
+    let text_code_off = align_u32_m(32_u32 +% sizeofcmds, 16_u32);
+
+    // 3. Layout `__TEXT` (__text, __stubs, __const)
+    var text_buf = try MachBuf.init(alloc, input.text.len() +% ext_syms.len() *% 16_usize +% 64_usize);
+    errdefer text_buf.destroy(alloc);
+    text_buf.pbytes(alloc, input.text.as_slice());
+    text_buf.align_to(alloc, 16_usize);
+    let stubs_in_text_off = text_buf.len().trunc.[u32]();
+    let ext_mut = ext_syms.as_mut_slice();
+    var xi: usize = 0_usize;
+    while xi < ext_mut.len {
+        ext_mut[xi].stub_text_off = text_buf.len().trunc.[u32]();
+        if is_arm64 {
+            // ADRP x16, got@PAGE; LDR x16, [x16, got@PAGEOFF]; BR x16
+            text_buf.pu32(alloc, 0x90000010_u32);
+            text_buf.pu32(alloc, 0xF9400210_u32);
+            text_buf.pu32(alloc, 0xD61F0200_u32);
+        } else {
+            // jmp qword ptr [rip + disp32]
+            text_buf.pu8(alloc, 0xFF_u8);
+            text_buf.pu8(alloc, 0x25_u8);
+            text_buf.pu32(alloc, 0_u32);
+        }
+        xi = xi +% 1_usize;
+    }
+    let stubs_size = text_buf.len().trunc.[u32]() -% stubs_in_text_off;
+    text_buf.align_to(alloc, 16_usize);
+    let rodata_in_text_off = text_buf.len().trunc.[u32]();
+    text_buf.pbytes(alloc, input.rodata.as_slice());
+    let rodata_size = input.rodata.len().trunc.[u32]();
+
+    let text_end_raw = text_code_off.widen.[u64]() +% text_buf.len().widen.[u64]();
+    let text_seg_size = align_u64_m(text_end_raw, page_sz);
+
+    // 4. Layout `__DATA_CONST` (__got + __const / data_rel_ro)
+    var dc_buf = try MachBuf.init(alloc, ext_mut.len *% 8_usize +% input.data_rel_ro.len() +% 64_usize);
+    errdefer dc_buf.destroy(alloc);
+    xi = 0_usize;
+    while xi < ext_mut.len {
+        ext_mut[xi].got_dc_off = dc_buf.len().trunc.[u32]();
+        dc_buf.pu64(alloc, 0_u64); // populated by dyld chained bind below
+        xi = xi +% 1_usize;
+    }
+    let got_size = dc_buf.len().trunc.[u32]();
+    dc_buf.align_to(alloc, 16_usize);
+    let relro_in_dc_off = dc_buf.len().trunc.[u32]();
+    dc_buf.pbytes(alloc, input.data_rel_ro.as_slice());
+    let dc_file_off = text_seg_size;
+    let dc_vm_addr = text_vm_base +% text_seg_size;
+    let dc_seg_size = align_u64_m(if dc_buf.len() == 0_usize { 16_u64 } else { dc_buf.len().widen.[u64]() }, page_sz);
+
+    // 5. Layout `__DATA` (__data + __bss)
+    var data_buf = try MachBuf.init(alloc, input.data.len() +% input.tdata.len() +% 64_usize);
+    errdefer data_buf.destroy(alloc);
+    data_buf.pbytes(alloc, input.data.as_slice());
+    data_buf.align_to(alloc, 16_usize);
+    let tdata_in_data_off = data_buf.len().trunc.[u32]();
+    data_buf.pbytes(alloc, input.tdata.as_slice());
+    data_buf.align_to(alloc, 16_usize);
+    let data_init_size = data_buf.len().trunc.[u32]();
+    let bss_in_data_off = data_init_size;
+    let tbss_in_data_off = align_u32_m(bss_in_data_off +% input.bss_size.trunc.[u32](), 16_u32);
+    let total_bss = (tbss_in_data_off +% input.tbss_size.trunc.[u32]()) -% data_init_size;
+
+    let data_file_off = dc_file_off +% dc_seg_size;
+    let data_vm_addr = dc_vm_addr +% dc_seg_size;
+    let data_file_size = align_u64_m(if data_init_size == 0_u32 { 16_u64 } else { data_init_size.widen.[u64]() }, page_sz);
+    let data_vm_size = align_u64_m(data_init_size.widen.[u64]() +% total_bss.widen.[u64]() +% 16_u64, page_sz);
+
+    // 6. Compute symbol virtual addresses and patch stubs + relocations!
+    var sym_vm = try col.HashMap.[u64].init(alloc, (syms.len +% ext_mut.len) *% 2_usize +% 16_usize);
+    errdefer sym_vm.destroy(alloc);
+    si = 0_usize;
+    while si < syms.len {
+        let sym = syms[si];
+        var vma: u64 = text_vm_base +% text_code_off.widen.[u64]();
+        match sym.section {
+            .Text => { vma = text_vm_base +% text_code_off.widen.[u64]() +% sym.offset; }
+            .Rodata => { vma = text_vm_base +% text_code_off.widen.[u64]() +% rodata_in_text_off.widen.[u64]() +% sym.offset; }
+            .DataRelRo => { vma = dc_vm_addr +% relro_in_dc_off.widen.[u64]() +% sym.offset; }
+            .Data => { vma = data_vm_addr +% sym.offset; }
+            .Bss => { vma = data_vm_addr +% bss_in_data_off.widen.[u64]() +% sym.offset; }
+            .Tdata => { vma = data_vm_addr +% tdata_in_data_off.widen.[u64]() +% sym.offset; }
+            .Tbss => { vma = data_vm_addr +% tbss_in_data_off.widen.[u64]() +% sym.offset; }
+        }
+        try sym_vm.insert(alloc, sym.name_sym.widen.[u64](), vma);
+        si = si +% 1_usize;
+    }
+    xi = 0_usize;
+    while xi < ext_mut.len {
+        let stub_vm = text_vm_base +% text_code_off.widen.[u64]() +% ext_mut[xi].stub_text_off.widen.[u64]();
+        let got_vm = dc_vm_addr +% ext_mut[xi].got_dc_off.widen.[u64]();
+        try sym_vm.insert(alloc, ext_mut[xi].sym_id.widen.[u64](), stub_vm);
+        if is_arm64 {
+            let pc_pg = (stub_vm & (~0xFFF_u64)).bitcast.[i64]();
+            let dst_pg = (got_vm & (~0xFFF_u64)).bitcast.[i64]();
+            let imm21 = ((dst_pg -% pc_pg) >> 12_i64).bitcast.[u64]();
+            let immlo = (imm21 & 3_u64).trunc.[u32]();
+            let immhi = ((imm21 >> 2_u64) & 0x7FFFF_u64).trunc.[u32]();
+            text_buf.patch_u32(ext_mut[xi].stub_text_off.widen.[usize](), 0x90000010_u32 | (immlo << 29_u32) | (immhi << 5_u32));
+            let pg_off = ((got_vm & 0xFFF_u64) >> 3_u64).trunc.[u32]();
+            text_buf.patch_u32(ext_mut[xi].stub_text_off.widen.[usize]() +% 4_usize, 0xF9400210_u32 | (pg_off << 10_u32));
+        } else {
+            let disp = got_vm.bitcast.[i64]() -% (stub_vm +% 6_u64).bitcast.[i64]();
+            text_buf.patch_u32(ext_mut[xi].stub_text_off.widen.[usize]() +% 2_usize, disp.bitcast.[u64]().trunc.[u32]());
+        }
+        xi = xi +% 1_usize;
+    }
+
+    // Apply code/data relocations!
+    ri = 0_usize;
+    while ri < rels.len {
+        let r = rels[ri];
+        let tgt_vm = sym_vm.get(r.target_sym.widen.[u64]()) orelse text_vm_base;
+        var sec_k: u8 = 0_u8; // 0=text_buf, 1=dc_buf, 2=data_buf
+        var buf_off: usize = r.offset.trunc.[usize]();
+        var site_vm: u64 = 0_u64;
+        match r.section {
+            .Text => {
+                sec_k = 0_u8;
+                site_vm = text_vm_base +% text_code_off.widen.[u64]() +% r.offset;
+            }
+            .Rodata => {
+                sec_k = 0_u8;
+                buf_off = rodata_in_text_off.widen.[usize]() +% r.offset.trunc.[usize]();
+                site_vm = text_vm_base +% text_code_off.widen.[u64]() +% buf_off.widen.[u64]();
+            }
+            .DataRelRo => {
+                sec_k = 1_u8;
+                buf_off = relro_in_dc_off.widen.[usize]() +% r.offset.trunc.[usize]();
+                site_vm = dc_vm_addr +% buf_off.widen.[u64]();
+            }
+            .Data => {
+                sec_k = 2_u8;
+                site_vm = data_vm_addr +% r.offset;
+            }
+            .Tdata => {
+                sec_k = 2_u8;
+                buf_off = tdata_in_data_off.widen.[usize]() +% r.offset.trunc.[usize]();
+                site_vm = data_vm_addr +% buf_off.widen.[u64]();
+            }
+            _ => { ri = ri +% 1_usize; continue; }
+        }
+
+        if r.kind == .Abs64 {
+            let v64 = tgt_vm +% r.addend.bitcast.[u64]();
+            if sec_k == 0_u8 { text_buf.patch_u64(buf_off, v64); }
+            else if sec_k == 1_u8 { dc_buf.patch_u64(buf_off, v64); }
+            else { data_buf.patch_u64(buf_off, v64); }
+        } else if r.kind == .Rel32 || r.kind == .Plt32 || r.kind == .GotPcRel32 {
+            var tv = tgt_vm;
+            if r.kind == .GotPcRel32 {
+                if let eidx = ext_map.get(r.target_sym.widen.[u64]()) {
+                    let eu = eidx.widen.[usize]();
+                    if eu < ext_mut.len { tv = dc_vm_addr +% ext_mut[eu].got_dc_off.widen.[u64](); }
+                }
+            }
+            let d = (tv.bitcast.[i64]() +% r.addend -% (site_vm.bitcast.[i64]() +% 4_i64)).bitcast.[u64]().trunc.[u32]();
+            if sec_k == 0_u8 { text_buf.patch_u32(buf_off, d); }
+            else if sec_k == 1_u8 { dc_buf.patch_u32(buf_off, d); }
+            else { data_buf.patch_u32(buf_off, d); }
+        } else if r.kind == .A64Call26 || r.kind == .A64Jump26 {
+            let s = text_buf.bytes.as_slice();
+            if sec_k == 0_u8 && s.len >= 4_usize && buf_off <= s.len - 4_usize {
+                let old_w = s[buf_off].widen.[u32]()
+                    | (s[buf_off + 1_usize].widen.[u32]() << 8_u32)
+                    | (s[buf_off + 2_usize].widen.[u32]() << 16_u32)
+                    | (s[buf_off + 3_usize].widen.[u32]() << 24_u32);
+                let imm26 = (((tgt_vm.bitcast.[i64]() +% r.addend -% site_vm.bitcast.[i64]()) >> 2_i64).bitcast.[u64]() & 0x03FFFFFF_u64).trunc.[u32]();
+                text_buf.patch_u32(buf_off, (old_w & 0xFC000000_u32) | imm26);
+            }
+        } else if r.kind == .A64Adrp21 || r.kind == .A64AdrpGot21 {
+            var tv = tgt_vm +% r.addend.bitcast.[u64]();
+            if r.kind == .A64AdrpGot21 {
+                if let eidx = ext_map.get(r.target_sym.widen.[u64]()) {
+                    let eu = eidx.widen.[usize]();
+                    if eu < ext_mut.len { tv = dc_vm_addr +% ext_mut[eu].got_dc_off.widen.[u64](); }
+                }
+            }
+            let s = text_buf.bytes.as_slice();
+            if sec_k == 0_u8 && s.len >= 4_usize && buf_off <= s.len - 4_usize {
+                let old_w = s[buf_off].widen.[u32]()
+                    | (s[buf_off + 1_usize].widen.[u32]() << 8_u32)
+                    | (s[buf_off + 2_usize].widen.[u32]() << 16_u32)
+                    | (s[buf_off + 3_usize].widen.[u32]() << 24_u32);
+                let pc_pg = (site_vm & (~0xFFF_u64)).bitcast.[i64]();
+                let dst_pg = (tv & (~0xFFF_u64)).bitcast.[i64]();
+                let imm21 = ((dst_pg -% pc_pg) >> 12_i64).bitcast.[u64]();
+                let immlo = (imm21 & 3_u64).trunc.[u32]();
+                let immhi = ((imm21 >> 2_u64) & 0x7FFFF_u64).trunc.[u32]();
+                text_buf.patch_u32(buf_off, (old_w & 0x9F00001F_u32) | (immlo << 29_u32) | (immhi << 5_u32));
+            }
+        } else if r.kind == .A64AddLo12 || r.kind == .A64Ldst64Lo12 || r.kind == .A64Ld64GotLo12 {
+            var tv = tgt_vm +% r.addend.bitcast.[u64]();
+            if r.kind == .A64Ld64GotLo12 {
+                if let eidx = ext_map.get(r.target_sym.widen.[u64]()) {
+                    let eu = eidx.widen.[usize]();
+                    if eu < ext_mut.len { tv = dc_vm_addr +% ext_mut[eu].got_dc_off.widen.[u64](); }
+                }
+            }
+            let s = text_buf.bytes.as_slice();
+            if sec_k == 0_u8 && s.len >= 4_usize && buf_off <= s.len - 4_usize {
+                let old_w = s[buf_off].widen.[u32]()
+                    | (s[buf_off + 1_usize].widen.[u32]() << 8_u32)
+                    | (s[buf_off + 2_usize].widen.[u32]() << 16_u32)
+                    | (s[buf_off + 3_usize].widen.[u32]() << 24_u32);
+                let shift: u64 = if r.kind == .A64AddLo12 { 0_u64 } else { 3_u64 };
+                let imm12 = (((tv & 0xFFF_u64) >> shift) & 0xFFF_u64).trunc.[u32]();
+                text_buf.patch_u32(buf_off, (old_w & 0xFFC003FF_u32) | (imm12 << 10_u32));
+            }
+        }
+        ri = ri +% 1_usize;
+    }
+
+    // Encode DYLD_CHAINED_PTR_64_BIND entries into `__got` (each 8B slot chained with next=2 (2*4B=8B)).
+    xi = 0_usize;
+    while xi < ext_mut.len {
+        let next_stride: u64 = if xi +% 1_usize < ext_mut.len { 2_u64 } else { 0_u64 };
+        // DYLD_CHAINED_PTR_64_BIND: bit 63=1(bind), bits 62..51=next(12b), bits 50..24=0, bits 23..0=ordinal
+        let bind_val: u64 = (1_u64 << 63_u64) | (next_stride << 51_u64) | xi.widen.[u64]();
+        dc_buf.patch_u64(ext_mut[xi].got_dc_off.widen.[usize](), bind_val);
+        xi = xi +% 1_usize;
+    }
+
+    // 7. Build `__LINKEDIT` payloads: Chained Fixups + Exports Trie + Symtab/Strtab!
+    var fixups_buf = try MachBuf.init(alloc, 256_usize);
+    errdefer fixups_buf.destroy(alloc);
+    // dyld_chained_fixups_header (28 bytes + 4 pad = 32)
+    // seg_count = 4 (__PAGEZERO, __TEXT, __DATA_CONST, __DATA, __LINKEDIT -> 5 if exec, 4 if dylib)
+    let seg_count: u32 = if is_dylib { 4_u32 } else { 5_u32 };
+    let starts_off: u32 = 32_u32;
+    let dc_seg_idx: u32 = if is_dylib { 1_u32 } else { 2_u32 };
+    let starts_img_hdr: u32 = 4_u32 +% seg_count *% 4_u32;
+    let has_dc_binds = ext_mut.len > 0_usize;
+    let seg_info_size: u32 = if has_dc_binds { 24_u32 } else { 0_u32 }; // 22 bytes + 1 page_start(2)
+    let imports_off: u32 = align_u32_m(starts_off +% starts_img_hdr +% seg_info_size, 4_u32);
+    let syms_off: u32 = imports_off +% (ext_mut.len *% 4_usize).trunc.[u32]();
+
+    fixups_buf.pu32(alloc, 0_u32);        // fixups_version = 0
+    fixups_buf.pu32(alloc, starts_off);   // starts_offset
+    fixups_buf.pu32(alloc, imports_off);  // imports_offset
+    fixups_buf.pu32(alloc, syms_off);     // symbols_offset
+    fixups_buf.pu32(alloc, ext_mut.len.trunc.[u32]()); // imports_count
+    fixups_buf.pu32(alloc, 1_u32);        // DYLD_CHAINED_IMPORT = 1
+    fixups_buf.pu32(alloc, 0_u32);        // symbols_format = 0 (uncompressed)
+    fixups_buf.pu32(alloc, 0_u32);        // pad to 32
+
+    // dyld_chained_starts_in_image
+    fixups_buf.pu32(alloc, seg_count);
+    var sgi: u32 = 0_u32;
+    while sgi < seg_count {
+        if has_dc_binds && sgi == dc_seg_idx {
+            fixups_buf.pu32(alloc, starts_img_hdr);
+        } else {
+            fixups_buf.pu32(alloc, 0_u32);
+        }
+        sgi = sgi +% 1_u32;
+    }
+    if has_dc_binds {
+        // dyld_chained_starts_in_segment for __DATA_CONST
+        fixups_buf.pu32(alloc, 24_u32);                     // size
+        fixups_buf.pu16(alloc, page_sz.trunc.[u16]());      // page_size
+        fixups_buf.pu16(alloc, 2_u16);                      // DYLD_CHAINED_PTR_64 = 2
+        fixups_buf.pu64(alloc, dc_file_off);                // segment_offset
+        fixups_buf.pu32(alloc, 0_u32);                      // max_valid_pointer
+        fixups_buf.pu16(alloc, 1_u16);                      // page_count = 1
+        fixups_buf.pu16(alloc, 0_u16);                      // page_start[0] = 0
+    }
+    fixups_buf.align_to(alloc, 4_usize);
+    // Emit symbol names pool for imports first into a temp buffer to know offsets.
+    var imp_names = try MachBuf.init(alloc, 128_usize);
+    errdefer imp_names.destroy(alloc);
+    imp_names.pu8(alloc, 0_u8); // offset 0 = ""
+    xi = 0_usize;
+    while xi < ext_mut.len {
+        let name_off = imp_names.len().trunc.[u32]();
+        let nb = interner.get(ext_mut[xi].sym_id);
+        if nb.len == 0_usize || nb[0_usize] != b'_' {
+            imp_names.pu8(alloc, b'_');
+        }
+        imp_names.pbytes(alloc, nb);
+        imp_names.pu8(alloc, 0_u8);
+        // dyld_chained_import: bits 0..7=lib_ordinal, bit 8=weak(0), bits 9..31=name_offset
+        let imp_word: u32 = (ext_mut[xi].lib_ordinal & 0xFF_u32) | (name_off << 9_u32);
+        fixups_buf.pu32(alloc, imp_word);
+        xi = xi +% 1_usize;
+    }
+    fixups_buf.pbytes(alloc, imp_names.bytes.as_slice());
+    fixups_buf.align_to(alloc, 8_usize);
+
+    // Exports Trie (export `_main` for executable)
+    var entry_vm: u64 = text_vm_base +% text_code_off.widen.[u64]();
+    if input.entry_sym != span.SYM_EMPTY {
+        entry_vm = sym_vm.get(input.entry_sym.widen.[u64]()) orelse entry_vm;
+    }
+    let entry_file_off: u64 = entry_vm -% text_vm_base;
+    var exports_buf = try MachBuf.init(alloc, 64_usize);
+    errdefer exports_buf.destroy(alloc);
+    // Minimal valid prefix trie: root(term=0, child_cnt=1, edge="_main\0", child_off) -> leaf(term_sz, flags=0, addr=entry_off, child_cnt=0)
+    var leaf_tmp = try MachBuf.init(alloc, 16_usize);
+    errdefer leaf_tmp.destroy(alloc);
+    leaf_tmp.puleb(alloc, 0_u64); // EXPORT_SYMBOL_FLAGS_KIND_REGULAR
+    leaf_tmp.puleb(alloc, entry_file_off);
+    exports_buf.pu8(alloc, 0_u8); // root terminal_size = 0
+    exports_buf.pu8(alloc, 1_u8); // 1 child
+    exports_buf.pbytes(alloc, "_main".as_bytes());
+    exports_buf.pu8(alloc, 0_u8);
+    exports_buf.puleb(alloc, 9_u64); // child offset = 2 + 6 + 1 = 9
+    exports_buf.puleb(alloc, leaf_tmp.len().widen.[u64]());
+    exports_buf.pbytes(alloc, leaf_tmp.bytes.as_slice());
+    exports_buf.pu8(alloc, 0_u8); // leaf child count = 0
+    exports_buf.align_to(alloc, 8_usize);
+
+    // Symtab (`nlist_64`: 16 bytes each) + String Table
+    var symtab_buf = try MachBuf.init(alloc, (syms.len +% ext_mut.len +% 2_usize) *% 16_usize);
+    errdefer symtab_buf.destroy(alloc);
+    var strtab_buf = try MachBuf.init(alloc, 256_usize);
+    errdefer strtab_buf.destroy(alloc);
+    strtab_buf.pu8(alloc, 0x20_u8);
+    strtab_buf.pu8(alloc, 0_u8);
+    // Export `_main` in symtab
+    let main_strx = strtab_buf.len().trunc.[u32]();
+    strtab_buf.pbytes(alloc, "_main".as_bytes());
+    strtab_buf.pu8(alloc, 0_u8);
+    symtab_buf.pu32(alloc, main_strx);
+    symtab_buf.pu8(alloc, 0x0F_u8); // N_SECT | N_EXT
+    symtab_buf.pu8(alloc, 1_u8);    // sect 1 (__TEXT,__text)
+    symtab_buf.pu16(alloc, 0_u16);
+    symtab_buf.pu64(alloc, entry_vm);
+    let n_extdef: u32 = 1_u32;
+    // Undefined imported symbols
+    xi = 0_usize;
+    while xi < ext_mut.len {
+        let sx = strtab_buf.len().trunc.[u32]();
+        let nb = interner.get(ext_mut[xi].sym_id);
+        if nb.len == 0_usize || nb[0_usize] != b'_' { strtab_buf.pu8(alloc, b'_'); }
+        strtab_buf.pbytes(alloc, nb);
+        strtab_buf.pu8(alloc, 0_u8);
+        symtab_buf.pu32(alloc, sx);
+        symtab_buf.pu8(alloc, 0x01_u8); // N_UNDF | N_EXT
+        symtab_buf.pu8(alloc, 0_u8);
+        symtab_buf.pu16(alloc, (ext_mut[xi].lib_ordinal << 8_u32).trunc.[u16]());
+        symtab_buf.pu64(alloc, 0_u64);
+        xi = xi +% 1_usize;
+    }
+    strtab_buf.align_to(alloc, 8_usize);
+    let n_undef = ext_mut.len.trunc.[u32]();
+    let nsyms_total = n_extdef +% n_undef;
+
+    // 8. Compute `__LINKEDIT` offsets and deterministic UUID!
+    let linkedit_file_off = data_file_off +% data_file_size;
+    let linkedit_vm_addr = data_vm_addr +% data_vm_size;
+    let fixups_off_file = linkedit_file_off.trunc.[u32]();
+    let fixups_sz = fixups_buf.len().trunc.[u32]();
+    let exports_off_file = fixups_off_file +% fixups_sz;
+    let exports_sz = exports_buf.len().trunc.[u32]();
+    let symoff_file = exports_off_file +% exports_sz;
+    let stroff_file = symoff_file +% symtab_buf.len().trunc.[u32]();
+    let strsize = strtab_buf.len().trunc.[u32]();
+    let codesig_off_file = align_u32_m(stroff_file +% strsize, 16_u32);
+
+    // Precompute exact code signature size (depends only on `codesig_off_file` and ident length!).
+    let ident_str = if is_dylib { "libeon.dylib".as_bytes() } else { "eon_app".as_bytes() };
+    let n_cs_pages = ((codesig_off_file.widen.[usize]() +% 4095_usize) / 4096_usize).trunc.[u32]();
+    let codesig_sz = align_u32_m(20_u32 +% 88_u32 +% ident_str.len.trunc.[u32]() +% 1_u32 +% n_cs_pages *% 32_u32, 16_u32);
+    let linkedit_file_size = (codesig_off_file +% codesig_sz).widen.[u64]() -% linkedit_file_off;
+    let linkedit_vm_size = align_u64_m(linkedit_file_size, page_sz);
+
+    // Deterministic UUID v5 derived from SHA-256 of text bytes!
+    let uuid_hash = sha256_bytes(text_buf.bytes.as_slice());
+
+    // 9. Emit Mach-O 64-bit Header + Load Commands + Segments!
+    var out = try MachBuf.init(alloc, (codesig_off_file +% codesig_sz).widen.[usize]() +% 64_usize);
+    errdefer out.destroy(alloc);
+
+    // mach_header_64 (32 bytes)
+    out.pu32(alloc, MH_MAGIC_64);
+    out.pu32(alloc, if is_arm64 { CPU_TYPE_ARM64 } else { CPU_TYPE_X86_64 });
+    out.pu32(alloc, if is_arm64 { CPU_SUBTYPE_ARM64_ALL } else { CPU_SUBTYPE_X86_64_ALL });
+    out.pu32(alloc, if is_dylib { MH_DYLIB } else { MH_EXECUTE });
+    out.pu32(alloc, ncmds);
+    out.pu32(alloc, sizeofcmds);
+    out.pu32(alloc, if is_dylib { MH_FLAGS_DYLIB } else { MH_FLAGS_EXEC });
+    out.pu32(alloc, 0_u32); // reserved
+
+    // Load Command: __PAGEZERO (for executables)
+    if !is_dylib {
+        write_lc_segment64(&mut out, alloc, "__PAGEZERO", 0_u64, 0x100000000_u64, 0_u64, 0_u64, 0_u32, 0_u32, 0_u32, 0_u32);
+    }
+
+    // Load Command: __TEXT (3 sections: __text, __stubs, __const)
+    write_lc_segment64(&mut out, alloc, "__TEXT", text_vm_base, text_seg_size, 0_u64, text_seg_size, 5_u32, 5_u32, 3_u32, 0_u32);
+    write_sect64(&mut out, alloc, "__text", "__TEXT",
+        text_vm_base +% text_code_off.widen.[u64](),
+        stubs_in_text_off.widen.[u64](),
+        text_code_off, 4_u32, 0x80000400_u32, 0_u32, 0_u32);
+    write_sect64(&mut out, alloc, "__stubs", "__TEXT",
+        text_vm_base +% text_code_off.widen.[u64]() +% stubs_in_text_off.widen.[u64](),
+        stubs_size.widen.[u64](),
+        text_code_off +% stubs_in_text_off, 2_u32, 0x80000408_u32, 0_u32, if is_arm64 { 12_u32 } else { 6_u32 });
+    write_sect64(&mut out, alloc, "__const", "__TEXT",
+        text_vm_base +% text_code_off.widen.[u64]() +% rodata_in_text_off.widen.[u64](),
+        rodata_size.widen.[u64](),
+        text_code_off +% rodata_in_text_off, 4_u32, 0_u32, 0_u32, 0_u32);
+
+    // Load Command: __DATA_CONST (2 sections: __got, __const)
+    write_lc_segment64(&mut out, alloc, "__DATA_CONST", dc_vm_addr, dc_seg_size, dc_file_off, dc_seg_size, 3_u32, 3_u32, 2_u32, 0x10_u32);
+    write_sect64(&mut out, alloc, "__got", "__DATA_CONST",
+        dc_vm_addr, got_size.widen.[u64](), dc_file_off.trunc.[u32](), 3_u32, 6_u32, 0_u32, 0_u32);
+    write_sect64(&mut out, alloc, "__const", "__DATA_CONST",
+        dc_vm_addr +% relro_in_dc_off.widen.[u64](), input.data_rel_ro.len().widen.[u64](),
+        dc_file_off.trunc.[u32]() +% relro_in_dc_off, 4_u32, 0_u32, 0_u32, 0_u32);
+
+    // Load Command: __DATA (2 sections: __data, __bss)
+    write_lc_segment64(&mut out, alloc, "__DATA", data_vm_addr, data_vm_size, data_file_off, data_file_size, 3_u32, 3_u32, 2_u32, 0_u32);
+    write_sect64(&mut out, alloc, "__data", "__DATA",
+        data_vm_addr, data_init_size.widen.[u64](), data_file_off.trunc.[u32](), 4_u32, 0_u32, 0_u32, 0_u32);
+    write_sect64(&mut out, alloc, "__bss", "__DATA",
+        data_vm_addr +% bss_in_data_off.widen.[u64](), total_bss.widen.[u64](), 0_u32, 4_u32, 1_u32, 0_u32, 0_u32);
+
+    // Load Command: __LINKEDIT
+    write_lc_segment64(&mut out, alloc, "__LINKEDIT", linkedit_vm_addr, linkedit_vm_size, linkedit_file_off, linkedit_file_size, 1_u32, 1_u32, 0_u32, 0_u32);
+
+    // LC_DYLD_CHAINED_FIXUPS
+    out.pu32(alloc, LC_DYLD_CHAINED_FIXUPS);
+    out.pu32(alloc, 16_u32);
+    out.pu32(alloc, fixups_off_file);
+    out.pu32(alloc, fixups_sz);
+
+    // LC_DYLD_EXPORTS_TRIE
+    out.pu32(alloc, LC_DYLD_EXPORTS_TRIE);
+    out.pu32(alloc, 16_u32);
+    out.pu32(alloc, exports_off_file);
+    out.pu32(alloc, exports_sz);
+
+    // LC_SYMTAB
+    out.pu32(alloc, LC_SYMTAB);
+    out.pu32(alloc, 24_u32);
+    out.pu32(alloc, symoff_file);
+    out.pu32(alloc, nsyms_total);
+    out.pu32(alloc, stroff_file);
+    out.pu32(alloc, strsize);
+
+    // LC_DYSYMTAB (80 bytes)
+    out.pu32(alloc, LC_DYSYMTAB);
+    out.pu32(alloc, 80_u32);
+    out.pu32(alloc, 0_u32); out.pu32(alloc, 0_u32);           // local syms
+    out.pu32(alloc, 0_u32); out.pu32(alloc, n_extdef);        // extdef syms
+    out.pu32(alloc, n_extdef); out.pu32(alloc, n_undef);      // undef syms
+    out.pzeros(alloc, 48_usize);                              // toc/modtab/extref/indirect/relocs = 0
+
+    // LC_LOAD_DYLINKER (exec) or LC_ID_DYLIB (dylib)
+    if is_dylib {
+        write_lc_load_dylib(&mut out, alloc, LC_ID_DYLIB, id_dylib_path);
+    } else {
+        out.pu32(alloc, LC_LOAD_DYLINKER);
+        out.pu32(alloc, 32_u32);
+        out.pu32(alloc, 12_u32);
+        out.pbytes(alloc, "/usr/lib/dyld".as_bytes());
+        out.pzeros(alloc, 7_usize);
+    }
+
+    // LC_UUID (deterministic)
+    out.pu32(alloc, LC_UUID);
+    out.pu32(alloc, 24_u32);
+    var ui: usize = 0_usize;
+    while ui < 16_usize {
+        var ub = uuid_hash[ui];
+        if ui == 6_usize { ub = (ub & 0x0F_u8) | 0x50_u8; }
+        if ui == 8_usize { ub = (ub & 0x3F_u8) | 0x80_u8; }
+        out.pu8(alloc, ub);
+        ui = ui +% 1_usize;
+    }
+
+    // LC_BUILD_VERSION
+    out.pu32(alloc, LC_BUILD_VERSION);
+    out.pu32(alloc, 24_u32);
+    out.pu32(alloc, if is_ios { PLATFORM_IOS } else { PLATFORM_MACOS });
+    out.pu32(alloc, if is_ios { 0x00100000_u32 } else { 0x000D0000_u32 }); // minos 16.0 / 13.0
+    out.pu32(alloc, if is_ios { 0x00110000_u32 } else { 0x000E0000_u32 }); // sdk 17.0 / 14.0
+    out.pu32(alloc, 0_u32); // ntools
+
+    // LC_MAIN (exec)
+    if !is_dylib {
+        out.pu32(alloc, LC_MAIN);
+        out.pu32(alloc, 24_u32);
+        out.pu64(alloc, entry_file_off);
+        out.pu64(alloc, 0_u64); // default stacksize
+    }
+
+    // LC_LOAD_DYLIB for every imported dylib/framework
+    let dp_ro = dylib_pool.as_slice();
+    di = 0_usize;
+    while di < dls.len {
+        let s = dls[di].path_off.widen.[usize]();
+        let e = s +% dls[di].path_len.widen.[usize]();
+        if e <= dp_ro.len {
+            let sl = dp_ro.sub(s, e) catch "/usr/lib/libSystem.B.dylib".as_bytes();
+            write_lc_load_dylib(&mut out, alloc, LC_LOAD_DYLIB, sl);
+        }
+        di = di +% 1_usize;
+    }
+
+    // LC_CODE_SIGNATURE
+    out.pu32(alloc, LC_CODE_SIGNATURE);
+    out.pu32(alloc, 16_u32);
+    out.pu32(alloc, codesig_off_file);
+    out.pu32(alloc, codesig_sz);
+
+    // Emit Segment Payloads at exact aligned file offsets!
+    out.align_to(alloc, 16_usize);
+    out.pbytes(alloc, text_buf.bytes.as_slice());
+    out.align_to(alloc, page_sz.trunc.[usize]());
+    out.pbytes(alloc, dc_buf.bytes.as_slice());
+    if dc_buf.len() == 0_usize { out.pzeros(alloc, page_sz.trunc.[usize]()); }
+    else { out.align_to(alloc, page_sz.trunc.[usize]()); }
+    out.pbytes(alloc, data_buf.bytes.as_slice());
+    if data_buf.len() == 0_usize { out.pzeros(alloc, page_sz.trunc.[usize]()); }
+    else { out.align_to(alloc, page_sz.trunc.[usize]()); }
+
+    // Emit __LINKEDIT (fixups + exports + symtab + strtab + ad-hoc SHA-256 LC_CODE_SIGNATURE!)
+    out.pbytes(alloc, fixups_buf.bytes.as_slice());
+    out.pbytes(alloc, exports_buf.bytes.as_slice());
+    out.pbytes(alloc, symtab_buf.bytes.as_slice());
+    out.pbytes(alloc, strtab_buf.bytes.as_slice());
+    out.align_to(alloc, 16_usize);
+
+    let cs_buf = try build_adhoc_code_signature(alloc, out.bytes.as_slice(), ident_str, text_seg_size, !is_dylib);
+    errdefer cs_buf.destroy(alloc);
+    out.pbytes(alloc, cs_buf.bytes.as_slice());
+    let any_oom = text_buf.oom || dc_buf.oom || data_buf.oom || fixups_buf.oom
+        || imp_names.oom || leaf_tmp.oom
+        || exports_buf.oom || symtab_buf.oom || strtab_buf.oom || cs_buf.oom || out.oom;
+    try check_macho_oom(any_oom);
+    let empty_err = try str.StrBuf.init(alloc, 0_usize);
+    errdefer empty_err.destroy(alloc);
+
+    cs_buf.destroy(alloc);
+    strtab_buf.destroy(alloc);
+    symtab_buf.destroy(alloc);
+    leaf_tmp.destroy(alloc);
+    exports_buf.destroy(alloc);
+    imp_names.destroy(alloc);
+    fixups_buf.destroy(alloc);
+    sym_vm.destroy(alloc);
+    data_buf.destroy(alloc);
+    dc_buf.destroy(alloc);
+    text_buf.destroy(alloc);
+    ext_map.destroy(alloc);
+    ext_syms.destroy(alloc);
+    dylibs.destroy(alloc);
+    dylib_pool.destroy(alloc);
+    def_map.destroy(alloc);
+
+    let MachBuf.{ bytes: final_bytes, oom: _ } = out;
+    let linked = elf64.LinkedElf.{
+        bytes: final_bytes,
+        entry_vaddr: entry_vm,
+        text_vaddr: text_vm_base +% text_code_off.widen.[u64](),
+        rodata_vaddr: text_vm_base +% text_code_off.widen.[u64]() +% rodata_in_text_off.widen.[u64](),
+        data_rel_ro_vaddr: dc_vm_addr +% relro_in_dc_off.widen.[u64](),
+        data_vaddr: data_vm_addr,
+        bss_vaddr: data_vm_addr +% bss_in_data_off.widen.[u64](),
+        tdata_vaddr: data_vm_addr +% tdata_in_data_off.widen.[u64](),
+        tls_memsz: 0_u64,
+    };
+    return elf64.LinkResult.{ ok: true, elf: linked, err_msg: empty_err };
+}

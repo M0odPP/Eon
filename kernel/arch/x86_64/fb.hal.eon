@@ -1,0 +1,194 @@
+module kernel.arch.x86_64.fb @hal;
+
+// ============================================================================
+// x86_64 Freestanding Linear Framebuffer (Bochs VBE DISPI + PCI BAR0 discovery)
+// + Static Bump Allocator Region for `nostd` Graphics / EonUI
+// ============================================================================
+
+const VBE_DISPI_IOPORT_INDEX: u16 = 0x01CE_u16;
+const VBE_DISPI_IOPORT_DATA: u16 = 0x01CF_u16;
+const VBE_DISPI_INDEX_ID: u16 = 0_u16;
+const VBE_DISPI_INDEX_XRES: u16 = 1_u16;
+const VBE_DISPI_INDEX_YRES: u16 = 2_u16;
+const VBE_DISPI_INDEX_BPP: u16 = 3_u16;
+const VBE_DISPI_INDEX_ENABLE: u16 = 4_u16;
+const VBE_DISPI_DISABLED: u16 = 0x00_u16;
+const VBE_DISPI_ENABLED: u16 = 0x01_u16;
+const VBE_DISPI_LFB_ENABLED: u16 = 0x40_u16;
+
+const PCI_CONFIG_ADDR: u16 = 0x0CF8_u16;
+const PCI_CONFIG_DATA: u16 = 0x0CFC_u16;
+
+pub struct LinearFbInfo {
+    pub base_addr: u64;
+    pub width: u32;
+    pub height: u32;
+    pub pitch_bytes: u32;
+    pub bpp: u8;
+    pub is_bgr: bool;
+}
+
+@naked
+fn outw(_port: u16, _val: u16) {
+    raw {
+        asm("mov rdx, rdi; mov rax, rsi; outw; ret", options(noreturn));
+    }
+}
+
+@naked
+fn outl(_port: u16, _val: u32) {
+    raw {
+        asm("mov rdx, rdi; mov rax, rsi; outl; ret", options(noreturn));
+    }
+}
+
+@naked
+fn inl(_port: u16) -> u32 {
+    raw {
+        asm("mov rdx, rdi; xor rax, rax; inl; ret", options(noreturn));
+    }
+    return 0_u32;
+}
+
+@naked
+fn outb(_port: u16, _val: u8) {
+    raw {
+        asm("mov rdx, rdi; mov rax, rsi; outb; ret", options(noreturn));
+    }
+}
+
+@naked
+fn inb(_port: u16) -> u8 {
+    raw {
+        asm("mov rdx, rdi; xor rax, rax; inb; ret", options(noreturn));
+    }
+    return 0_u8;
+}
+
+fn pci_read32(bus: u32, slot: u32, func: u32, off: u32) -> u32 {
+    let addr = 0x80000000_u32
+        | (bus << 16_u32)
+        | (slot << 11_u32)
+        | (func << 8_u32)
+        | (off & 0xFC_u32);
+    outl(PCI_CONFIG_ADDR, addr);
+    return inl(PCI_CONFIG_DATA);
+}
+
+fn vbe_write(idx: u16, val: u16) {
+    outw(VBE_DISPI_IOPORT_INDEX, idx);
+    outw(VBE_DISPI_IOPORT_DATA, val);
+}
+
+/// Discover QEMU Bochs/StdVGA linear framebuffer BAR0 over PCI bus 0 (fallback 0xFD000000).
+fn discover_vbe_lfb_bar0() -> u64 {
+    var slot: u32 = 0_u32;
+    while slot < 32_u32 {
+        let id = pci_read32(0_u32, slot, 0_u32, 0_u32);
+        // QEMU stdvga / bochs-display: vendor=0x1234, device=0x1111
+        if id == 0x11111234_u32 {
+            let bar0 = pci_read32(0_u32, slot, 0_u32, 0x10_u32);
+            let phys = (bar0 & 0xFFFFFFF0_u32).widen.[u64]();
+            if phys != 0_u64 {
+                return phys;
+            }
+        }
+        slot = slot +% 1_u32;
+    }
+    return 0xFD000000_u64;
+}
+
+/// Configure Bochs VBE linear framebuffer (`width x height x 32bpp` BGRX).
+pub fn init_framebuffer(width: u32, height: u32) -> LinearFbInfo {
+    let lfb = discover_vbe_lfb_bar0();
+    vbe_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
+    vbe_write(VBE_DISPI_INDEX_XRES, width.trunc.[u16]());
+    vbe_write(VBE_DISPI_INDEX_YRES, height.trunc.[u16]());
+    vbe_write(VBE_DISPI_INDEX_BPP, 32_u16);
+    vbe_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED);
+    return LinearFbInfo.{
+        base_addr: lfb,
+        width: width,
+        height: height,
+        pitch_bytes: width *% 4_u32,
+        bpp: 32_u8,
+        is_bgr: true,
+    };
+}
+
+pub fn put_pixel(fb: *LinearFbInfo, x: u32, y: u32, argb: u32) {
+    if x >= fb.width || y >= fb.height || fb.base_addr == 0_u64 {
+        return;
+    }
+    let off = y.widen.[u64]() *% fb.pitch_bytes.widen.[u64]() +% x.widen.[u64]() *% 4_u64;
+    raw {
+        let ptr = rawptr_mut.[u32].from_usize((fb.base_addr +% off).trunc.[usize]());
+        ptr.* = argb;
+    }
+}
+
+pub fn read_pixel(fb: *LinearFbInfo, x: u32, y: u32) -> u32 {
+    if x >= fb.width || y >= fb.height || fb.base_addr == 0_u64 {
+        return 0_u32;
+    }
+    let off = y.widen.[u64]() *% fb.pitch_bytes.widen.[u64]() +% x.widen.[u64]() *% 4_u64;
+    raw {
+        let ptr = rawptr.[u32].from_usize((fb.base_addr +% off).trunc.[usize]());
+        return ptr.*;
+    }
+}
+
+pub fn serial_init() {
+    outb(0x03F8_u16 +% 1_u16, 0x00_u8);
+    outb(0x03F8_u16 +% 3_u16, 0x80_u8);
+    outb(0x03F8_u16, 0x01_u8);
+    outb(0x03F8_u16 +% 1_u16, 0x00_u8);
+    outb(0x03F8_u16 +% 3_u16, 0x03_u8);
+    outb(0x03F8_u16 +% 2_u16, 0xC7_u8);
+    outb(0x03F8_u16 +% 4_u16, 0x0B_u8);
+}
+
+pub fn serial_write(s: *str) {
+    let bs = s.as_bytes();
+    var i: usize = 0_usize;
+    while i < bs.len {
+        var spin: u32 = 0_u32;
+        while (inb(0x03F8_u16 +% 5_u16) & 0x20_u8) == 0_u8 && spin < 100000_u32 {
+            spin = spin +% 1_u32;
+        }
+        outb(0x03F8_u16, bs[i]);
+        i = i +% 1_usize;
+    }
+}
+
+pub fn qemu_exit(code: u8) {
+    outb(0x00F4_u16, code);
+    loop {
+        raw { asm("hlt"); }
+    }
+}
+
+/// Static bump allocator over fixed physical RAM for `nostd` UI / software rasterizer.
+pub struct StaticHeap {
+    pub cursor: u64;
+    pub limit: u64;
+    pub used: u64;
+}
+
+impl StaticHeap {
+    pub fn init(base_phys: u64, size_bytes: u64) -> StaticHeap {
+        return StaticHeap.{ cursor: base_phys, limit: base_phys +% size_bytes, used: 0_u64 };
+    }
+
+    pub fn alloc_aligned(self: *mut Self, size: u64, align: u64) -> u64 {
+        let a: u64 = if align < 16_u64 { 16_u64 } else { align };
+        let rem = self.cursor % a;
+        let aligned = if rem == 0_u64 { self.cursor } else { self.cursor +% (a - rem) };
+        if aligned +% size > self.limit {
+            return 0_u64;
+        }
+        self.cursor = aligned +% size;
+        self.used = self.used +% size;
+        return aligned;
+    }
+}

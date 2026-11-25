@@ -24,6 +24,8 @@ import eonc.verify;
 import eonc.eir_opt;
 import eonc.interp;
 import eonc.elf64;
+import eonc.macho;
+import eonc.apk_pkg;
 import eonc.tcb_audit;
 import eonc.emi;
 import eonc.build_sys;
@@ -1411,7 +1413,7 @@ fn parse_fids_batch_parallel(
         return;
     }
 
-    var nw: usize = if jobs == 0_u32 { 12_usize } else { jobs.widen.[usize]() };
+    var nw: usize = if jobs == 0_u32 { 4_usize } else { jobs.widen.[usize]() };
     if nw > 12_usize { nw = 12_usize; }
     if nw > fids.len { nw = fids.len; }
     if jobs == 1_u32 { nw = 1_usize; }
@@ -4882,7 +4884,7 @@ fn stream_check_and_lower_batches(
     errdefer sess.destroy(alloc);
     while true {
         let br_opt = try sess.next_batch(
-            alloc, arena, resolved, tenv, cfg_prog, ct, &ttable, interner, 64_usize,
+            alloc, arena, resolved, tenv, cfg_prog, ct, &ttable, interner, 32_usize,
         );
         let br = br_opt orelse { break; };
         try borrow.analyze_fn_range_with_jobs(
@@ -5121,8 +5123,68 @@ fn compile_loaded_to_elf_file(
                 }
             } else {
                 let elf_bs = res.elf.bytes.as_slice();
-                out_byte_len.* = elf_bs.len;
-                ok = try write_elf_artifact(alloc, fs, out_path, elf_bs, is_shared, err_buf);
+                if copts.target_spec.os == .Android && str.ends_with(out_path, ".apk".as_bytes()) {
+                    let apk_res = try apk_pkg.package_android_apk(
+                        alloc, elf_bs, copts.target_spec.arch, "org.eon.app", "EonApp",
+                    );
+                    errdefer apk_res.destroy(alloc);
+                    if !apk_res.ok {
+                        err_buf.clear();
+                        try err_buf.push_bytes_grow(alloc, apk_res.err_msg.as_bytes());
+                        ok = false;
+                    } else {
+                        let apk_bs = apk_res.elf.bytes.as_slice();
+                        out_byte_len.* = apk_bs.len;
+                        ok = try write_elf_artifact(alloc, fs, out_path, apk_bs, true, err_buf);
+                    }
+                    apk_res.destroy(alloc);
+                } else if copts.target_spec.is_darwin() && str.ends_with(out_path, ".app".as_bytes()) {
+                    // Extract app stem from `.../Foo.app`
+                    var slash_pos: usize = 0_usize;
+                    var si: usize = 0_usize;
+                    while si < out_path.len {
+                        if out_path[si] == b'/' { slash_pos = si +% 1_usize; }
+                        si = si +% 1_usize;
+                    }
+                    let stem_end = if out_path.len >= 4_usize { out_path.len - 4_usize } else { out_path.len };
+                    let stem = if slash_pos < stem_end {
+                        out_path.sub(slash_pos, stem_end) catch "EonApp".as_bytes()
+                    } else {
+                        "EonApp".as_bytes()
+                    };
+                    var bin_p = try str.StrBuf.init(alloc, out_path.len +% 64_usize);
+                    errdefer bin_p.destroy(alloc);
+                    var plist_p = try str.StrBuf.init(alloc, out_path.len +% 64_usize);
+                    errdefer plist_p.destroy(alloc);
+                    var plist_xml = try str.StrBuf.init(alloc, 512_usize);
+                    errdefer plist_xml.destroy(alloc);
+                    try bin_p.push_bytes_grow(alloc, out_path);
+                    try plist_p.push_bytes_grow(alloc, out_path);
+                    if copts.target_spec.os == .IOS {
+                        try bin_p.push_str_grow(alloc, "/");
+                        try bin_p.push_bytes_grow(alloc, stem);
+                        try plist_p.push_str_grow(alloc, "/Info.plist");
+                    } else {
+                        try bin_p.push_str_grow(alloc, "/Contents/MacOS/");
+                        try bin_p.push_bytes_grow(alloc, stem);
+                        try plist_p.push_str_grow(alloc, "/Contents/Info.plist");
+                    }
+                    try macho.emit_app_info_plist(alloc, stem, "org.eon.app".as_bytes(), copts.target_spec.os == .IOS, &mut plist_xml);
+                    out_byte_len.* = elf_bs.len;
+                    let ok_bin = try write_elf_artifact(alloc, fs, bin_p.as_bytes(), elf_bs, false, err_buf);
+                    let ok_pl = if ok_bin {
+                        try write_elf_artifact(alloc, fs, plist_p.as_bytes(), plist_xml.as_bytes(), true, err_buf)
+                    } else {
+                        false
+                    };
+                    ok = ok_bin && ok_pl;
+                    plist_xml.destroy(alloc);
+                    plist_p.destroy(alloc);
+                    bin_p.destroy(alloc);
+                } else {
+                    out_byte_len.* = elf_bs.len;
+                    ok = try write_elf_artifact(alloc, fs, out_path, elf_bs, is_shared, err_buf);
+                }
             }
             res.destroy(alloc);
             lib_syms.destroy(alloc);
@@ -5153,6 +5215,7 @@ linear struct BuildCliArgs {
     has_emi_cache: bool;
     opt_stats: bool;
     profile_phases: bool;
+    win_gui: bool;
     jobs: u32;
     target_spec: target.TargetSpec;
     opt: eir.EirOptConfig;
@@ -5186,6 +5249,7 @@ impl BuildCliArgs {
             has_emi_cache: false,
             opt_stats: false,
             profile_phases: false,
+            win_gui: false,
             jobs: 0_u32,
             target_spec: target.TargetSpec.host_default(),
             opt: eir.opt_config_dev(),
@@ -5209,6 +5273,7 @@ impl BuildCliArgs {
             has_emi_cache: _,
             opt_stats: _,
             profile_phases: _,
+            win_gui: _,
             jobs: _,
             target_spec: _,
             opt: _,
@@ -5290,6 +5355,8 @@ fn parse_cmd_build_args(
                 }
             } else if rt.str_eq(arg, "--shared") {
                 out.shared = true;
+            } else if rt.str_eq(arg, "--gui") || rt.str_eq(arg, "--subsystem=gui") {
+                out.win_gui = true;
             } else if rt.str_eq(arg, "--soname") {
                 ai = ai +% 1_usize;
                 if ai >= argc {
@@ -6232,7 +6299,8 @@ fn build_plan_target(
         target_spec: eff_target,
         sanitize: sanitize,
         emit_debug_line: true,
-        has_emi_cache: args.has_emi_cache && eff_target.arch == .X86_64,
+        has_emi_cache: args.has_emi_cache && eff_target.arch == .X86_64 && eff_target.os == .Linux,
+        win_gui: args.win_gui,
         opt: args.opt,
         jobs: args.jobs,
     };
@@ -6634,20 +6702,24 @@ fn cmd_build(env: *mut Env) -> i32 ! OutOfMemory | Utf8Error {
     };
     let mode_base = if is_nostd {
         elf64.ElfMode.freestanding(base_vaddr, eff_target.arch == .X86_64)
-    } else if args.shared {
+    } else if args.shared || eff_target.is_shared {
         elf64.ElfMode.linux_shared(0_u32, 0_u32)
     } else {
         elf64.ElfMode.linux_pie()
     };
     let mode = mode_base.with_arch(eff_target.arch);
     var opt_cfg = args.opt;
-    opt_cfg.incremental_cgu = args.has_emi_cache && eff_target.arch == .X86_64;
+    opt_cfg.incremental_cgu = args.has_emi_cache && eff_target.arch == .X86_64 && eff_target.os == .Linux;
+    if is_nostd || !eff_target.has_avx2 {
+        opt_cfg.target_avx2 = false;
+    }
     let copts = mach_x64.CompileOptions.{
         mode: mode,
         target_spec: eff_target,
         sanitize: args.sanitize,
         emit_debug_line: true,
-        has_emi_cache: args.has_emi_cache && eff_target.arch == .X86_64,
+        has_emi_cache: args.has_emi_cache && eff_target.arch == .X86_64 && eff_target.os == .Linux,
+        win_gui: args.win_gui,
         opt: opt_cfg,
         jobs: args.jobs,
     };
@@ -6808,6 +6880,7 @@ linear struct RunCliArgs {
     has_emi_cache: bool;
     opt_stats: bool;
     profile_phases: bool;
+    win_gui: bool;
     jobs: u32;
     target_spec: target.TargetSpec;
     opt: eir.EirOptConfig;
@@ -6835,6 +6908,7 @@ impl RunCliArgs {
             has_emi_cache: false,
             opt_stats: false,
             profile_phases: false,
+            win_gui: false,
             jobs: 0_u32,
             target_spec: target.TargetSpec.host_default(),
             opt: eir.opt_config_dev(),
@@ -6854,6 +6928,7 @@ impl RunCliArgs {
             has_emi_cache: _,
             opt_stats: _,
             profile_phases: _,
+            win_gui: _,
             jobs: _,
             target_spec: _,
             opt: _,
@@ -7249,7 +7324,8 @@ fn cmd_run(env: *mut Env) -> i32 ! OutOfMemory | Utf8Error {
             target_spec: args.target_spec,
             sanitize: args.sanitize,
             emit_debug_line: true,
-            has_emi_cache: args.has_emi_cache && args.target_spec.arch == .X86_64,
+            has_emi_cache: args.has_emi_cache && args.target_spec.arch == .X86_64 && args.target_spec.os == .Linux,
+            win_gui: false,
             opt: args.opt,
             jobs: args.jobs,
         };

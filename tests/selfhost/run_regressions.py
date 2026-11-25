@@ -1520,6 +1520,277 @@ def test_m23_riscv64_backend(eonc: str) -> None:
     print("[PASS] M2.3 Native RISC-V 64 Backend (RV64IMAFD/LP64D, ELF64 EM_RISCV, std/core live on qemu-riscv64, --shared & nostd)")
 
 
+def _find_qemu_sys(name: str) -> tuple[str | None, dict[str, str]]:
+    env = os.environ.copy()
+    local_bin = Path.home() / ".local/usr/bin" / name
+    if local_bin.exists():
+        lib_dir = str(Path.home() / ".local/usr/lib")
+        prev = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = f"{lib_dir}:{prev}" if prev else lib_dir
+        return str(local_bin), env
+    found = shutil.which(name)
+    return found, env
+
+
+def test_m24_linkers_and_nostd_fb(eonc: str):
+    """Verify M2.4: Zero-C PE32+ (.exe/--gui/.dll) live in Wine, Mach-O 64 + SHA-256 LC_CODE_SIGNATURE
+    + .app bundle, Android ET_DYN .so + zipalign + AXML + OpenSSL-verified ECDSA-P256 APK v2,
+    and all 3 bare-metal nostd framebuffers (x86_64, AArch64, RISC-V 64) live in QEMU."""
+    import hashlib
+    import struct
+    import zipfile
+
+    with tempfile.TemporaryDirectory(prefix="eon_m24_reg_") as td:
+        p = Path(td)
+
+        # 1. Windows PE32+ (--dev + --release + --gui + --shared .dll) live under Wine
+        win_src = p / "win_m24.eon"
+        win_src.write_text(
+            "module demo.win_m24;\n"
+            "import core.col;\n"
+            "import core.str;\n"
+            "import std.rt;\n"
+            "import std.os.windows;\n"
+            "@extern(\"C\")\n"
+            "fn win_cb(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {\n"
+            "    return a *% 10000_i64 +% b *% 1000_i64 +% c *% 100_i64 +% d *% 10_i64 +% e;\n"
+            "}\n"
+            "fn sum_sq(alloc: *mut AllocCap) -> i64 ! OutOfMemory {\n"
+            "    var buf = try col.DynBuf.[i64].init(alloc, 16_usize);\n"
+            "    errdefer buf.destroy(alloc);\n"
+            "    var i: i64 = 1_i64;\n"
+            "    while i <= 10_i64 { try buf.push(alloc, i *% i); i = i +% 1_i64; }\n"
+            "    var sum: i64 = 0_i64;\n"
+            "    let s = buf.as_slice();\n"
+            "    var k: usize = 0_usize;\n"
+            "    while k < s.len { sum = sum +% s[k]; k = k +% 1_usize; }\n"
+            "    buf.destroy(alloc);\n"
+            "    return sum;\n"
+            "}\n"
+            "pub fn main(env: *mut Env) -> i32 ! OutOfMemory {\n"
+            "    rt.print_str(\"WIN_M24_OK\\n\");\n"
+            "    let sum = try sum_sq(&mut env.alloc);\n"
+            "    let qpc_ok: u64 = if windows.qpc_freq() > 0_u64 && windows.qpc_now() > 0_u64 { 1_u64 } else { 0_u64 };\n"
+            "    let cb = win_cb(1_i64, 2_i64, 3_i64, 4_i64, 5_i64);\n"
+            "    var out = try str.StrBuf.init(&mut env.alloc, 64_usize);\n"
+            "    errdefer out.destroy(&mut env.alloc);\n"
+            "    try out.push_str_grow(&mut env.alloc, \"SUM=\");\n"
+            "    try out.push_u64_grow(&mut env.alloc, sum.bitcast.[u64]());\n"
+            "    try out.push_str_grow(&mut env.alloc, \" CB=\");\n"
+            "    try out.push_u64_grow(&mut env.alloc, cb.bitcast.[u64]());\n"
+            "    try out.push_str_grow(&mut env.alloc, \" QPC=\");\n"
+            "    try out.push_u64_grow(&mut env.alloc, qpc_ok);\n"
+            "    try out.push_byte_grow(&mut env.alloc, b'\\n');\n"
+            "    rt.print_bytes(out.as_bytes());\n"
+            "    out.destroy(&mut env.alloc);\n"
+            "    return 42_i32;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        wine = shutil.which("wine")
+        for mode in ("--dev", "--release"):
+            exe = p / f"win_{mode[2:]}.exe"
+            r = run_cmd([eonc, "build", mode, "--target=x86_64-windows", str(win_src), "-o", str(exe)])
+            assert r.returncode == 0, f"Windows PE32+ {mode} build failed:\n{r.stderr}"
+            b = exe.read_bytes()
+            assert b[:2] == b"MZ", "Missing MZ DOS stub"
+            if wine:
+                wenv = os.environ.copy()
+                wenv["WINEDEBUG"] = "-all"
+                w = subprocess.run([wine, str(exe)], env=wenv, capture_output=True, text=True, timeout=30)
+                assert w.returncode == 42 and "WIN_M24_OK" in w.stdout and "SUM=385 CB=12345 QPC=1" in w.stdout, (
+                    f"Wine {mode} failed: rc={w.returncode} out={w.stdout!r} err={w.stderr[:300]!r}"
+                )
+        gui_exe = p / "win_gui.exe"
+        assert run_cmd([eonc, "build", "--release", "--gui", "--target=x86_64-windows", str(win_src), "-o", str(gui_exe)]).returncode == 0
+        gb = gui_exe.read_bytes()
+        g_pe = struct.unpack_from("<I", gb, 0x3C)[0]
+        assert struct.unpack_from("<H", gb, g_pe + 24 + 68)[0] == 2, "Expected IMAGE_SUBSYSTEM_WINDOWS_GUI (2)"
+        dll_p = p / "win_lib.dll"
+        assert run_cmd([eonc, "build", "--release", "--shared", "--target=x86_64-windows", str(win_src), "-o", str(dll_p)]).returncode == 0
+        db = dll_p.read_bytes()
+        d_pe = struct.unpack_from("<I", db, 0x3C)[0]
+        assert (struct.unpack_from("<H", db, d_pe + 22)[0] & 0x2000) != 0, "Expected IMAGE_FILE_DLL"
+
+        # 2. Darwin Mach-O 64 + SHA-256 LC_CODE_SIGNATURE + .app bundle
+        dar_src = p / "dar_m24.eon"
+        dar_src.write_text(
+            "module demo.dar_m24;\n"
+            "import std.rt;\n"
+            "import std.os.darwin;\n"
+            "pub fn main(env: *mut Env) -> i32 {\n"
+            "    _ = env;\n"
+            "    let ptr = darwin.page_alloc(4096_usize);\n"
+            "    if ptr != 0_u64 { _ = darwin.page_free(ptr, 4096_usize); }\n"
+            "    rt.print_str(\"DARWIN_M24_OK\\n\");\n"
+            "    return 0_i32;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+
+        def check_macho(path: Path, exp_cpu: int, exp_plat: int):
+            data = path.read_bytes()
+            magic, cputype, _, _, ncmds, sizeofcmds, _, _ = struct.unpack_from("<8I", data, 0)
+            assert magic == 0xFEEDFACF and cputype == exp_cpu
+            off = 32
+            cs_off = cs_sz = plat = 0
+            seen = set()
+            for _ in range(ncmds):
+                cmd, cmdsize = struct.unpack_from("<II", data, off)
+                seen.add(cmd)
+                if cmd == 0x1D:
+                    cs_off, cs_sz = struct.unpack_from("<II", data, off + 8)
+                elif cmd == 0x32:
+                    plat = struct.unpack_from("<I", data, off + 8)[0]
+                off += cmdsize
+            assert off == 32 + sizeofcmds and plat == exp_plat
+            assert {0x80000034, 0x80000033, 0x80000028, 0x1D}.issubset(seen)
+            sb_magic, _, sb_cnt, slot_ty, cd_rel = struct.unpack_from(">5I", data, cs_off)
+            assert sb_magic == 0xFADE0CC0 and sb_cnt == 1 and slot_ty == 0
+            cd_off = cs_off + cd_rel
+            cd_magic, _, _, _, hash_off, _, _, n_code, code_limit = struct.unpack_from(">9I", data, cd_off)
+            hsz, hty, _, psh = struct.unpack_from(">4B", data, cd_off + 36)
+            assert cd_magic == 0xFADE0C02 and hsz == 32 and hty == 2 and psh == 12 and code_limit == cs_off
+            pg_sz = 1 << psh
+            assert n_code == (code_limit + pg_sz - 1) // pg_sz
+            for idx in range(n_code):
+                want = hashlib.sha256(data[idx * pg_sz : min((idx + 1) * pg_sz, code_limit)]).digest()
+                got = data[cd_off + hash_off + idx * 32 : cd_off + hash_off + (idx + 1) * 32]
+                assert want == got, f"Mach-O LC_CODE_SIGNATURE SHA-256 mismatch on page {idx}"
+
+        for triple, cput, plat, nm in [
+            ("aarch64-macos", 0x0100000C, 1, "mac_arm64"),
+            ("x86_64-macos", 0x01000007, 1, "mac_x64"),
+            ("aarch64-ios", 0x0100000C, 2, "ios_arm64"),
+        ]:
+            outp = p / nm
+            r = run_cmd([eonc, "build", "--release", f"--target={triple}", str(dar_src), "-o", str(outp)])
+            assert r.returncode == 0, f"Mach-O {triple} build failed:\n{r.stderr}"
+            check_macho(outp, cput, plat)
+        app_dir = p / "CalcTest.app"
+        assert run_cmd([eonc, "build", "--release", "--target=aarch64-macos", str(dar_src), "-o", str(app_dir)]).returncode == 0
+        assert (app_dir / "Contents/Info.plist").is_file()
+        check_macho(app_dir / "Contents/MacOS/CalcTest", 0x0100000C, 1)
+
+        # 3. Android ET_DYN .so + Signed APK v2 (zipalign + AXML + OpenSSL ECDSA-P256 verify)
+        and_src = p / "and_m24.eon"
+        and_src.write_text(
+            "module demo.and_m24;\n"
+            "import std.rt;\n"
+            "import std.os.android;\n"
+            "@export\n"
+            "@extern(\"C\")\n"
+            "pub fn ANativeActivity_onCreate(act: u64, st: u64, sz: usize) {\n"
+            "    _ = act; _ = st; _ = sz;\n"
+            "    _ = android.log_info(\"EonM24\\0\".as_bytes(), \"OK\\0\".as_bytes());\n"
+            "}\n"
+            "pub fn main(env: *mut Env) -> i32 { _ = env; rt.print_str(\"AND\\n\"); return 0_i32; }\n",
+            encoding="utf-8",
+        )
+        openssl = shutil.which("openssl")
+        for triple, abi, em in [("aarch64-android", "arm64-v8a", 183), ("x86_64-android", "x86_64", 62)]:
+            apkp = p / f"app_{abi}.apk"
+            r = run_cmd([eonc, "build", "--release", f"--target={triple}", str(and_src), "-o", str(apkp)])
+            assert r.returncode == 0, f"Android APK {triple} build failed:\n{r.stderr}"
+            raw_apk = apkp.read_bytes()
+            with zipfile.ZipFile(apkp, "r") as zf:
+                assert zf.testzip() is None
+                axml = zf.read("AndroidManifest.xml")
+                assert struct.unpack_from("<I", axml, 0)[0] == 0x00080003
+                so_name = f"lib/{abi}/libmain.so"
+                so_b = zf.read(so_name)
+                assert so_b[:4] == b"\x7fELF" and struct.unpack_from("<HH", so_b, 16) == (3, em)
+                lh = zf.getinfo(so_name).header_offset
+                fn_l, ex_l = struct.unpack_from("<HH", raw_apk, lh + 26)
+                assert (lh + 30 + fn_l + ex_l) % 4096 == 0, "libmain.so not 4096-byte zipaligned"
+            eocd_off = raw_apk.rfind(b"PK\x05\x06")
+            _, cd_off = struct.unpack_from("<II", raw_apk, eocd_off + 12)
+            assert raw_apk[cd_off - 16 : cd_off] == b"APK Sig Block 42"
+            blk_sz = struct.unpack_from("<Q", raw_apk, cd_off - 24)[0]
+            blk_start = cd_off - blk_sz - 8
+            pos = blk_start + 20 + 8
+            sd_len = struct.unpack_from("<I", raw_apk, pos)[0]; pos += 4
+            sd = raw_apk[pos : pos + sd_len]; pos += sd_len
+            pos += 8
+            sig_alg, sig_len = struct.unpack_from("<II", raw_apk, pos); pos += 8
+            sig_der = raw_apk[pos : pos + sig_len]
+            assert sig_alg == 0x0201
+            sec1, sec3, sec4 = raw_apk[:blk_start], raw_apk[cd_off:eocd_off], bytearray(raw_apk[eocd_off:])
+            struct.pack_into("<I", sec4, 16, blk_start)
+            chunks = []
+            for sec in (sec1, sec3, bytes(sec4)):
+                if not sec:
+                    chunks.append(hashlib.sha256(b"\xa5\x00\x00\x00\x00").digest())
+                else:
+                    for off_c in range(0, len(sec), 1048576):
+                        part = sec[off_c : off_c + 1048576]
+                        chunks.append(hashlib.sha256(b"\xa5" + struct.pack("<I", len(part)) + part).digest())
+            want_d = hashlib.sha256(b"\x5a" + struct.pack("<I", len(chunks)) + b"".join(chunks)).digest()
+            assert want_d == sd[16:48], "APK v2 Merkle digest mismatch"
+            if openssl:
+                cert_len = struct.unpack_from("<I", sd, 52)[0]
+                cf, pf, sdf, sigf = p / f"c_{abi}.der", p / f"p_{abi}.pem", p / f"s_{abi}.bin", p / f"g_{abi}.der"
+                cf.write_bytes(sd[56 : 56 + cert_len])
+                sdf.write_bytes(sd)
+                sigf.write_bytes(sig_der)
+                pf.write_bytes(subprocess.check_output([openssl, "x509", "-inform", "DER", "-in", str(cf), "-pubkey", "-noout"]))
+                vr = subprocess.run([openssl, "dgst", "-sha256", "-verify", str(pf), "-signature", str(sigf), str(sdf)], capture_output=True, text=True)
+                assert vr.returncode == 0 and "Verified OK" in vr.stdout, f"OpenSSL ECDSA-P256 failed: {vr.stdout} {vr.stderr}"
+
+        # 4. All 3 bare-metal nostd framebuffers live in QEMU (x86_64, AArch64, RISC-V 64)
+        nostd_cases = [
+            ("x86_64-nostd", "x86_64", "qemu-system-x86_64", "0x00400000_u64", True),
+            ("aarch64-nostd", "aarch64", "qemu-system-aarch64", "0x45000000_u64", False),
+            ("riscv64-nostd", "riscv64", "qemu-system-riscv64", "0x85000000_u64", False),
+        ]
+        for triple, arch, qname, heap_base, is_x64 in nostd_cases:
+            ksrc = p / f"fb_{arch}.eon"
+            init_ser = "    fb.serial_init();\n" if is_x64 else ""
+            exit_ok = "        fb.qemu_exit(0x10_u8);\n" if is_x64 else "        fb.qemu_exit();\n"
+            exit_fl = "        fb.qemu_exit(0x20_u8);\n" if is_x64 else "        fb.qemu_exit();\n"
+            ksrc.write_text(
+                f"module demo.fb_{arch};\n"
+                f"import kernel.arch.{arch}.fb;\n"
+                "pub fn kmain() {\n"
+                f"{init_ser}"
+                "    let info = fb.init_framebuffer(800_u32, 600_u32);\n"
+                "    fb.put_pixel(&info, 10_u32, 5_u32, 0xFF112233_u32);\n"
+                "    let px = fb.read_pixel(&info, 10_u32, 5_u32);\n"
+                f"    var hp = fb.StaticHeap.init({heap_base}, 0x01000000_u64);\n"
+                "    let blk = hp.alloc_aligned(4096_u64, 64_u64);\n"
+                "    let fp: f32 = 1.5_f32 * 4.0_f32;\n"
+                f"    if px == 0xFF112233_u32 && blk == {heap_base} && fp > 5.9_f32 && fp < 6.1_f32 {{\n"
+                f"        fb.serial_write(\"[Eon-nostd-fb] {arch} 800x600 OK\\n\");\n"
+                f"{exit_ok}"
+                "    } else {\n"
+                f"        fb.serial_write(\"[Eon-nostd-fb] {arch} FAIL\\n\");\n"
+                f"{exit_fl}"
+                "    }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            kelf = p / f"fb_{arch}.elf"
+            rb = run_cmd([eonc, "build", "--release", f"--target={triple}", str(ksrc), str(ROOT / f"kernel/arch/{arch}/fb.hal.eon"), "-o", str(kelf)])
+            assert rb.returncode == 0, f"{triple} build failed:\n{rb.stderr}"
+            qbin, qenv = _find_qemu_sys(qname)
+            if qbin:
+                if arch == "x86_64":
+                    qcmd = [qbin, "-nographic", "-m", "128M", "-vga", "std", "-no-reboot", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-kernel", str(kelf)]
+                    exp_rc = 33
+                elif arch == "aarch64":
+                    qcmd = [qbin, "-M", "virt", "-cpu", "cortex-a57", "-m", "256M", "-device", "ramfb", "-nographic", "-kernel", str(kelf)]
+                    exp_rc = 0
+                else:
+                    qcmd = [qbin, "-M", "virt", "-bios", str(kelf), "-m", "256M", "-device", "ramfb", "-nographic"]
+                    exp_rc = 0
+                qr = subprocess.run(qcmd, env=qenv, capture_output=True, text=True, timeout=20)
+                assert qr.returncode == exp_rc and f"[Eon-nostd-fb] {arch} 800x600 OK" in qr.stdout, (
+                    f"{qname} failed rc={qr.returncode} out={qr.stdout!r} err={qr.stderr[:300]!r}"
+                )
+
+    print("[PASS] M2.4 Zero-C Linkers (PE32+ live in Wine, Mach-O SHA-256 + .app, Android APK OpenSSL ECDSA-P256) & 3x QEMU nostd Framebuffers")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--eonc", default=str(ROOT / "selfhost/out/eonc2_rel"))
@@ -1536,6 +1807,7 @@ def main() -> int:
     test_m21_target_spec_and_comptime(eonc)
     test_m22_aarch64_backend(eonc)
     test_m23_riscv64_backend(eonc)
+    test_m24_linkers_and_nostd_fb(eonc)
     print("ALL SELFHOST SOUNDNESS REGRESSIONS PASSED!")
     return 0
 

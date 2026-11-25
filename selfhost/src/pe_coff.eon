@@ -1,0 +1,1063 @@
+module eonc.pe_coff;
+
+import core.col;
+import core.str;
+import eonc.span;
+import eonc.target;
+import eonc.elf64;
+
+// ============================================================================
+// Direct Zero-C PE32+ (`.exe` / `.dll`) Linker for x86_64-windows / arm64-windows
+// Emits W^X sections: .text, .rdata (+ .xdata / IAT / .idata / .edata),
+// .data (+ .bss), .pdata (Win64 RUNTIME_FUNCTION unwind), and .reloc (ASLR).
+// ============================================================================
+
+const PE_IMAGE_BASE_EXE: u64 = 0x0000000140000000_u64;
+const PE_IMAGE_BASE_DLL: u64 = 0x0000000180000000_u64;
+const PE_SECT_ALIGN: u32 = 0x1000_u32;
+const PE_FILE_ALIGN: u32 = 0x200_u32;
+const PE_HEADER_RAW_SIZE: u32 = 0x400_u32;
+
+const PE_MACHINE_AMD64: u16 = 0x8664_u16;
+const PE_MACHINE_ARM64: u16 = 0xAA64_u16;
+
+const PE_SUBSYSTEM_WINDOWS_GUI: u16 = 2_u16;
+const PE_SUBSYSTEM_WINDOWS_CUI: u16 = 3_u16;
+
+const PE_SCN_CNT_CODE: u32 = 0x00000020_u32;
+const PE_SCN_CNT_INIT_DATA: u32 = 0x00000040_u32;
+const PE_SCN_MEM_DISCARDABLE: u32 = 0x02000000_u32;
+const PE_SCN_MEM_EXECUTE: u32 = 0x20000000_u32;
+const PE_SCN_MEM_READ: u32 = 0x40000000_u32;
+const PE_SCN_MEM_WRITE: u32 = 0x80000000_u32;
+
+// Sticky-OOM byte writer to keep selfhost Peak RSS minimal.
+linear struct PeBuf {
+    bytes: col.DynBuf[u8];
+    oom: bool;
+}
+
+impl PeBuf {
+    fn init(alloc: *mut AllocCap, cap: usize) -> PeBuf ! OutOfMemory {
+        let bs = try col.DynBuf.[u8].init(alloc, cap);
+        return PeBuf.{ bytes: bs, oom: false };
+    }
+
+    fn destroy(self: PeBuf, alloc: *mut AllocCap) {
+        let PeBuf.{ bytes, oom: _ } = self;
+        bytes.destroy(alloc);
+    }
+
+    fn len(self: *Self) -> usize {
+        return self.bytes.len();
+    }
+
+    fn pu8(self: *mut Self, alloc: *mut AllocCap, v: u8) {
+        if self.oom { return; }
+        self.bytes.push(alloc, v) catch { self.oom = true; return; };
+    }
+
+    fn pu16(self: *mut Self, alloc: *mut AllocCap, v: u16) {
+        self.pu8(alloc, (v & 0xFF_u16).trunc.[u8]());
+        self.pu8(alloc, ((v >> 8_u16) & 0xFF_u16).trunc.[u8]());
+    }
+
+    fn pu32(self: *mut Self, alloc: *mut AllocCap, v: u32) {
+        self.pu8(alloc, (v & 0xFF_u32).trunc.[u8]());
+        self.pu8(alloc, ((v >> 8_u32) & 0xFF_u32).trunc.[u8]());
+        self.pu8(alloc, ((v >> 16_u32) & 0xFF_u32).trunc.[u8]());
+        self.pu8(alloc, ((v >> 24_u32) & 0xFF_u32).trunc.[u8]());
+    }
+
+    fn pu64(self: *mut Self, alloc: *mut AllocCap, v: u64) {
+        self.pu32(alloc, (v & 0xFFFFFFFF_u64).trunc.[u32]());
+        self.pu32(alloc, ((v >> 32_u64) & 0xFFFFFFFF_u64).trunc.[u32]());
+    }
+
+    fn pbytes(self: *mut Self, alloc: *mut AllocCap, src: *[u8]) {
+        if self.oom || src.len == 0_usize { return; }
+        self.bytes.push_slice(alloc, src) catch { self.oom = true; return; };
+    }
+
+    fn pzeros(self: *mut Self, alloc: *mut AllocCap, n: usize) {
+        var i: usize = 0_usize;
+        while i < n && !self.oom {
+            self.pu8(alloc, 0_u8);
+            i = i +% 1_usize;
+        }
+    }
+
+    fn align_to(self: *mut Self, alloc: *mut AllocCap, align: usize) {
+        if align <= 1_usize { return; }
+        let rem = self.bytes.len() % align;
+        if rem != 0_usize {
+            self.pzeros(alloc, align - rem);
+        }
+    }
+
+    fn patch_u32(self: *mut Self, off: usize, v: u32) {
+        let s = self.bytes.as_mut_slice();
+        if s.len >= 4_usize && off <= s.len - 4_usize {
+            s[off] = (v & 0xFF_u32).trunc.[u8]();
+            s[off + 1_usize] = ((v >> 8_u32) & 0xFF_u32).trunc.[u8]();
+            s[off + 2_usize] = ((v >> 16_u32) & 0xFF_u32).trunc.[u8]();
+            s[off + 3_usize] = ((v >> 24_u32) & 0xFF_u32).trunc.[u8]();
+        }
+    }
+
+    fn patch_u64(self: *mut Self, off: usize, v: u64) {
+        self.patch_u32(off, (v & 0xFFFFFFFF_u64).trunc.[u32]());
+        self.patch_u32(off +% 4_usize, ((v >> 32_u64) & 0xFFFFFFFF_u64).trunc.[u32]());
+    }
+}
+
+fn align_u32(v: u32, a: u32) -> u32 {
+    if a <= 1_u32 { return v; }
+    let r = v % a;
+    if r == 0_u32 { return v; }
+    return v +% (a - r);
+}
+
+fn eq_s(a: *[u8], b: *str) -> bool {
+    return str.bytes_eq(a, b.as_bytes());
+}
+
+fn starts_s(a: *[u8], p: *str) -> bool {
+    return str.starts_with(a, p.as_bytes());
+}
+
+fn check_pe_oom(oom: bool) -> !OutOfMemory {
+    if oom { return OutOfMemory; }
+    return;
+}
+
+/// Map a Windows API import symbol name to a DLL code (0=fallback, 1=kernel32, 2=user32, 3=gdi32, 4=ws2_32, 5=vulkan-1, 6=ntdll, 7=synch).
+fn resolve_win_dll_kind(name: *[u8]) -> u8 {
+    // user32.dll
+    if eq_s(name, "RegisterClassExW") || eq_s(name, "RegisterClassExA")
+        || eq_s(name, "UnregisterClassW") || eq_s(name, "CreateWindowExW")
+        || eq_s(name, "CreateWindowExA") || eq_s(name, "DestroyWindow")
+        || eq_s(name, "ShowWindow") || eq_s(name, "UpdateWindow")
+        || eq_s(name, "DefWindowProcW") || eq_s(name, "DefWindowProcA")
+        || eq_s(name, "PeekMessageW") || eq_s(name, "GetMessageW")
+        || eq_s(name, "TranslateMessage") || eq_s(name, "DispatchMessageW")
+        || eq_s(name, "PostQuitMessage") || eq_s(name, "PostMessageW")
+        || eq_s(name, "SendMessageW") || eq_s(name, "SetWindowLongPtrW")
+        || eq_s(name, "GetWindowLongPtrW") || eq_s(name, "GetClientRect")
+        || eq_s(name, "GetWindowRect") || eq_s(name, "AdjustWindowRectEx")
+        || eq_s(name, "SetWindowTextW") || eq_s(name, "InvalidateRect")
+        || eq_s(name, "BeginPaint") || eq_s(name, "EndPaint")
+        || eq_s(name, "GetDC") || eq_s(name, "ReleaseDC")
+        || eq_s(name, "LoadCursorW") || eq_s(name, "SetCursor")
+        || eq_s(name, "GetKeyState") || eq_s(name, "GetAsyncKeyState")
+        || eq_s(name, "OpenClipboard") || eq_s(name, "CloseClipboard")
+        || eq_s(name, "EmptyClipboard") || eq_s(name, "GetClipboardData")
+        || eq_s(name, "SetClipboardData") || eq_s(name, "SetProcessDpiAwarenessContext")
+        || eq_s(name, "GetDpiForWindow") || eq_s(name, "MessageBoxW")
+        || eq_s(name, "MessageBoxA") || eq_s(name, "SetCapture")
+        || eq_s(name, "ReleaseCapture") || eq_s(name, "TrackMouseEvent")
+        || eq_s(name, "SetTimer") || eq_s(name, "KillTimer")
+        || eq_s(name, "GetSystemMetrics") || eq_s(name, "ScreenToClient")
+        || eq_s(name, "ClientToScreen") || eq_s(name, "MapVirtualKeyW")
+        || eq_s(name, "ToUnicode")
+    {
+        return 2_u8;
+    }
+    // gdi32.dll
+    if eq_s(name, "StretchDIBits") || eq_s(name, "SetDIBitsToDevice")
+        || eq_s(name, "CreateDIBSection") || eq_s(name, "BitBlt")
+        || eq_s(name, "CreateCompatibleDC") || eq_s(name, "DeleteDC")
+        || eq_s(name, "SelectObject") || eq_s(name, "DeleteObject")
+        || eq_s(name, "SwapBuffers") || eq_s(name, "ChoosePixelFormat")
+        || eq_s(name, "SetPixelFormat")
+    {
+        return 3_u8;
+    }
+    // ws2_32.dll
+    if eq_s(name, "WSAStartup") || eq_s(name, "WSACleanup")
+        || eq_s(name, "WSAGetLastError") || eq_s(name, "socket")
+        || eq_s(name, "bind") || eq_s(name, "listen") || eq_s(name, "accept")
+        || eq_s(name, "connect") || eq_s(name, "send") || eq_s(name, "recv")
+        || eq_s(name, "sendto") || eq_s(name, "recvfrom") || eq_s(name, "closesocket")
+        || eq_s(name, "setsockopt") || eq_s(name, "getsockname")
+        || eq_s(name, "ioctlsocket") || eq_s(name, "select") || eq_s(name, "WSAPoll")
+    {
+        return 4_u8;
+    }
+    // vulkan-1.dll
+    if starts_s(name, "vk") {
+        return 5_u8;
+    }
+    // ntdll.dll
+    if starts_s(name, "Nt") || starts_s(name, "Rtl") {
+        return 6_u8;
+    }
+    // API-MS-Win-Core-Synch-l1-2-0.dll for WaitOnAddress
+    if eq_s(name, "WaitOnAddress") || eq_s(name, "WakeByAddressSingle")
+        || eq_s(name, "WakeByAddressAll")
+    {
+        return 7_u8;
+    }
+    // kernel32.dll
+    if eq_s(name, "ExitProcess") || eq_s(name, "VirtualAlloc") || eq_s(name, "VirtualFree")
+        || eq_s(name, "VirtualProtect") || eq_s(name, "GetStdHandle")
+        || eq_s(name, "WriteFile") || eq_s(name, "ReadFile") || eq_s(name, "CloseHandle")
+        || eq_s(name, "CreateFileW") || eq_s(name, "CreateFileA")
+        || eq_s(name, "GetFileSizeEx") || eq_s(name, "SetFilePointerEx")
+        || eq_s(name, "DeleteFileW") || eq_s(name, "CreateDirectoryW")
+        || eq_s(name, "GetFileAttributesW") || eq_s(name, "FindFirstFileW")
+        || eq_s(name, "FindNextFileW") || eq_s(name, "FindClose")
+        || eq_s(name, "GetCommandLineW") || eq_s(name, "GetCommandLineA")
+        || eq_s(name, "GetModuleHandleW") || eq_s(name, "GetModuleHandleA")
+        || eq_s(name, "LoadLibraryA") || eq_s(name, "LoadLibraryW")
+        || eq_s(name, "GetProcAddress") || eq_s(name, "FreeLibrary")
+        || eq_s(name, "QueryPerformanceCounter") || eq_s(name, "QueryPerformanceFrequency")
+        || eq_s(name, "GetSystemTimeAsFileTime") || eq_s(name, "Sleep")
+        || eq_s(name, "CreateThread") || eq_s(name, "WaitForSingleObject")
+        || eq_s(name, "WaitForMultipleObjects") || eq_s(name, "GetLastError")
+        || eq_s(name, "SetLastError") || eq_s(name, "GetCurrentThreadId")
+        || eq_s(name, "GetCurrentProcessId") || eq_s(name, "GetEnvironmentVariableW")
+        || eq_s(name, "GlobalAlloc") || eq_s(name, "GlobalFree")
+        || eq_s(name, "GlobalLock") || eq_s(name, "GlobalUnlock")
+        || eq_s(name, "CreateProcessW") || eq_s(name, "GetExitCodeProcess")
+        || eq_s(name, "GetSystemInfo") || eq_s(name, "SwitchToThread")
+        || eq_s(name, "InitializeSRWLock") || eq_s(name, "AcquireSRWLockExclusive")
+        || eq_s(name, "ReleaseSRWLockExclusive") || eq_s(name, "InitializeConditionVariable")
+        || eq_s(name, "SleepConditionVariableSRW") || eq_s(name, "WakeConditionVariable")
+        || eq_s(name, "WakeAllConditionVariable") || eq_s(name, "OutputDebugStringA")
+    {
+        return 1_u8;
+    }
+    return 0_u8;
+}
+
+struct PeImportSym {
+    sym_id: u32;
+    dll_idx: u32;
+    thunk_text_off: u32;
+    iat_rdata_off: u32;
+    ilt_rdata_off: u32;
+    hint_rdata_off: u32;
+}
+
+struct PeDllGroup {
+    name_off: u32;
+    name_len: u32;
+    name_rdata_off: u32;
+    ilt_rdata_off: u32;
+    iat_rdata_off: u32;
+    sym_count: u32;
+}
+
+struct PeFuncSpan {
+    start_rva: u32;
+    end_rva: u32;
+}
+
+struct PeRelocFixup {
+    rva: u32;
+}
+
+fn sort_func_spans(spans: *mut [PeFuncSpan]) {
+    let n = spans.len;
+    if n <= 1_usize { return; }
+    var gap: usize = 1_usize;
+    while gap < n / 3_usize { gap = gap *% 3_usize +% 1_usize; }
+    while gap > 0_usize {
+        var i = gap;
+        while i < n {
+            let cur = spans[i];
+            var j = i;
+            while j >= gap && spans[j - gap].start_rva > cur.start_rva {
+                spans[j] = spans[j - gap];
+                j = j - gap;
+            }
+            spans[j] = cur;
+            i = i +% 1_usize;
+        }
+        gap = gap / 3_usize;
+    }
+}
+
+fn sort_reloc_rvas(rvas: *mut [u32]) {
+    let n = rvas.len;
+    if n <= 1_usize { return; }
+    var gap: usize = 1_usize;
+    while gap < n / 3_usize { gap = gap *% 3_usize +% 1_usize; }
+    while gap > 0_usize {
+        var i = gap;
+        while i < n {
+            let cur = rvas[i];
+            var j = i;
+            while j >= gap && rvas[j - gap] > cur {
+                rvas[j] = rvas[j - gap];
+                j = j - gap;
+            }
+            rvas[j] = cur;
+            i = i +% 1_usize;
+        }
+        gap = gap / 3_usize;
+    }
+}
+
+fn write_sect_name(out: *mut PeBuf, alloc: *mut AllocCap, name: *str) {
+    let bs = name.as_bytes();
+    var i: usize = 0_usize;
+    while i < 8_usize {
+        if i < bs.len { out.pu8(alloc, bs[i]); }
+        else { out.pu8(alloc, 0_u8); }
+        i = i +% 1_usize;
+    }
+}
+
+/// Link `ElfLinkInput` directly into a complete PE32+ executable (`.exe`) or DLL (`.dll`).
+pub fn link_pe64(
+    alloc: *mut AllocCap,
+    input: *elf64.ElfLinkInput,
+    interner: *span.SymInterner,
+    spec: target.TargetSpec,
+    is_gui: bool,
+) -> elf64.LinkResult ! OutOfMemory {
+    let is_dll = spec.is_shared || input.mode.kind == .LinuxShared;
+    let image_base: u64 = if is_dll { PE_IMAGE_BASE_DLL } else { PE_IMAGE_BASE_EXE };
+    let machine: u16 = if spec.arch == .AArch64 { PE_MACHINE_ARM64 } else { PE_MACHINE_AMD64 };
+
+    // 1. Collect defined symbols and discover external DLL imports.
+    var def_map = try col.HashMap.[u32].init(alloc, input.symbols.len() *% 2_usize +% 16_usize);
+    errdefer def_map.destroy(alloc);
+    let syms = input.symbols.as_slice();
+    var si: usize = 0_usize;
+    while si < syms.len {
+        try def_map.insert(alloc, syms[si].name_sym.widen.[u64](), si.trunc.[u32]());
+        si = si +% 1_usize;
+    }
+
+    var fallback_dll: *[u8] = "".as_bytes();
+    let nlibs = input.needed_libs.as_slice();
+    if nlibs.len > 0_usize {
+        fallback_dll = interner.get(nlibs[0_usize]);
+    }
+
+    var dll_names = try col.DynBuf.[u8].init(alloc, 128_usize);
+    errdefer dll_names.destroy(alloc);
+    var dll_groups = try col.DynBuf.[PeDllGroup].init(alloc, 8_usize);
+    errdefer dll_groups.destroy(alloc);
+    var imp_syms = try col.DynBuf.[PeImportSym].init(alloc, 32_usize);
+    errdefer imp_syms.destroy(alloc);
+    var imp_sym_map = try col.HashMap.[u32].init(alloc, 64_usize);
+    errdefer imp_sym_map.destroy(alloc);
+
+    // Gather unique external symbols referenced by relocations or explicit external_syms.
+    var ext_list = try col.DynBuf.[u32].init(alloc, 32_usize);
+    errdefer ext_list.destroy(alloc);
+    let exts = input.external_syms.as_slice();
+    var ei: usize = 0_usize;
+    while ei < exts.len {
+        let ek = exts[ei].widen.[u64]();
+        if !def_map.contains(ek) && !imp_sym_map.contains(ek) {
+            try imp_sym_map.insert(alloc, ek, ext_list.len().trunc.[u32]());
+            try ext_list.push(alloc, exts[ei]);
+        }
+        ei = ei +% 1_usize;
+    }
+    let rels = input.relocs.as_slice();
+    var ri: usize = 0_usize;
+    while ri < rels.len {
+        let tk = rels[ri].target_sym.widen.[u64]();
+        if !def_map.contains(tk) && !imp_sym_map.contains(tk) {
+            try imp_sym_map.insert(alloc, tk, ext_list.len().trunc.[u32]());
+            try ext_list.push(alloc, rels[ri].target_sym);
+        }
+        ri = ri +% 1_usize;
+    }
+
+    // Group external symbols by DLL.
+    let ext_s = ext_list.as_slice();
+    var xi: usize = 0_usize;
+    while xi < ext_s.len {
+        let sym_id = ext_s[xi];
+        let sname = interner.get(sym_id);
+        let dk = resolve_win_dll_kind(sname);
+        let dname: *[u8] = if dk == 2_u8 {
+            "user32.dll".as_bytes()
+        } else if dk == 3_u8 {
+            "gdi32.dll".as_bytes()
+        } else if dk == 4_u8 {
+            "ws2_32.dll".as_bytes()
+        } else if dk == 5_u8 {
+            "vulkan-1.dll".as_bytes()
+        } else if dk == 6_u8 {
+            "ntdll.dll".as_bytes()
+        } else if dk == 7_u8 {
+            "API-MS-Win-Core-Synch-l1-2-0.dll".as_bytes()
+        } else if dk == 1_u8 {
+            "kernel32.dll".as_bytes()
+        } else if fallback_dll.len > 0_usize {
+            fallback_dll
+        } else {
+            "kernel32.dll".as_bytes()
+        };
+        var found_dll: usize = dll_groups.len();
+        let dgs = dll_groups.as_slice();
+        let dns = dll_names.as_slice();
+        var di: usize = 0_usize;
+        while di < dgs.len {
+            let ds = dgs[di].name_off.widen.[usize]();
+            let de = ds +% dgs[di].name_len.widen.[usize]();
+            if de <= dns.len {
+                let sl = dns.sub(ds, de) catch "".as_bytes();
+                if str.bytes_eq(sl, dname) {
+                    found_dll = di;
+                    break;
+                }
+            }
+            di = di +% 1_usize;
+        }
+        if found_dll == dll_groups.len() {
+            let doff = dll_names.len().trunc.[u32]();
+            try dll_names.push_slice(alloc, dname);
+            try dll_groups.push(alloc, PeDllGroup.{
+                name_off: doff,
+                name_len: dname.len.trunc.[u32](),
+                name_rdata_off: 0_u32,
+                ilt_rdata_off: 0_u32,
+                iat_rdata_off: 0_u32,
+                sym_count: 0_u32,
+            });
+        }
+        let dg_mut = dll_groups.as_mut_slice();
+        if found_dll < dg_mut.len {
+            dg_mut[found_dll].sym_count = dg_mut[found_dll].sym_count +% 1_u32;
+        }
+        try imp_syms.push(alloc, PeImportSym.{
+            sym_id: sym_id,
+            dll_idx: found_dll.trunc.[u32](),
+            thunk_text_off: 0_u32,
+            iat_rdata_off: 0_u32,
+            ilt_rdata_off: 0_u32,
+            hint_rdata_off: 0_u32,
+        });
+        xi = xi +% 1_usize;
+    }
+
+    // 2. Build `.text` = input.text + synthesized IAT jump thunks (6 bytes each on x86_64).
+    var text_buf = try PeBuf.init(alloc, input.text.len() +% imp_syms.len() *% 16_usize +% 64_usize);
+    errdefer text_buf.destroy(alloc);
+    text_buf.pbytes(alloc, input.text.as_slice());
+    text_buf.align_to(alloc, 16_usize);
+
+    let thunk_stride: u32 = if spec.arch == .AArch64 { 12_u32 } else { 6_u32 };
+    let imp_mut = imp_syms.as_mut_slice();
+    var ii: usize = 0_usize;
+    while ii < imp_mut.len {
+        imp_mut[ii].thunk_text_off = text_buf.len().trunc.[u32]();
+        if spec.arch == .AArch64 {
+            // ADRP x16, iat@PAGE; LDR x16, [x16, iat@PAGEOFF]; BR x16 (patched below)
+            text_buf.pu32(alloc, 0x90000010_u32);
+            text_buf.pu32(alloc, 0xF9400210_u32);
+            text_buf.pu32(alloc, 0xD61F0200_u32);
+        } else {
+            // FF 25 <disp32> -> jmp qword ptr [rip + disp32]
+            text_buf.pu8(alloc, 0xFF_u8);
+            text_buf.pu8(alloc, 0x25_u8);
+            text_buf.pu32(alloc, 0_u32);
+        }
+        ii = ii +% 1_usize;
+    }
+    let _ = thunk_stride;
+
+    // 3. Build `.rdata` = rodata + data_rel_ro + .xdata unwind info + IAT + IDT + ILT + Hint/Name + Export Dir.
+    var rdata_buf = try PeBuf.init(alloc, input.rodata.len() +% input.data_rel_ro.len() +% 2048_usize);
+    errdefer rdata_buf.destroy(alloc);
+    rdata_buf.pbytes(alloc, input.rodata.as_slice());
+    rdata_buf.align_to(alloc, 16_usize);
+    let relro_in_rdata_off = rdata_buf.len().trunc.[u32]();
+    rdata_buf.pbytes(alloc, input.data_rel_ro.as_slice());
+    rdata_buf.align_to(alloc, 8_usize);
+
+    // Emit canonical Win64 `.xdata` UNWIND_INFO (Version=1, Flags=0, Prolog=4, Codes=2: PUSH RBP + SET_FPREG RBP).
+    let xdata_rdata_off = rdata_buf.len().trunc.[u32]();
+    rdata_buf.pu8(alloc, 0x01_u8); // Version=1, Flags=0
+    rdata_buf.pu8(alloc, 0x04_u8); // SizeOfProlog = 4 (`push rbp; mov rbp, rsp`)
+    rdata_buf.pu8(alloc, 0x02_u8); // CountOfCodes = 2
+    rdata_buf.pu8(alloc, 0x05_u8); // FrameRegister = RBP (5), FrameOffset = 0
+    // Unwind code 0: offset 4, UWOP_SET_FPREG (3), info 0 -> 0x04, 0x03
+    rdata_buf.pu8(alloc, 0x04_u8);
+    rdata_buf.pu8(alloc, 0x03_u8);
+    // Unwind code 1: offset 1, UWOP_PUSH_NONVOL (0), info RBP (5) -> 0x01, 0x50
+    rdata_buf.pu8(alloc, 0x01_u8);
+    rdata_buf.pu8(alloc, 0x50_u8);
+
+    // Reserve IAT (FirstThunk) entries grouped by DLL (each DLL terminated by 8-byte 0).
+    rdata_buf.align_to(alloc, 8_usize);
+    let iat_dir_rdata_off = rdata_buf.len().trunc.[u32]();
+    let ndlls = dll_groups.len();
+    var dgi: usize = 0_usize;
+    while dgi < ndlls {
+        let dg_m = dll_groups.as_mut_slice();
+        if dgi < dg_m.len {
+            dg_m[dgi].iat_rdata_off = rdata_buf.len().trunc.[u32]();
+        }
+        var si2: usize = 0_usize;
+        while si2 < imp_mut.len {
+            if imp_mut[si2].dll_idx.widen.[usize]() == dgi {
+                imp_mut[si2].iat_rdata_off = rdata_buf.len().trunc.[u32]();
+                rdata_buf.pu64(alloc, 0_u64);
+            }
+            si2 = si2 +% 1_usize;
+        }
+        rdata_buf.pu64(alloc, 0_u64); // null terminator
+        dgi = dgi +% 1_usize;
+    }
+    let iat_dir_size = rdata_buf.len().trunc.[u32]() -% iat_dir_rdata_off;
+
+    // Reserve Import Directory Table (20 bytes per DLL + 20-byte null terminator).
+    rdata_buf.align_to(alloc, 4_usize);
+    let idt_rdata_off = rdata_buf.len().trunc.[u32]();
+    let idt_size: u32 = if ndlls > 0_usize { ((ndlls +% 1_usize) *% 20_usize).trunc.[u32]() } else { 0_u32 };
+    rdata_buf.pzeros(alloc, idt_size.widen.[usize]());
+
+    // Reserve ILT (OriginalFirstThunk) entries grouped by DLL.
+    rdata_buf.align_to(alloc, 8_usize);
+    dgi = 0_usize;
+    while dgi < ndlls {
+        let dg_m = dll_groups.as_mut_slice();
+        if dgi < dg_m.len {
+            dg_m[dgi].ilt_rdata_off = rdata_buf.len().trunc.[u32]();
+        }
+        var si2: usize = 0_usize;
+        while si2 < imp_mut.len {
+            let matches_dg = imp_mut[si2].dll_idx.widen.[usize]() == dgi;
+            if matches_dg && si2 < imp_mut.len {
+                let ilt_cur = rdata_buf.len().trunc.[u32]();
+                imp_mut[si2].ilt_rdata_off = ilt_cur;
+                rdata_buf.pu64(alloc, 0_u64);
+            }
+            si2 = si2 +% 1_usize;
+        }
+        rdata_buf.pu64(alloc, 0_u64);
+        dgi = dgi +% 1_usize;
+    }
+
+    // Emit Hint/Name entries (2-byte hint=0 + ASCII name + NUL, aligned to 2 bytes).
+    ii = 0_usize;
+    while ii < imp_mut.len {
+        rdata_buf.align_to(alloc, 2_usize);
+        imp_mut[ii].hint_rdata_off = rdata_buf.len().trunc.[u32]();
+        rdata_buf.pu16(alloc, 0_u16);
+        rdata_buf.pbytes(alloc, interner.get(imp_mut[ii].sym_id));
+        rdata_buf.pu8(alloc, 0_u8);
+        ii = ii +% 1_usize;
+    }
+
+    // Emit DLL ASCII names.
+    dgi = 0_usize;
+    while dgi < ndlls {
+        let dg_m = dll_groups.as_mut_slice();
+        let dns = dll_names.as_slice();
+        if dgi < dg_m.len {
+            dg_m[dgi].name_rdata_off = rdata_buf.len().trunc.[u32]();
+            let ds = dg_m[dgi].name_off.widen.[usize]();
+            let de = ds +% dg_m[dgi].name_len.widen.[usize]();
+            if de <= dns.len {
+                let sl = dns.sub(ds, de) catch "".as_bytes();
+                rdata_buf.pbytes(alloc, sl);
+            }
+            rdata_buf.pu8(alloc, 0_u8);
+        }
+        dgi = dgi +% 1_usize;
+    }
+
+    // Reserve Export Directory for DLLs if `exported_syms` is non-empty.
+    var edata_rdata_off: u32 = 0_u32;
+    var edata_size: u32 = 0_u32;
+    var exp_eat_off: u32 = 0_u32;
+    var exp_npt_off: u32 = 0_u32;
+    var exp_ord_off: u32 = 0_u32;
+    var exp_dll_name_off: u32 = 0_u32;
+    var exp_name_offs = try col.DynBuf.[u32].init(alloc, 8_usize);
+    errdefer exp_name_offs.destroy(alloc);
+    let exps = input.exported_syms.as_slice();
+    if is_dll && exps.len > 0_usize {
+        rdata_buf.align_to(alloc, 4_usize);
+        edata_rdata_off = rdata_buf.len().trunc.[u32]();
+        rdata_buf.pzeros(alloc, 40_usize); // IMAGE_EXPORT_DIRECTORY (40 bytes)
+        exp_eat_off = rdata_buf.len().trunc.[u32]();
+        rdata_buf.pzeros(alloc, exps.len *% 4_usize);
+        exp_npt_off = rdata_buf.len().trunc.[u32]();
+        rdata_buf.pzeros(alloc, exps.len *% 4_usize);
+        exp_ord_off = rdata_buf.len().trunc.[u32]();
+        var oi: usize = 0_usize;
+        while oi < exps.len {
+            rdata_buf.pu16(alloc, oi.trunc.[u16]());
+            oi = oi +% 1_usize;
+        }
+        exp_dll_name_off = rdata_buf.len().trunc.[u32]();
+        rdata_buf.pbytes(alloc, "eon_module.dll".as_bytes());
+        rdata_buf.pu8(alloc, 0_u8);
+        var ni: usize = 0_usize;
+        while ni < exps.len {
+            try exp_name_offs.push(alloc, rdata_buf.len().trunc.[u32]());
+            rdata_buf.pbytes(alloc, interner.get(exps[ni]));
+            rdata_buf.pu8(alloc, 0_u8);
+            ni = ni +% 1_usize;
+        }
+        edata_size = rdata_buf.len().trunc.[u32]() -% edata_rdata_off;
+    }
+
+    // 4. Build `.data` (initialized data + tdata; .bss accounted in VirtualSize!).
+    var data_buf = try PeBuf.init(alloc, input.data.len() +% input.tdata.len() +% 64_usize);
+    errdefer data_buf.destroy(alloc);
+    data_buf.pbytes(alloc, input.data.as_slice());
+    data_buf.align_to(alloc, 16_usize);
+    let tdata_in_data_off = data_buf.len().trunc.[u32]();
+    data_buf.pbytes(alloc, input.tdata.as_slice());
+    data_buf.align_to(alloc, 16_usize);
+    let bss_in_data_off = data_buf.len().trunc.[u32]();
+    let tbss_in_data_off = align_u32(bss_in_data_off +% input.bss_size.trunc.[u32](), 16_u32);
+    let data_vsize_raw = tbss_in_data_off +% input.tbss_size.trunc.[u32]();
+    let data_vsize: u32 = if data_vsize_raw == 0_u32 { 16_u32 } else { data_vsize_raw };
+
+    // 5. Compute section RVAs and raw file offsets!
+    // Sections: 0=.text, 1=.rdata, 2=.data, 3=.pdata, 4=.reloc
+    let text_vsize: u32 = if text_buf.len() == 0_usize { 16_u32 } else { text_buf.len().trunc.[u32]() };
+    let text_raw_sz = align_u32(text_vsize, PE_FILE_ALIGN);
+    let text_rva: u32 = PE_SECT_ALIGN;
+    let text_raw_ptr: u32 = PE_HEADER_RAW_SIZE;
+
+    let rdata_vsize: u32 = if rdata_buf.len() == 0_usize { 16_u32 } else { rdata_buf.len().trunc.[u32]() };
+    let rdata_raw_sz = align_u32(rdata_vsize, PE_FILE_ALIGN);
+    let rdata_rva: u32 = text_rva +% align_u32(text_vsize, PE_SECT_ALIGN);
+    let rdata_raw_ptr: u32 = text_raw_ptr +% text_raw_sz;
+
+    let data_raw_sz: u32 = if data_buf.len() == 0_usize { PE_FILE_ALIGN } else { align_u32(data_buf.len().trunc.[u32](), PE_FILE_ALIGN) };
+    let data_rva: u32 = rdata_rva +% align_u32(rdata_vsize, PE_SECT_ALIGN);
+    let data_raw_ptr: u32 = rdata_raw_ptr +% rdata_raw_sz;
+
+    // 6. Build `.pdata` (sorted RUNTIME_FUNCTION entries for every function in `.text`).
+    var fspans = try col.DynBuf.[PeFuncSpan].init(alloc, 32_usize);
+    errdefer fspans.destroy(alloc);
+    si = 0_usize;
+    while si < syms.len {
+        let sym = syms[si];
+        if sym.section == .Text && sym.is_func && sym.size > 0_u64 {
+            let sr = text_rva +% sym.offset.trunc.[u32]();
+            let er = sr +% sym.size.trunc.[u32]();
+            try fspans.push(alloc, PeFuncSpan.{ start_rva: sr, end_rva: er });
+        }
+        si = si +% 1_usize;
+    }
+    sort_func_spans(fspans.as_mut_slice());
+    var pdata_buf = try PeBuf.init(alloc, fspans.len() *% 12_usize +% 16_usize);
+    errdefer pdata_buf.destroy(alloc);
+    let xdata_rva = rdata_rva +% xdata_rdata_off;
+    let fs_ro = fspans.as_slice();
+    var fi: usize = 0_usize;
+    while fi < fs_ro.len {
+        if fi > 0_usize && fs_ro[fi].start_rva == fs_ro[fi - 1_usize].start_rva {
+            fi = fi +% 1_usize;
+            continue;
+        }
+        pdata_buf.pu32(alloc, fs_ro[fi].start_rva);
+        pdata_buf.pu32(alloc, fs_ro[fi].end_rva);
+        pdata_buf.pu32(alloc, xdata_rva);
+        fi = fi +% 1_usize;
+    }
+    let pdata_vsize: u32 = if pdata_buf.len() == 0_usize { 12_u32 } else { pdata_buf.len().trunc.[u32]() };
+    let pdata_raw_sz = align_u32(pdata_vsize, PE_FILE_ALIGN);
+    let pdata_rva: u32 = data_rva +% align_u32(data_vsize, PE_SECT_ALIGN);
+    let pdata_raw_ptr: u32 = data_raw_ptr +% data_raw_sz;
+
+    // 7. Patch Import Directory, ILT, IAT, and `.text` IAT jump thunks!
+    ii = 0_usize;
+    while ii < imp_mut.len {
+        let imp = imp_mut[ii];
+        let hint_rva = (rdata_rva +% imp.hint_rdata_off).widen.[u64]();
+        rdata_buf.patch_u64(imp.ilt_rdata_off.widen.[usize](), hint_rva);
+        rdata_buf.patch_u64(imp.iat_rdata_off.widen.[usize](), hint_rva);
+        let iat_rva = rdata_rva +% imp.iat_rdata_off;
+        if spec.arch == .AArch64 {
+            let pc_rva = text_rva +% imp.thunk_text_off;
+            let pc_pg = (pc_rva & 0xFFFFF000_u32).widen.[i64]();
+            let dst_pg = (iat_rva & 0xFFFFF000_u32).widen.[i64]();
+            let imm21 = ((dst_pg -% pc_pg) >> 12_i64).bitcast.[u64]();
+            let immlo = (imm21 & 3_u64).trunc.[u32]();
+            let immhi = ((imm21 >> 2_u64) & 0x7FFFF_u64).trunc.[u32]();
+            let adrp_w = 0x90000010_u32 | (immlo << 29_u32) | (immhi << 5_u32);
+            let pg_off = (iat_rva & 0xFFF_u32) >> 3_u32;
+            let ldr_w = 0xF9400210_u32 | (pg_off << 10_u32);
+            text_buf.patch_u32(imp.thunk_text_off.widen.[usize](), adrp_w);
+            text_buf.patch_u32(imp.thunk_text_off.widen.[usize]() +% 4_usize, ldr_w);
+        } else {
+            // `jmp qword ptr [rip + disp32]` where next_rip = text_rva + thunk_off + 6
+            let next_rva = text_rva +% imp.thunk_text_off +% 6_u32;
+            let disp = iat_rva.widen.[i64]() -% next_rva.widen.[i64]();
+            text_buf.patch_u32(imp.thunk_text_off.widen.[usize]() +% 2_usize, disp.bitcast.[u64]().trunc.[u32]());
+        }
+        ii = ii +% 1_usize;
+    }
+
+    let dgs_ro = dll_groups.as_slice();
+    dgi = 0_usize;
+    while dgi < dgs_ro.len {
+        let off = idt_rdata_off.widen.[usize]() +% dgi *% 20_usize;
+        rdata_buf.patch_u32(off, rdata_rva +% dgs_ro[dgi].ilt_rdata_off);      // OriginalFirstThunk
+        rdata_buf.patch_u32(off +% 4_usize, 0_u32);                            // TimeDateStamp
+        rdata_buf.patch_u32(off +% 8_usize, 0_u32);                            // ForwarderChain
+        rdata_buf.patch_u32(off +% 12_usize, rdata_rva +% dgs_ro[dgi].name_rdata_off); // Name RVA
+        rdata_buf.patch_u32(off +% 16_usize, rdata_rva +% dgs_ro[dgi].iat_rdata_off);  // FirstThunk (IAT)
+        dgi = dgi +% 1_usize;
+    }
+
+    // 8. Build symbol RVA map (defined symbols + synthesized import thunks).
+    var sym_rva = try col.HashMap.[u32].init(alloc, (syms.len +% imp_mut.len) *% 2_usize +% 16_usize);
+    errdefer sym_rva.destroy(alloc);
+    si = 0_usize;
+    while si < syms.len {
+        let sym = syms[si];
+        var rva: u32 = text_rva;
+        match sym.section {
+            .Text => { rva = text_rva +% sym.offset.trunc.[u32](); }
+            .Rodata => { rva = rdata_rva +% sym.offset.trunc.[u32](); }
+            .DataRelRo => { rva = rdata_rva +% relro_in_rdata_off +% sym.offset.trunc.[u32](); }
+            .Data => { rva = data_rva +% sym.offset.trunc.[u32](); }
+            .Bss => { rva = data_rva +% bss_in_data_off +% sym.offset.trunc.[u32](); }
+            .Tdata => { rva = data_rva +% tdata_in_data_off +% sym.offset.trunc.[u32](); }
+            .Tbss => { rva = data_rva +% tbss_in_data_off +% sym.offset.trunc.[u32](); }
+        }
+        try sym_rva.insert(alloc, sym.name_sym.widen.[u64](), rva);
+        si = si +% 1_usize;
+    }
+    ii = 0_usize;
+    while ii < imp_mut.len {
+        try sym_rva.insert(alloc, imp_mut[ii].sym_id.widen.[u64](), text_rva +% imp_mut[ii].thunk_text_off);
+        ii = ii +% 1_usize;
+    }
+
+    // Patch DLL Export Directory if present.
+    if is_dll && exps.len > 0_usize {
+        let eo = edata_rdata_off.widen.[usize]();
+        rdata_buf.patch_u32(eo +% 12_usize, rdata_rva +% exp_dll_name_off);
+        rdata_buf.patch_u32(eo +% 16_usize, 1_u32); // OrdinalBase
+        rdata_buf.patch_u32(eo +% 20_usize, exps.len.trunc.[u32]());
+        rdata_buf.patch_u32(eo +% 24_usize, exps.len.trunc.[u32]());
+        rdata_buf.patch_u32(eo +% 28_usize, rdata_rva +% exp_eat_off);
+        rdata_buf.patch_u32(eo +% 32_usize, rdata_rva +% exp_npt_off);
+        rdata_buf.patch_u32(eo +% 36_usize, rdata_rva +% exp_ord_off);
+        let enos = exp_name_offs.as_slice();
+        var ei2: usize = 0_usize;
+        while ei2 < exps.len && ei2 < enos.len {
+            let trva = sym_rva.get(exps[ei2].widen.[u64]()) orelse text_rva;
+            rdata_buf.patch_u32(exp_eat_off.widen.[usize]() +% ei2 *% 4_usize, trva);
+            rdata_buf.patch_u32(exp_npt_off.widen.[usize]() +% ei2 *% 4_usize, rdata_rva +% enos[ei2]);
+            ei2 = ei2 +% 1_usize;
+        }
+    }
+
+    // 9. Apply relocations and collect DIR64 base relocations for `.reloc`!
+    var base_relocs = try col.DynBuf.[u32].init(alloc, 32_usize);
+    errdefer base_relocs.destroy(alloc);
+    ri = 0_usize;
+    while ri < rels.len {
+        let r = rels[ri];
+        let target_rva = sym_rva.get(r.target_sym.widen.[u64]()) orelse 0_u32;
+        var site_rva: u32 = 0_u32;
+        var buf_off: usize = r.offset.trunc.[usize]();
+        var sec_kind: u8 = 0_u8; // 0=text, 1=rdata, 2=data
+        match r.section {
+            .Text => { site_rva = text_rva +% r.offset.trunc.[u32](); sec_kind = 0_u8; }
+            .Rodata => { site_rva = rdata_rva +% r.offset.trunc.[u32](); sec_kind = 1_u8; }
+            .DataRelRo => {
+                buf_off = relro_in_rdata_off.widen.[usize]() +% r.offset.trunc.[usize]();
+                site_rva = rdata_rva +% buf_off.trunc.[u32]();
+                sec_kind = 1_u8;
+            }
+            .Data => { site_rva = data_rva +% r.offset.trunc.[u32](); sec_kind = 2_u8; }
+            .Tdata => {
+                buf_off = tdata_in_data_off.widen.[usize]() +% r.offset.trunc.[usize]();
+                site_rva = data_rva +% buf_off.trunc.[u32]();
+                sec_kind = 2_u8;
+            }
+            _ => { ri = ri +% 1_usize; continue; }
+        }
+
+        if r.kind == .Abs64 {
+            let abs_v = image_base +% target_rva.widen.[u64]() +% r.addend.bitcast.[u64]();
+            if sec_kind == 0_u8 { text_buf.patch_u64(buf_off, abs_v); }
+            else if sec_kind == 1_u8 { rdata_buf.patch_u64(buf_off, abs_v); }
+            else { data_buf.patch_u64(buf_off, abs_v); }
+            try base_relocs.push(alloc, site_rva);
+        } else if r.kind == .Rel32 || r.kind == .Plt32 || r.kind == .GotPcRel32 {
+            // Note: on PE32+, x86_64 rel32 addend is typically -4 (PC-relative to next instruction).
+            var tgt = target_rva;
+            if r.kind == .GotPcRel32 {
+                if let imp_idx = imp_sym_map.get(r.target_sym.widen.[u64]()) {
+                    let iu = imp_idx.widen.[usize]();
+                    if iu < imp_mut.len {
+                        tgt = rdata_rva +% imp_mut[iu].iat_rdata_off;
+                    }
+                }
+            }
+            let disp = tgt.widen.[i64]() +% r.addend -% (site_rva.widen.[i64]() +% 4_i64);
+            let d32 = disp.bitcast.[u64]().trunc.[u32]();
+            if sec_kind == 0_u8 { text_buf.patch_u32(buf_off, d32); }
+            else if sec_kind == 1_u8 { rdata_buf.patch_u32(buf_off, d32); }
+            else { data_buf.patch_u32(buf_off, d32); }
+        } else if r.kind == .TpOff32 {
+            // Fallback static TLS offset for single-threaded PE globals.
+            let t32 = (target_rva.widen.[i64]() -% data_rva.widen.[i64]() +% r.addend).bitcast.[u64]().trunc.[u32]();
+            if sec_kind == 0_u8 { text_buf.patch_u32(buf_off, t32); }
+            else if sec_kind == 1_u8 { rdata_buf.patch_u32(buf_off, t32); }
+            else { data_buf.patch_u32(buf_off, t32); }
+        }
+        ri = ri +% 1_usize;
+    }
+
+    // 10. Build `.reloc` section (4 KiB page blocks of IMAGE_REL_BASED_DIR64 = 10).
+    sort_reloc_rvas(base_relocs.as_mut_slice());
+    var reloc_buf = try PeBuf.init(alloc, base_relocs.len() *% 4_usize +% 32_usize);
+    errdefer reloc_buf.destroy(alloc);
+    let brs = base_relocs.as_slice();
+    var bri: usize = 0_usize;
+    while bri < brs.len {
+        let page_rva = brs[bri] & 0xFFFFF000_u32;
+        var brj = bri;
+        while brj < brs.len && (brs[brj] & 0xFFFFF000_u32) == page_rva {
+            brj = brj +% 1_usize;
+        }
+        let cnt = brj -% bri;
+        let pad_entry: usize = if (cnt & 1_usize) != 0_usize { 1_usize } else { 0_usize };
+        let blk_sz = (8_usize +% (cnt +% pad_entry) *% 2_usize).trunc.[u32]();
+        reloc_buf.pu32(alloc, page_rva);
+        reloc_buf.pu32(alloc, blk_sz);
+        var bk = bri;
+        while bk < brj && bk < brs.len {
+            let entry: u16 = (10_u16 << 12_u16) | (brs[bk] & 0xFFF_u32).trunc.[u16]();
+            reloc_buf.pu16(alloc, entry);
+            bk = bk +% 1_usize;
+        }
+        if pad_entry != 0_usize {
+            reloc_buf.pu16(alloc, 0_u16);
+        }
+        bri = brj;
+    }
+    let has_relocs = reloc_buf.len() > 0_usize;
+    let reloc_vsize: u32 = if has_relocs { reloc_buf.len().trunc.[u32]() } else { 12_u32 };
+    if !has_relocs {
+        // Minimal empty reloc block so PE loaders accept DYNAMIC_BASE cleanly.
+        reloc_buf.pu32(alloc, text_rva);
+        reloc_buf.pu32(alloc, 12_u32);
+        reloc_buf.pu16(alloc, 0_u16);
+        reloc_buf.pu16(alloc, 0_u16);
+    }
+    let reloc_raw_sz = align_u32(reloc_buf.len().trunc.[u32](), PE_FILE_ALIGN);
+    let reloc_rva: u32 = pdata_rva +% align_u32(pdata_vsize, PE_SECT_ALIGN);
+    let reloc_raw_ptr: u32 = pdata_raw_ptr +% pdata_raw_sz;
+    let size_of_image: u32 = reloc_rva +% align_u32(reloc_vsize, PE_SECT_ALIGN);
+
+    var entry_rva: u32 = 0_u32;
+    if input.entry_sym != span.SYM_EMPTY {
+        entry_rva = sym_rva.get(input.entry_sym.widen.[u64]()) orelse text_rva;
+    } else if !is_dll {
+        entry_rva = text_rva;
+    }
+
+    // 11. Emit complete PE32+ image!
+    let total_est = (reloc_raw_ptr +% reloc_raw_sz).widen.[usize]();
+    var out = try PeBuf.init(alloc, total_est);
+    errdefer out.destroy(alloc);
+
+    // DOS Header (0x00..0x40) + minimal DOS stub (0x40..0x80)
+    out.pu16(alloc, 0x5A4D_u16); // "MZ"
+    out.pu16(alloc, 0x0090_u16);
+    out.pu16(alloc, 0x0003_u16);
+    out.pzeros(alloc, 54_usize);
+    out.pu32(alloc, 0x00000080_u32); // e_lfanew = 0x80
+    out.pzeros(alloc, 64_usize);     // 0x40..0x80 DOS stub padding
+
+    // PE Signature (0x80) + COFF File Header (20 bytes)
+    out.pu32(alloc, 0x00004550_u32); // "PE\0\0"
+    out.pu16(alloc, machine);
+    out.pu16(alloc, 5_u16);          // NumberOfSections = 5 (.text, .rdata, .data, .pdata, .reloc)
+    out.pu32(alloc, 0_u32);          // TimeDateStamp = 0 (100% deterministic!)
+    out.pu32(alloc, 0_u32);          // PointerToSymbolTable
+    out.pu32(alloc, 0_u32);          // NumberOfSymbols
+    out.pu16(alloc, 240_u16);        // SizeOfOptionalHeader (PE32+ = 240 bytes)
+    let chars: u16 = if is_dll { 0x2022_u16 } else { 0x0022_u16 }; // EXEC | LARGE_ADDR [| DLL]
+    out.pu16(alloc, chars);
+
+    // Optional Header Standard + Windows-Specific Fields (PE32+ = 112 bytes + 16*8 = 240 bytes)
+    out.pu16(alloc, 0x020B_u16);     // Magic = PE32+
+    out.pu8(alloc, 14_u8);           // MajorLinkerVersion
+    out.pu8(alloc, 0_u8);            // MinorLinkerVersion
+    out.pu32(alloc, text_raw_sz);    // SizeOfCode
+    out.pu32(alloc, rdata_raw_sz +% data_raw_sz +% pdata_raw_sz +% reloc_raw_sz); // SizeOfInitializedData
+    out.pu32(alloc, input.bss_size.trunc.[u32]()); // SizeOfUninitializedData
+    out.pu32(alloc, entry_rva);      // AddressOfEntryPoint
+    out.pu32(alloc, text_rva);       // BaseOfCode
+    out.pu64(alloc, image_base);     // ImageBase
+    out.pu32(alloc, PE_SECT_ALIGN);  // SectionAlignment
+    out.pu32(alloc, PE_FILE_ALIGN);  // FileAlignment
+    out.pu16(alloc, 6_u16);          // MajorOperatingSystemVersion (Windows Vista+/10/11)
+    out.pu16(alloc, 0_u16);          // MinorOperatingSystemVersion
+    out.pu16(alloc, 0_u16);          // MajorImageVersion
+    out.pu16(alloc, 0_u16);          // MinorImageVersion
+    out.pu16(alloc, 6_u16);          // MajorSubsystemVersion
+    out.pu16(alloc, 0_u16);          // MinorSubsystemVersion
+    out.pu32(alloc, 0_u32);          // Win32VersionValue
+    out.pu32(alloc, size_of_image);  // SizeOfImage
+    out.pu32(alloc, PE_HEADER_RAW_SIZE); // SizeOfHeaders
+    out.pu32(alloc, 0_u32);          // CheckSum
+    out.pu16(alloc, if is_gui { PE_SUBSYSTEM_WINDOWS_GUI } else { PE_SUBSYSTEM_WINDOWS_CUI });
+    out.pu16(alloc, 0x8160_u16);     // DllCharacteristics: HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT | TERMINAL_SERVER_AWARE
+    out.pu64(alloc, 0x00800000_u64); // SizeOfStackReserve = 8 MiB
+    out.pu64(alloc, 0x00010000_u64); // SizeOfStackCommit = 64 KiB
+    out.pu64(alloc, 0x00100000_u64); // SizeOfHeapReserve = 1 MiB
+    out.pu64(alloc, 0x00001000_u64); // SizeOfHeapCommit = 4 KiB
+    out.pu32(alloc, 0_u32);          // LoaderFlags
+    out.pu32(alloc, 16_u32);         // NumberOfRvaAndSizes
+
+    // 16 Data Directories:
+    // 0: Export Table
+    if is_dll && edata_size > 0_u32 {
+        out.pu32(alloc, rdata_rva +% edata_rdata_off);
+        out.pu32(alloc, edata_size);
+    } else {
+        out.pu32(alloc, 0_u32); out.pu32(alloc, 0_u32);
+    }
+    // 1: Import Table
+    if idt_size > 0_u32 {
+        out.pu32(alloc, rdata_rva +% idt_rdata_off);
+        out.pu32(alloc, idt_size);
+    } else {
+        out.pu32(alloc, 0_u32); out.pu32(alloc, 0_u32);
+    }
+    // 2: Resource Table
+    out.pu32(alloc, 0_u32); out.pu32(alloc, 0_u32);
+    // 3: Exception Table (.pdata)
+    if pdata_buf.len() > 0_usize {
+        out.pu32(alloc, pdata_rva);
+        out.pu32(alloc, pdata_buf.len().trunc.[u32]());
+    } else {
+        out.pu32(alloc, 0_u32); out.pu32(alloc, 0_u32);
+    }
+    // 4: Certificate Table
+    out.pu32(alloc, 0_u32); out.pu32(alloc, 0_u32);
+    // 5: Base Relocation Table (.reloc)
+    out.pu32(alloc, reloc_rva);
+    out.pu32(alloc, reloc_buf.len().trunc.[u32]());
+    // 6..11: Debug, Architecture, GlobalPtr, TLS, LoadConfig, BoundImport
+    var ddi: usize = 6_usize;
+    while ddi < 12_usize {
+        out.pu32(alloc, 0_u32); out.pu32(alloc, 0_u32);
+        ddi = ddi +% 1_usize;
+    }
+    // 12: IAT
+    if iat_dir_size > 0_u32 {
+        out.pu32(alloc, rdata_rva +% iat_dir_rdata_off);
+        out.pu32(alloc, iat_dir_size);
+    } else {
+        out.pu32(alloc, 0_u32); out.pu32(alloc, 0_u32);
+    }
+    // 13..15: DelayImport, CLR, Reserved
+    ddi = 13_usize;
+    while ddi < 16_usize {
+        out.pu32(alloc, 0_u32); out.pu32(alloc, 0_u32);
+        ddi = ddi +% 1_usize;
+    }
+
+    // 5 Section Headers (40 bytes each):
+    // .text (R E)
+    write_sect_name(&mut out, alloc, ".text");
+    out.pu32(alloc, text_vsize);
+    out.pu32(alloc, text_rva);
+    out.pu32(alloc, text_raw_sz);
+    out.pu32(alloc, text_raw_ptr);
+    out.pu32(alloc, 0_u32); out.pu32(alloc, 0_u32); out.pu16(alloc, 0_u16); out.pu16(alloc, 0_u16);
+    out.pu32(alloc, PE_SCN_CNT_CODE | PE_SCN_MEM_EXECUTE | PE_SCN_MEM_READ);
+
+    // .rdata (R)
+    write_sect_name(&mut out, alloc, ".rdata");
+    out.pu32(alloc, rdata_vsize);
+    out.pu32(alloc, rdata_rva);
+    out.pu32(alloc, rdata_raw_sz);
+    out.pu32(alloc, rdata_raw_ptr);
+    out.pu32(alloc, 0_u32); out.pu32(alloc, 0_u32); out.pu16(alloc, 0_u16); out.pu16(alloc, 0_u16);
+    out.pu32(alloc, PE_SCN_CNT_INIT_DATA | PE_SCN_MEM_READ);
+
+    // .data (RW)
+    write_sect_name(&mut out, alloc, ".data");
+    out.pu32(alloc, data_vsize);
+    out.pu32(alloc, data_rva);
+    out.pu32(alloc, data_raw_sz);
+    out.pu32(alloc, data_raw_ptr);
+    out.pu32(alloc, 0_u32); out.pu32(alloc, 0_u32); out.pu16(alloc, 0_u16); out.pu16(alloc, 0_u16);
+    out.pu32(alloc, PE_SCN_CNT_INIT_DATA | PE_SCN_MEM_READ | PE_SCN_MEM_WRITE);
+
+    // .pdata (R)
+    write_sect_name(&mut out, alloc, ".pdata");
+    out.pu32(alloc, pdata_vsize);
+    out.pu32(alloc, pdata_rva);
+    out.pu32(alloc, pdata_raw_sz);
+    out.pu32(alloc, pdata_raw_ptr);
+    out.pu32(alloc, 0_u32); out.pu32(alloc, 0_u32); out.pu16(alloc, 0_u16); out.pu16(alloc, 0_u16);
+    out.pu32(alloc, PE_SCN_CNT_INIT_DATA | PE_SCN_MEM_READ);
+
+    // .reloc (R Discardable)
+    write_sect_name(&mut out, alloc, ".reloc");
+    out.pu32(alloc, reloc_vsize);
+    out.pu32(alloc, reloc_rva);
+    out.pu32(alloc, reloc_raw_sz);
+    out.pu32(alloc, reloc_raw_ptr);
+    out.pu32(alloc, 0_u32); out.pu32(alloc, 0_u32); out.pu16(alloc, 0_u16); out.pu16(alloc, 0_u16);
+    out.pu32(alloc, PE_SCN_CNT_INIT_DATA | PE_SCN_MEM_READ | PE_SCN_MEM_DISCARDABLE);
+
+    // Pad headers to PE_HEADER_RAW_SIZE and write all 5 section payloads.
+    out.align_to(alloc, PE_HEADER_RAW_SIZE.widen.[usize]());
+    out.pbytes(alloc, text_buf.bytes.as_slice());
+    out.align_to(alloc, PE_FILE_ALIGN.widen.[usize]());
+    out.pbytes(alloc, rdata_buf.bytes.as_slice());
+    out.align_to(alloc, PE_FILE_ALIGN.widen.[usize]());
+    out.pbytes(alloc, data_buf.bytes.as_slice());
+    if data_buf.len() == 0_usize { out.pzeros(alloc, PE_FILE_ALIGN.widen.[usize]()); }
+    else { out.align_to(alloc, PE_FILE_ALIGN.widen.[usize]()); }
+    out.pbytes(alloc, pdata_buf.bytes.as_slice());
+    out.align_to(alloc, PE_FILE_ALIGN.widen.[usize]());
+    out.pbytes(alloc, reloc_buf.bytes.as_slice());
+    out.align_to(alloc, PE_FILE_ALIGN.widen.[usize]());
+
+    let any_oom = text_buf.oom || rdata_buf.oom || data_buf.oom || pdata_buf.oom || reloc_buf.oom || out.oom;
+    try check_pe_oom(any_oom);
+    let empty_err = try str.StrBuf.init(alloc, 0_usize);
+    errdefer empty_err.destroy(alloc);
+
+    reloc_buf.destroy(alloc);
+    base_relocs.destroy(alloc);
+    sym_rva.destroy(alloc);
+    pdata_buf.destroy(alloc);
+    fspans.destroy(alloc);
+    data_buf.destroy(alloc);
+    exp_name_offs.destroy(alloc);
+    rdata_buf.destroy(alloc);
+    text_buf.destroy(alloc);
+    ext_list.destroy(alloc);
+    imp_sym_map.destroy(alloc);
+    imp_syms.destroy(alloc);
+    dll_groups.destroy(alloc);
+    dll_names.destroy(alloc);
+    def_map.destroy(alloc);
+
+    let PeBuf.{ bytes: final_bytes, oom: _ } = out;
+    let linked = elf64.LinkedElf.{
+        bytes: final_bytes,
+        entry_vaddr: image_base +% entry_rva.widen.[u64](),
+        text_vaddr: image_base +% text_rva.widen.[u64](),
+        rodata_vaddr: image_base +% rdata_rva.widen.[u64](),
+        data_rel_ro_vaddr: image_base +% rdata_rva.widen.[u64]() +% relro_in_rdata_off.widen.[u64](),
+        data_vaddr: image_base +% data_rva.widen.[u64](),
+        bss_vaddr: image_base +% data_rva.widen.[u64]() +% bss_in_data_off.widen.[u64](),
+        tdata_vaddr: image_base +% data_rva.widen.[u64]() +% tdata_in_data_off.widen.[u64](),
+        tls_memsz: 0_u64,
+    };
+    return elf64.LinkResult.{ ok: true, elf: linked, err_msg: empty_err };
+}

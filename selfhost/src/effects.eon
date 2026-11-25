@@ -1205,13 +1205,7 @@ fn resolve_effects_workers(jobs: u32, n_items: usize) -> usize {
         let j = jobs.widen.[usize]();
         return if j > 12_usize { 12_usize } else { j };
     }
-    if n_items < 192_usize {
-        return 4_usize;
-    }
-    if n_items < 480_usize {
-        return 8_usize;
-    }
-    return 12_usize;
+    return 4_usize;
 }
 
 fn resolve_deferred_call_edges(cfg: *cfg_ir.CfgProgram, cg: *mut CallGraphState) {

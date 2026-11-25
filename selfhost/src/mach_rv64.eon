@@ -779,7 +779,47 @@ pub fn compile_and_link_rv64(
             sbuf.destroy(alloc);
         } else if input.mode.kind == .Freestanding {
             if let ef = eir_prog.get_fn(entry_fid) {
-                input.entry_sym = try mach_isel_a64.a64_fn_sym_name_id(alloc, ef.key, eir_prog, interner);
+                let ef_sym = try mach_isel_a64.a64_fn_sym_name_id(alloc, ef.key, eir_prog, interner);
+                if str.bytes_eq(interner.get(ef.name), "_start".as_bytes()) {
+                    input.entry_sym = ef_sym;
+                } else {
+                    // Bare-metal RISC-V 64 boot trampoline: initialize SP in QEMU virt RAM + enable FPU (mstatus.FS).
+                    var sbuf = try rv64_asm.Rv64Buf.init(alloc);
+                    errdefer sbuf.destroy(alloc);
+                    sbuf.li64(alloc, rv64_asm.SP, 0x83E00000_u64);
+                    sbuf.li64(alloc, rv64_asm.T0, 0x6000_u64);
+                    sbuf.emit32(alloc, 0x3002A073_u32); // csrs mstatus, t0 (enable FS)
+                    sbuf.call_sym(alloc, ef_sym);
+                    sbuf.emit32(alloc, 0x10500073_u32); // wfi
+                    sbuf.emit32(alloc, 0xFFDFF06F_u32); // j -4
+                    _ = sbuf.finish();
+                    try pad_dyn_u8(alloc, &mut input.text, 4_usize);
+                    let soff = input.text.len().widen.[u64]();
+                    let start_sym = try interner.intern_str(alloc, "_start");
+                    input.entry_sym = start_sym;
+                    try input.symbols.push(alloc, elf64.ElfSymbol.{
+                        name_sym: start_sym,
+                        section: .Text,
+                        offset: soff,
+                        size: sbuf.code.len().widen.[u64](),
+                        is_global: true,
+                        is_func: true,
+                    });
+                    let srels = sbuf.relocs.as_slice();
+                    var sri: usize = 0_usize;
+                    while sri < srels.len {
+                        try input.relocs.push(alloc, elf64.ElfReloc.{
+                            section: .Text,
+                            offset: soff +% srels[sri].offset.widen.[u64](),
+                            kind: srels[sri].kind,
+                            target_sym: srels[sri].sym_id,
+                            addend: srels[sri].addend,
+                        });
+                        sri = sri +% 1_usize;
+                    }
+                    try input.text.push_slice(alloc, sbuf.code.as_slice());
+                    sbuf.destroy(alloc);
+                }
             }
         }
     }

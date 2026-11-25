@@ -7319,15 +7319,11 @@ pub fn lower_cfg_fn_range_with_jobs(
     } else {
         if n_items < 32_usize {
             n_workers = 1_usize;
-        } else if n_items < 192_usize {
-            n_workers = 4_usize;
-        } else if n_items < 480_usize {
-            n_workers = 8_usize;
         } else {
-            n_workers = 12_usize;
+            n_workers = 4_usize;
         }
     }
-    if n_items < 32_usize || n_workers <= 1_usize {
+    if n_items <= 32_usize || n_workers <= 1_usize {
         let its = items.as_slice();
         var ii: usize = 0_usize;
         while ii < its.len {

@@ -9921,11 +9921,11 @@ impl CfgStreamSession {
             n_workers = 1_usize;
         } else if jobs > 1_u32 {
             n_workers = jobs.widen.[usize]();
-            // Cap CFG workers at 6 because each worker holds a cloned TypeEnv (~3.5 MiB)
+            // Cap streaming CFG workers at 3 because each worker holds a cloned TypeEnv (~18 MiB)
             // concurrently with the AST arena, TypeTable, and growing EirProgram.
-            if n_workers > 6_usize { n_workers = 6_usize; }
+            if n_workers > 3_usize { n_workers = 3_usize; }
         } else {
-            n_workers = 4_usize;
+            n_workers = 2_usize;
         }
 
         let par_on = n_workers > 1_usize;

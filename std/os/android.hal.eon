@@ -1,0 +1,148 @@
+module std.os.android @hal;
+
+// ============================================================================
+// Android Bionic / NDK Runtime HAL (`libc.so`, `libandroid.so`, `liblog.so`,
+// `libvulkan.so`) — Zero NDK / C / Gradle Toolchain!
+// ============================================================================
+
+pub const ANDROID_LOG_DEBUG: i32 = 3_i32;
+pub const ANDROID_LOG_INFO: i32 = 4_i32;
+pub const ANDROID_LOG_WARN: i32 = 5_i32;
+pub const ANDROID_LOG_ERROR: i32 = 6_i32;
+
+pub const WINDOW_FORMAT_RGBA_8888: i32 = 1_i32;
+pub const AINPUT_EVENT_TYPE_KEY: i32 = 1_i32;
+pub const AINPUT_EVENT_TYPE_MOTION: i32 = 2_i32;
+
+@layout(c)
+pub struct ANativeWindowBuffer {
+    pub width: i32;
+    pub height: i32;
+    pub stride: i32;
+    pub format: i32;
+    pub bits: u64;
+    pub reserved: [6]u32;
+}
+
+@naked
+fn slice_ptr(_s: *[u8]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw {
+            asm("ret", options(noreturn));
+        }
+    } else {
+        raw {
+            asm("mov rax, rdi; ret", options(noreturn));
+        }
+    }
+    return 0_u64;
+}
+
+extern "C" fn __android_log_write(prio: i32, tag: u64, text: u64) -> i32;
+extern "C" fn ANativeWindow_getWidth(window: u64) -> i32;
+extern "C" fn ANativeWindow_getHeight(window: u64) -> i32;
+extern "C" fn ANativeWindow_setBuffersGeometry(window: u64, width: i32, height: i32, format: i32) -> i32;
+extern "C" fn ANativeWindow_lock(window: u64, out_buf: *mut ANativeWindowBuffer, dirty: u64) -> i32;
+extern "C" fn ANativeWindow_unlockAndPost(window: u64) -> i32;
+extern "C" fn ALooper_pollOnce(timeout_ms: i32, out_fd: u64, out_events: u64, out_data: u64) -> i32;
+extern "C" fn AInputQueue_getEvent(queue: u64, out_event: *mut u64) -> i32;
+extern "C" fn AInputQueue_finishEvent(queue: u64, event: u64, handled: i32);
+extern "C" fn AInputEvent_getType(event: u64) -> i32;
+extern "C" fn AKeyEvent_getKeyCode(event: u64) -> i32;
+extern "C" fn AKeyEvent_getAction(event: u64) -> i32;
+extern "C" fn AMotionEvent_getAction(event: u64) -> i32;
+extern "C" fn AMotionEvent_getX(event: u64, ptr_idx: usize) -> f32;
+extern "C" fn AMotionEvent_getY(event: u64, ptr_idx: usize) -> f32;
+
+pub fn log_info(tag_z: *[u8], msg_z: *[u8]) -> i32 {
+    if tag_z.len == 0_usize || msg_z.len == 0_usize {
+        return 0_i32;
+    }
+    raw {
+        return __android_log_write(ANDROID_LOG_INFO, slice_ptr(tag_z), slice_ptr(msg_z));
+    }
+}
+
+pub fn window_width(win: u64) -> i32 {
+    raw {
+        return ANativeWindow_getWidth(win);
+    }
+}
+
+pub fn window_height(win: u64) -> i32 {
+    raw {
+        return ANativeWindow_getHeight(win);
+    }
+}
+
+pub fn window_configure_rgba(win: u64, w: i32, h: i32) -> i32 {
+    raw {
+        return ANativeWindow_setBuffersGeometry(win, w, h, WINDOW_FORMAT_RGBA_8888);
+    }
+}
+
+pub fn window_lock(win: u64, out_buf: *mut ANativeWindowBuffer) -> i32 {
+    raw {
+        return ANativeWindow_lock(win, out_buf, 0_u64);
+    }
+}
+
+pub fn window_unlock_and_post(win: u64) -> i32 {
+    raw {
+        return ANativeWindow_unlockAndPost(win);
+    }
+}
+
+pub fn looper_poll(timeout_ms: i32) -> i32 {
+    raw {
+        return ALooper_pollOnce(timeout_ms, 0_u64, 0_u64, 0_u64);
+    }
+}
+
+pub fn input_get_event(queue: u64, out_event: *mut u64) -> i32 {
+    raw {
+        return AInputQueue_getEvent(queue, out_event);
+    }
+}
+
+pub fn input_finish_event(queue: u64, event: u64, handled: i32) {
+    raw {
+        AInputQueue_finishEvent(queue, event, handled);
+    }
+}
+
+pub fn event_type(event: u64) -> i32 {
+    raw {
+        return AInputEvent_getType(event);
+    }
+}
+
+pub fn key_code(event: u64) -> i32 {
+    raw {
+        return AKeyEvent_getKeyCode(event);
+    }
+}
+
+pub fn key_action(event: u64) -> i32 {
+    raw {
+        return AKeyEvent_getAction(event);
+    }
+}
+
+pub fn motion_action(event: u64) -> i32 {
+    raw {
+        return AMotionEvent_getAction(event);
+    }
+}
+
+pub fn motion_x(event: u64, idx: usize) -> f32 {
+    raw {
+        return AMotionEvent_getX(event, idx);
+    }
+}
+
+pub fn motion_y(event: u64, idx: usize) -> f32 {
+    raw {
+        return AMotionEvent_getY(event, idx);
+    }
+}

@@ -8532,12 +8532,22 @@ pub fn rt_helper_deps(
     out: *mut col.DynBuf[u32],
 ) -> !OutOfMemory {
     if str.bytes_eq(name, "eon_rt_print_bytes".as_bytes())
+        || str.bytes_eq(name, "eon_rt_print_str".as_bytes())
+        || str.bytes_eq(name, "eon_rt_print_nl".as_bytes())
+        || str.bytes_eq(name, "eon_rt_print_u64".as_bytes())
         || str.bytes_eq(name, "eon_rt_eprint_str".as_bytes())
         || str.bytes_eq(name, "eon_rt_eprint_bytes".as_bytes())
         || str.bytes_eq(name, "eon_rt_eprint_nl".as_bytes())
     {
         let sid = try interner.intern_str(alloc, "eon_rt_write_fd");
         try out.push(alloc, sid);
+        return;
+    }
+    if str.bytes_eq(name, "eon_rt_print_i64".as_bytes()) {
+        let s0 = try interner.intern_str(alloc, "eon_rt_write_fd");
+        let s1 = try interner.intern_str(alloc, "eon_rt_print_u64");
+        try out.push(alloc, s0);
+        try out.push(alloc, s1);
         return;
     }
     if str.bytes_eq(name, "eon_par_for".as_bytes())
@@ -8758,4 +8768,464 @@ pub fn emit_rt_helper_by_name(
         return true;
     }
     return try dispatch_rt_helper_sys_sched(alloc, name, interner, out);
+}
+
+// ============================================================================
+// Win64 & Darwin x86_64 OS Runtime Helpers (Zero-C, EonCall -> Win32 / libSystem)
+// ============================================================================
+
+/// Win64 `eon_alloc_raw(alloc=rdi, bytes=rsi, align=rdx) -> (rax=ptr, r15=0, CF=0/1)`
+fn emit_win64_alloc_raw(alloc: *mut AllocCap, interner: *mut span.SymInterner, b: *mut X64Buf) -> !OutOfMemory {
+    let s_va = try interner.intern_str(alloc, "VirtualAlloc");
+    let l_nz = try b.new_label(alloc);
+    try b.test_rr(alloc, .Rsi, .Rsi);
+    try b.jcc_label(alloc, .Ne, l_nz);
+    try b.xor_rr32(alloc, .Rax, .Rax);
+    try b.xor_rr32(alloc, .R15, .R15);
+    try b.ret(alloc);
+    b.bind_label(l_nz);
+
+    // Save rbp, rbx, r12, r13, r14 (5 pushes + ret addr = 6*8 = 48 => 16B aligned!)
+    try b.push(alloc, .Rbp);
+    try b.mov_rr(alloc, .Rbp, .Rsp);
+    try b.push(alloc, .Rbx);
+    try b.push(alloc, .R12);
+    try b.push(alloc, .R13);
+    try b.push(alloc, .R14);
+    try b.sub_ri32(alloc, .Rsp, 32_i32); // 32B Win64 shadow space (rsp is 16B aligned!)
+
+    try b.mov_rr(alloc, .R12, .Rdi); // alloc_cap*
+    try b.mov_rr(alloc, .R13, .Rsi); // req_bytes
+    try b.mov_rr(alloc, .R14, .Rdx); // align
+    let l_al_ok = try b.new_label(alloc);
+    try b.cmp_ri32(alloc, .R14, 16_i32);
+    try b.jcc_label(alloc, .Ae, l_al_ok);
+    try b.mov_ri64(alloc, .R14, 16_u64);
+    b.bind_label(l_al_ok);
+
+    // total_map = align_up(req_bytes + align + 32, 4096)
+    try b.lea_mem(alloc, .Rbx, .R13, 32_i32);
+    try b.add_rr(alloc, .Rbx, .R14);
+    try b.add_ri32(alloc, .Rbx, 4095_i32);
+    try b.and_ri32(alloc, .Rbx, -4096_i32);
+
+    // Win64 call: VirtualAlloc(rcx=NULL, rdx=total_map, r8=0x3000, r9=0x04)
+    try b.xor_rr32(alloc, .Rcx, .Rcx);
+    try b.mov_rr(alloc, .Rdx, .Rbx);
+    try b.mov_ri64(alloc, .R8, 0x3000_u64);
+    try b.mov_ri64(alloc, .R9, 0x04_u64);
+    try b.call_sym(alloc, s_va);
+
+    let l_fail = try b.new_label(alloc);
+    try b.test_rr(alloc, .Rax, .Rax);
+    try b.jcc_label(alloc, .E, l_fail);
+
+    // user_ptr = align_up(base + 24, align)
+    try b.lea_mem(alloc, .Rcx, .Rax, 24_i32);
+    try b.lea_mem(alloc, .Rdx, .R14, -1_i32);
+    try b.add_rr(alloc, .Rcx, .Rdx);
+    try b.not_r(alloc, .Rdx);
+    try b.and_rr(alloc, .Rcx, .Rdx);
+    try b.store_mem(alloc, .Rcx, -24_i32, .Rax, 8_usize);
+    try b.store_mem(alloc, .Rcx, -16_i32, .Rbx, 8_usize);
+    try b.store_mem(alloc, .Rcx, -8_i32, .R13, 8_usize);
+
+    // Update AllocCap accounting if r12 != 0
+    let l_nc = try b.new_label(alloc);
+    try b.test_rr(alloc, .R12, .R12);
+    try b.jcc_label(alloc, .E, l_nc);
+    try b.load_mem(alloc, .Rdx, .R12, 0_i32, 8_usize, false);
+    try b.add_ri32(alloc, .Rdx, 1_i32);
+    try b.store_mem(alloc, .R12, 0_i32, .Rdx, 8_usize);
+    try b.load_mem(alloc, .Rdx, .R12, 8_i32, 8_usize, false);
+    try b.add_rr(alloc, .Rdx, .R13);
+    try b.store_mem(alloc, .R12, 8_i32, .Rdx, 8_usize);
+    try b.load_mem(alloc, .R8, .R12, 16_i32, 8_usize, false);
+    let l_np = try b.new_label(alloc);
+    try b.cmp_rr(alloc, .R8, .Rdx);
+    try b.jcc_label(alloc, .Ae, l_np);
+    try b.store_mem(alloc, .R12, 16_i32, .Rdx, 8_usize);
+    b.bind_label(l_np);
+    b.bind_label(l_nc);
+
+    try b.mov_rr(alloc, .Rax, .Rcx);
+    try b.xor_rr32(alloc, .R15, .R15); // clears CF
+    let l_done = try b.new_label(alloc);
+    try b.jmp_label(alloc, l_done);
+
+    b.bind_label(l_fail);
+    try b.xor_rr32(alloc, .Rax, .Rax);
+    try b.mov_ri64(alloc, .R15, 7_u64); // OutOfMemory
+    try b.stc(alloc);
+
+    b.bind_label(l_done);
+    try b.lea_mem(alloc, .Rsp, .Rsp, 32_i32);
+    try b.pop(alloc, .R14);
+    try b.pop(alloc, .R13);
+    try b.pop(alloc, .R12);
+    try b.pop(alloc, .Rbx);
+    try b.pop(alloc, .Rbp);
+    try b.ret(alloc);
+    return;
+}
+
+/// Win64 `eon_free_raw(alloc=rdi, ptr=rsi, bytes=rdx)`
+fn emit_win64_free_raw(alloc: *mut AllocCap, interner: *mut span.SymInterner, b: *mut X64Buf) -> !OutOfMemory {
+    let s_vf = try interner.intern_str(alloc, "VirtualFree");
+    let l_ret = try b.new_label(alloc);
+    try b.test_rr(alloc, .Rsi, .Rsi);
+    try b.jcc_label(alloc, .E, l_ret);
+
+    try b.push(alloc, .Rbp);
+    try b.mov_rr(alloc, .Rbp, .Rsp);
+    try b.sub_ri32(alloc, .Rsp, 32_i32);
+
+    try b.load_mem(alloc, .Rcx, .Rsi, -24_i32, 8_usize, false); // base ptr
+    try b.load_mem(alloc, .R9, .Rsi, -8_i32, 8_usize, false);   // req_bytes
+    let l_nc = try b.new_label(alloc);
+    try b.test_rr(alloc, .Rdi, .Rdi);
+    try b.jcc_label(alloc, .E, l_nc);
+    try b.load_mem(alloc, .R8, .Rdi, 0_i32, 8_usize, false);
+    let l_sd = try b.new_label(alloc);
+    try b.test_rr(alloc, .R8, .R8);
+    try b.jcc_label(alloc, .E, l_sd);
+    try b.sub_ri32(alloc, .R8, 1_i32);
+    try b.store_mem(alloc, .Rdi, 0_i32, .R8, 8_usize);
+    b.bind_label(l_sd);
+    try b.load_mem(alloc, .R8, .Rdi, 8_i32, 8_usize, false);
+    let l_u0 = try b.new_label(alloc);
+    try b.cmp_rr(alloc, .R8, .R9);
+    try b.jcc_label(alloc, .B, l_u0);
+    try b.sub_rr(alloc, .R8, .R9);
+    try b.store_mem(alloc, .Rdi, 8_i32, .R8, 8_usize);
+    try b.jmp_label(alloc, l_nc);
+    b.bind_label(l_u0);
+    try b.xor_rr32(alloc, .R8, .R8);
+    try b.store_mem(alloc, .Rdi, 8_i32, .R8, 8_usize);
+    b.bind_label(l_nc);
+
+    // VirtualFree(rcx=base, rdx=0, r8=MEM_RELEASE 0x8000)
+    try b.xor_rr32(alloc, .Rdx, .Rdx);
+    try b.mov_ri64(alloc, .R8, 0x8000_u64);
+    try b.call_sym(alloc, s_vf);
+
+    try b.lea_mem(alloc, .Rsp, .Rsp, 32_i32);
+    try b.pop(alloc, .Rbp);
+    b.bind_label(l_ret);
+    try b.ret(alloc);
+    return;
+}
+
+/// Win64 `eon_rt_write_fd(fd=rdi, ptr=rsi, len=rdx) -> rax=written`
+fn emit_win64_write_fd(alloc: *mut AllocCap, interner: *mut span.SymInterner, b: *mut X64Buf) -> !OutOfMemory {
+    let s_gsh = try interner.intern_str(alloc, "GetStdHandle");
+    let s_wf = try interner.intern_str(alloc, "WriteFile");
+    try b.push(alloc, .Rbp);
+    try b.mov_rr(alloc, .Rbp, .Rsp);
+    try b.push(alloc, .Rbx);
+    try b.push(alloc, .R12);
+    try b.sub_ri32(alloc, .Rsp, 64_i32); // 32 shadow + 8 arg5 + 8 written + align
+
+    try b.mov_rr(alloc, .Rbx, .Rsi); // ptr
+    try b.mov_rr(alloc, .R12, .Rdx); // len
+    // fd==2 -> STD_ERROR_HANDLE (-12), else STD_OUTPUT_HANDLE (-11)
+    try b.mov_ri64(alloc, .Rcx, 0xFFFFFFF5_u64);
+    let l_out = try b.new_label(alloc);
+    try b.cmp_ri32(alloc, .Rdi, 2_i32);
+    try b.jcc_label(alloc, .Ne, l_out);
+    try b.mov_ri64(alloc, .Rcx, 0xFFFFFFF4_u64);
+    b.bind_label(l_out);
+    try b.call_sym(alloc, s_gsh);
+
+    // WriteFile(rcx=handle, rdx=ptr, r8=len, r9=&written, [rsp+32]=NULL)
+    try b.xor_rr32(alloc, .R10, .R10);
+    try b.store_mem(alloc, .Rsp, 32_i32, .R10, 8_usize); // lpOverlapped = NULL
+    try b.store_mem(alloc, .Rsp, 40_i32, .R10, 8_usize); // written = 0
+    try b.mov_rr(alloc, .Rcx, .Rax);
+    try b.mov_rr(alloc, .Rdx, .Rbx);
+    try b.mov_rr(alloc, .R8, .R12);
+    try b.lea_mem(alloc, .R9, .Rsp, 40_i32);
+    try b.call_sym(alloc, s_wf);
+    try b.load_mem(alloc, .Rax, .Rsp, 40_i32, 4_usize, false);
+
+    try b.lea_mem(alloc, .Rsp, .Rsp, 64_i32);
+    try b.pop(alloc, .R12);
+    try b.pop(alloc, .Rbx);
+    try b.pop(alloc, .Rbp);
+    try b.ret(alloc);
+    return;
+}
+
+fn emit_win64_print_bytes(alloc: *mut AllocCap, interner: *mut span.SymInterner, b: *mut X64Buf, fd: u64) -> !OutOfMemory {
+    let s_wfd = try interner.intern_str(alloc, "eon_rt_write_fd");
+    let l_ret = try b.new_label(alloc);
+    try b.test_rr(alloc, .Rdi, .Rdi);
+    try b.jcc_label(alloc, .E, l_ret);
+    try b.test_rr(alloc, .Rsi, .Rsi);
+    try b.jcc_label(alloc, .E, l_ret);
+    try b.mov_rr(alloc, .Rdx, .Rsi);
+    try b.mov_rr(alloc, .Rsi, .Rdi);
+    try b.mov_ri64(alloc, .Rdi, fd);
+    try b.jmp_sym(alloc, s_wfd);
+    b.bind_label(l_ret);
+    try b.ret(alloc);
+    return;
+}
+
+fn emit_win64_print_nl(alloc: *mut AllocCap, interner: *mut span.SymInterner, b: *mut X64Buf, fd: u64) -> !OutOfMemory {
+    let s_wfd = try interner.intern_str(alloc, "eon_rt_write_fd");
+    try b.sub_ri32(alloc, .Rsp, 24_i32);
+    try b.mov_ri64(alloc, .Rax, 10_u64);
+    try b.store_mem(alloc, .Rsp, 0_i32, .Rax, 1_usize);
+    try b.mov_ri64(alloc, .Rdi, fd);
+    try b.mov_rr(alloc, .Rsi, .Rsp);
+    try b.mov_ri64(alloc, .Rdx, 1_u64);
+    try b.call_sym(alloc, s_wfd);
+    try b.add_ri32(alloc, .Rsp, 24_i32);
+    try b.ret(alloc);
+    return;
+}
+
+fn emit_win64_print_u64_helper(alloc: *mut AllocCap, interner: *mut span.SymInterner, b: *mut X64Buf) -> !OutOfMemory {
+    let s_wfd = try interner.intern_str(alloc, "eon_rt_write_fd");
+    try b.push(alloc, .Rbp);
+    try b.mov_rr(alloc, .Rbp, .Rsp);
+    try b.sub_ri32(alloc, .Rsp, 48_i32);
+    try b.mov_rr(alloc, .Rax, .Rdi);
+    try b.lea_mem(alloc, .R8, .Rsp, 32_i32); // end ptr
+    try b.mov_rr(alloc, .R9, .R8);
+    try b.mov_ri64(alloc, .R10, 10_u64);
+    let l_lp = try b.new_label(alloc);
+    b.bind_label(l_lp);
+    try b.xor_rr32(alloc, .Rdx, .Rdx);
+    try b.div_r(alloc, .R10);
+    try b.add_ri32(alloc, .Rdx, 48_i32);
+    try b.sub_ri32(alloc, .R8, 1_i32);
+    try b.store_mem(alloc, .R8, 0_i32, .Rdx, 1_usize);
+    try b.test_rr(alloc, .Rax, .Rax);
+    try b.jcc_label(alloc, .Ne, l_lp);
+    try b.mov_ri64(alloc, .Rdi, 1_u64);
+    try b.mov_rr(alloc, .Rsi, .R8);
+    try b.mov_rr(alloc, .Rdx, .R9);
+    try b.sub_rr(alloc, .Rdx, .R8);
+    try b.call_sym(alloc, s_wfd);
+    try b.add_ri32(alloc, .Rsp, 48_i32);
+    try b.pop(alloc, .Rbp);
+    try b.ret(alloc);
+    return;
+}
+
+fn emit_win64_print_i64_helper(alloc: *mut AllocCap, interner: *mut span.SymInterner, b: *mut X64Buf) -> !OutOfMemory {
+    let s_pu64 = try interner.intern_str(alloc, "eon_rt_print_u64");
+    let s_wfd = try interner.intern_str(alloc, "eon_rt_write_fd");
+    let l_pos = try b.new_label(alloc);
+    try b.cmp_ri32(alloc, .Rdi, 0_i32);
+    try b.jcc_label(alloc, .Ge, l_pos);
+    try b.push(alloc, .Rbx);
+    try b.mov_rr(alloc, .Rbx, .Rdi);
+    try b.neg_r(alloc, .Rbx);
+    try b.sub_ri32(alloc, .Rsp, 16_i32);
+    try b.mov_ri64(alloc, .Rax, 45_u64);
+    try b.store_mem(alloc, .Rsp, 0_i32, .Rax, 1_usize);
+    try b.mov_ri64(alloc, .Rdi, 1_u64);
+    try b.mov_rr(alloc, .Rsi, .Rsp);
+    try b.mov_ri64(alloc, .Rdx, 1_u64);
+    try b.call_sym(alloc, s_wfd);
+    try b.add_ri32(alloc, .Rsp, 16_i32);
+    try b.mov_rr(alloc, .Rdi, .Rbx);
+    try b.pop(alloc, .Rbx);
+    b.bind_label(l_pos);
+    try b.jmp_sym(alloc, s_pu64);
+    return;
+}
+
+fn emit_win64_now_ns(alloc: *mut AllocCap, interner: *mut span.SymInterner, b: *mut X64Buf) -> !OutOfMemory {
+    let s_qpc = try interner.intern_str(alloc, "QueryPerformanceCounter");
+    let s_qpf = try interner.intern_str(alloc, "QueryPerformanceFrequency");
+    try b.push(alloc, .Rbp);
+    try b.mov_rr(alloc, .Rbp, .Rsp);
+    try b.sub_ri32(alloc, .Rsp, 48_i32);
+    try b.lea_mem(alloc, .Rcx, .Rsp, 32_i32);
+    try b.call_sym(alloc, s_qpc);
+    try b.lea_mem(alloc, .Rcx, .Rsp, 40_i32);
+    try b.call_sym(alloc, s_qpf);
+    try b.load_mem(alloc, .Rax, .Rsp, 32_i32, 8_usize, false);
+    try b.load_mem(alloc, .Rcx, .Rsp, 40_i32, 8_usize, false);
+    try b.mov_ri64(alloc, .Rdx, 1000000000_u64);
+    try b.imul_rr(alloc, .Rax, .Rdx);
+    try b.xor_rr32(alloc, .Rdx, .Rdx);
+    try b.div_r(alloc, .Rcx);
+    try b.add_ri32(alloc, .Rsp, 48_i32);
+    try b.pop(alloc, .Rbp);
+    try b.ret(alloc);
+    return;
+}
+
+pub fn emit_win64_rt_helper_by_name(
+    alloc: *mut AllocCap,
+    name: *[u8],
+    interner: *mut span.SymInterner,
+    out: *mut X64Buf,
+) -> bool ! OutOfMemory {
+    if str.bytes_eq(name, "eon_alloc_raw".as_bytes())
+        || str.bytes_eq(name, "eon_alloc_raw_uninit".as_bytes())
+        || str.bytes_eq(name, "eon_alloc_raw_san".as_bytes())
+    {
+        out.clear(); try emit_win64_alloc_raw(alloc, interner, out); return out.finish();
+    }
+    if str.bytes_eq(name, "eon_free_raw".as_bytes())
+        || str.bytes_eq(name, "eon_free_raw_san".as_bytes())
+    {
+        out.clear(); try emit_win64_free_raw(alloc, interner, out); return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_write_fd".as_bytes()) {
+        out.clear(); try emit_win64_write_fd(alloc, interner, out); return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_print_bytes".as_bytes())
+        || str.bytes_eq(name, "eon_rt_print_str".as_bytes())
+    {
+        out.clear(); try emit_win64_print_bytes(alloc, interner, out, 1_u64); return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_eprint_bytes".as_bytes())
+        || str.bytes_eq(name, "eon_rt_eprint_str".as_bytes())
+    {
+        out.clear(); try emit_win64_print_bytes(alloc, interner, out, 2_u64); return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_print_nl".as_bytes()) {
+        out.clear(); try emit_win64_print_nl(alloc, interner, out, 1_u64); return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_eprint_nl".as_bytes()) {
+        out.clear(); try emit_win64_print_nl(alloc, interner, out, 2_u64); return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_print_u64".as_bytes()) {
+        out.clear(); try emit_win64_print_u64_helper(alloc, interner, out); return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_print_i64".as_bytes()) {
+        out.clear(); try emit_win64_print_i64_helper(alloc, interner, out); return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_now_ns".as_bytes()) {
+        out.clear(); try emit_win64_now_ns(alloc, interner, out); return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_tls_init".as_bytes())
+        || str.bytes_eq(name, "eon_rt_parse_vdso".as_bytes())
+        || str.bytes_eq(name, "eon_rt_install_san_handler".as_bytes())
+        || str.bytes_eq(name, "eon_rt_arena_reset_san".as_bytes())
+        || str.bytes_eq(name, "eon_sched_init".as_bytes())
+        || str.bytes_eq(name, "eon_sched_shutdown".as_bytes())
+    {
+        out.clear(); try out.ret(alloc); return out.finish();
+    }
+    return try emit_rt_helper_by_name(alloc, name, interner, out);
+}
+
+/// Darwin x86_64 helpers bridging OS syscalls to `/usr/lib/libSystem.B.dylib` (`mmap`, `munmap`, `write`, `clock_gettime`).
+pub fn emit_darwin_x64_rt_helper_by_name(
+    alloc: *mut AllocCap,
+    name: *[u8],
+    interner: *mut span.SymInterner,
+    out: *mut X64Buf,
+) -> bool ! OutOfMemory {
+    if str.bytes_eq(name, "eon_rt_write_fd".as_bytes()) {
+        out.clear();
+        let s_w = try interner.intern_str(alloc, "write");
+        try out.jmp_sym(alloc, s_w);
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_print_bytes".as_bytes())
+        || str.bytes_eq(name, "eon_rt_print_str".as_bytes())
+    {
+        out.clear(); try emit_win64_print_bytes(alloc, interner, out, 1_u64); return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_eprint_bytes".as_bytes())
+        || str.bytes_eq(name, "eon_rt_eprint_str".as_bytes())
+    {
+        out.clear(); try emit_win64_print_bytes(alloc, interner, out, 2_u64); return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_print_nl".as_bytes()) {
+        out.clear(); try emit_win64_print_nl(alloc, interner, out, 1_u64); return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_eprint_nl".as_bytes()) {
+        out.clear(); try emit_win64_print_nl(alloc, interner, out, 2_u64); return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_print_u64".as_bytes()) {
+        out.clear(); try emit_win64_print_u64_helper(alloc, interner, out); return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_print_i64".as_bytes()) {
+        out.clear(); try emit_win64_print_i64_helper(alloc, interner, out); return out.finish();
+    }
+    if str.bytes_eq(name, "eon_alloc_raw".as_bytes())
+        || str.bytes_eq(name, "eon_alloc_raw_uninit".as_bytes())
+        || str.bytes_eq(name, "eon_alloc_raw_san".as_bytes())
+    {
+        out.clear();
+        let s_mm = try interner.intern_str(alloc, "mmap");
+        // Simple libSystem mmap(NULL, align_up(bytes+align+32, 4096), PROT_RW=3, MAP_PRIVATE|MAP_ANON=0x1002, -1, 0)
+        try out.push(alloc, .Rbp);
+        try out.mov_rr(alloc, .Rbp, .Rsp);
+        try out.push(alloc, .Rbx);
+        try out.push(alloc, .R12);
+        try out.push(alloc, .R13);
+        try out.push(alloc, .R14);
+        try out.mov_rr(alloc, .R12, .Rdi);
+        try out.mov_rr(alloc, .R13, .Rsi);
+        try out.mov_rr(alloc, .R14, .Rdx);
+        let l_al = try out.new_label(alloc);
+        try out.cmp_ri32(alloc, .R14, 16_i32);
+        try out.jcc_label(alloc, .Ae, l_al);
+        try out.mov_ri64(alloc, .R14, 16_u64);
+        out.bind_label(l_al);
+        try out.lea_mem(alloc, .Rbx, .R13, 32_i32);
+        try out.add_rr(alloc, .Rbx, .R14);
+        try out.add_ri32(alloc, .Rbx, 4095_i32);
+        try out.and_ri32(alloc, .Rbx, -4096_i32);
+        try out.xor_rr32(alloc, .Rdi, .Rdi);
+        try out.mov_rr(alloc, .Rsi, .Rbx);
+        try out.mov_ri64(alloc, .Rdx, 3_u64);
+        try out.mov_ri64(alloc, .Rcx, 0x1002_u64);
+        try out.mov_ri64(alloc, .R8, 0xFFFFFFFFFFFFFFFF_u64);
+        try out.xor_rr32(alloc, .R9, .R9);
+        try out.call_sym(alloc, s_mm);
+        try out.lea_mem(alloc, .Rcx, .Rax, 24_i32);
+        try out.lea_mem(alloc, .Rdx, .R14, -1_i32);
+        try out.add_rr(alloc, .Rcx, .Rdx);
+        try out.not_r(alloc, .Rdx);
+        try out.and_rr(alloc, .Rcx, .Rdx);
+        try out.store_mem(alloc, .Rcx, -24_i32, .Rax, 8_usize);
+        try out.store_mem(alloc, .Rcx, -16_i32, .Rbx, 8_usize);
+        try out.store_mem(alloc, .Rcx, -8_i32, .R13, 8_usize);
+        try out.mov_rr(alloc, .Rax, .Rcx);
+        try out.xor_rr32(alloc, .R15, .R15);
+        try out.pop(alloc, .R14);
+        try out.pop(alloc, .R13);
+        try out.pop(alloc, .R12);
+        try out.pop(alloc, .Rbx);
+        try out.pop(alloc, .Rbp);
+        try out.ret(alloc);
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_free_raw".as_bytes())
+        || str.bytes_eq(name, "eon_free_raw_san".as_bytes())
+    {
+        out.clear();
+        let s_mu = try interner.intern_str(alloc, "munmap");
+        let l_ret = try out.new_label(alloc);
+        try out.test_rr(alloc, .Rsi, .Rsi);
+        try out.jcc_label(alloc, .E, l_ret);
+        try out.load_mem(alloc, .Rdi, .Rsi, -24_i32, 8_usize, false);
+        try out.load_mem(alloc, .Rsi, .Rsi, -16_i32, 8_usize, false);
+        try out.jmp_sym(alloc, s_mu);
+        out.bind_label(l_ret);
+        try out.ret(alloc);
+        return out.finish();
+    }
+    if str.bytes_eq(name, "eon_rt_tls_init".as_bytes())
+        || str.bytes_eq(name, "eon_rt_parse_vdso".as_bytes())
+        || str.bytes_eq(name, "eon_rt_install_san_handler".as_bytes())
+        || str.bytes_eq(name, "eon_rt_arena_reset_san".as_bytes())
+        || str.bytes_eq(name, "eon_sched_init".as_bytes())
+        || str.bytes_eq(name, "eon_sched_shutdown".as_bytes())
+    {
+        out.clear(); try out.ret(alloc); return out.finish();
+    }
+    return try emit_rt_helper_by_name(alloc, name, interner, out);
 }

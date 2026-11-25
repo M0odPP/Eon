@@ -10581,12 +10581,8 @@ pub fn check_program_with_jobs(
         let ni = items.len();
         if ni < 64_usize {
             nw = 1_usize;
-        } else if ni < 192_usize {
-            nw = 4_usize;
-        } else if ni < 480_usize {
-            nw = 8_usize;
         } else {
-            nw = 12_usize;
+            nw = 4_usize;
         }
     }
 

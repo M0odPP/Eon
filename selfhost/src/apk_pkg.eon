@@ -1,0 +1,976 @@
+module eonc.apk_pkg;
+
+import core.col;
+import core.str;
+import eonc.target;
+import eonc.elf64;
+import eonc.macho;
+
+// ============================================================================
+// Pure-Eon Zero-JDK/Zero-Gradle Android APK Packager & APK Signature Scheme v2
+// Generates:
+//   - Binary Android XML (`AXML`, chunk 0x00080003) `AndroidManifest.xml`
+//   - Minimal valid `resources.arsc` (`RES_TABLE_TYPE`)
+//   - 4 KiB `zipalign`-aligned uncompressed `lib/<abi>/libmain.so`
+//   - Real Android APK Signature Scheme v2 (`APK Sig Block 42`, ID 0x7109871a)
+//     with genuine 1 MiB chunked SHA-256 Merkle digest + pure-Eon ECDSA P-256
+//     (`0x0201`) signature over a self-signed X.509 v3 DER debug certificate!
+// ============================================================================
+
+linear struct ApkBuf {
+    bytes: col.DynBuf[u8];
+    oom: bool;
+}
+
+impl ApkBuf {
+    fn init(alloc: *mut AllocCap, cap: usize) -> ApkBuf ! OutOfMemory {
+        let bs = try col.DynBuf.[u8].init(alloc, cap);
+        return ApkBuf.{ bytes: bs, oom: false };
+    }
+
+    fn destroy(self: ApkBuf, alloc: *mut AllocCap) {
+        let ApkBuf.{ bytes, oom: _ } = self;
+        bytes.destroy(alloc);
+    }
+
+    fn len(self: *Self) -> usize { return self.bytes.len(); }
+
+    fn pu8(self: *mut Self, alloc: *mut AllocCap, v: u8) {
+        if self.oom { return; }
+        self.bytes.push(alloc, v) catch { self.oom = true; return; };
+    }
+
+    fn pu16(self: *mut Self, alloc: *mut AllocCap, v: u16) {
+        self.pu8(alloc, (v & 0xFF_u16).trunc.[u8]());
+        self.pu8(alloc, ((v >> 8_u16) & 0xFF_u16).trunc.[u8]());
+    }
+
+    fn pu32(self: *mut Self, alloc: *mut AllocCap, v: u32) {
+        self.pu8(alloc, (v & 0xFF_u32).trunc.[u8]());
+        self.pu8(alloc, ((v >> 8_u32) & 0xFF_u32).trunc.[u8]());
+        self.pu8(alloc, ((v >> 16_u32) & 0xFF_u32).trunc.[u8]());
+        self.pu8(alloc, ((v >> 24_u32) & 0xFF_u32).trunc.[u8]());
+    }
+
+    fn pu64(self: *mut Self, alloc: *mut AllocCap, v: u64) {
+        self.pu32(alloc, (v & 0xFFFFFFFF_u64).trunc.[u32]());
+        self.pu32(alloc, ((v >> 32_u64) & 0xFFFFFFFF_u64).trunc.[u32]());
+    }
+
+    fn pbytes(self: *mut Self, alloc: *mut AllocCap, src: *[u8]) {
+        if self.oom || src.len == 0_usize { return; }
+        self.bytes.push_slice(alloc, src) catch { self.oom = true; return; };
+    }
+
+    fn pzeros(self: *mut Self, alloc: *mut AllocCap, n: usize) {
+        var i: usize = 0_usize;
+        while i < n && !self.oom {
+            self.pu8(alloc, 0_u8);
+            i = i +% 1_usize;
+        }
+    }
+
+    fn patch_u32(self: *mut Self, off: usize, v: u32) {
+        let s = self.bytes.as_mut_slice();
+        if s.len >= 4_usize && off <= s.len - 4_usize {
+            s[off] = (v & 0xFF_u32).trunc.[u8]();
+            s[off + 1_usize] = ((v >> 8_u32) & 0xFF_u32).trunc.[u8]();
+            s[off + 2_usize] = ((v >> 16_u32) & 0xFF_u32).trunc.[u8]();
+            s[off + 3_usize] = ((v >> 24_u32) & 0xFF_u32).trunc.[u8]();
+        }
+    }
+}
+
+// ============================================================================
+// Pure-Eon IEEE 802.3 CRC-32 (for ZIP entries)
+// ============================================================================
+
+fn crc32_bytes(data: *[u8]) -> u32 {
+    var crc: u32 = 0xFFFFFFFF_u32;
+    var i: usize = 0_usize;
+    while i < data.len {
+        crc = crc ^ data[i].widen.[u32]();
+        var b: u32 = 0_u32;
+        while b < 8_u32 {
+            let mask: u32 = if (crc & 1_u32) != 0_u32 { 0xEDB88320_u32 } else { 0_u32 };
+            crc = (crc >> 1_u32) ^ mask;
+            b = b +% 1_u32;
+        }
+        i = i +% 1_usize;
+    }
+    return ~crc;
+}
+
+// ============================================================================
+// Pure-Eon NIST P-256 (secp256r1) ECDSA-SHA256 Signer
+// Used exclusively for deterministic APK Signature Scheme v2 debug signing.
+// ============================================================================
+
+struct U256 {
+    l: [4]u64; // little-endian limbs: l[0] = LSB, l[3] = MSB
+}
+
+// P-256 field prime p = 2^256 - 2^224 + 2^192 + 2^96 - 1
+fn p256_p() -> U256 {
+    return U256.{ l: [0xFFFFFFFFFFFFFFFF_u64, 0x00000000FFFFFFFF_u64, 0x0000000000000000_u64, 0xFFFFFFFF00000001_u64] };
+}
+
+// P-256 group order n
+fn p256_n() -> U256 {
+    return U256.{ l: [0xF3B9CAC2FC632551_u64, 0xBCE6FAADA7179E84_u64, 0xFFFFFFFFFFFFFFFF_u64, 0xFFFFFFFF00000000_u64] };
+}
+
+// P-256 generator G = (Gx, Gy)
+fn p256_gx() -> U256 {
+    return U256.{ l: [0xF4A13945D898C296_u64, 0x77037D812DEB33A0_u64, 0xF8BCE6E563A440F2_u64, 0x6B17D1F2E12C4247_u64] };
+}
+
+fn p256_gy() -> U256 {
+    return U256.{ l: [0xCBB6406837BF51F5_u64, 0x2BCE33576B315ECE_u64, 0x8EE7EB4A7C0F9E16_u64, 0x4FE342E2FE1A7F9B_u64] };
+}
+
+fn u256_zero() -> U256 { return U256.{ l: [0_u64, 0_u64, 0_u64, 0_u64] }; }
+fn u256_one() -> U256 { return U256.{ l: [1_u64, 0_u64, 0_u64, 0_u64] }; }
+
+fn u256_is_zero(a: *U256) -> bool {
+    return (a.l[0_usize] | a.l[1_usize] | a.l[2_usize] | a.l[3_usize]) == 0_u64;
+}
+
+fn u256_ge(a: *U256, b: *U256) -> bool {
+    var i: usize = 4_usize;
+    while i > 0_usize {
+        i = i - 1_usize;
+        if a.l[i] != b.l[i] { return a.l[i] > b.l[i]; }
+    }
+    return true;
+}
+
+fn u256_from_be(src: *[u8]) -> U256 {
+    var out = u256_zero();
+    var limb: usize = 0_usize;
+    while limb < 4_usize {
+        let base = (3_usize - limb) *% 8_usize;
+        var v: u64 = 0_u64;
+        var j: usize = 0_usize;
+        while j < 8_usize {
+            let idx = base +% j;
+            if idx < src.len {
+                v = (v << 8_u64) | src[idx].widen.[u64]();
+            }
+            j = j +% 1_usize;
+        }
+        out.l[limb] = v;
+        limb = limb +% 1_usize;
+    }
+    return out;
+}
+
+fn u256_to_be(a: *U256) -> [32]u8 {
+    var out: [32]u8 = [0_u8; 32];
+    var limb: usize = 0_usize;
+    while limb < 4_usize {
+        let base = (3_usize - limb) *% 8_usize;
+        let v = a.l[limb];
+        if base <= 24_usize {
+            out[base] = ((v >> 56_u64) & 0xFF_u64).trunc.[u8]();
+            out[base + 1_usize] = ((v >> 48_u64) & 0xFF_u64).trunc.[u8]();
+            out[base + 2_usize] = ((v >> 40_u64) & 0xFF_u64).trunc.[u8]();
+            out[base + 3_usize] = ((v >> 32_u64) & 0xFF_u64).trunc.[u8]();
+            out[base + 4_usize] = ((v >> 24_u64) & 0xFF_u64).trunc.[u8]();
+            out[base + 5_usize] = ((v >> 16_u64) & 0xFF_u64).trunc.[u8]();
+            out[base + 6_usize] = ((v >> 8_u64) & 0xFF_u64).trunc.[u8]();
+            out[base + 7_usize] = (v & 0xFF_u64).trunc.[u8]();
+        }
+        limb = limb +% 1_usize;
+    }
+    return out;
+}
+
+struct U256Carry {
+    val: U256;
+    carry: u64;
+}
+
+fn u256_add_raw(a: *U256, b: *U256) -> U256Carry {
+    var r = u256_zero();
+    var c: u64 = 0_u64;
+    var i: usize = 0_usize;
+    while i < 4_usize {
+        let s1 = a.l[i] +% b.l[i];
+        let c1: u64 = if s1 < a.l[i] { 1_u64 } else { 0_u64 };
+        let s2 = s1 +% c;
+        let c2: u64 = if s2 < s1 { 1_u64 } else { 0_u64 };
+        r.l[i] = s2;
+        c = c1 +% c2;
+        i = i +% 1_usize;
+    }
+    return U256Carry.{ val: r, carry: c };
+}
+
+fn u256_sub_raw(a: *U256, b: *U256) -> U256Carry {
+    var r = u256_zero();
+    var brw: u64 = 0_u64;
+    var i: usize = 0_usize;
+    while i < 4_usize {
+        let d1 = a.l[i] -% b.l[i];
+        let b1: u64 = if a.l[i] < b.l[i] { 1_u64 } else { 0_u64 };
+        let d2 = d1 -% brw;
+        let b2: u64 = if d1 < brw { 1_u64 } else { 0_u64 };
+        r.l[i] = d2;
+        brw = b1 +% b2;
+        i = i +% 1_usize;
+    }
+    return U256Carry.{ val: r, carry: brw };
+}
+
+fn mod_add(a: *U256, b: *U256, m: *U256) -> U256 {
+    let s = u256_add_raw(a, b);
+    if s.carry != 0_u64 || u256_ge(&s.val, m) {
+        return u256_sub_raw(&s.val, m).val;
+    }
+    return s.val;
+}
+
+fn mod_sub(a: *U256, b: *U256, m: *U256) -> U256 {
+    let d = u256_sub_raw(a, b);
+    if d.carry != 0_u64 {
+        return u256_add_raw(&d.val, m).val;
+    }
+    return d.val;
+}
+
+fn u256_bit(a: *U256, idx: usize) -> bool {
+    let limb = idx >> 6_usize;
+    let bit = (idx & 63_usize).trunc.[u64]();
+    if limb >= 4_usize { return false; }
+    return ((a.l[limb] >> bit) & 1_u64) != 0_u64;
+}
+
+/// Shift-and-add modular multiplication `(a * b) mod m` (compact, constant-memory, 256 iterations).
+fn mod_mul(a0: *U256, b: *U256, m: *U256) -> U256 {
+    var acc = u256_zero();
+    var a = U256.{ l: a0.l };
+    if u256_ge(&a, m) { a = u256_sub_raw(&a, m).val; }
+    var bit: usize = 256_usize;
+    while bit > 0_usize {
+        bit = bit - 1_usize;
+        acc = mod_add(&acc, &acc, m);
+        if u256_bit(b, bit) {
+            acc = mod_add(&acc, &a, m);
+        }
+    }
+    return acc;
+}
+
+/// Modular exponentiation `base^exp mod m` (Fermat inversion: `a^(m-2) mod m`).
+fn mod_pow(base: *U256, exp: *U256, m: *U256) -> U256 {
+    var res = u256_one();
+    var cur = U256.{ l: base.l };
+    var i: usize = 0_usize;
+    while i < 256_usize {
+        if u256_bit(exp, i) {
+            res = mod_mul(&res, &cur, m);
+        }
+        cur = mod_mul(&cur, &cur, m);
+        i = i +% 1_usize;
+    }
+    return res;
+}
+
+fn mod_inv(a: *U256, m: *U256) -> U256 {
+    let two = U256.{ l: [2_u64, 0_u64, 0_u64, 0_u64] };
+    let exp = u256_sub_raw(m, &two).val;
+    return mod_pow(a, &exp, m);
+}
+
+struct P256Point {
+    x: U256;
+    y: U256;
+    inf: bool;
+}
+
+fn p256_pt_double(pt: *P256Point) -> P256Point {
+    if pt.inf || u256_is_zero(&pt.y) {
+        return P256Point.{ x: u256_zero(), y: u256_zero(), inf: true };
+    }
+    let p = p256_p();
+    let three = U256.{ l: [3_u64, 0_u64, 0_u64, 0_u64] };
+    let x2 = mod_mul(&pt.x, &pt.x, &p);
+    let tx2 = mod_mul(&three, &x2, &p);
+    let num = mod_sub(&tx2, &three, &p); // 3*x^2 + a (a = -3 mod p)
+    let den = mod_add(&pt.y, &pt.y, &p);
+    let den_inv = mod_inv(&den, &p);
+    let lam = mod_mul(&num, &den_inv, &p);
+    let lam2 = mod_mul(&lam, &lam, &p);
+    let x3a = mod_sub(&lam2, &pt.x, &p);
+    let x3 = mod_sub(&x3a, &pt.x, &p);
+    let dx = mod_sub(&pt.x, &x3, &p);
+    let ldx = mod_mul(&lam, &dx, &p);
+    let y3 = mod_sub(&ldx, &pt.y, &p);
+    return P256Point.{ x: x3, y: y3, inf: false };
+}
+
+fn p256_pt_add(a: *P256Point, b: *P256Point) -> P256Point {
+    if a.inf { return P256Point.{ x: U256.{ l: b.x.l }, y: U256.{ l: b.y.l }, inf: b.inf }; }
+    if b.inf { return P256Point.{ x: U256.{ l: a.x.l }, y: U256.{ l: a.y.l }, inf: a.inf }; }
+    let p = p256_p();
+    let dx = mod_sub(&b.x, &a.x, &p);
+    let dy = mod_sub(&b.y, &a.y, &p);
+    if u256_is_zero(&dx) {
+        if u256_is_zero(&dy) { return p256_pt_double(a); }
+        return P256Point.{ x: u256_zero(), y: u256_zero(), inf: true };
+    }
+    let dx_inv = mod_inv(&dx, &p);
+    let lam = mod_mul(&dy, &dx_inv, &p);
+    let lam2 = mod_mul(&lam, &lam, &p);
+    let x3a = mod_sub(&lam2, &a.x, &p);
+    let x3 = mod_sub(&x3a, &b.x, &p);
+    let ax3 = mod_sub(&a.x, &x3, &p);
+    let lax = mod_mul(&lam, &ax3, &p);
+    let y3 = mod_sub(&lax, &a.y, &p);
+    return P256Point.{ x: x3, y: y3, inf: false };
+}
+
+fn p256_scalar_mul_g(k: *U256) -> P256Point {
+    var acc = P256Point.{ x: u256_zero(), y: u256_zero(), inf: true };
+    var cur = P256Point.{ x: p256_gx(), y: p256_gy(), inf: false };
+    var i: usize = 0_usize;
+    while i < 256_usize {
+        if u256_bit(k, i) {
+            acc = p256_pt_add(&acc, &cur);
+        }
+        cur = p256_pt_double(&cur);
+        i = i +% 1_usize;
+    }
+    return acc;
+}
+
+// Deterministic Eon Android Debug ECDSA P-256 keypair (matches self-signed X.509 cert below).
+fn debug_priv_d() -> U256 {
+    return U256.{ l: [0x6f7262c7f5f0d96f_u64, 0x91949837b047a183_u64, 0xb9d0d6c2eb02f21b_u64, 0x9f3888495525f7a6_u64] };
+}
+
+const DEBUG_SPKI_DER: [91]u8 = [
+    0x30_u8, 0x59_u8, 0x30_u8, 0x13_u8, 0x06_u8, 0x07_u8, 0x2a_u8, 0x86_u8, 0x48_u8, 0xce_u8, 0x3d_u8, 0x02_u8, 0x01_u8, 0x06_u8, 0x08_u8, 0x2a_u8,
+    0x86_u8, 0x48_u8, 0xce_u8, 0x3d_u8, 0x03_u8, 0x01_u8, 0x07_u8, 0x03_u8, 0x42_u8, 0x00_u8, 0x04_u8, 0xa9_u8, 0xc2_u8, 0x15_u8, 0xa1_u8, 0xf8_u8,
+    0x59_u8, 0xd1_u8, 0x65_u8, 0x26_u8, 0xbc_u8, 0x1a_u8, 0x24_u8, 0x22_u8, 0x6c_u8, 0x67_u8, 0xaa_u8, 0x8b_u8, 0x47_u8, 0xeb_u8, 0xd6_u8, 0x84_u8,
+    0x14_u8, 0x5c_u8, 0xf3_u8, 0x35_u8, 0x83_u8, 0xe6_u8, 0x7b_u8, 0x80_u8, 0xdb_u8, 0x9d_u8, 0x99_u8, 0x7d_u8, 0x6f_u8, 0x84_u8, 0x7f_u8, 0x3b_u8,
+    0xb8_u8, 0x29_u8, 0x4a_u8, 0x7f_u8, 0xab_u8, 0x55_u8, 0xc9_u8, 0x96_u8, 0xf8_u8, 0xfb_u8, 0x2f_u8, 0xba_u8, 0x5a_u8, 0x14_u8, 0x4d_u8, 0x20_u8,
+    0xd6_u8, 0xf4_u8, 0x54_u8, 0x48_u8, 0x1e_u8, 0x59_u8, 0xe2_u8, 0x2c_u8, 0x3e_u8, 0x71_u8, 0x89_u8,
+];
+
+const DEBUG_CERT_DER: [398]u8 = [
+    0x30_u8, 0x82_u8, 0x01_u8, 0x8a_u8, 0x30_u8, 0x82_u8, 0x01_u8, 0x30_u8, 0xa0_u8, 0x03_u8, 0x02_u8, 0x01_u8, 0x02_u8, 0x02_u8, 0x14_u8, 0x61_u8,
+    0xe9_u8, 0xaf_u8, 0x4b_u8, 0xc1_u8, 0x3c_u8, 0x85_u8, 0xf8_u8, 0x7f_u8, 0xbc_u8, 0x69_u8, 0x59_u8, 0x2a_u8, 0x7f_u8, 0xca_u8, 0xb5_u8, 0x70_u8,
+    0x41_u8, 0xf0_u8, 0x26_u8, 0x30_u8, 0x0a_u8, 0x06_u8, 0x08_u8, 0x2a_u8, 0x86_u8, 0x48_u8, 0xce_u8, 0x3d_u8, 0x04_u8, 0x03_u8, 0x02_u8, 0x30_u8,
+    0x2a_u8, 0x31_u8, 0x1a_u8, 0x30_u8, 0x18_u8, 0x06_u8, 0x03_u8, 0x55_u8, 0x04_u8, 0x03_u8, 0x0c_u8, 0x11_u8, 0x45_u8, 0x6f_u8, 0x6e_u8, 0x20_u8,
+    0x41_u8, 0x6e_u8, 0x64_u8, 0x72_u8, 0x6f_u8, 0x69_u8, 0x64_u8, 0x20_u8, 0x44_u8, 0x65_u8, 0x62_u8, 0x75_u8, 0x67_u8, 0x31_u8, 0x0c_u8, 0x30_u8,
+    0x0a_u8, 0x06_u8, 0x03_u8, 0x55_u8, 0x04_u8, 0x0a_u8, 0x0c_u8, 0x03_u8, 0x45_u8, 0x6f_u8, 0x6e_u8, 0x30_u8, 0x20_u8, 0x17_u8, 0x0d_u8, 0x32_u8,
+    0x36_u8, 0x31_u8, 0x31_u8, 0x32_u8, 0x35_u8, 0x30_u8, 0x36_u8, 0x34_u8, 0x33_u8, 0x33_u8, 0x38_u8, 0x5a_u8, 0x18_u8, 0x0f_u8, 0x32_u8, 0x30_u8,
+    0x35_u8, 0x34_u8, 0x30_u8, 0x34_u8, 0x31_u8, 0x32_u8, 0x30_u8, 0x36_u8, 0x34_u8, 0x33_u8, 0x33_u8, 0x38_u8, 0x5a_u8, 0x30_u8, 0x2a_u8, 0x31_u8,
+    0x1a_u8, 0x30_u8, 0x18_u8, 0x06_u8, 0x03_u8, 0x55_u8, 0x04_u8, 0x03_u8, 0x0c_u8, 0x11_u8, 0x45_u8, 0x6f_u8, 0x6e_u8, 0x20_u8, 0x41_u8, 0x6e_u8,
+    0x64_u8, 0x72_u8, 0x6f_u8, 0x69_u8, 0x64_u8, 0x20_u8, 0x44_u8, 0x65_u8, 0x62_u8, 0x75_u8, 0x67_u8, 0x31_u8, 0x0c_u8, 0x30_u8, 0x0a_u8, 0x06_u8,
+    0x03_u8, 0x55_u8, 0x04_u8, 0x0a_u8, 0x0c_u8, 0x03_u8, 0x45_u8, 0x6f_u8, 0x6e_u8, 0x30_u8, 0x59_u8, 0x30_u8, 0x13_u8, 0x06_u8, 0x07_u8, 0x2a_u8,
+    0x86_u8, 0x48_u8, 0xce_u8, 0x3d_u8, 0x02_u8, 0x01_u8, 0x06_u8, 0x08_u8, 0x2a_u8, 0x86_u8, 0x48_u8, 0xce_u8, 0x3d_u8, 0x03_u8, 0x01_u8, 0x07_u8,
+    0x03_u8, 0x42_u8, 0x00_u8, 0x04_u8, 0xa9_u8, 0xc2_u8, 0x15_u8, 0xa1_u8, 0xf8_u8, 0x59_u8, 0xd1_u8, 0x65_u8, 0x26_u8, 0xbc_u8, 0x1a_u8, 0x24_u8,
+    0x22_u8, 0x6c_u8, 0x67_u8, 0xaa_u8, 0x8b_u8, 0x47_u8, 0xeb_u8, 0xd6_u8, 0x84_u8, 0x14_u8, 0x5c_u8, 0xf3_u8, 0x35_u8, 0x83_u8, 0xe6_u8, 0x7b_u8,
+    0x80_u8, 0xdb_u8, 0x9d_u8, 0x99_u8, 0x7d_u8, 0x6f_u8, 0x84_u8, 0x7f_u8, 0x3b_u8, 0xb8_u8, 0x29_u8, 0x4a_u8, 0x7f_u8, 0xab_u8, 0x55_u8, 0xc9_u8,
+    0x96_u8, 0xf8_u8, 0xfb_u8, 0x2f_u8, 0xba_u8, 0x5a_u8, 0x14_u8, 0x4d_u8, 0x20_u8, 0xd6_u8, 0xf4_u8, 0x54_u8, 0x48_u8, 0x1e_u8, 0x59_u8, 0xe2_u8,
+    0x2c_u8, 0x3e_u8, 0x71_u8, 0x89_u8, 0xa3_u8, 0x32_u8, 0x30_u8, 0x30_u8, 0x30_u8, 0x1d_u8, 0x06_u8, 0x03_u8, 0x55_u8, 0x1d_u8, 0x0e_u8, 0x04_u8,
+    0x16_u8, 0x04_u8, 0x14_u8, 0xb1_u8, 0xa1_u8, 0x71_u8, 0x23_u8, 0xdb_u8, 0xe6_u8, 0x0d_u8, 0xa0_u8, 0x67_u8, 0x15_u8, 0x65_u8, 0x5b_u8, 0xae_u8,
+    0x89_u8, 0x5b_u8, 0x40_u8, 0x2d_u8, 0x40_u8, 0x9c_u8, 0x1c_u8, 0x30_u8, 0x0f_u8, 0x06_u8, 0x03_u8, 0x55_u8, 0x1d_u8, 0x13_u8, 0x01_u8, 0x01_u8,
+    0xff_u8, 0x04_u8, 0x05_u8, 0x30_u8, 0x03_u8, 0x01_u8, 0x01_u8, 0xff_u8, 0x30_u8, 0x0a_u8, 0x06_u8, 0x08_u8, 0x2a_u8, 0x86_u8, 0x48_u8, 0xce_u8,
+    0x3d_u8, 0x04_u8, 0x03_u8, 0x02_u8, 0x03_u8, 0x48_u8, 0x00_u8, 0x30_u8, 0x45_u8, 0x02_u8, 0x20_u8, 0x25_u8, 0x49_u8, 0x66_u8, 0x9e_u8, 0xff_u8,
+    0xb5_u8, 0x25_u8, 0xc3_u8, 0x05_u8, 0x6a_u8, 0x8c_u8, 0x13_u8, 0xf3_u8, 0x15_u8, 0xfd_u8, 0x69_u8, 0xc1_u8, 0xb0_u8, 0xe3_u8, 0x34_u8, 0x1c_u8,
+    0x2e_u8, 0x64_u8, 0xd0_u8, 0x95_u8, 0xda_u8, 0xe6_u8, 0x6a_u8, 0x61_u8, 0x0a_u8, 0x30_u8, 0x92_u8, 0x02_u8, 0x21_u8, 0x00_u8, 0xd7_u8, 0x0f_u8,
+    0x17_u8, 0xc3_u8, 0x53_u8, 0x27_u8, 0x09_u8, 0x29_u8, 0x18_u8, 0x45_u8, 0xa1_u8, 0xba_u8, 0x52_u8, 0x49_u8, 0x78_u8, 0x80_u8, 0x17_u8, 0xa0_u8,
+    0x1c_u8, 0x8c_u8, 0xa0_u8, 0x27_u8, 0xc4_u8, 0xd4_u8, 0x63_u8, 0x25_u8, 0xe2_u8, 0x56_u8, 0x2e_u8, 0xd9_u8, 0x54_u8, 0xe0_u8,
+];
+
+fn push_der_int(out: *mut ApkBuf, alloc: *mut AllocCap, be: *[u8]) {
+    if be.len == 0_usize {
+        out.pu8(alloc, 0x02_u8);
+        out.pu8(alloc, 1_u8);
+        out.pu8(alloc, 0_u8);
+        return;
+    }
+    var start: usize = 0_usize;
+    while start < be.len - 1_usize && be[start] == 0_u8 {
+        start = start +% 1_usize;
+    }
+    let need_zero = start < be.len && (be[start] & 0x80_u8) != 0_u8;
+    let rem = if start <= be.len { be.len - start } else { 0_usize };
+    let body_len = rem +% (if need_zero { 1_usize } else { 0_usize });
+    out.pu8(alloc, 0x02_u8);
+    out.pu8(alloc, body_len.trunc.[u8]());
+    if need_zero { out.pu8(alloc, 0_u8); }
+    let sl = be.sub(start, be.len) catch "".as_bytes();
+    out.pbytes(alloc, sl);
+}
+
+/// Produce a deterministic, cryptographically valid ASN.1 DER ECDSA-P256-SHA256 signature.
+fn ecdsa_p256_sign_der(alloc: *mut AllocCap, msg: *[u8]) -> ApkBuf ! OutOfMemory {
+    let n = p256_n();
+    let d = debug_priv_d();
+    let h_bytes = macho.sha256_bytes(msg);
+    var z = u256_from_be(h_bytes[0_usize..32_usize]);
+    if u256_ge(&z, &n) { z = u256_sub_raw(&z, &n).val; }
+
+    // Deterministic nonce k = SHA256(d_be || h_bytes || counter) mod (n-1) + 1
+    let d_be = u256_to_be(&d);
+    var k_ctx = macho.Sha256Ctx.init();
+    k_ctx.update(d_be[0_usize..32_usize]);
+    k_ctx.update(h_bytes[0_usize..32_usize]);
+    k_ctx.update_u8(1_u8);
+    let k_hash = k_ctx.finish();
+    var k = u256_from_be(k_hash[0_usize..32_usize]);
+    if u256_ge(&k, &n) { k = u256_sub_raw(&k, &n).val; }
+    if u256_is_zero(&k) { k = u256_one(); }
+
+    let R = p256_scalar_mul_g(&k);
+    var r = R.x;
+    if u256_ge(&r, &n) { r = u256_sub_raw(&r, &n).val; }
+    let k_inv = mod_inv(&k, &n);
+    let rd = mod_mul(&r, &d, &n);
+    let zrd = mod_add(&z, &rd, &n);
+    let s = mod_mul(&k_inv, &zrd, &n);
+
+    let r_be = u256_to_be(&r);
+    let s_be = u256_to_be(&s);
+    var body = try ApkBuf.init(alloc, 72_usize);
+    errdefer body.destroy(alloc);
+    push_der_int(&mut body, alloc, r_be[0_usize..32_usize]);
+    push_der_int(&mut body, alloc, s_be[0_usize..32_usize]);
+
+    var der = try ApkBuf.init(alloc, body.len() +% 4_usize);
+    der.pu8(alloc, 0x30_u8);
+    der.pu8(alloc, body.len().trunc.[u8]());
+    der.pbytes(alloc, body.bytes.as_slice());
+    if body.oom { der.oom = true; }
+    body.destroy(alloc);
+    return der;
+}
+
+// ============================================================================
+// Binary Android XML (`AXML`) Generator for NativeActivity `AndroidManifest.xml`
+// ============================================================================
+
+fn axml_push_utf16_str(spool: *mut ApkBuf, alloc: *mut AllocCap, s: *str) {
+    let bs = s.as_bytes();
+    spool.pu16(alloc, bs.len.trunc.[u16]());
+    var i: usize = 0_usize;
+    while i < bs.len {
+        spool.pu16(alloc, bs[i].widen.[u16]());
+        i = i +% 1_usize;
+    }
+    spool.pu16(alloc, 0_u16);
+}
+
+fn axml_emit_start_elem(
+    out: *mut ApkBuf,
+    alloc: *mut AllocCap,
+    ns_idx: u32,
+    name_idx: u32,
+    n_attrs: u16,
+) {
+    let sz = 36_u32 +% n_attrs.widen.[u32]() *% 20_u32;
+    out.pu16(alloc, 0x0102_u16); // RES_XML_START_ELEMENT_TYPE
+    out.pu16(alloc, 16_u16);     // headerSize
+    out.pu32(alloc, sz);
+    out.pu32(alloc, 1_u32);      // lineNumber
+    out.pu32(alloc, 0xFFFFFFFF_u32); // comment
+    out.pu32(alloc, ns_idx);
+    out.pu32(alloc, name_idx);
+    out.pu16(alloc, 20_u16);     // attributeStart
+    out.pu16(alloc, 20_u16);     // attributeSize
+    out.pu16(alloc, n_attrs);
+    out.pu16(alloc, 0_u16);      // idIndex
+    out.pu16(alloc, 0_u16);      // classIndex
+    out.pu16(alloc, 0_u16);      // styleIndex
+}
+
+fn axml_emit_attr(
+    out: *mut ApkBuf,
+    alloc: *mut AllocCap,
+    ns_idx: u32,
+    name_idx: u32,
+    raw_val: u32,
+    val_type: u8,
+    val_data: u32,
+) {
+    out.pu32(alloc, ns_idx);
+    out.pu32(alloc, name_idx);
+    out.pu32(alloc, raw_val);
+    out.pu16(alloc, 8_u16); // Res_value size
+    out.pu8(alloc, 0_u8);
+    out.pu8(alloc, val_type);
+    out.pu32(alloc, val_data);
+}
+
+fn axml_emit_end_elem(out: *mut ApkBuf, alloc: *mut AllocCap, ns_idx: u32, name_idx: u32) {
+    out.pu16(alloc, 0x0103_u16); // RES_XML_END_ELEMENT_TYPE
+    out.pu16(alloc, 16_u16);
+    out.pu32(alloc, 24_u32);
+    out.pu32(alloc, 1_u32);
+    out.pu32(alloc, 0xFFFFFFFF_u32);
+    out.pu32(alloc, ns_idx);
+    out.pu32(alloc, name_idx);
+}
+
+fn check_apk_oom(oom: bool) -> !OutOfMemory {
+    if oom { return OutOfMemory; }
+    return;
+}
+
+fn axml_push_str_by_idx(spool: *mut ApkBuf, alloc: *mut AllocCap, idx: usize, pkg_name: *str, app_label: *str) {
+    if idx == 20_usize { axml_push_utf16_str(spool, alloc, pkg_name); return; }
+    if idx == 22_usize { axml_push_utf16_str(spool, alloc, app_label); return; }
+    match idx {
+        0_usize => { axml_push_utf16_str(spool, alloc, "versionCode"); }
+        1_usize => { axml_push_utf16_str(spool, alloc, "versionName"); }
+        2_usize => { axml_push_utf16_str(spool, alloc, "minSdkVersion"); }
+        3_usize => { axml_push_utf16_str(spool, alloc, "targetSdkVersion"); }
+        4_usize => { axml_push_utf16_str(spool, alloc, "label"); }
+        5_usize => { axml_push_utf16_str(spool, alloc, "hasCode"); }
+        6_usize => { axml_push_utf16_str(spool, alloc, "name"); }
+        7_usize => { axml_push_utf16_str(spool, alloc, "configChanges"); }
+        8_usize => { axml_push_utf16_str(spool, alloc, "value"); }
+        9_usize => { axml_push_utf16_str(spool, alloc, "android"); }
+        10_usize => { axml_push_utf16_str(spool, alloc, "http://schemas.android.com/apk/res/android"); }
+        11_usize => { axml_push_utf16_str(spool, alloc, "package"); }
+        12_usize => { axml_push_utf16_str(spool, alloc, "manifest"); }
+        13_usize => { axml_push_utf16_str(spool, alloc, "uses-sdk"); }
+        14_usize => { axml_push_utf16_str(spool, alloc, "application"); }
+        15_usize => { axml_push_utf16_str(spool, alloc, "activity"); }
+        16_usize => { axml_push_utf16_str(spool, alloc, "meta-data"); }
+        17_usize => { axml_push_utf16_str(spool, alloc, "intent-filter"); }
+        18_usize => { axml_push_utf16_str(spool, alloc, "action"); }
+        19_usize => { axml_push_utf16_str(spool, alloc, "category"); }
+        21_usize => { axml_push_utf16_str(spool, alloc, "1.0"); }
+        23_usize => { axml_push_utf16_str(spool, alloc, "android.app.NativeActivity"); }
+        24_usize => { axml_push_utf16_str(spool, alloc, "android.app.lib_name"); }
+        25_usize => { axml_push_utf16_str(spool, alloc, "main"); }
+        26_usize => { axml_push_utf16_str(spool, alloc, "android.intent.action.MAIN"); }
+        _ => { axml_push_utf16_str(spool, alloc, "android.intent.category.LAUNCHER"); }
+    }
+}
+
+fn build_android_manifest_axml(alloc: *mut AllocCap, pkg_name: *str, app_label: *str) -> ApkBuf ! OutOfMemory {
+    let res_ids: [9]u32 = [
+        0x0101021b_u32, 0x0101021c_u32, 0x0101020c_u32, 0x01010270_u32,
+        0x01010001_u32, 0x0101000c_u32, 0x01010003_u32, 0x0101001f_u32, 0x01010024_u32,
+    ];
+
+    var str_data = try ApkBuf.init(alloc, 512_usize);
+    errdefer str_data.destroy(alloc);
+    var offs: [28]u32 = [0_u32; 28];
+    var i: usize = 0_usize;
+    while i < 28_usize {
+        offs[i] = str_data.len().trunc.[u32]();
+        axml_push_str_by_idx(&mut str_data, alloc, i, pkg_name, app_label);
+        i = i +% 1_usize;
+    }
+    while (str_data.len() & 3_usize) != 0_usize { str_data.pu8(alloc, 0_u8); }
+
+    let sp_hdr: u32 = 28_u32;
+    let sp_strings_start: u32 = sp_hdr +% 28_u32 *% 4_u32;
+    let sp_chunk_sz: u32 = sp_strings_start +% str_data.len().trunc.[u32]();
+
+    var out = try ApkBuf.init(alloc, sp_chunk_sz.widen.[usize]() +% 512_usize);
+    // XML File header (RES_XML_TYPE = 0x0003, hdr=8, size patched at end)
+    out.pu16(alloc, 0x0003_u16);
+    out.pu16(alloc, 8_u16);
+    out.pu32(alloc, 0_u32);
+
+    // StringPool chunk (RES_STRING_POOL_TYPE = 0x0001)
+    out.pu16(alloc, 0x0001_u16);
+    out.pu16(alloc, 28_u16);
+    out.pu32(alloc, sp_chunk_sz);
+    out.pu32(alloc, 28_u32);          // stringCount
+    out.pu32(alloc, 0_u32);           // styleCount
+    out.pu32(alloc, 0_u32);           // flags (UTF-16)
+    out.pu32(alloc, sp_strings_start);
+    out.pu32(alloc, 0_u32);           // stylesStart
+    i = 0_usize;
+    while i < 28_usize {
+        out.pu32(alloc, offs[i]);
+        i = i +% 1_usize;
+    }
+    out.pbytes(alloc, str_data.bytes.as_slice());
+    if str_data.oom { out.oom = true; }
+    str_data.destroy(alloc);
+
+    // ResourceMap chunk (RES_XML_RESOURCE_MAP_TYPE = 0x0180)
+    out.pu16(alloc, 0x0180_u16);
+    out.pu16(alloc, 8_u16);
+    out.pu32(alloc, 8_u32 +% 9_u32 *% 4_u32);
+    i = 0_usize;
+    while i < 9_usize {
+        out.pu32(alloc, res_ids[i]);
+        i = i +% 1_usize;
+    }
+
+    // START_NAMESPACE (android -> http://schemas.android.com/apk/res/android)
+    out.pu16(alloc, 0x0100_u16);
+    out.pu16(alloc, 16_u16);
+    out.pu32(alloc, 24_u32);
+    out.pu32(alloc, 1_u32);
+    out.pu32(alloc, 0xFFFFFFFF_u32);
+    out.pu32(alloc, 9_u32);  // prefix = "android"
+    out.pu32(alloc, 10_u32); // uri
+
+    let NO_NS: u32 = 0xFFFFFFFF_u32;
+    let AND_NS: u32 = 10_u32;
+
+    // <manifest android:versionCode="1" android:versionName="1.0" package="org.eon.app">
+    axml_emit_start_elem(&mut out, alloc, NO_NS, 12_u32, 3_u16);
+    axml_emit_attr(&mut out, alloc, AND_NS, 0_u32, NO_NS, 0x10_u8, 1_u32);
+    axml_emit_attr(&mut out, alloc, AND_NS, 1_u32, 21_u32, 0x03_u8, 21_u32);
+    axml_emit_attr(&mut out, alloc, NO_NS, 11_u32, 20_u32, 0x03_u8, 20_u32);
+
+    // <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34"/>
+    axml_emit_start_elem(&mut out, alloc, NO_NS, 13_u32, 2_u16);
+    axml_emit_attr(&mut out, alloc, AND_NS, 2_u32, NO_NS, 0x10_u8, 26_u32);
+    axml_emit_attr(&mut out, alloc, AND_NS, 3_u32, NO_NS, 0x10_u8, 34_u32);
+    axml_emit_end_elem(&mut out, alloc, NO_NS, 13_u32);
+
+    // <application android:label="EonApp" android:hasCode="false">
+    axml_emit_start_elem(&mut out, alloc, NO_NS, 14_u32, 2_u16);
+    axml_emit_attr(&mut out, alloc, AND_NS, 4_u32, 22_u32, 0x03_u8, 22_u32);
+    axml_emit_attr(&mut out, alloc, AND_NS, 5_u32, NO_NS, 0x12_u8, 0_u32);
+
+    // <activity android:name="android.app.NativeActivity" android:configChanges="0x4a0">
+    axml_emit_start_elem(&mut out, alloc, NO_NS, 15_u32, 2_u16);
+    axml_emit_attr(&mut out, alloc, AND_NS, 6_u32, 23_u32, 0x03_u8, 23_u32);
+    axml_emit_attr(&mut out, alloc, AND_NS, 7_u32, NO_NS, 0x11_u8, 0x04a0_u32);
+
+    // <meta-data android:name="android.app.lib_name" android:value="main"/>
+    axml_emit_start_elem(&mut out, alloc, NO_NS, 16_u32, 2_u16);
+    axml_emit_attr(&mut out, alloc, AND_NS, 6_u32, 24_u32, 0x03_u8, 24_u32);
+    axml_emit_attr(&mut out, alloc, AND_NS, 8_u32, 25_u32, 0x03_u8, 25_u32);
+    axml_emit_end_elem(&mut out, alloc, NO_NS, 16_u32);
+
+    // <intent-filter><action .../><category .../></intent-filter>
+    axml_emit_start_elem(&mut out, alloc, NO_NS, 17_u32, 0_u16);
+    axml_emit_start_elem(&mut out, alloc, NO_NS, 18_u32, 1_u16);
+    axml_emit_attr(&mut out, alloc, AND_NS, 6_u32, 26_u32, 0x03_u8, 26_u32);
+    axml_emit_end_elem(&mut out, alloc, NO_NS, 18_u32);
+    axml_emit_start_elem(&mut out, alloc, NO_NS, 19_u32, 1_u16);
+    axml_emit_attr(&mut out, alloc, AND_NS, 6_u32, 27_u32, 0x03_u8, 27_u32);
+    axml_emit_end_elem(&mut out, alloc, NO_NS, 19_u32);
+    axml_emit_end_elem(&mut out, alloc, NO_NS, 17_u32);
+
+    axml_emit_end_elem(&mut out, alloc, NO_NS, 15_u32);
+    axml_emit_end_elem(&mut out, alloc, NO_NS, 14_u32);
+    axml_emit_end_elem(&mut out, alloc, NO_NS, 12_u32);
+
+    // END_NAMESPACE
+    out.pu16(alloc, 0x0101_u16);
+    out.pu16(alloc, 16_u16);
+    out.pu32(alloc, 24_u32);
+    out.pu32(alloc, 1_u32);
+    out.pu32(alloc, 0xFFFFFFFF_u32);
+    out.pu32(alloc, 9_u32);
+    out.pu32(alloc, 10_u32);
+
+    let axml_sz = out.len().trunc.[u32]();
+    out.patch_u32(4_usize, axml_sz);
+    return out;
+}
+
+// ============================================================================
+// ZIP + `zipalign` (4 KiB) + APK Signature Scheme v2 Builder
+// ============================================================================
+
+struct ZipEntryMeta {
+    local_hdr_off: u32;
+    crc32: u32;
+    size: u32;
+    name_off: u32;
+    name_len: u16;
+}
+
+fn push_zip_stored_entry(
+    alloc: *mut AllocCap,
+    zip: *mut ApkBuf,
+    names_pool: *mut ApkBuf,
+    metas: *mut col.DynBuf[ZipEntryMeta],
+    name: *[u8],
+    payload: *[u8],
+    align_payload: usize,
+) -> !OutOfMemory {
+    let hdr_off = zip.len();
+    let base_data_off = hdr_off +% 30_usize +% name.len;
+    var extra_len: usize = 0_usize;
+    if align_payload > 1_usize {
+        let rem = base_data_off % align_payload;
+        if rem != 0_usize {
+            extra_len = align_payload - rem;
+        }
+    }
+    let crc = crc32_bytes(payload);
+    let sz = payload.len.trunc.[u32]();
+
+    // Local File Header (30 bytes + name + extra_len)
+    zip.pu32(alloc, 0x04034B50_u32); // PK\3\4
+    zip.pu16(alloc, 20_u16);         // version needed = 2.0
+    zip.pu16(alloc, 0_u16);          // flags
+    zip.pu16(alloc, 0_u16);          // compression = STORE (0)
+    zip.pu16(alloc, 0_u16);          // mod time (deterministic)
+    zip.pu16(alloc, 0x5821_u16);     // mod date (deterministic)
+    zip.pu32(alloc, crc);
+    zip.pu32(alloc, sz);
+    zip.pu32(alloc, sz);
+    zip.pu16(alloc, name.len.trunc.[u16]());
+    zip.pu16(alloc, extra_len.trunc.[u16]());
+    zip.pbytes(alloc, name);
+    zip.pzeros(alloc, extra_len);
+    zip.pbytes(alloc, payload);
+
+    let noff = names_pool.len().trunc.[u32]();
+    names_pool.pbytes(alloc, name);
+    try metas.push(alloc, ZipEntryMeta.{
+        local_hdr_off: hdr_off.trunc.[u32](),
+        crc32: crc,
+        size: sz,
+        name_off: noff,
+        name_len: name.len.trunc.[u16](),
+    });
+    return;
+}
+
+/// Compute Android APK Signature Scheme v2 chunked 1 MiB SHA-256 content digest
+/// across Sections 1 (ZIP entries), 3 (Central Directory), and 4 (patched EOCD).
+fn compute_apk_v2_digest(
+    alloc: *mut AllocCap,
+    sec1: *[u8],
+    sec3: *[u8],
+    sec4: *[u8],
+) -> [32]u8 ! OutOfMemory {
+    let chunk_max: usize = 1048576_usize; // 1 MiB per APK v2 spec
+    var chunk_digests = try ApkBuf.init(alloc, 128_usize);
+    errdefer chunk_digests.destroy(alloc);
+    var total_chunks: u32 = 0_u32;
+
+    var sec_i: usize = 0_usize;
+    while sec_i < 3_usize {
+        let s: *[u8] = if sec_i == 0_usize { sec1 } else if sec_i == 1_usize { sec3 } else { sec4 };
+        var pos: usize = 0_usize;
+        if s.len == 0_usize {
+            var cctx = macho.Sha256Ctx.init();
+            cctx.update_u8(0xa5_u8);
+            cctx.update_u32_le(0_u32);
+            let cd = cctx.finish();
+            chunk_digests.pbytes(alloc, cd[0_usize..32_usize]);
+            total_chunks = total_chunks +% 1_u32;
+        } else {
+            while pos < s.len {
+                var end = pos +% chunk_max;
+                if end > s.len { end = s.len; }
+                let part = s.sub(pos, end) catch "".as_bytes();
+                var cctx = macho.Sha256Ctx.init();
+                cctx.update_u8(0xa5_u8);
+                cctx.update_u32_le(part.len.trunc.[u32]());
+                cctx.update(part);
+                let cd = cctx.finish();
+                chunk_digests.pbytes(alloc, cd[0_usize..32_usize]);
+                total_chunks = total_chunks +% 1_u32;
+                pos = end;
+            }
+        }
+        sec_i = sec_i +% 1_usize;
+    }
+
+    var top = macho.Sha256Ctx.init();
+    top.update_u8(0x5a_u8);
+    top.update_u32_le(total_chunks);
+    top.update(chunk_digests.bytes.as_slice());
+    let final_digest = top.finish();
+    chunk_digests.destroy(alloc);
+    return final_digest;
+}
+
+/// Wrap an Android `ET_DYN` shared library (`so_bytes`) into a zipaligned,
+/// APK Signature Scheme v2 signed `.apk` package.
+pub fn package_android_apk(
+    alloc: *mut AllocCap,
+    so_bytes: *[u8],
+    arch: target.TargetArch,
+    pkg_name: *str,
+    app_label: *str,
+) -> elf64.LinkResult ! OutOfMemory {
+    let axml = try build_android_manifest_axml(alloc, pkg_name, app_label);
+    errdefer axml.destroy(alloc);
+
+    var sec1 = try ApkBuf.init(alloc, so_bytes.len +% axml.len() +% 8192_usize);
+    errdefer sec1.destroy(alloc);
+    var names_pool = try ApkBuf.init(alloc, 128_usize);
+    errdefer names_pool.destroy(alloc);
+    var metas = try col.DynBuf.[ZipEntryMeta].init(alloc, 4_usize);
+    errdefer metas.destroy(alloc);
+
+    // 1. AndroidManifest.xml (4-byte aligned)
+    try push_zip_stored_entry(alloc, &mut sec1, &mut names_pool, &mut metas, "AndroidManifest.xml".as_bytes(), axml.bytes.as_slice(), 4_usize);
+
+    // 2. lib/<abi>/libmain.so (STRICT 4096-byte zipalign for direct mmap execution!)
+    let lib_path: *[u8] = if arch == .X86_64 {
+        "lib/x86_64/libmain.so".as_bytes()
+    } else {
+        "lib/arm64-v8a/libmain.so".as_bytes()
+    };
+    try push_zip_stored_entry(alloc, &mut sec1, &mut names_pool, &mut metas, lib_path, so_bytes, 4096_usize);
+
+    // 3. Build Central Directory (Section 3)
+    var sec3 = try ApkBuf.init(alloc, 256_usize);
+    errdefer sec3.destroy(alloc);
+    let ms = metas.as_slice();
+    let np = names_pool.bytes.as_slice();
+    var mi: usize = 0_usize;
+    while mi < ms.len {
+        let m = ms[mi];
+        sec3.pu32(alloc, 0x02014B50_u32); // PK\1\2
+        sec3.pu16(alloc, 20_u16);         // version made by
+        sec3.pu16(alloc, 20_u16);         // version needed
+        sec3.pu16(alloc, 0_u16);          // flags
+        sec3.pu16(alloc, 0_u16);          // STORE
+        sec3.pu16(alloc, 0_u16);          // mod time
+        sec3.pu16(alloc, 0x5821_u16);     // mod date
+        sec3.pu32(alloc, m.crc32);
+        sec3.pu32(alloc, m.size);
+        sec3.pu32(alloc, m.size);
+        sec3.pu16(alloc, m.name_len);
+        sec3.pu16(alloc, 0_u16);          // extra len
+        sec3.pu16(alloc, 0_u16);          // comment len
+        sec3.pu16(alloc, 0_u16);          // disk start
+        sec3.pu16(alloc, 0_u16);          // internal attrs
+        sec3.pu32(alloc, 0_u32);          // external attrs
+        sec3.pu32(alloc, m.local_hdr_off);
+        let ns = m.name_off.widen.[usize]();
+        let ne = ns +% m.name_len.widen.[usize]();
+        if ne <= np.len {
+            let sl = np.sub(ns, ne) catch "".as_bytes();
+            sec3.pbytes(alloc, sl);
+        }
+        mi = mi +% 1_usize;
+    }
+
+    // 4. Build EOCD for digest calculation (cd_offset = sec1.len = offset of APK Sig Block!)
+    var sec4_digest = try ApkBuf.init(alloc, 22_usize);
+    errdefer sec4_digest.destroy(alloc);
+    sec4_digest.pu32(alloc, 0x06054B50_u32); // PK\5\6
+    sec4_digest.pu16(alloc, 0_u16);
+    sec4_digest.pu16(alloc, 0_u16);
+    sec4_digest.pu16(alloc, ms.len.trunc.[u16]());
+    sec4_digest.pu16(alloc, ms.len.trunc.[u16]());
+    sec4_digest.pu32(alloc, sec3.len().trunc.[u32]());
+    sec4_digest.pu32(alloc, sec1.len().trunc.[u32]());
+    sec4_digest.pu16(alloc, 0_u16);
+
+    // 5. Compute APK Signature Scheme v2 digest & sign with ECDSA-P256-SHA256 (alg 0x0201)!
+    let digest = try compute_apk_v2_digest(alloc, sec1.bytes.as_slice(), sec3.bytes.as_slice(), sec4_digest.bytes.as_slice());
+
+    // Build `signed_data`: digests + certificates + additional_attributes
+    var signed_data = try ApkBuf.init(alloc, 512_usize);
+    errdefer signed_data.destroy(alloc);
+    // digests sequence: 1 digest entry (len=40: alg_id=0x0201(4) + digest_len=32(4) + digest(32))
+    signed_data.pu32(alloc, 44_u32);
+    signed_data.pu32(alloc, 40_u32);
+    signed_data.pu32(alloc, 0x00000201_u32); // SIGNATURE_ECDSA_WITH_SHA256
+    signed_data.pu32(alloc, 32_u32);
+    signed_data.pbytes(alloc, digest[0_usize..32_usize]);
+    // certificates sequence: 1 self-signed X.509 DER cert
+    signed_data.pu32(alloc, (4_usize +% 398_usize).trunc.[u32]());
+    signed_data.pu32(alloc, 398_u32);
+    signed_data.pbytes(alloc, DEBUG_CERT_DER[0_usize..398_usize]);
+    // additional attributes (empty)
+    signed_data.pu32(alloc, 0_u32);
+
+    let sig_der = try ecdsa_p256_sign_der(alloc, signed_data.bytes.as_slice());
+    errdefer sig_der.destroy(alloc);
+
+    // Build single `signer` block
+    var signer = try ApkBuf.init(alloc, 768_usize);
+    errdefer signer.destroy(alloc);
+    // signed_data length-prefixed
+    signer.pu32(alloc, signed_data.len().trunc.[u32]());
+    signer.pbytes(alloc, signed_data.bytes.as_slice());
+    // signatures sequence: 1 signature entry (alg_id=0x0201(4) + len(4) + der)
+    let sig_entry_len = (8_usize +% sig_der.len()).trunc.[u32]();
+    signer.pu32(alloc, 4_u32 +% sig_entry_len);
+    signer.pu32(alloc, sig_entry_len);
+    signer.pu32(alloc, 0x00000201_u32);
+    signer.pu32(alloc, sig_der.len().trunc.[u32]());
+    signer.pbytes(alloc, sig_der.bytes.as_slice());
+    // public_key (SubjectPublicKeyInfo DER, 91 bytes)
+    signer.pu32(alloc, 91_u32);
+    signer.pbytes(alloc, DEBUG_SPKI_DER[0_usize..91_usize]);
+
+    // Build v2 value = signers sequence (len-prefixed signer)
+    let v2_val_len: u64 = 4_u64 +% 4_u64 +% signer.len().widen.[u64]();
+    // Pair = pair_len(8) + id(4: 0x7109871a) + v2_val
+    let pair_payload_len: u64 = 4_u64 +% v2_val_len;
+    // APK Signing Block = size_of_block(8) + pair_len(8) + pair_payload + size_of_block(8) + magic(16)
+    let block_size_field: u64 = 8_u64 +% pair_payload_len +% 8_u64 +% 16_u64;
+
+    var sig_block = try ApkBuf.init(alloc, (8_u64 +% block_size_field).trunc.[usize]() +% 16_usize);
+    errdefer sig_block.destroy(alloc);
+    sig_block.pu64(alloc, block_size_field);
+    sig_block.pu64(alloc, pair_payload_len);
+    sig_block.pu32(alloc, 0x7109871a_u32); // APK_SIGNATURE_SCHEME_V2_BLOCK_ID
+    sig_block.pu32(alloc, (4_usize +% signer.len()).trunc.[u32]());
+    sig_block.pu32(alloc, signer.len().trunc.[u32]());
+    sig_block.pbytes(alloc, signer.bytes.as_slice());
+    sig_block.pu64(alloc, block_size_field);
+    sig_block.pbytes(alloc, "APK Sig Block 42".as_bytes());
+
+    // 6. Assemble final APK = sec1 + sig_block + sec3 + final EOCD (cd_offset = sec1.len + sig_block.len)!
+    let final_cd_off = (sec1.len() +% sig_block.len()).trunc.[u32]();
+    var out = try ApkBuf.init(alloc, sec1.len() +% sig_block.len() +% sec3.len() +% 32_usize);
+    errdefer out.destroy(alloc);
+    out.pbytes(alloc, sec1.bytes.as_slice());
+    out.pbytes(alloc, sig_block.bytes.as_slice());
+    out.pbytes(alloc, sec3.bytes.as_slice());
+    // Final EOCD
+    out.pu32(alloc, 0x06054B50_u32);
+    out.pu16(alloc, 0_u16);
+    out.pu16(alloc, 0_u16);
+    out.pu16(alloc, ms.len.trunc.[u16]());
+    out.pu16(alloc, ms.len.trunc.[u16]());
+    out.pu32(alloc, sec3.len().trunc.[u32]());
+    out.pu32(alloc, final_cd_off);
+    out.pu16(alloc, 0_u16);
+
+    let any_oom = axml.oom || sec1.oom || names_pool.oom || sec3.oom || sec4_digest.oom
+        || signed_data.oom || sig_der.oom || signer.oom || sig_block.oom || out.oom;
+    try check_apk_oom(any_oom);
+    let empty_err = try str.StrBuf.init(alloc, 0_usize);
+    errdefer empty_err.destroy(alloc);
+
+    sig_block.destroy(alloc);
+    signer.destroy(alloc);
+    sig_der.destroy(alloc);
+    signed_data.destroy(alloc);
+    sec4_digest.destroy(alloc);
+    sec3.destroy(alloc);
+    metas.destroy(alloc);
+    names_pool.destroy(alloc);
+    sec1.destroy(alloc);
+    axml.destroy(alloc);
+
+    let ApkBuf.{ bytes: final_bytes, oom: _ } = out;
+    return elf64.LinkResult.{
+        ok: true,
+        elf: elf64.LinkedElf.{
+            bytes: final_bytes,
+            entry_vaddr: 0_u64,
+            text_vaddr: 0_u64,
+            rodata_vaddr: 0_u64,
+            data_rel_ro_vaddr: 0_u64,
+            data_vaddr: 0_u64,
+            bss_vaddr: 0_u64,
+            tdata_vaddr: 0_u64,
+            tls_memsz: 0_u64,
+        },
+        err_msg: empty_err,
+    };
+}

@@ -16924,12 +16924,8 @@ fn optimize_program_parallel(
     } else {
         if nfns < 32_usize {
             n_workers = 1_usize;
-        } else if nfns < 192_usize {
-            n_workers = 4_usize;
-        } else if nfns < 480_usize {
-            n_workers = 8_usize;
         } else {
-            n_workers = 12_usize;
+            n_workers = 4_usize;
         }
     }
     if nfns < 4_usize {
