@@ -924,6 +924,240 @@ def test_m13_core_and_std(eonc: str):
     print("[PASS] M1.3 freestanding core/{math_vec,color,fmt} and OS std/{time,fs,sync,net,dl} (--release + --sanitize)")
 
 
+def _lsp_send(proc: subprocess.Popen, obj: dict):
+    import json
+    body = json.dumps(obj).encode("utf-8")
+    hdr = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+    proc.stdin.write(hdr + body)
+    proc.stdin.flush()
+
+
+def _lsp_recv(proc: subprocess.Popen) -> dict:
+    import json
+    content_len = None
+    while True:
+        line = proc.stdout.readline()
+        assert line, "LSP server closed stdout unexpectedly"
+        s = line.decode("ascii", errors="replace").strip()
+        if s == "":
+            if content_len is not None:
+                break
+            continue
+        if s.lower().startswith("content-length:"):
+            content_len = int(s.split(":", 1)[1].strip())
+    data = proc.stdout.read(content_len)
+    assert len(data) == content_len, f"Short LSP read: {len(data)} != {content_len}"
+    return json.loads(data.decode("utf-8"))
+
+
+def test_m14_fmt_and_lsp(eonc: str):
+    """Verify M1.4: canonical idempotent `eonc fmt [--check]` and full `eonc lsp` JSON-RPC lifecycle
+    (diagnostics, hover with DBM proven intervals & @stack(N), definition, completion, formatting, quick-fixes, 0 leaks)."""
+    with tempfile.TemporaryDirectory(prefix="eon_m14_reg_") as td:
+        td_p = Path(td)
+
+        # 1. `eonc fmt` & `eonc fmt --check` idempotency + comment preservation + valid code
+        messy = td_p / "messy.eon"
+        messy.write_text(
+            "module demo.fmt;\n"
+            "/// Doc comment preserved\n"
+            "pub fn add_pair( a:i32,b:i32 )->i32{\n"
+            "\n\n\n"
+            "  // line comment preserved\n"
+            "  let s=a+%b;\n"
+            "  /* block comment preserved */\n"
+            "  return s;\n"
+            "}\n"
+            "pub fn main()->i32{\n"
+            "    let r=add_pair(20_i32,22_i32);\n"
+            "    if r==42_i32{return 0_i32;}\n"
+            "    return 1_i32;\n"
+            "}\n"
+        )
+        r_chk1 = run_cmd([eonc, "fmt", "--check", str(messy)])
+        assert r_chk1.returncode != 0 and "would reformat" in r_chk1.stderr, (
+            f"Expected fmt --check to flag messy.eon: rc={r_chk1.returncode}\n{r_chk1.stderr}"
+        )
+        r_fmt = run_cmd([eonc, "fmt", str(messy)])
+        assert r_fmt.returncode == 0, f"eonc fmt failed:\n{r_fmt.stderr}"
+        fmt_txt = messy.read_text()
+        for keep in ("/// Doc comment preserved", "// line comment preserved", "/* block comment preserved */"):
+            assert keep in fmt_txt, f"Formatter lost comment `{keep}`:\n{fmt_txt}"
+        assert "let s = a +% b;" in fmt_txt, f"Expected canonical spacing in:\n{fmt_txt}"
+        # Second pass must be 100% idempotent
+        r_chk2 = run_cmd([eonc, "fmt", "--check", str(messy)])
+        assert r_chk2.returncode == 0, f"eonc fmt is not idempotent:\n{r_chk2.stderr}\n{fmt_txt}"
+        # Formatted file must still compile and run
+        fmt_bin = td_p / "messy_bin"
+        r_b = run_cmd([eonc, "build", "--release", str(messy), "-o", str(fmt_bin)])
+        assert r_b.returncode == 0, f"Formatted file failed to build:\n{r_b.stderr}\n{fmt_txt}"
+        assert subprocess.run([str(fmt_bin)]).returncode == 0
+
+        # Real-world idempotency check on copies of core/{math_vec,color,fmt}.eon
+        core_copy = td_p / "core_fmt_test"
+        core_copy.mkdir()
+        for nm in ("math_vec.eon", "color.eon", "fmt.eon"):
+            shutil.copy(ROOT / "core" / nm, core_copy / nm)
+        assert run_cmd([eonc, "fmt", str(core_copy)]).returncode == 0
+        r_core_chk = run_cmd([eonc, "fmt", "--check", str(core_copy)])
+        assert r_core_chk.returncode == 0, f"core/ fmt not idempotent:\n{r_core_chk.stderr}"
+
+        # 2. Live `eonc lsp` JSON-RPC 2.0 session
+        lsp_file = td_p / "sample.eon"
+        lsp_uri = lsp_file.as_uri()
+        sample_src = (
+            "module demo.lsp;\n"
+            "\n"
+            "pub fn clamp_inc(x: usize) -> usize {\n"
+            "    if x < 10_usize {\n"
+            "        let y = x + 1_usize;\n"
+            "        return y;\n"
+            "    }\n"
+            "    return 10_usize;\n"
+            "}\n"
+            "\n"
+            "pub fn main() -> i32 {\n"
+            "    let r = clamp_inc(4_usize);\n"
+            "    return if r == 5_usize { 0_i32 } else { 1_i32 };\n"
+            "}\n"
+        )
+        lsp_file.write_text(sample_src)
+
+        proc = subprocess.Popen(
+            [eonc, "lsp"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            # initialize
+            _lsp_send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}}})
+            init_resp = _lsp_recv(proc)
+            assert init_resp["id"] == 1
+            caps = init_resp["result"]["capabilities"]
+            for cap_k in ("hoverProvider", "definitionProvider", "completionProvider", "documentFormattingProvider", "codeActionProvider"):
+                assert caps.get(cap_k), f"Missing LSP capability {cap_k}: {caps}"
+
+            _lsp_send(proc, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
+
+            # didOpen -> clean publishDiagnostics
+            _lsp_send(proc, {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {"textDocument": {"uri": lsp_uri, "languageId": "eon", "version": 1, "text": sample_src}},
+            })
+            diag1 = _lsp_recv(proc)
+            assert diag1["method"] == "textDocument/publishDiagnostics"
+            assert diag1["params"]["diagnostics"] == [], f"Expected 0 diagnostics on valid file, got {diag1}"
+
+            # hover on function `clamp_inc` (line 2, col 8) -> must show @stack(...) & DBM checks
+            _lsp_send(proc, {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/hover",
+                "params": {"textDocument": {"uri": lsp_uri}, "position": {"line": 2, "character": 8}},
+            })
+            hov_fn = _lsp_recv(proc)
+            hv_fn = hov_fn["result"]["contents"]["value"]
+            assert "@stack(" in hv_fn and "DBM checks:" in hv_fn and "clamp_inc" in hv_fn, f"Unexpected fn hover:\n{hv_fn}"
+
+            # hover on local `y` (line 4, col 12) -> must show type AND proven DBM interval [1..=10]
+            _lsp_send(proc, {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "textDocument/hover",
+                "params": {"textDocument": {"uri": lsp_uri}, "position": {"line": 4, "character": 12}},
+            })
+            hov_var = _lsp_recv(proc)
+            hv_var = hov_var["result"]["contents"]["value"]
+            assert "let y: usize" in hv_var and "DBM proven interval:" in hv_var and "[1..=10]" in hv_var, (
+                f"Expected DBM proven interval [1..=10] in var hover:\n{hv_var}"
+            )
+
+            # definition on call `clamp_inc` in main (line 11, col 15) -> points to line 2
+            _lsp_send(proc, {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "textDocument/definition",
+                "params": {"textDocument": {"uri": lsp_uri}, "position": {"line": 11, "character": 15}},
+            })
+            def_resp = _lsp_recv(proc)
+            assert def_resp["result"]["range"]["start"]["line"] == 2, f"Unexpected definition: {def_resp}"
+
+            # completion at `clamp_` (line 11, col 16) -> includes `clamp_inc`
+            _lsp_send(proc, {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": lsp_uri}, "position": {"line": 11, "character": 16}},
+            })
+            comp_resp = _lsp_recv(proc)
+            labels = [it["label"] for it in comp_resp["result"]]
+            assert "clamp_inc" in labels, f"Expected clamp_inc in completions: {labels}"
+
+            # formatting
+            _lsp_send(proc, {
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "textDocument/formatting",
+                "params": {"textDocument": {"uri": lsp_uri}, "options": {"tabSize": 4, "insertSpaces": True}},
+            })
+            fmt_resp = _lsp_recv(proc)
+            assert len(fmt_resp["result"]) == 1 and "pub fn clamp_inc" in fmt_resp["result"][0]["newText"]
+
+            # didChange with ZM-01 & ZM-02 errors -> publishDiagnostics + codeAction quick-fixes
+            bad_src = (
+                "module demo.lsp;\n"
+                "pub fn helper() -> i32 { return 7_i32; }\n"
+                "pub fn main() -> i32 {\n"
+                "    let unused_v = 1_i32;\n"
+                "    helper();\n"
+                "    return 0_i32;\n"
+                "}\n"
+            )
+            _lsp_send(proc, {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didChange",
+                "params": {
+                    "textDocument": {"uri": lsp_uri, "version": 2},
+                    "contentChanges": [{"text": bad_src}],
+                },
+            })
+            diag2 = _lsp_recv(proc)
+            codes = {d["code"] for d in diag2["params"]["diagnostics"]}
+            assert "E0101" in codes and "E0102" in codes, f"Expected E0101 & E0102 in diagnostics: {diag2}"
+
+            _lsp_send(proc, {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "textDocument/codeAction",
+                "params": {
+                    "textDocument": {"uri": lsp_uri},
+                    "range": {"start": {"line": 3, "character": 0}, "end": {"line": 5, "character": 0}},
+                    "context": {"diagnostics": diag2["params"]["diagnostics"]},
+                },
+            })
+            ca_resp = _lsp_recv(proc)
+            titles = [a["title"] for a in ca_resp["result"]]
+            assert any("ZM-01" in t for t in titles) and any("ZM-02" in t for t in titles), (
+                f"Expected ZM-01 and ZM-02 quick-fixes: {ca_resp}"
+            )
+
+            # shutdown + exit -> rc=0 (proving zero heap leaks!)
+            _lsp_send(proc, {"jsonrpc": "2.0", "id": 8, "method": "shutdown"})
+            sd_resp = _lsp_recv(proc)
+            assert sd_resp["id"] == 8 and sd_resp["result"] is None
+            _lsp_send(proc, {"jsonrpc": "2.0", "method": "exit"})
+            rc_lsp = proc.wait(timeout=10)
+            err_lsp = proc.stderr.read().decode("utf-8", errors="replace")
+            assert rc_lsp == 0, f"eonc lsp exited {rc_lsp} (possible leak!):\n{err_lsp}"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+    print("[PASS] M1.4 eonc fmt [--check] (idempotent, comment-safe) and eonc lsp (diagnostics, DBM+@stack hover, definition, completion, formatting, quick-fixes, 0 leaks)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--eonc", default=str(ROOT / "selfhost/out/eonc2_rel"))
@@ -936,6 +1170,7 @@ def main() -> int:
     test_m11_opt_and_dbm(eonc)
     test_m12_deps_lock_and_impl_cutoff(eonc)
     test_m13_core_and_std(eonc)
+    test_m14_fmt_and_lsp(eonc)
     print("ALL SELFHOST SOUNDNESS REGRESSIONS PASSED!")
     return 0
 

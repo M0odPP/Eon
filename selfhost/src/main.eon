@@ -28,6 +28,8 @@ import eonc.emi;
 import eonc.build_sys;
 import eonc.mach_x64;
 import eonc.ui_test;
+import eonc.fmt;
+import eonc.lsp;
 
 // ---------------------------------------------------------------------------
 // Path component comparison (matches Rust `std::path::Path::cmp` on POSIX)
@@ -469,7 +471,7 @@ fn lex_and_print_file(
 
 fn print_usage() {
     rt.eprint_str(
-        "eonc1 — self-hosted Eon compiler\n\nUSAGE:\n\teonc1 lex [--dump] <path...>\n\teonc1 parse [--dump-ast | --dump-ast-full] [--repeat N] <path...>\n\teonc1 resolve [--dump] [--no-stdlib] <path...>\n\teonc1 check [--dump-types] [--dump-cfg] [--dump-eir] [--dump-verify] [--no-stdlib] <path...>\n\teonc1 build [--native] [--freestanding] [--shared] [--soname NAME] [-l LIB] [--sanitize] [--audit-tcb] [--emi-cache DIR] [-o out_path] [path...|build.eon]\n\teonc1 run [--native | --interp] [--sanitize] [-l LIB] [--emi-cache DIR] <path...> [-- <prog_args...>]\n\teonc1 test [tests/ui]\n\teonc1 --help\n",
+        "eonc1 — self-hosted Eon compiler\n\nUSAGE:\n\teonc1 lex [--dump] <path...>\n\teonc1 parse [--dump-ast | --dump-ast-full] [--repeat N] <path...>\n\teonc1 resolve [--dump] [--no-stdlib] <path...>\n\teonc1 check [--dump-types] [--dump-cfg] [--dump-eir] [--dump-verify] [--no-stdlib] <path...>\n\teonc1 build [--native] [--freestanding] [--shared] [--soname NAME] [-l LIB] [--sanitize] [--audit-tcb] [--emi-cache DIR] [-o out_path] [path...|build.eon]\n\teonc1 run [--native | --interp] [--sanitize] [-l LIB] [--emi-cache DIR] <path...> [-- <prog_args...>]\n\teonc1 test [tests/ui]\n\teonc1 fmt [--check] <path...>\n\teonc1 lsp\n\teonc1 --help\n",
     );
 }
 
@@ -7192,6 +7194,123 @@ fn cmd_test(env: *mut Env) -> i32 ! OutOfMemory | Utf8Error {
     return rc;
 }
 
+// ---------------------------------------------------------------------------
+// `fmt` subcommand (`eonc fmt [--check] <path...>`)
+// ---------------------------------------------------------------------------
+
+fn cmd_fmt(env: *mut Env) -> i32 ! OutOfMemory | Utf8Error {
+    let argc = env.args.len();
+    var check_only = false;
+    var inputs = try PathList.init(&mut env.alloc);
+    errdefer inputs.destroy(&mut env.alloc);
+    var err_buf = try str.StrBuf.init(&mut env.alloc, 256_usize);
+    errdefer err_buf.destroy(&mut env.alloc);
+
+    var ai: usize = 2_usize;
+    while ai < argc {
+        if let arg = env.args.get(ai) {
+            if rt.str_eq(arg, "-h") || rt.str_eq(arg, "--help") {
+                rt.eprint_str("usage: eonc fmt [--check] <path...>\n");
+                err_buf.destroy(&mut env.alloc);
+                inputs.destroy(&mut env.alloc);
+                return 0_i32;
+            } else if rt.str_eq(arg, "--check") {
+                check_only = true;
+            } else {
+                try inputs.push(&mut env.alloc, arg.as_bytes());
+            }
+        }
+        ai = ai +% 1_usize;
+    }
+    if inputs.len() == 0_usize {
+        rt.eprint_str("usage: eonc fmt [--check] <path...>\n");
+        err_buf.destroy(&mut env.alloc);
+        inputs.destroy(&mut env.alloc);
+        return 1_i32;
+    }
+
+    var files = try PathList.init(&mut env.alloc);
+    errdefer files.destroy(&mut env.alloc);
+    var ii: usize = 0_usize;
+    while ii < inputs.len() {
+        let pstr = try inputs.get(ii).as_str();
+        let ok = try collect_eon_files(&mut env.alloc, &env.fs, pstr, &mut files, &mut err_buf);
+        if !ok {
+            rt.eprint_bytes(err_buf.as_bytes());
+            files.destroy(&mut env.alloc);
+            err_buf.destroy(&mut env.alloc);
+            inputs.destroy(&mut env.alloc);
+            return 1_i32;
+        }
+        ii = ii +% 1_usize;
+    }
+    files.sort();
+
+    var formatted = try str.StrBuf.init(&mut env.alloc, 4096_usize);
+    errdefer formatted.destroy(&mut env.alloc);
+    var unformatted_count: usize = 0_usize;
+    var write_failed = false;
+
+    var fi: usize = 0_usize;
+    while fi < files.len() {
+        let fp = files.get(fi);
+        let fstr = try fp.as_str();
+        let orig = env.fs.read_file(&mut env.alloc, fstr) catch {
+            rt.eprint_str("fmt: failed to read `");
+            rt.eprint_bytes(fp);
+            rt.eprint_str("`\n");
+            write_failed = true;
+            fi = fi +% 1_usize;
+            continue;
+        };
+        try fmt.format_eon_source(&mut env.alloc, orig.as_slice(), &mut formatted);
+        let changed = !str.bytes_eq(orig.as_slice(), formatted.as_bytes());
+        orig.destroy(&mut env.alloc);
+        if changed {
+            unformatted_count = unformatted_count +% 1_usize;
+            if check_only {
+                rt.eprint_str("would reformat: ");
+                rt.eprint_bytes(fp);
+                rt.eprint_nl();
+            } else {
+                env.fs.write_file(fstr, formatted.as_bytes()) catch {
+                    rt.eprint_str("fmt: failed to write `");
+                    rt.eprint_bytes(fp);
+                    rt.eprint_str("`\n");
+                    write_failed = true;
+                };
+            }
+        }
+        fi = fi +% 1_usize;
+    }
+
+    formatted.destroy(&mut env.alloc);
+    files.destroy(&mut env.alloc);
+    err_buf.destroy(&mut env.alloc);
+    inputs.destroy(&mut env.alloc);
+    if write_failed {
+        return 1_i32;
+    }
+    if check_only && unformatted_count > 0_usize {
+        return 1_i32;
+    }
+    return 0_i32;
+}
+
+// ---------------------------------------------------------------------------
+// `lsp` subcommand (`eonc lsp`)
+// ---------------------------------------------------------------------------
+
+fn cmd_lsp(env: *mut Env) -> i32 ! OutOfMemory | Utf8Error {
+    if let arg = env.args.get(2_usize) {
+        if rt.str_eq(arg, "-h") || rt.str_eq(arg, "--help") {
+            rt.eprint_str("usage: eonc lsp\n");
+            return 0_i32;
+        }
+    }
+    return try lsp.run_lsp_server(env);
+}
+
 pub fn main(env: *mut Env) -> i32 ! OutOfMemory | IoError | Utf8Error {
     let argc = env.args.len();
     if argc < 2_usize {
@@ -7216,6 +7335,10 @@ pub fn main(env: *mut Env) -> i32 ! OutOfMemory | IoError | Utf8Error {
             mode = 7_u8;
         } else if rt.str_eq(s, "test") {
             mode = 8_u8;
+        } else if rt.str_eq(s, "fmt") {
+            mode = 9_u8;
+        } else if rt.str_eq(s, "lsp") {
+            mode = 10_u8;
         }
     }
     if mode == 2_u8 {
@@ -7247,6 +7370,10 @@ pub fn main(env: *mut Env) -> i32 ! OutOfMemory | IoError | Utf8Error {
         rc = try cmd_run(env);
     } else if mode == 8_u8 {
         rc = try cmd_test(env);
+    } else if mode == 9_u8 {
+        rc = try cmd_fmt(env);
+    } else if mode == 10_u8 {
+        rc = try cmd_lsp(env);
     }
 
     if env.alloc.live_allocs() != 0_usize {

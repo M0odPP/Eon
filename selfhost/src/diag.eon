@@ -190,6 +190,37 @@ impl DiagBag {
         return self.diags.len();
     }
 
+    pub fn diag_at(self: *Self, idx: usize) -> ?DiagEntry {
+        let ds = self.diags.as_slice();
+        if idx < ds.len {
+            return ds[idx];
+        }
+        return null;
+    }
+
+    pub view fn diag_msg(self: *Self, idx: usize) -> *[u8] {
+        let empty: *str = "";
+        let ds = self.diags.as_slice();
+        if idx < ds.len {
+            let d = ds[idx];
+            return self.text_slice(d.msg_off, d.msg_len);
+        }
+        return empty.as_bytes();
+    }
+
+    pub view fn diag_first_help(self: *Self, diag_idx: u32) -> *[u8] {
+        let empty: *str = "";
+        let hs = self.helps.as_slice();
+        var i: usize = 0_usize;
+        while i < hs.len {
+            if hs[i].diag_idx == diag_idx {
+                return self.text_slice(hs[i].msg_off, hs[i].msg_len);
+            }
+            i = i +% 1_usize;
+        }
+        return empty.as_bytes();
+    }
+
     pub fn clear(self: *mut Self) {
         self.diags.clear();
         self.labels.clear();

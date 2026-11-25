@@ -1,0 +1,1621 @@
+module eonc.lsp;
+
+import core.col;
+import core.str;
+import std.rt;
+import eonc.span;
+import eonc.diag;
+import eonc.ast;
+import eonc.parser;
+import eonc.resolve;
+import eonc.types;
+import eonc.ctvm;
+import eonc.check;
+import eonc.cfg;
+import eonc.borrow;
+import eonc.effects;
+import eonc.eir;
+import eonc.verify;
+import eonc.fmt;
+
+// ===========================================================================
+// Minimal JSON-RPC 2.0 Framing, Parsing, and Serialization for `eonc lsp`
+// ===========================================================================
+
+fn is_json_ws(b: u8) -> bool {
+    return b == b' ' || b == 9_u8 || b == 10_u8 || b == 13_u8;
+}
+
+fn is_ident_start_b(b: u8) -> bool {
+    return (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') || b == b'_';
+}
+
+fn is_ident_cont_b(b: u8) -> bool {
+    return is_ident_start_b(b) || (b >= b'0' && b <= b'9');
+}
+
+fn json_push_escaped(
+    alloc: *mut AllocCap,
+    s: *[u8],
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    try out.push_byte_grow(alloc, b'"');
+    var i: usize = 0_usize;
+    while i < s.len {
+        let ch = s[i];
+        if ch == b'"' {
+            try out.push_str_grow(alloc, "\\\"");
+        } else if ch == b'\\' {
+            try out.push_str_grow(alloc, "\\\\");
+        } else if ch == 10_u8 {
+            try out.push_str_grow(alloc, "\\n");
+        } else if ch == 13_u8 {
+            try out.push_str_grow(alloc, "\\r");
+        } else if ch == 9_u8 {
+            try out.push_str_grow(alloc, "\\t");
+        } else if ch < 32_u8 {
+            try out.push_str_grow(alloc, "\\u00");
+            let hi = (ch >> 4_u8) & 15_u8;
+            let lo = ch & 15_u8;
+            try out.push_byte_grow(alloc, b'0' +% hi);
+            try out.push_byte_grow(alloc, if lo < 10_u8 { b'0' +% lo } else { b'a' +% (lo -% 10_u8) });
+        } else {
+            try out.push_byte_grow(alloc, ch);
+        }
+        i = i +% 1_usize;
+    }
+    try out.push_byte_grow(alloc, b'"');
+    return;
+}
+
+fn json_skip_ws(bytes: *[u8], pos_in: usize) -> usize {
+    var p = pos_in;
+    while p < bytes.len && is_json_ws(bytes[p]) {
+        p = p +% 1_usize;
+    }
+    return p;
+}
+
+fn json_skip_string(bytes: *[u8], pos_in: usize) -> usize {
+    if pos_in >= bytes.len || bytes[pos_in] != b'"' {
+        return pos_in;
+    }
+    var p = pos_in +% 1_usize;
+    while p < bytes.len {
+        let ch = bytes[p];
+        if ch == b'\\' && p +% 1_usize < bytes.len {
+            p = p +% 2_usize;
+            continue;
+        }
+        p = p +% 1_usize;
+        if ch == b'"' {
+            return p;
+        }
+    }
+    return bytes.len;
+}
+
+fn json_skip_value(bytes: *[u8], pos_in: usize) -> usize {
+    var p = json_skip_ws(bytes, pos_in);
+    if p >= bytes.len {
+        return bytes.len;
+    }
+    let ch = bytes[p];
+    if ch == b'"' {
+        return json_skip_string(bytes, p);
+    }
+    if ch == b'{' || ch == b'[' {
+        var depth: usize = 0_usize;
+        while p < bytes.len {
+            let c = bytes[p];
+            if c == b'"' {
+                p = json_skip_string(bytes, p);
+                continue;
+            }
+            if c == b'{' || c == b'[' {
+                depth = depth +% 1_usize;
+            } else if c == b'}' || c == b']' {
+                if depth > 0_usize {
+                    depth = depth - 1_usize;
+                }
+                p = p +% 1_usize;
+                if depth == 0_usize {
+                    return p;
+                }
+                continue;
+            }
+            p = p +% 1_usize;
+        }
+        return bytes.len;
+    }
+    while p < bytes.len {
+        let c = bytes[p];
+        if c == b',' || c == b'}' || c == b']' || is_json_ws(c) {
+            break;
+        }
+        p = p +% 1_usize;
+    }
+    return p;
+}
+
+struct JsonSpan {
+    found: bool;
+    start: usize;
+    end: usize;
+}
+
+fn json_unescape_into(
+    alloc: *mut AllocCap,
+    bytes: *[u8],
+    start: usize,
+    end: usize,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    out.clear();
+    if start >= end || end > bytes.len {
+        return;
+    }
+    var p = start;
+    var lim = end;
+    if bytes[p] == b'"' {
+        p = p +% 1_usize;
+    }
+    if lim > p {
+        let l1 = lim - 1_usize;
+        if l1 < bytes.len && bytes[l1] == b'"' {
+            lim = l1;
+        }
+    }
+    while p < lim && p < bytes.len {
+        let ch = bytes[p];
+        if ch == b'\\' && p +% 1_usize < lim && p +% 1_usize < bytes.len {
+            let esc = bytes[p +% 1_usize];
+            p = p +% 2_usize;
+            if esc == b'n' { try out.push_byte_grow(alloc, 10_u8); }
+            else if esc == b'r' { try out.push_byte_grow(alloc, 13_u8); }
+            else if esc == b't' { try out.push_byte_grow(alloc, 9_u8); }
+            else if esc == b'"' { try out.push_byte_grow(alloc, b'"'); }
+            else if esc == b'\\' { try out.push_byte_grow(alloc, b'\\'); }
+            else if esc == b'/' { try out.push_byte_grow(alloc, b'/'); }
+            else if esc == b'u' && p +% 4_usize <= lim {
+                let hex_sl = bytes.sub(p, p +% 4_usize) catch { "".as_bytes() };
+                let cp = str.parse_u64_radix(hex_sl, 16_u64) orelse 32_u64;
+                if cp < 128_u64 {
+                    try out.push_byte_grow(alloc, cp.trunc.[u8]());
+                } else {
+                    try out.push_byte_grow(alloc, b'?');
+                }
+                p = p +% 4_usize;
+            } else {
+                try out.push_byte_grow(alloc, esc);
+            }
+        } else {
+            try out.push_byte_grow(alloc, ch);
+            p = p +% 1_usize;
+        }
+    }
+    return;
+}
+
+/// Find top-level field `key` inside a JSON object slice `bytes[obj_start..obj_end]`.
+fn json_find_field(bytes: *[u8], obj_start: usize, obj_end: usize, key: *str) -> JsonSpan {
+    let not_found = JsonSpan.{ found: false, start: 0_usize, end: 0_usize };
+    if obj_start >= obj_end || obj_end > bytes.len {
+        return not_found;
+    }
+    var p = json_skip_ws(bytes, obj_start);
+    if p >= obj_end || bytes[p] != b'{' {
+        return not_found;
+    }
+    p = p +% 1_usize;
+    let kb = key.as_bytes();
+    while p < obj_end {
+        p = json_skip_ws(bytes, p);
+        if p >= obj_end || bytes[p] == b'}' {
+            break;
+        }
+        if bytes[p] == b',' {
+            p = p +% 1_usize;
+            continue;
+        }
+        if bytes[p] != b'"' {
+            break;
+        }
+        let ks = p +% 1_usize;
+        let ke_q = json_skip_string(bytes, p);
+        let ke = if ke_q > ks { ke_q - 1_usize } else { ks };
+        p = json_skip_ws(bytes, ke_q);
+        if p >= obj_end || bytes[p] != b':' {
+            break;
+        }
+        p = json_skip_ws(bytes, p +% 1_usize);
+        let vs = p;
+        let ve = json_skip_value(bytes, vs);
+        let kslice = bytes.sub(ks, ke) catch { "".as_bytes() };
+        if str.bytes_eq(kslice, kb) {
+            return JsonSpan.{ found: true, start: vs, end: ve };
+        }
+        p = ve;
+    }
+    return not_found;
+}
+
+/// Return the first element of a JSON array `bytes[arr_start..arr_end]`.
+fn json_array_first(bytes: *[u8], arr_start: usize, arr_end: usize) -> JsonSpan {
+    let not_found = JsonSpan.{ found: false, start: 0_usize, end: 0_usize };
+    if arr_start >= arr_end || arr_end > bytes.len {
+        return not_found;
+    }
+    var p = json_skip_ws(bytes, arr_start);
+    if p >= arr_end || bytes[p] != b'[' {
+        return not_found;
+    }
+    p = json_skip_ws(bytes, p +% 1_usize);
+    if p >= arr_end || bytes[p] == b']' {
+        return not_found;
+    }
+    let ve = json_skip_value(bytes, p);
+    return JsonSpan.{ found: true, start: p, end: ve };
+}
+
+fn json_span_u32(bytes: *[u8], sp: JsonSpan) -> ?u32 {
+    if !sp.found || sp.start >= sp.end || sp.end > bytes.len {
+        return null;
+    }
+    let sl = bytes.sub(sp.start, sp.end) catch { return null; };
+    if let v = str.parse_u64_radix(sl, 10_u64) {
+        return v.trunc.[u32]();
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Stdin buffered reader & Content-Length LSP transport
+// ---------------------------------------------------------------------------
+
+linear struct StdinReader {
+    buf: col.DynBuf[u8];
+    pos: usize;
+    eof: bool;
+}
+
+impl StdinReader {
+    fn init(alloc: *mut AllocCap) -> StdinReader ! OutOfMemory {
+        let buf = try col.DynBuf.[u8].init(alloc, 4096_usize);
+        return StdinReader.{ buf: buf, pos: 0_usize, eof: false };
+    }
+
+    fn destroy(self: StdinReader, alloc: *mut AllocCap) {
+        let StdinReader.{ buf, pos, eof } = self;
+        let _ = pos;
+        let _ = eof;
+        buf.destroy(alloc);
+    }
+
+    fn compact(self: *mut Self) {
+        if self.pos == 0_usize {
+            return;
+        }
+        let n = self.buf.len();
+        if self.pos >= n {
+            self.buf.clear();
+            self.pos = 0_usize;
+            return;
+        }
+        let rem = n - self.pos;
+        let s = self.buf.as_mut_slice();
+        var i: usize = 0_usize;
+        while i < rem {
+            let src_i = self.pos +% i;
+            if i < s.len && src_i < s.len {
+                s[i] = s[src_i];
+            }
+            i = i +% 1_usize;
+        }
+        while self.buf.len() > rem {
+            _ = self.buf.pop();
+        }
+        self.pos = 0_usize;
+    }
+
+    fn fill_more(self: *mut Self, alloc: *mut AllocCap) -> bool ! OutOfMemory {
+        if self.eof {
+            return false;
+        }
+        if self.pos > 2048_usize {
+            self.compact();
+        }
+        var tmp: [4096]u8 = [0_u8; 4096];
+        let n = rt.read_stdin(&mut tmp);
+        if n == 0_usize {
+            self.eof = true;
+            return false;
+        }
+        let sl = tmp.sub(0_usize, n) catch { return false; };
+        try self.buf.push_slice(alloc, sl);
+        return true;
+    }
+
+    fn read_byte(self: *mut Self, alloc: *mut AllocCap) -> ?u8 ! OutOfMemory {
+        while self.pos >= self.buf.len() {
+            if !(try self.fill_more(alloc)) {
+                return null;
+            }
+        }
+        let s = self.buf.as_slice();
+        if self.pos < s.len {
+            let b = s[self.pos];
+            self.pos = self.pos +% 1_usize;
+            return b;
+        }
+        return null;
+    }
+
+    fn read_line(self: *mut Self, alloc: *mut AllocCap, out: *mut str.StrBuf) -> bool ! OutOfMemory {
+        out.clear();
+        var got_any = false;
+        loop {
+            let mb = try self.read_byte(alloc);
+            if let b = mb {
+                got_any = true;
+                if b == 10_u8 {
+                    return true;
+                }
+                if b != 13_u8 {
+                    try out.push_byte_grow(alloc, b);
+                }
+            } else {
+                return got_any;
+            }
+        }
+    }
+
+    fn read_exact(self: *mut Self, alloc: *mut AllocCap, n: usize, out: *mut str.StrBuf) -> bool ! OutOfMemory {
+        out.clear();
+        try out.reserve(alloc, n);
+        var got: usize = 0_usize;
+        while got < n {
+            while self.pos >= self.buf.len() {
+                if !(try self.fill_more(alloc)) {
+                    return false;
+                }
+            }
+            let blen = self.buf.len();
+            let avail = if blen > self.pos { blen - self.pos } else { 0_usize };
+            let need = n - got;
+            let take = if avail < need { avail } else { need };
+            let sl = self.buf.as_slice().sub(self.pos, self.pos +% take) catch { return false; };
+            try out.push_bytes_grow(alloc, sl);
+            self.pos = self.pos +% take;
+            got = got +% take;
+        }
+        return true;
+    }
+}
+
+fn read_lsp_message(
+    alloc: *mut AllocCap,
+    rd: *mut StdinReader,
+    out_body: *mut str.StrBuf,
+) -> bool ! OutOfMemory {
+    var line = try str.StrBuf.init(alloc, 128_usize);
+    errdefer line.destroy(alloc);
+    var content_len: usize = 0_usize;
+    var has_len = false;
+    loop {
+        let ok = try rd.read_line(alloc, &mut line);
+        if !ok {
+            line.destroy(alloc);
+            return false;
+        }
+        let lb = line.as_bytes();
+        if lb.len == 0_usize {
+            if has_len {
+                break;
+            }
+            continue;
+        }
+        // Parse `Content-Length: N` (case-insensitive prefix check)
+        if lb.len >= 15_usize && (str.starts_with(lb, "Content-Length:".as_bytes()) || str.starts_with(lb, "content-length:".as_bytes())) {
+            var p: usize = 15_usize;
+            while p < lb.len && (lb[p] == b' ' || lb[p] == 9_u8) {
+                p = p +% 1_usize;
+            }
+            let num_sl = lb.sub(p, lb.len) catch { "".as_bytes() };
+            if let v = str.parse_u64_radix(num_sl, 10_u64) {
+                content_len = v.trunc.[usize]();
+                has_len = true;
+            }
+        }
+    }
+    if !has_len || content_len > 16777216_usize {
+        line.destroy(alloc);
+        return false;
+    }
+    let ok_read = try rd.read_exact(alloc, content_len, out_body);
+    line.destroy(alloc);
+    return ok_read;
+}
+
+fn send_lsp_payload(alloc: *mut AllocCap, payload: *[u8]) -> !OutOfMemory {
+    var hdr = try str.StrBuf.init(alloc, 64_usize);
+    errdefer hdr.destroy(alloc);
+    try hdr.push_str_grow(alloc, "Content-Length: ");
+    try hdr.push_u64_grow(alloc, payload.len.widen.[u64]());
+    try hdr.push_str_grow(alloc, "\r\n\r\n");
+    rt.print_bytes(hdr.as_bytes());
+    rt.print_bytes(payload);
+    hdr.destroy(alloc);
+    return;
+}
+
+// ===========================================================================
+// Analyzed Document Cache (Diagnostics, Hover, Definitions, Completions)
+// ===========================================================================
+
+struct LspDiagRec {
+    code: u32;
+    line0: u32;
+    col0: u32;
+    end_line0: u32;
+    end_col0: u32;
+    msg_off: u32;
+    msg_len: u32;
+    help_off: u32;
+    help_len: u32;
+}
+
+struct LspDefRec {
+    name_off: u32;
+    name_len: u32;
+    kind: u8; // 0=fn, 1=struct, 2=enum, 3=union, 4=const, 5=type, 6=iface, 7=local/param
+    line0: u32;
+    col0: u32;
+    end_line0: u32;
+    end_col0: u32;
+    scope_start: u32;
+    scope_end: u32;
+    hover_off: u32;
+    hover_len: u32;
+}
+
+linear struct LspDoc {
+    uri: str.StrBuf;
+    fs_path: str.StrBuf;
+    text: str.StrBuf;
+    diags: col.DynBuf[LspDiagRec];
+    defs: col.DynBuf[LspDefRec];
+    strings: str.StrBuf;
+}
+
+impl LspDoc {
+    fn init(alloc: *mut AllocCap, uri: *[u8], fs_path: *[u8], text: *[u8]) -> LspDoc ! OutOfMemory {
+        var u = try str.StrBuf.init(alloc, uri.len +% 16_usize);
+        errdefer u.destroy(alloc);
+        try u.push_bytes_grow(alloc, uri);
+        var fp = try str.StrBuf.init(alloc, fs_path.len +% 16_usize);
+        errdefer fp.destroy(alloc);
+        try fp.push_bytes_grow(alloc, fs_path);
+        var t = try str.StrBuf.init(alloc, text.len +% 64_usize);
+        errdefer t.destroy(alloc);
+        try t.push_bytes_grow(alloc, text);
+        let diags = try col.DynBuf.[LspDiagRec].init(alloc, 16_usize);
+        errdefer diags.destroy(alloc);
+        let defs = try col.DynBuf.[LspDefRec].init(alloc, 32_usize);
+        errdefer defs.destroy(alloc);
+        let strings = try str.StrBuf.init(alloc, 512_usize);
+        return LspDoc.{
+            uri: u,
+            fs_path: fp,
+            text: t,
+            diags: diags,
+            defs: defs,
+            strings: strings,
+        };
+    }
+
+    fn destroy(self: LspDoc, alloc: *mut AllocCap) {
+        let LspDoc.{ uri, fs_path, text, diags, defs, strings } = self;
+        strings.destroy(alloc);
+        defs.destroy(alloc);
+        diags.destroy(alloc);
+        text.destroy(alloc);
+        fs_path.destroy(alloc);
+        uri.destroy(alloc);
+    }
+
+    fn set_text(self: *mut Self, alloc: *mut AllocCap, new_text: *[u8]) -> !OutOfMemory {
+        self.text.clear();
+        try self.text.push_bytes_grow(alloc, new_text);
+        return;
+    }
+
+    fn clear_analysis(self: *mut Self) {
+        self.diags.clear();
+        self.defs.clear();
+        self.strings.clear();
+    }
+
+    view fn str_slice(self: *Self, off: u32, len: u32) -> *[u8] {
+        let empty: *str = "";
+        let o = off.widen.[usize]();
+        let n = len.widen.[usize]();
+        let s = self.strings.as_bytes().sub(o, o +% n) catch {
+            return empty.as_bytes();
+        };
+        return s;
+    }
+}
+
+fn uri_to_fs_path(alloc: *mut AllocCap, uri: *[u8], out: *mut str.StrBuf) -> !OutOfMemory {
+    out.clear();
+    var p: usize = 0_usize;
+    if str.starts_with(uri, "file://".as_bytes()) {
+        p = 7_usize;
+    }
+    while p < uri.len {
+        let ch = uri[p];
+        if ch == b'%' && p +% 2_usize < uri.len {
+            let hx = uri.sub(p +% 1_usize, p +% 3_usize) catch { "".as_bytes() };
+            if let v = str.parse_u64_radix(hx, 16_u64) {
+                try out.push_byte_grow(alloc, v.trunc.[u8]());
+                p = p +% 3_usize;
+                continue;
+            }
+        }
+        try out.push_byte_grow(alloc, ch);
+        p = p +% 1_usize;
+    }
+    if out.len() == 0_usize {
+        try out.push_str_grow(alloc, "untitled.eon");
+    }
+    return;
+}
+
+fn line_col_to_offset(text: *[u8], line0: u32, col0: u32) -> usize {
+    var cur_line: u32 = 0_u32;
+    var i: usize = 0_usize;
+    while i < text.len && cur_line < line0 {
+        if text[i] == 10_u8 {
+            cur_line = cur_line +% 1_u32;
+        }
+        i = i +% 1_usize;
+    }
+    var cur_col: u32 = 0_u32;
+    while i < text.len && text[i] != 10_u8 && cur_col < col0 {
+        i = i +% 1_usize;
+        cur_col = cur_col +% 1_u32;
+    }
+    return i;
+}
+
+struct WordAtPos {
+    found: bool;
+    start: usize;
+    end: usize;
+    dot_before: bool;
+}
+
+fn extract_ident_at(text: *[u8], off_in: usize) -> WordAtPos {
+    let none = WordAtPos.{ found: false, start: 0_usize, end: 0_usize, dot_before: false };
+    if text.len == 0_usize {
+        return none;
+    }
+    var pos = if off_in < text.len { off_in } else { text.len - 1_usize };
+    if !is_ident_cont_b(text[pos]) && pos > 0_usize && is_ident_cont_b(text[pos - 1_usize]) {
+        pos = pos - 1_usize;
+    }
+    if !is_ident_cont_b(text[pos]) {
+        let db = pos > 0_usize && text[pos - 1_usize] == b'.';
+        return WordAtPos.{ found: false, start: off_in, end: off_in, dot_before: db };
+    }
+    var s = pos;
+    while s > 0_usize && is_ident_cont_b(text[s - 1_usize]) {
+        s = s - 1_usize;
+    }
+    var e = pos +% 1_usize;
+    while e < text.len && is_ident_cont_b(text[e]) {
+        e = e +% 1_usize;
+    }
+    let db = s > 0_usize && text[s - 1_usize] == b'.';
+    return WordAtPos.{ found: true, start: s, end: e, dot_before: db };
+}
+
+fn append_effects_summary(
+    alloc: *mut AllocCap,
+    einfo: *effects.FnEffectsInfo,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    var cnt: usize = 0_usize;
+    if !einfo.can_alloc {
+        try out.push_str_grow(alloc, "@noalloc");
+        cnt = cnt +% 1_usize;
+    }
+    if !einfo.can_block {
+        if cnt > 0_usize { try out.push_str_grow(alloc, ", "); }
+        try out.push_str_grow(alloc, "@noblock");
+        cnt = cnt +% 1_usize;
+    }
+    if einfo.is_recursive {
+        if cnt > 0_usize { try out.push_str_grow(alloc, ", "); }
+        try out.push_str_grow(alloc, "@recursive");
+        cnt = cnt +% 1_usize;
+    }
+    if cnt == 0_usize {
+        try out.push_str_grow(alloc, "general");
+    }
+    return;
+}
+
+fn load_lsp_stdlib(
+    env: *mut Env,
+    doc_fs_path: *[u8],
+    sm: *mut span.SourceMap,
+    interner: *mut span.SymInterner,
+    diags: *mut diag.DiagBag,
+    arena: *mut ast.AstArena,
+    unit_ids: *mut col.DynBuf[u32],
+) -> !OutOfMemory | Utf8Error {
+    var std_root = try str.StrBuf.init(&mut env.alloc, 128_usize);
+    errdefer std_root.destroy(&mut env.alloc);
+    let has_std = try resolve.find_stdlib_root_from(&mut env.alloc, &env.fs, doc_fs_path, &mut std_root);
+    if has_std {
+        var seen_mods = try col.HashMap.[u8].init(&mut env.alloc, 16_usize);
+        errdefer seen_mods.destroy(&mut env.alloc);
+        var pending = try col.DynBuf.[u32].init(&mut env.alloc, 8_usize);
+        errdefer pending.destroy(&mut env.alloc);
+        var cand = try str.StrBuf.init(&mut env.alloc, 128_usize);
+        errdefer cand.destroy(&mut env.alloc);
+        var scan_i: usize = 0_usize;
+        while scan_i < unit_ids.len() {
+            let us = unit_ids.as_slice();
+            let uid = if scan_i < us.len { us[scan_i] } else { 0_u32 };
+            scan_i = scan_i +% 1_usize;
+            pending.clear();
+            try resolve.collect_unit_stdlib_imports(&mut env.alloc, arena, uid, interner, &mut pending);
+            var mi: usize = 0_usize;
+            while mi < pending.len() {
+                let ms = pending.as_slice();
+                let msym = if mi < ms.len { ms[mi] } else { 0_u32 };
+                mi = mi +% 1_usize;
+                let mk = msym.widen.[u64]();
+                if seen_mods.contains(mk) { continue; }
+                try seen_mods.insert(&mut env.alloc, mk, 1_u8);
+                cand.clear();
+                let found = try resolve.resolve_stdlib_module_file(
+                    &mut env.alloc, &env.fs, std_root.as_bytes(), interner.get(msym), &mut cand,
+                );
+                if !found { continue; }
+                let cstr = try cand.as_str();
+                let fbuf = env.fs.read_file(&mut env.alloc, cstr) catch { continue; };
+                let sfid = try sm.add_file_bytes(&mut env.alloc, cand.as_bytes(), fbuf.as_slice());
+                fbuf.destroy(&mut env.alloc);
+                let suid = try parser.parse_file(&mut env.alloc, sm, sfid, interner, diags, arena);
+                try unit_ids.push(&mut env.alloc, suid);
+            }
+        }
+        cand.destroy(&mut env.alloc);
+        pending.destroy(&mut env.alloc);
+        seen_mods.destroy(&mut env.alloc);
+    }
+    std_root.destroy(&mut env.alloc);
+    return;
+}
+
+fn enrich_lsp_with_verify(
+    env: *mut Env,
+    sm: *span.SourceMap,
+    main_fid: u32,
+    arena: *ast.AstArena,
+    unit_ids: *[u32],
+    resolved: *resolve.ResolvedProgram,
+    tenv: *mut types.TypeEnv,
+    ct: *ctvm.CtArena,
+    ttable: *check.TypeTable,
+    interner: *mut span.SymInterner,
+    diags: *mut diag.DiagBag,
+    doc: *mut LspDoc,
+) -> !OutOfMemory {
+    let cfg_prog = try cfg.lower_program(
+        &mut env.alloc, arena, unit_ids, resolved, tenv, ct, ttable, interner,
+    );
+    errdefer cfg_prog.destroy(&mut env.alloc);
+    try borrow.analyze_program(&mut env.alloc, resolved, tenv, &cfg_prog, interner, diags);
+    let eff_rep = try effects.check_effects_and_concurrency(
+        &mut env.alloc, arena, unit_ids, resolved, tenv, &cfg_prog, interner, diags,
+    );
+    errdefer eff_rep.destroy(&mut env.alloc);
+    var eir_prog = try eir.lower_cfg_to_eir_with_diags(
+        &mut env.alloc, &cfg_prog, resolved, tenv, interner, diags, false,
+    );
+    errdefer eir_prog.destroy(&mut env.alloc);
+    let ver_rep = try verify.verify_program(
+        &mut env.alloc, arena, resolved, tenv, &mut eir_prog, interner, diags,
+    );
+    errdefer ver_rep.destroy(&mut env.alloc);
+    var hover_tmp = try str.StrBuf.init(&mut env.alloc, 256_usize);
+    errdefer hover_tmp.destroy(&mut env.alloc);
+
+    let n_fns = eir_prog.fn_count();
+    var fi: u32 = 0_u32;
+    while fi < n_fns {
+        if let f = eir_prog.get_fn(fi) {
+            if f.body_span.file == main_fid {
+                let fname = interner.get(f.name);
+                let einfo = eff_rep.get_by_key(&cfg_prog, f.key) orelse effects.fn_effects_default();
+                let vinfo = ver_rep.get_by_key(f.key) orelse verify.fn_verify_default();
+
+                hover_tmp.clear();
+                try hover_tmp.push_str_grow(&mut env.alloc, "```eon\n");
+                if f.is_sys { try hover_tmp.push_str_grow(&mut env.alloc, "sys "); }
+                else { try hover_tmp.push_str_grow(&mut env.alloc, "fn "); }
+                try hover_tmp.push_bytes_grow(&mut env.alloc, fname);
+                try hover_tmp.push_byte_grow(&mut env.alloc, b'(');
+                let ps = tenv.params_range(f.sig.params);
+                let pnames = eir_prog.fn_param_names(fi);
+                var pi: usize = 0_usize;
+                while pi < ps.len {
+                    if pi > 0_usize { try hover_tmp.push_str_grow(&mut env.alloc, ", "); }
+                    if pi < pnames.len && pnames[pi] != span.SYM_EMPTY {
+                        try hover_tmp.push_bytes_grow(&mut env.alloc, interner.get(pnames[pi]));
+                        try hover_tmp.push_str_grow(&mut env.alloc, ": ");
+                    }
+                    try tenv.format_ty_named(&mut env.alloc, ps[pi].ty, resolved, interner, &mut hover_tmp);
+                    pi = pi +% 1_usize;
+                }
+                try hover_tmp.push_str_grow(&mut env.alloc, ") -> ");
+                try tenv.format_ty_named(&mut env.alloc, f.sig.ret, resolved, interner, &mut hover_tmp);
+                try hover_tmp.push_str_grow(&mut env.alloc, "\n```\n");
+                try hover_tmp.push_str_grow(&mut env.alloc, "Stack: `");
+                if einfo.stack_unbounded {
+                    try hover_tmp.push_str_grow(&mut env.alloc, "unbounded");
+                } else {
+                    try hover_tmp.push_u64_grow(&mut env.alloc, einfo.total_stack_bytes);
+                    try hover_tmp.push_str_grow(&mut env.alloc, " B` (`@stack(");
+                    try hover_tmp.push_u64_grow(&mut env.alloc, einfo.total_stack_bytes);
+                    try hover_tmp.push_str_grow(&mut env.alloc, ")`, own ");
+                    try hover_tmp.push_u64_grow(&mut env.alloc, einfo.own_stack_bytes);
+                    try hover_tmp.push_str_grow(&mut env.alloc, " B)");
+                }
+                try hover_tmp.push_str_grow(&mut env.alloc, " | Effects: `");
+                try append_effects_summary(&mut env.alloc, &einfo, &mut hover_tmp);
+                try hover_tmp.push_str_grow(&mut env.alloc, "` | DBM checks: `");
+                try hover_tmp.push_u64_grow(&mut env.alloc, vinfo.proven_checks.widen.[u64]());
+                try hover_tmp.push_byte_grow(&mut env.alloc, b'/');
+                try hover_tmp.push_u64_grow(&mut env.alloc, vinfo.total_checks.widen.[u64]());
+                try hover_tmp.push_str_grow(&mut env.alloc, " proven`");
+
+                let hoff = doc.strings.len().trunc.[u32]();
+                let hlen = hover_tmp.len().trunc.[u32]();
+                try doc.strings.push_bytes_grow(&mut env.alloc, hover_tmp.as_bytes());
+                var updated = false;
+                let defs_mut = doc.defs.as_mut_slice();
+                var dxi: usize = 0_usize;
+                while dxi < defs_mut.len {
+                    if defs_mut[dxi].kind == 0_u8 {
+                        let dnm = doc.strings.as_bytes().sub(
+                            defs_mut[dxi].name_off.widen.[usize](),
+                            defs_mut[dxi].name_off.widen.[usize]() +% defs_mut[dxi].name_len.widen.[usize](),
+                        ) catch { "".as_bytes() };
+                        if str.bytes_eq(dnm, fname) {
+                            defs_mut[dxi].hover_off = hoff;
+                            defs_mut[dxi].hover_len = hlen;
+                            updated = true;
+                            break;
+                        }
+                    }
+                    dxi = dxi +% 1_usize;
+                }
+                let fs_lc = sm.line_col(main_fid, f.body_span.start);
+                let fe_lc = sm.line_col(main_fid, f.body_span.end);
+                let fl0 = if fs_lc.line > 0_u32 { fs_lc.line - 1_u32 } else { 0_u32 };
+                let fc0 = if fs_lc.col > 0_u32 { fs_lc.col - 1_u32 } else { 0_u32 };
+                let fel0 = if fe_lc.line > 0_u32 { fe_lc.line - 1_u32 } else { fl0 };
+                let fec0 = if fe_lc.col > 0_u32 { fe_lc.col - 1_u32 } else { fc0 };
+                if !updated {
+                    let noff = doc.strings.len().trunc.[u32]();
+                    try doc.strings.push_bytes_grow(&mut env.alloc, fname);
+                    try doc.defs.push(&mut env.alloc, LspDefRec.{
+                        name_off: noff,
+                        name_len: fname.len.trunc.[u32](),
+                        kind: 0_u8,
+                        line0: fl0,
+                        col0: fc0,
+                        end_line0: fel0,
+                        end_col0: fec0,
+                        scope_start: 0_u32,
+                        scope_end: 0xFFFFFFFF_u32,
+                        hover_off: hoff,
+                        hover_len: hlen,
+                    });
+                }
+
+                let vnames = eir_prog.fn_val_names(fi);
+                let vranges = eir_prog.fn_value_ranges(fi);
+                var vni: usize = 0_usize;
+                while vni < vnames.len {
+                    let vn = vnames[vni];
+                    if vn.sym != span.SYM_EMPTY {
+                        let vstr = interner.get(vn.sym);
+                        if vstr.len > 0_usize && vstr[0_usize] != b'_' {
+                            let vty = eir_prog.fn_val_ty(fi, vn.val);
+                            hover_tmp.clear();
+                            try hover_tmp.push_str_grow(&mut env.alloc, "```eon\nlet ");
+                            try hover_tmp.push_bytes_grow(&mut env.alloc, vstr);
+                            try hover_tmp.push_str_grow(&mut env.alloc, ": ");
+                            try tenv.format_ty_named(&mut env.alloc, vty, resolved, interner, &mut hover_tmp);
+                            try hover_tmp.push_str_grow(&mut env.alloc, "\n```");
+                            var ri: usize = 0_usize;
+                            while ri < vranges.len {
+                                if vranges[ri].val == vn.val {
+                                    try hover_tmp.push_str_grow(&mut env.alloc, "\nDBM proven interval: `[");
+                                    try types.push_int_val_grow(&mut env.alloc, vranges[ri].lo, &mut hover_tmp);
+                                    try hover_tmp.push_str_grow(&mut env.alloc, "..=");
+                                    try types.push_int_val_grow(&mut env.alloc, vranges[ri].hi, &mut hover_tmp);
+                                    try hover_tmp.push_str_grow(&mut env.alloc, "]`");
+                                    break;
+                                }
+                                ri = ri +% 1_usize;
+                            }
+                            let vnoff = doc.strings.len().trunc.[u32]();
+                            try doc.strings.push_bytes_grow(&mut env.alloc, vstr);
+                            let vhoff = doc.strings.len().trunc.[u32]();
+                            try doc.strings.push_bytes_grow(&mut env.alloc, hover_tmp.as_bytes());
+                            try doc.defs.push(&mut env.alloc, LspDefRec.{
+                                name_off: vnoff,
+                                name_len: vstr.len.trunc.[u32](),
+                                kind: 7_u8,
+                                line0: fl0,
+                                col0: fc0,
+                                end_line0: fl0,
+                                end_col0: fc0 +% vstr.len.trunc.[u32](),
+                                scope_start: f.body_span.start,
+                                scope_end: f.body_span.end,
+                                hover_off: vhoff,
+                                hover_len: hover_tmp.len().trunc.[u32](),
+                            });
+                        }
+                    }
+                    vni = vni +% 1_usize;
+                }
+            }
+        }
+        fi = fi +% 1_u32;
+    }
+
+    hover_tmp.destroy(&mut env.alloc);
+    ver_rep.destroy(&mut env.alloc);
+    eir_prog.destroy(&mut env.alloc);
+    eff_rep.destroy(&mut env.alloc);
+    cfg_prog.destroy(&mut env.alloc);
+    return;
+}
+
+/// Run the real Eon frontend + borrow + effects + EIR + relational DBM verifier on `doc`,
+/// populating diagnostics, hover entries (with DBM proven intervals & `@stack(N)`), and definitions.
+fn analyze_lsp_doc(
+    env: *mut Env,
+    doc: *mut LspDoc,
+) -> !OutOfMemory | Utf8Error {
+    doc.clear_analysis();
+
+    var sm = try span.SourceMap.init(&mut env.alloc);
+    errdefer sm.destroy(&mut env.alloc);
+    var interner = try span.SymInterner.init(&mut env.alloc);
+    errdefer interner.destroy(&mut env.alloc);
+    var diags = try diag.DiagBag.init(&mut env.alloc);
+    errdefer diags.destroy(&mut env.alloc);
+    var arena = try ast.AstArena.init(&mut env.alloc);
+    errdefer arena.destroy(&mut env.alloc);
+    var unit_ids = try col.DynBuf.[u32].init(&mut env.alloc, 8_usize);
+    errdefer unit_ids.destroy(&mut env.alloc);
+
+    let main_fid = try sm.add_file_bytes(&mut env.alloc, doc.fs_path.as_bytes(), doc.text.as_bytes());
+    let main_uid = try parser.parse_file(&mut env.alloc, &sm, main_fid, &mut interner, &mut diags, &mut arena);
+    try unit_ids.push(&mut env.alloc, main_uid);
+
+    try load_lsp_stdlib(env, doc.fs_path.as_bytes(), &mut sm, &mut interner, &mut diags, &mut arena, &mut unit_ids);
+
+    var resolved = try resolve.resolve_program(&mut env.alloc, &arena, unit_ids.as_slice(), &mut interner, &mut diags);
+    errdefer resolved.destroy(&mut env.alloc);
+    var tenv = try types.build_type_env(&mut env.alloc, &arena, &mut resolved, &mut interner, &mut diags);
+    errdefer tenv.destroy(&mut env.alloc);
+    var ct = try ctvm.CtArena.init(&mut env.alloc);
+    errdefer ct.destroy(&mut env.alloc);
+
+    var hover_tmp = try str.StrBuf.init(&mut env.alloc, 256_usize);
+    errdefer hover_tmp.destroy(&mut env.alloc);
+
+    let all_defs = resolved.defs.as_slice();
+    var di_def: usize = 0_usize;
+    while di_def < all_defs.len {
+        let td = all_defs[di_def];
+        if td.span.file == main_fid {
+            let nm = interner.get(td.name);
+            let s_lc = sm.line_col(main_fid, td.span.start);
+            let e_lc = sm.line_col(main_fid, td.span.end);
+            let l0 = if s_lc.line > 0_u32 { s_lc.line - 1_u32 } else { 0_u32 };
+            let c0 = if s_lc.col > 0_u32 { s_lc.col - 1_u32 } else { 0_u32 };
+            let el0 = if e_lc.line > 0_u32 { e_lc.line - 1_u32 } else { l0 };
+            let ec0 = if e_lc.col > 0_u32 { e_lc.col - 1_u32 } else { c0 };
+            hover_tmp.clear();
+            try hover_tmp.push_str_grow(&mut env.alloc, "```eon\n");
+            if td.is_pub { try hover_tmp.push_str_grow(&mut env.alloc, "pub "); }
+            try resolve.write_top_def_kind(&mut env.alloc, td.kind, &mut hover_tmp);
+            try hover_tmp.push_byte_grow(&mut env.alloc, b' ');
+            try hover_tmp.push_bytes_grow(&mut env.alloc, nm);
+            try hover_tmp.push_str_grow(&mut env.alloc, "\n```");
+            let noff = doc.strings.len().trunc.[u32]();
+            try doc.strings.push_bytes_grow(&mut env.alloc, nm);
+            let hoff = doc.strings.len().trunc.[u32]();
+            try doc.strings.push_bytes_grow(&mut env.alloc, hover_tmp.as_bytes());
+            var k_u8: u8 = 1_u8;
+            if td.kind == .Fn || td.kind == .Sys { k_u8 = 0_u8; }
+            else if td.kind == .Enum { k_u8 = 2_u8; }
+            else if td.kind == .Union { k_u8 = 3_u8; }
+            else if td.kind == .Const { k_u8 = 4_u8; }
+            else if td.kind == .TypeAlias { k_u8 = 5_u8; }
+            else if td.kind == .Iface { k_u8 = 6_u8; }
+            try doc.defs.push(&mut env.alloc, LspDefRec.{
+                name_off: noff,
+                name_len: nm.len.trunc.[u32](),
+                kind: k_u8,
+                line0: l0,
+                col0: c0,
+                end_line0: el0,
+                end_col0: ec0,
+                scope_start: 0_u32,
+                scope_end: 0xFFFFFFFF_u32,
+                hover_off: hoff,
+                hover_len: hover_tmp.len().trunc.[u32](),
+            });
+        }
+        di_def = di_def +% 1_usize;
+    }
+
+    if !diags.has_errors() {
+        let ttable = try check.check_program(
+            &mut env.alloc, &arena, unit_ids.as_slice(), &mut resolved, &mut tenv, &mut ct, &mut interner, &mut diags,
+        );
+        errdefer ttable.destroy(&mut env.alloc);
+        if !diags.has_errors() {
+            try enrich_lsp_with_verify(
+                env, &sm, main_fid, &arena, unit_ids.as_slice(), &resolved, &mut tenv, &ct, &ttable, &mut interner, &mut diags, doc,
+            );
+        }
+        ttable.destroy(&mut env.alloc);
+    }
+
+    // Collect diagnostics belonging to the primary document.
+    var d_i: usize = 0_usize;
+    while d_i < diags.count() {
+        if let de = diags.diag_at(d_i) {
+            if de.span.file == main_fid || de.span.file == span.FILE_DUMMY {
+                var l0: u32 = 0_u32;
+                var c0: u32 = 0_u32;
+                var el0: u32 = 0_u32;
+                var ec0: u32 = 1_u32;
+                if de.span.file == main_fid {
+                    let s_lc = sm.line_col(main_fid, de.span.start);
+                    let e_lc = sm.line_col(main_fid, de.span.end);
+                    l0 = if s_lc.line > 0_u32 { s_lc.line - 1_u32 } else { 0_u32 };
+                    c0 = if s_lc.col > 0_u32 { s_lc.col - 1_u32 } else { 0_u32 };
+                    el0 = if e_lc.line > 0_u32 { e_lc.line - 1_u32 } else { l0 };
+                    ec0 = if e_lc.col > 0_u32 { e_lc.col - 1_u32 } else { c0 +% 1_u32 };
+                    if el0 == l0 && ec0 <= c0 {
+                        ec0 = c0 +% 1_u32;
+                    }
+                }
+                let msg = diags.diag_msg(d_i);
+                let help = diags.diag_first_help(d_i.trunc.[u32]());
+                let moff = doc.strings.len().trunc.[u32]();
+                try doc.strings.push_bytes_grow(&mut env.alloc, msg);
+                let hoff = doc.strings.len().trunc.[u32]();
+                try doc.strings.push_bytes_grow(&mut env.alloc, help);
+                try doc.diags.push(&mut env.alloc, LspDiagRec.{
+                    code: de.code,
+                    line0: l0,
+                    col0: c0,
+                    end_line0: el0,
+                    end_col0: ec0,
+                    msg_off: moff,
+                    msg_len: msg.len.trunc.[u32](),
+                    help_off: hoff,
+                    help_len: help.len.trunc.[u32](),
+                });
+            }
+        }
+        d_i = d_i +% 1_usize;
+    }
+
+    hover_tmp.destroy(&mut env.alloc);
+    ct.destroy(&mut env.alloc);
+    tenv.destroy(&mut env.alloc);
+    resolved.destroy(&mut env.alloc);
+    unit_ids.destroy(&mut env.alloc);
+    arena.destroy(&mut env.alloc);
+    diags.destroy(&mut env.alloc);
+    interner.destroy(&mut env.alloc);
+    sm.destroy(&mut env.alloc);
+    return;
+}
+
+// ===========================================================================
+// LSP Notification & Request Response Builders
+// ===========================================================================
+
+fn publish_diagnostics(alloc: *mut AllocCap, doc: *LspDoc) -> !OutOfMemory {
+    var out = try str.StrBuf.init(alloc, 512_usize);
+    errdefer out.destroy(alloc);
+    try out.push_str_grow(alloc, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":");
+    try json_push_escaped(alloc, doc.uri.as_bytes(), &mut out);
+    try out.push_str_grow(alloc, ",\"diagnostics\":[");
+    let ds = doc.diags.as_slice();
+    var i: usize = 0_usize;
+    while i < ds.len {
+        if i > 0_usize {
+            try out.push_byte_grow(alloc, b',');
+        }
+        let d = ds[i];
+        try out.push_str_grow(alloc, "{\"range\":{\"start\":{\"line\":");
+        try out.push_u64_grow(alloc, d.line0.widen.[u64]());
+        try out.push_str_grow(alloc, ",\"character\":");
+        try out.push_u64_grow(alloc, d.col0.widen.[u64]());
+        try out.push_str_grow(alloc, "},\"end\":{\"line\":");
+        try out.push_u64_grow(alloc, d.end_line0.widen.[u64]());
+        try out.push_str_grow(alloc, ",\"character\":");
+        try out.push_u64_grow(alloc, d.end_col0.widen.[u64]());
+        try out.push_str_grow(alloc, "}},\"severity\":1,\"code\":\"E");
+        try out.push_u32_pad4_grow(alloc, d.code);
+        try out.push_str_grow(alloc, "\",\"source\":\"eonc\",\"message\":");
+        try json_push_escaped(alloc, doc.str_slice(d.msg_off, d.msg_len), &mut out);
+        try out.push_byte_grow(alloc, b'}');
+        i = i +% 1_usize;
+    }
+    try out.push_str_grow(alloc, "]}}");
+    try send_lsp_payload(alloc, out.as_bytes());
+    out.destroy(alloc);
+    return;
+}
+
+fn find_best_def_at(doc: *LspDoc, ident: *[u8], offset: u32) -> ?usize {
+    let ds = doc.defs.as_slice();
+    // Prefer tightest scoped local/param containing `offset` (with DBM range if multiple).
+    var best_local: usize = ds.len;
+    var best_local_has_dbm = false;
+    var best_top: usize = ds.len;
+    var i: usize = 0_usize;
+    while i < ds.len {
+        let d = ds[i];
+        let nm = doc.str_slice(d.name_off, d.name_len);
+        if str.bytes_eq(nm, ident) {
+            if d.kind == 7_u8 {
+                if offset >= d.scope_start && offset <= d.scope_end {
+                    let h = doc.str_slice(d.hover_off, d.hover_len);
+                    let has_dbm = str.ends_with(h, "]`".as_bytes());
+                    if best_local >= ds.len || (has_dbm && !best_local_has_dbm) {
+                        best_local = i;
+                        best_local_has_dbm = has_dbm;
+                    }
+                }
+            } else if best_top >= ds.len {
+                best_top = i;
+            }
+        }
+        i = i +% 1_usize;
+    }
+    if best_local < ds.len {
+        return best_local;
+    }
+    if best_top < ds.len {
+        return best_top;
+    }
+    return null;
+}
+
+fn handle_hover(
+    alloc: *mut AllocCap,
+    id_raw: *[u8],
+    doc: *LspDoc,
+    line0: u32,
+    col0: u32,
+) -> !OutOfMemory {
+    var out = try str.StrBuf.init(alloc, 512_usize);
+    errdefer out.destroy(alloc);
+    try out.push_str_grow(alloc, "{\"jsonrpc\":\"2.0\",\"id\":");
+    try out.push_bytes_grow(alloc, id_raw);
+    try out.push_str_grow(alloc, ",\"result\":");
+
+    let text = doc.text.as_bytes();
+    let off = line_col_to_offset(text, line0, col0);
+    let w = extract_ident_at(text, off);
+    var wrote = false;
+    if w.found {
+        let ident = text.sub(w.start, w.end) catch { "".as_bytes() };
+        if let idx = find_best_def_at(doc, ident, off.trunc.[u32]()) {
+            let ds = doc.defs.as_slice();
+            if idx < ds.len {
+                let h = doc.str_slice(ds[idx].hover_off, ds[idx].hover_len);
+                try out.push_str_grow(alloc, "{\"contents\":{\"kind\":\"markdown\",\"value\":");
+                try json_push_escaped(alloc, h, &mut out);
+                try out.push_str_grow(alloc, "}}");
+                wrote = true;
+            }
+        }
+    }
+    if !wrote {
+        try out.push_str_grow(alloc, "null");
+    }
+    try out.push_byte_grow(alloc, b'}');
+    try send_lsp_payload(alloc, out.as_bytes());
+    out.destroy(alloc);
+    return;
+}
+
+fn handle_definition(
+    alloc: *mut AllocCap,
+    id_raw: *[u8],
+    doc: *LspDoc,
+    line0: u32,
+    col0: u32,
+) -> !OutOfMemory {
+    var out = try str.StrBuf.init(alloc, 256_usize);
+    errdefer out.destroy(alloc);
+    try out.push_str_grow(alloc, "{\"jsonrpc\":\"2.0\",\"id\":");
+    try out.push_bytes_grow(alloc, id_raw);
+    try out.push_str_grow(alloc, ",\"result\":");
+
+    let text = doc.text.as_bytes();
+    let off = line_col_to_offset(text, line0, col0);
+    let w = extract_ident_at(text, off);
+    var wrote = false;
+    if w.found {
+        let ident = text.sub(w.start, w.end) catch { "".as_bytes() };
+        if let idx = find_best_def_at(doc, ident, off.trunc.[u32]()) {
+            let ds = doc.defs.as_slice();
+            if idx < ds.len {
+                let d = ds[idx];
+                try out.push_str_grow(alloc, "{\"uri\":");
+                try json_push_escaped(alloc, doc.uri.as_bytes(), &mut out);
+                try out.push_str_grow(alloc, ",\"range\":{\"start\":{\"line\":");
+                try out.push_u64_grow(alloc, d.line0.widen.[u64]());
+                try out.push_str_grow(alloc, ",\"character\":");
+                try out.push_u64_grow(alloc, d.col0.widen.[u64]());
+                try out.push_str_grow(alloc, "},\"end\":{\"line\":");
+                try out.push_u64_grow(alloc, d.end_line0.widen.[u64]());
+                try out.push_str_grow(alloc, ",\"character\":");
+                try out.push_u64_grow(alloc, d.end_col0.widen.[u64]());
+                try out.push_str_grow(alloc, "}}}");
+                wrote = true;
+            }
+        }
+    }
+    if !wrote {
+        try out.push_str_grow(alloc, "null");
+    }
+    try out.push_byte_grow(alloc, b'}');
+    try send_lsp_payload(alloc, out.as_bytes());
+    out.destroy(alloc);
+    return;
+}
+
+fn push_kw_comp(
+    alloc: *mut AllocCap,
+    seen: *mut col.Interner,
+    pref: *[u8],
+    kw: *str,
+    count: *mut usize,
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    if count.* >= 64_usize {
+        return;
+    }
+    let kb = kw.as_bytes();
+    if (pref.len == 0_usize || str.starts_with(kb, pref)) && seen.lookup(kb) == null {
+        _ = try seen.intern(alloc, kb);
+        if count.* > 0_usize { try out.push_byte_grow(alloc, b','); }
+        try out.push_str_grow(alloc, "{\"label\":");
+        try json_push_escaped(alloc, kb, out);
+        try out.push_str_grow(alloc, ",\"kind\":14}");
+        count.* = count.* +% 1_usize;
+    }
+    return;
+}
+
+fn handle_completion(
+    alloc: *mut AllocCap,
+    id_raw: *[u8],
+    doc: *LspDoc,
+    line0: u32,
+    col0: u32,
+) -> !OutOfMemory {
+    var out = try str.StrBuf.init(alloc, 512_usize);
+    errdefer out.destroy(alloc);
+    try out.push_str_grow(alloc, "{\"jsonrpc\":\"2.0\",\"id\":");
+    try out.push_bytes_grow(alloc, id_raw);
+    try out.push_str_grow(alloc, ",\"result\":[");
+
+    let text = doc.text.as_bytes();
+    let off = line_col_to_offset(text, line0, col0);
+    let w = extract_ident_at(text, off);
+    let pref = if w.found {
+        text.sub(w.start, if off <= w.end { off } else { w.end }) catch { "".as_bytes() }
+    } else {
+        "".as_bytes()
+    };
+
+    var seen = try col.Interner.init(alloc, 32_usize);
+    errdefer seen.destroy(alloc);
+    var count: usize = 0_usize;
+
+    // 1. Definitions and locals in current document
+    let ds = doc.defs.as_slice();
+    var i: usize = 0_usize;
+    while i < ds.len && count < 64_usize {
+        let d = ds[i];
+        let in_scope = d.kind != 7_u8 || (off.trunc.[u32]() >= d.scope_start && off.trunc.[u32]() <= d.scope_end);
+        if in_scope {
+            let nm = doc.str_slice(d.name_off, d.name_len);
+            if (pref.len == 0_usize || str.starts_with(nm, pref)) && seen.lookup(nm) == null {
+                _ = try seen.intern(alloc, nm);
+                if count > 0_usize { try out.push_byte_grow(alloc, b','); }
+                let lsp_kind: u64 = if d.kind == 0_u8 { 3_u64 } else if d.kind == 7_u8 { 6_u64 } else { 22_u64 };
+                try out.push_str_grow(alloc, "{\"label\":");
+                try json_push_escaped(alloc, nm, &mut out);
+                try out.push_str_grow(alloc, ",\"kind\":");
+                try out.push_u64_grow(alloc, lsp_kind);
+                try out.push_byte_grow(alloc, b'}');
+                count = count +% 1_usize;
+            }
+        }
+        i = i +% 1_usize;
+    }
+
+    // 2. Common Eon keywords (when not after `.`)
+    if !w.dot_before {
+        try push_kw_comp(alloc, &mut seen, pref, "fn", &mut count, &mut out);
+        try push_kw_comp(alloc, &mut seen, pref, "pub", &mut count, &mut out);
+        try push_kw_comp(alloc, &mut seen, pref, "let", &mut count, &mut out);
+        try push_kw_comp(alloc, &mut seen, pref, "var", &mut count, &mut out);
+        try push_kw_comp(alloc, &mut seen, pref, "struct", &mut count, &mut out);
+        try push_kw_comp(alloc, &mut seen, pref, "enum", &mut count, &mut out);
+        try push_kw_comp(alloc, &mut seen, pref, "impl", &mut count, &mut out);
+        try push_kw_comp(alloc, &mut seen, pref, "if", &mut count, &mut out);
+        try push_kw_comp(alloc, &mut seen, pref, "else", &mut count, &mut out);
+        try push_kw_comp(alloc, &mut seen, pref, "while", &mut count, &mut out);
+        try push_kw_comp(alloc, &mut seen, pref, "return", &mut count, &mut out);
+        try push_kw_comp(alloc, &mut seen, pref, "try", &mut count, &mut out);
+    }
+
+    try out.push_str_grow(alloc, "]}");
+    try send_lsp_payload(alloc, out.as_bytes());
+    seen.destroy(alloc);
+    out.destroy(alloc);
+    return;
+}
+
+fn handle_formatting(
+    alloc: *mut AllocCap,
+    id_raw: *[u8],
+    doc: *LspDoc,
+) -> !OutOfMemory {
+    var formatted = try str.StrBuf.init(alloc, doc.text.len() +% 64_usize);
+    errdefer formatted.destroy(alloc);
+    try fmt.format_eon_source(alloc, doc.text.as_bytes(), &mut formatted);
+
+    // Count lines in original text for full-document replacement range.
+    let orig = doc.text.as_bytes();
+    var lines: u64 = 0_u64;
+    var last_line_len: u64 = 0_u64;
+    var i: usize = 0_usize;
+    while i < orig.len {
+        if orig[i] == 10_u8 {
+            lines = lines +% 1_u64;
+            last_line_len = 0_u64;
+        } else {
+            last_line_len = last_line_len +% 1_u64;
+        }
+        i = i +% 1_usize;
+    }
+
+    var out = try str.StrBuf.init(alloc, formatted.len() +% 256_usize);
+    errdefer out.destroy(alloc);
+    try out.push_str_grow(alloc, "{\"jsonrpc\":\"2.0\",\"id\":");
+    try out.push_bytes_grow(alloc, id_raw);
+    try out.push_str_grow(alloc, ",\"result\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":");
+    try out.push_u64_grow(alloc, lines);
+    try out.push_str_grow(alloc, ",\"character\":");
+    try out.push_u64_grow(alloc, last_line_len);
+    try out.push_str_grow(alloc, "}},\"newText\":");
+    try json_push_escaped(alloc, formatted.as_bytes(), &mut out);
+    try out.push_str_grow(alloc, "}]}");
+    try send_lsp_payload(alloc, out.as_bytes());
+    out.destroy(alloc);
+    formatted.destroy(alloc);
+    return;
+}
+
+fn handle_code_action(
+    alloc: *mut AllocCap,
+    id_raw: *[u8],
+    doc: *LspDoc,
+    req_start_line: u32,
+    req_end_line: u32,
+) -> !OutOfMemory {
+    var out = try str.StrBuf.init(alloc, 512_usize);
+    errdefer out.destroy(alloc);
+    try out.push_str_grow(alloc, "{\"jsonrpc\":\"2.0\",\"id\":");
+    try out.push_bytes_grow(alloc, id_raw);
+    try out.push_str_grow(alloc, ",\"result\":[");
+
+    let ds = doc.diags.as_slice();
+    var emitted: usize = 0_usize;
+    var i: usize = 0_usize;
+    while i < ds.len {
+        let d = ds[i];
+        if d.line0 >= req_start_line && d.line0 <= req_end_line {
+            var has_fix = false;
+            var title: *str = "";
+            var new_text: *str = "";
+            var ins_line = d.line0;
+            var ins_col = d.col0;
+            var end_line = d.line0;
+            var end_col = d.col0;
+            if d.code == diag.E0101 {
+                has_fix = true;
+                title = "Prefix unused binding with `_` (ZM-01)";
+                new_text = "_";
+            } else if d.code == diag.E0102 {
+                has_fix = true;
+                title = "Explicitly discard value with `_ = ` (ZM-02)";
+                new_text = "_ = ";
+            } else if d.code == diag.E0105 || d.code == diag.E0230 {
+                let msg = doc.str_slice(d.msg_off, d.msg_len);
+                if str.starts_with(msg, "ZM-05".as_bytes()) {
+                    has_fix = true;
+                    title = "Add explicit `.widen.[]()` cast (ZM-05)";
+                    new_text = ".widen.[]()";
+                    ins_line = d.end_line0;
+                    ins_col = d.end_col0;
+                    end_line = d.end_line0;
+                    end_col = d.end_col0;
+                } else {
+                    has_fix = true;
+                    title = "Propagate error with `try `";
+                    new_text = "try ";
+                }
+            }
+            if has_fix {
+                if emitted > 0_usize { try out.push_byte_grow(alloc, b','); }
+                try out.push_str_grow(alloc, "{\"title\":");
+                try json_push_escaped(alloc, title.as_bytes(), &mut out);
+                try out.push_str_grow(alloc, ",\"kind\":\"quickfix\",\"edit\":{\"changes\":{");
+                try json_push_escaped(alloc, doc.uri.as_bytes(), &mut out);
+                try out.push_str_grow(alloc, ":[{\"range\":{\"start\":{\"line\":");
+                try out.push_u64_grow(alloc, ins_line.widen.[u64]());
+                try out.push_str_grow(alloc, ",\"character\":");
+                try out.push_u64_grow(alloc, ins_col.widen.[u64]());
+                try out.push_str_grow(alloc, "},\"end\":{\"line\":");
+                try out.push_u64_grow(alloc, end_line.widen.[u64]());
+                try out.push_str_grow(alloc, ",\"character\":");
+                try out.push_u64_grow(alloc, end_col.widen.[u64]());
+                try out.push_str_grow(alloc, "}},\"newText\":");
+                try json_push_escaped(alloc, new_text.as_bytes(), &mut out);
+                try out.push_str_grow(alloc, "}]}}}");
+                emitted = emitted +% 1_usize;
+            }
+        }
+        i = i +% 1_usize;
+    }
+
+    try out.push_str_grow(alloc, "]}");
+    try send_lsp_payload(alloc, out.as_bytes());
+    out.destroy(alloc);
+    return;
+}
+
+// ===========================================================================
+// Main JSON-RPC Event Loop (`eonc lsp`)
+// ===========================================================================
+
+fn send_null_result(alloc: *mut AllocCap, id_raw: *[u8]) -> !OutOfMemory {
+    var out = try str.StrBuf.init(alloc, 64_usize);
+    errdefer out.destroy(alloc);
+    try out.push_str_grow(alloc, "{\"jsonrpc\":\"2.0\",\"id\":");
+    try out.push_bytes_grow(alloc, id_raw);
+    try out.push_str_grow(alloc, ",\"result\":null}");
+    try send_lsp_payload(alloc, out.as_bytes());
+    out.destroy(alloc);
+    return;
+}
+
+pub fn run_lsp_server(env: *mut Env) -> i32 ! OutOfMemory | Utf8Error {
+    var rd = try StdinReader.init(&mut env.alloc);
+    errdefer rd.destroy(&mut env.alloc);
+    var body = try str.StrBuf.init(&mut env.alloc, 1024_usize);
+    errdefer body.destroy(&mut env.alloc);
+    var method_buf = try str.StrBuf.init(&mut env.alloc, 64_usize);
+    errdefer method_buf.destroy(&mut env.alloc);
+    var uri_buf = try str.StrBuf.init(&mut env.alloc, 128_usize);
+    errdefer uri_buf.destroy(&mut env.alloc);
+    var fs_buf = try str.StrBuf.init(&mut env.alloc, 128_usize);
+    errdefer fs_buf.destroy(&mut env.alloc);
+    var text_buf = try str.StrBuf.init(&mut env.alloc, 1024_usize);
+    errdefer text_buf.destroy(&mut env.alloc);
+
+    var cur_doc = try LspDoc.init(&mut env.alloc, "".as_bytes(), "untitled.eon".as_bytes(), "".as_bytes());
+    errdefer cur_doc.destroy(&mut env.alloc);
+    var has_doc = false;
+    var shutdown_req = false;
+
+    loop {
+        let got = try read_lsp_message(&mut env.alloc, &mut rd, &mut body);
+        if !got {
+            break;
+        }
+        let jb = body.as_bytes();
+        let method_sp = json_find_field(jb, 0_usize, jb.len, "method");
+        let id_sp = json_find_field(jb, 0_usize, jb.len, "id");
+        let params_sp = json_find_field(jb, 0_usize, jb.len, "params");
+        let id_raw = if id_sp.found {
+            jb.sub(id_sp.start, id_sp.end) catch { "null".as_bytes() }
+        } else {
+            "null".as_bytes()
+        };
+
+        if !method_sp.found {
+            continue;
+        }
+        try json_unescape_into(&mut env.alloc, jb, method_sp.start, method_sp.end, &mut method_buf);
+        let m = method_buf.as_bytes();
+
+        if str.bytes_eq(m, "initialize".as_bytes()) {
+            var resp = try str.StrBuf.init(&mut env.alloc, 384_usize);
+            errdefer resp.destroy(&mut env.alloc);
+            try resp.push_str_grow(&mut env.alloc, "{\"jsonrpc\":\"2.0\",\"id\":");
+            try resp.push_bytes_grow(&mut env.alloc, id_raw);
+            try resp.push_str_grow(
+                &mut env.alloc,
+                ",\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]},\"documentFormattingProvider\":true,\"codeActionProvider\":true},\"serverInfo\":{\"name\":\"eonc-lsp\",\"version\":\"0.1\"}}}",
+            );
+            try send_lsp_payload(&mut env.alloc, resp.as_bytes());
+            resp.destroy(&mut env.alloc);
+            continue;
+        }
+        if str.bytes_eq(m, "initialized".as_bytes()) {
+            continue;
+        }
+        if str.bytes_eq(m, "shutdown".as_bytes()) {
+            shutdown_req = true;
+            try send_null_result(&mut env.alloc, id_raw);
+            continue;
+        }
+        if str.bytes_eq(m, "exit".as_bytes()) {
+            break;
+        }
+
+        if str.bytes_eq(m, "textDocument/didOpen".as_bytes()) && params_sp.found {
+            let td_sp = json_find_field(jb, params_sp.start, params_sp.end, "textDocument");
+            if td_sp.found {
+                let u_sp = json_find_field(jb, td_sp.start, td_sp.end, "uri");
+                let t_sp = json_find_field(jb, td_sp.start, td_sp.end, "text");
+                if u_sp.found && t_sp.found {
+                    try json_unescape_into(&mut env.alloc, jb, u_sp.start, u_sp.end, &mut uri_buf);
+                    try uri_to_fs_path(&mut env.alloc, uri_buf.as_bytes(), &mut fs_buf);
+                    try json_unescape_into(&mut env.alloc, jb, t_sp.start, t_sp.end, &mut text_buf);
+                    cur_doc.uri.clear();
+                    try cur_doc.uri.push_bytes_grow(&mut env.alloc, uri_buf.as_bytes());
+                    cur_doc.fs_path.clear();
+                    try cur_doc.fs_path.push_bytes_grow(&mut env.alloc, fs_buf.as_bytes());
+                    try cur_doc.set_text(&mut env.alloc, text_buf.as_bytes());
+                    has_doc = true;
+                    try analyze_lsp_doc(env, &mut cur_doc);
+                    try publish_diagnostics(&mut env.alloc, &cur_doc);
+                }
+            }
+            continue;
+        }
+
+        if str.bytes_eq(m, "textDocument/didChange".as_bytes()) && params_sp.found {
+            let cc_sp = json_find_field(jb, params_sp.start, params_sp.end, "contentChanges");
+            if cc_sp.found && has_doc {
+                let first = json_array_first(jb, cc_sp.start, cc_sp.end);
+                if first.found {
+                    let t_sp = json_find_field(jb, first.start, first.end, "text");
+                    if t_sp.found {
+                        try json_unescape_into(&mut env.alloc, jb, t_sp.start, t_sp.end, &mut text_buf);
+                        try cur_doc.set_text(&mut env.alloc, text_buf.as_bytes());
+                        try analyze_lsp_doc(env, &mut cur_doc);
+                        try publish_diagnostics(&mut env.alloc, &cur_doc);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if str.bytes_eq(m, "textDocument/didSave".as_bytes()) && has_doc {
+            try analyze_lsp_doc(env, &mut cur_doc);
+            try publish_diagnostics(&mut env.alloc, &cur_doc);
+            continue;
+        }
+
+        if str.bytes_eq(m, "textDocument/didClose".as_bytes()) {
+            has_doc = false;
+            cur_doc.clear_analysis();
+            continue;
+        }
+
+        if str.bytes_eq(m, "textDocument/hover".as_bytes()) && params_sp.found {
+            let pos_sp = json_find_field(jb, params_sp.start, params_sp.end, "position");
+            if has_doc && pos_sp.found {
+                let l0 = json_span_u32(jb, json_find_field(jb, pos_sp.start, pos_sp.end, "line")) orelse 0_u32;
+                let c0 = json_span_u32(jb, json_find_field(jb, pos_sp.start, pos_sp.end, "character")) orelse 0_u32;
+                try handle_hover(&mut env.alloc, id_raw, &cur_doc, l0, c0);
+            } else if id_sp.found {
+                try send_null_result(&mut env.alloc, id_raw);
+            }
+            continue;
+        }
+
+        if str.bytes_eq(m, "textDocument/definition".as_bytes()) && params_sp.found {
+            let pos_sp = json_find_field(jb, params_sp.start, params_sp.end, "position");
+            if has_doc && pos_sp.found {
+                let l0 = json_span_u32(jb, json_find_field(jb, pos_sp.start, pos_sp.end, "line")) orelse 0_u32;
+                let c0 = json_span_u32(jb, json_find_field(jb, pos_sp.start, pos_sp.end, "character")) orelse 0_u32;
+                try handle_definition(&mut env.alloc, id_raw, &cur_doc, l0, c0);
+            } else if id_sp.found {
+                try send_null_result(&mut env.alloc, id_raw);
+            }
+            continue;
+        }
+
+        if str.bytes_eq(m, "textDocument/completion".as_bytes()) && params_sp.found {
+            let pos_sp = json_find_field(jb, params_sp.start, params_sp.end, "position");
+            if has_doc && pos_sp.found {
+                let l0 = json_span_u32(jb, json_find_field(jb, pos_sp.start, pos_sp.end, "line")) orelse 0_u32;
+                let c0 = json_span_u32(jb, json_find_field(jb, pos_sp.start, pos_sp.end, "character")) orelse 0_u32;
+                try handle_completion(&mut env.alloc, id_raw, &cur_doc, l0, c0);
+            } else if id_sp.found {
+                try send_null_result(&mut env.alloc, id_raw);
+            }
+            continue;
+        }
+
+        if str.bytes_eq(m, "textDocument/formatting".as_bytes()) {
+            if has_doc {
+                try handle_formatting(&mut env.alloc, id_raw, &cur_doc);
+            } else if id_sp.found {
+                try send_null_result(&mut env.alloc, id_raw);
+            }
+            continue;
+        }
+
+        if str.bytes_eq(m, "textDocument/codeAction".as_bytes()) && params_sp.found {
+            let rng_sp = json_find_field(jb, params_sp.start, params_sp.end, "range");
+            if has_doc && rng_sp.found {
+                let st_sp = json_find_field(jb, rng_sp.start, rng_sp.end, "start");
+                let en_sp = json_find_field(jb, rng_sp.start, rng_sp.end, "end");
+                let sl0 = if st_sp.found { json_span_u32(jb, json_find_field(jb, st_sp.start, st_sp.end, "line")) orelse 0_u32 } else { 0_u32 };
+                let el0 = if en_sp.found { json_span_u32(jb, json_find_field(jb, en_sp.start, en_sp.end, "line")) orelse sl0 } else { sl0 };
+                try handle_code_action(&mut env.alloc, id_raw, &cur_doc, sl0, el0);
+            } else if id_sp.found {
+                try send_null_result(&mut env.alloc, id_raw);
+            }
+            continue;
+        }
+
+        // Any other request with an `id`: respond with `null` so clients never hang.
+        if id_sp.found {
+            try send_null_result(&mut env.alloc, id_raw);
+        }
+    }
+
+    cur_doc.destroy(&mut env.alloc);
+    text_buf.destroy(&mut env.alloc);
+    fs_buf.destroy(&mut env.alloc);
+    uri_buf.destroy(&mut env.alloc);
+    method_buf.destroy(&mut env.alloc);
+    body.destroy(&mut env.alloc);
+    rd.destroy(&mut env.alloc);
+    return if shutdown_req { 0_i32 } else { 0_i32 };
+}

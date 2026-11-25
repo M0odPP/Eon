@@ -11,6 +11,39 @@ extern "C" fn eon_rt_eprint_str(s: *str);
 extern "C" fn eon_rt_eprint_bytes(b: *[u8]);
 extern "C" fn eon_rt_eprint_nl();
 
+@naked
+fn rt_syscall3(_nr: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    raw {
+        asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; syscall; ret", options(noreturn));
+    }
+    return 0_i64;
+}
+
+@naked
+fn rt_slice_mut_ptr(_s: *mut [u8]) -> u64 {
+    raw {
+        asm("mov rax, rdi; ret", options(noreturn));
+    }
+    return 0_u64;
+}
+
+/// Read up to `buf.len` bytes from standard input (fd 0); returns `0` on EOF or error.
+pub fn read_stdin(buf: *mut [u8]) -> usize {
+    if buf.len == 0_usize {
+        return 0_usize;
+    }
+    loop {
+        let rc = rt_syscall3(0_u64, 0_u64, rt_slice_mut_ptr(buf), buf.len.widen.[u64]());
+        if rc == -4_i64 {
+            continue;
+        }
+        if rc <= 0_i64 {
+            return 0_usize;
+        }
+        return rc.bitcast.[u64]().trunc.[usize]();
+    }
+}
+
 /// Print a UTF-8 string slice to standard output.
 pub fn print_str(s: *str) {
     raw {

@@ -1,0 +1,674 @@
+module eonc.fmt;
+
+import core.col;
+import core.str;
+
+// ---------------------------------------------------------------------------
+// Canonical, comment-preserving, idempotent Eon source formatter (`eonc fmt`)
+// ---------------------------------------------------------------------------
+
+enum FmtTokKind : u8 {
+    Word = 0,       // identifier, keyword, number literal
+    Str = 1,        // string / raw string / byte string / char literal
+    Comment = 2,    // // ... or /* ... */
+    LParen = 3,     // (
+    RParen = 4,     // )
+    LBracket = 5,   // [
+    RBracket = 6,   // ]
+    LBrace = 7,     // {
+    RBrace = 8,     // }
+    Comma = 9,      // ,
+    Semi = 10,      // ;
+    Colon = 11,     // :
+    DoubleColon = 12, // ::
+    Dot = 13,       // .
+    DotBrace = 14,  // .{
+    DotStar = 15,   // .*
+    DotBracket = 16,// .[
+    Range = 17,     // .. or ..=
+    Arrow = 18,     // ->
+    FatArrow = 19,  // =>
+    At = 20,        // @
+    Question = 21,  // ?
+    Bang = 22,      // !
+    Tilde = 23,     // ~
+    Amp = 24,       // &
+    Star = 25,      // *
+    Minus = 26,     // -
+    BinOp = 27,     // +, /, %, +%, -%, *%, +?, ==, !=, <=, >=, &&, ||, =, +=, etc.
+    Label = 28,     // 'outer
+    Other = 29,
+}
+
+struct FmtTok {
+    kind: FmtTokKind;
+    start: usize;
+    end: usize;
+}
+
+fn is_ws(b: u8) -> bool {
+    return b == b' ' || b == 9_u8 || b == 13_u8;
+}
+
+fn is_ident_start(b: u8) -> bool {
+    return (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') || b == b'_';
+}
+
+fn is_ident_cont(b: u8) -> bool {
+    return is_ident_start(b) || (b >= b'0' && b <= b'9');
+}
+
+fn is_digit(b: u8) -> bool {
+    return b >= b'0' && b <= b'9';
+}
+
+fn tok_bytes_eq(src: *[u8], t: *FmtTok, lit: *str) -> bool {
+    let sl = src.sub(t.start, t.end) catch {
+        return false;
+    };
+    return str.bytes_eq(sl, lit.as_bytes());
+}
+
+fn is_space_after_kw(src: *[u8], t: *FmtTok) -> bool {
+    if t.kind != .Word {
+        return false;
+    }
+    return tok_bytes_eq(src, t, "if")
+        || tok_bytes_eq(src, t, "else")
+        || tok_bytes_eq(src, t, "while")
+        || tok_bytes_eq(src, t, "for")
+        || tok_bytes_eq(src, t, "match")
+        || tok_bytes_eq(src, t, "return")
+        || tok_bytes_eq(src, t, "let")
+        || tok_bytes_eq(src, t, "var")
+        || tok_bytes_eq(src, t, "const")
+        || tok_bytes_eq(src, t, "in")
+        || tok_bytes_eq(src, t, "as")
+        || tok_bytes_eq(src, t, "is")
+        || tok_bytes_eq(src, t, "try")
+        || tok_bytes_eq(src, t, "catch")
+        || tok_bytes_eq(src, t, "orelse")
+        || tok_bytes_eq(src, t, "where")
+        || tok_bytes_eq(src, t, "ensures")
+        || tok_bytes_eq(src, t, "mut")
+        || tok_bytes_eq(src, t, "move")
+        || tok_bytes_eq(src, t, "copy")
+        || tok_bytes_eq(src, t, "pub")
+        || tok_bytes_eq(src, t, "fn")
+        || tok_bytes_eq(src, t, "sys")
+        || tok_bytes_eq(src, t, "struct")
+        || tok_bytes_eq(src, t, "enum")
+        || tok_bytes_eq(src, t, "union")
+        || tok_bytes_eq(src, t, "bitfield")
+        || tok_bytes_eq(src, t, "linear")
+        || tok_bytes_eq(src, t, "pool")
+        || tok_bytes_eq(src, t, "iface")
+        || tok_bytes_eq(src, t, "impl")
+        || tok_bytes_eq(src, t, "type")
+        || tok_bytes_eq(src, t, "error")
+        || tok_bytes_eq(src, t, "module")
+        || tok_bytes_eq(src, t, "import")
+        || tok_bytes_eq(src, t, "extern")
+        || tok_bytes_eq(src, t, "comptime")
+        || tok_bytes_eq(src, t, "view")
+        || tok_bytes_eq(src, t, "par")
+        || tok_bytes_eq(src, t, "defer")
+        || tok_bytes_eq(src, t, "errdefer")
+        || tok_bytes_eq(src, t, "break")
+        || tok_bytes_eq(src, t, "continue")
+        || tok_bytes_eq(src, t, "loop")
+        || tok_bytes_eq(src, t, "raw")
+        || tok_bytes_eq(src, t, "volatile")
+        || tok_bytes_eq(src, t, "dyn");
+}
+
+fn is_prefix_prev(k: FmtTokKind) -> bool {
+    return k == .LParen
+        || k == .LBracket
+        || k == .LBrace
+        || k == .Comma
+        || k == .Semi
+        || k == .Colon
+        || k == .Arrow
+        || k == .FatArrow
+        || k == .BinOp
+        || k == .Bang
+        || k == .Tilde
+        || k == .Amp
+        || k == .Star
+        || k == .Minus
+        || k == .Question
+        || k == .Range
+        || k == .DotBrace;
+}
+
+fn is_word_or_val(k: FmtTokKind) -> bool {
+    return k == .Word || k == .Str || k == .RParen || k == .RBracket || k == .RBrace || k == .DotStar;
+}
+
+fn tokenize_line(
+    alloc: *mut AllocCap,
+    src: *[u8],
+    line_start: usize,
+    line_end: usize,
+    in_block_comment: *mut bool,
+    out: *mut col.DynBuf[FmtTok],
+) -> !OutOfMemory {
+    out.clear();
+    var p = line_start;
+    while p < line_end && p < src.len {
+        if in_block_comment.* {
+            let cs = p;
+            while p < line_end && p < src.len {
+                if src[p] == b'*' && p +% 1_usize < line_end && p +% 1_usize < src.len && src[p +% 1_usize] == b'/' {
+                    p = p +% 2_usize;
+                    in_block_comment.* = false;
+                    break;
+                }
+                p = p +% 1_usize;
+            }
+            try out.push(alloc, FmtTok.{ kind: .Comment, start: cs, end: p });
+            continue;
+        }
+        let ch = src[p];
+        if is_ws(ch) {
+            p = p +% 1_usize;
+            continue;
+        }
+        // Line comment `// ...`
+        if ch == b'/' && p +% 1_usize < line_end && p +% 1_usize < src.len && src[p +% 1_usize] == b'/' {
+            var ce = line_end;
+            while ce > p {
+                let c1 = ce - 1_usize;
+                if c1 < src.len && is_ws(src[c1]) {
+                    ce = c1;
+                } else {
+                    break;
+                }
+            }
+            try out.push(alloc, FmtTok.{ kind: .Comment, start: p, end: ce });
+            break;
+        }
+        // Block comment `/* ... */`
+        if ch == b'/' && p +% 1_usize < line_end && p +% 1_usize < src.len && src[p +% 1_usize] == b'*' {
+            let cs = p;
+            p = p +% 2_usize;
+            in_block_comment.* = true;
+            while p < line_end && p < src.len {
+                if src[p] == b'*' && p +% 1_usize < line_end && p +% 1_usize < src.len && src[p +% 1_usize] == b'/' {
+                    p = p +% 2_usize;
+                    in_block_comment.* = false;
+                    break;
+                }
+                p = p +% 1_usize;
+            }
+            try out.push(alloc, FmtTok.{ kind: .Comment, start: cs, end: p });
+            continue;
+        }
+        // Raw string `r"..."` or byte string `b"..."` or byte char `b'...'`
+        if (ch == b'r' || ch == b'b') && p +% 1_usize < line_end && p +% 1_usize < src.len {
+            let nx = src[p +% 1_usize];
+            if nx == b'"' || (ch == b'b' && nx == b'\'') {
+                let ss = p;
+                let quote = nx;
+                p = p +% 2_usize;
+                while p < line_end && p < src.len {
+                    let c2 = src[p];
+                    if ch == b'b' && c2 == b'\\' && p +% 1_usize < line_end {
+                        p = p +% 2_usize;
+                        continue;
+                    }
+                    p = p +% 1_usize;
+                    if c2 == quote {
+                        break;
+                    }
+                }
+                try out.push(alloc, FmtTok.{ kind: .Str, start: ss, end: p });
+                continue;
+            }
+        }
+        // Double-quoted string literal
+        if ch == b'"' {
+            let ss = p;
+            p = p +% 1_usize;
+            while p < line_end && p < src.len {
+                let c2 = src[p];
+                if c2 == b'\\' && p +% 1_usize < line_end {
+                    p = p +% 2_usize;
+                    continue;
+                }
+                p = p +% 1_usize;
+                if c2 == b'"' {
+                    break;
+                }
+            }
+            try out.push(alloc, FmtTok.{ kind: .Str, start: ss, end: p });
+            continue;
+        }
+        // Char literal or loop label `'outer`
+        if ch == b'\'' {
+            let ss = p;
+            // Detect char literal: `'x'` or `'\n'` or `'\xNN'`
+            var is_char = false;
+            if p +% 2_usize < line_end && p +% 2_usize < src.len && src[p +% 1_usize] != b'\\' && src[p +% 2_usize] == b'\'' {
+                is_char = true;
+                p = p +% 3_usize;
+            } else if p +% 1_usize < line_end && p +% 1_usize < src.len && src[p +% 1_usize] == b'\\' {
+                is_char = true;
+                p = p +% 2_usize;
+                while p < line_end && p < src.len {
+                    let c2 = src[p];
+                    p = p +% 1_usize;
+                    if c2 == b'\'' {
+                        break;
+                    }
+                }
+            } else {
+                p = p +% 1_usize;
+                while p < line_end && p < src.len && is_ident_cont(src[p]) {
+                    p = p +% 1_usize;
+                }
+            }
+            let fk: FmtTokKind = if is_char { .Str } else { .Label };
+            try out.push(alloc, FmtTok.{ kind: fk, start: ss, end: p });
+            continue;
+        }
+        // Identifier / keyword
+        if is_ident_start(ch) {
+            let ws = p;
+            p = p +% 1_usize;
+            while p < line_end && p < src.len && is_ident_cont(src[p]) {
+                p = p +% 1_usize;
+            }
+            try out.push(alloc, FmtTok.{ kind: .Word, start: ws, end: p });
+            continue;
+        }
+        // Numeric literal (including hex, bin, float `1.5e-3_f64`)
+        if is_digit(ch) {
+            let ns = p;
+            p = p +% 1_usize;
+            while p < line_end && p < src.len {
+                let c2 = src[p];
+                if is_ident_cont(c2) {
+                    if (c2 == b'e' || c2 == b'E') && p +% 1_usize < line_end && p +% 1_usize < src.len {
+                        let c3 = src[p +% 1_usize];
+                        if c3 == b'+' || c3 == b'-' {
+                            p = p +% 2_usize;
+                            continue;
+                        }
+                    }
+                    p = p +% 1_usize;
+                    continue;
+                }
+                if c2 == b'.' && p +% 1_usize < line_end && p +% 1_usize < src.len && is_digit(src[p +% 1_usize]) {
+                    p = p +% 1_usize;
+                    continue;
+                }
+                break;
+            }
+            try out.push(alloc, FmtTok.{ kind: .Word, start: ns, end: p });
+            continue;
+        }
+        // Multi-character operators & punctuation
+        let rem = line_end - p;
+        let next1: u8 = if rem >= 2_usize && p +% 1_usize < src.len { src[p +% 1_usize] } else { 0_u8 };
+        let next2: u8 = if rem >= 3_usize && p +% 2_usize < src.len { src[p +% 2_usize] } else { 0_u8 };
+
+        if ch == b'.' && next1 == b'.' && next2 == b'=' {
+            try out.push(alloc, FmtTok.{ kind: .Range, start: p, end: p +% 3_usize });
+            p = p +% 3_usize;
+            continue;
+        }
+        if (ch == b'<' && next1 == b'<' && (next2 == b'%' || next2 == b'='))
+            || (ch == b'>' && next1 == b'>' && next2 == b'=')
+            || ((ch == b'+' || ch == b'-' || ch == b'*') && (next1 == b'%' || next1 == b'|') && next2 == b'=')
+        {
+            try out.push(alloc, FmtTok.{ kind: .BinOp, start: p, end: p +% 3_usize });
+            p = p +% 3_usize;
+            continue;
+        }
+        if ch == b'.' && next1 == b'.' {
+            try out.push(alloc, FmtTok.{ kind: .Range, start: p, end: p +% 2_usize });
+            p = p +% 2_usize;
+            continue;
+        }
+        if ch == b'.' && next1 == b'{' {
+            try out.push(alloc, FmtTok.{ kind: .DotBrace, start: p, end: p +% 2_usize });
+            p = p +% 2_usize;
+            continue;
+        }
+        if ch == b'.' && next1 == b'*' {
+            try out.push(alloc, FmtTok.{ kind: .DotStar, start: p, end: p +% 2_usize });
+            p = p +% 2_usize;
+            continue;
+        }
+        if ch == b'.' && next1 == b'[' {
+            try out.push(alloc, FmtTok.{ kind: .DotBracket, start: p, end: p +% 2_usize });
+            p = p +% 2_usize;
+            continue;
+        }
+        if ch == b':' && next1 == b':' {
+            try out.push(alloc, FmtTok.{ kind: .DoubleColon, start: p, end: p +% 2_usize });
+            p = p +% 2_usize;
+            continue;
+        }
+        if ch == b'-' && next1 == b'>' {
+            try out.push(alloc, FmtTok.{ kind: .Arrow, start: p, end: p +% 2_usize });
+            p = p +% 2_usize;
+            continue;
+        }
+        if ch == b'=' && next1 == b'>' {
+            try out.push(alloc, FmtTok.{ kind: .FatArrow, start: p, end: p +% 2_usize });
+            p = p +% 2_usize;
+            continue;
+        }
+        if (ch == b'+' && (next1 == b'%' || next1 == b'|' || next1 == b'?' || next1 == b'='))
+            || (ch == b'-' && (next1 == b'%' || next1 == b'|' || next1 == b'?' || next1 == b'='))
+            || (ch == b'*' && (next1 == b'%' || next1 == b'|' || next1 == b'?' || next1 == b'='))
+            || (ch == b'/' && (next1 == b'?' || next1 == b'='))
+            || (ch == b'%' && (next1 == b'?' || next1 == b'='))
+            || (ch == b'=' && next1 == b'=')
+            || (ch == b'!' && next1 == b'=')
+            || (ch == b'<' && (next1 == b'=' || next1 == b'<'))
+            || (ch == b'>' && (next1 == b'=' || next1 == b'>'))
+            || (ch == b'&' && (next1 == b'&' || next1 == b'='))
+            || (ch == b'|' && (next1 == b'|' || next1 == b'='))
+            || (ch == b'^' && next1 == b'=')
+        {
+            try out.push(alloc, FmtTok.{ kind: .BinOp, start: p, end: p +% 2_usize });
+            p = p +% 2_usize;
+            continue;
+        }
+
+        // Single-character token
+        var k: FmtTokKind = .Other;
+        if ch == b'(' { k = .LParen; }
+        else if ch == b')' { k = .RParen; }
+        else if ch == b'[' { k = .LBracket; }
+        else if ch == b']' { k = .RBracket; }
+        else if ch == b'{' { k = .LBrace; }
+        else if ch == b'}' { k = .RBrace; }
+        else if ch == b',' { k = .Comma; }
+        else if ch == b';' { k = .Semi; }
+        else if ch == b':' { k = .Colon; }
+        else if ch == b'.' { k = .Dot; }
+        else if ch == b'@' { k = .At; }
+        else if ch == b'?' { k = .Question; }
+        else if ch == b'!' { k = .Bang; }
+        else if ch == b'~' { k = .Tilde; }
+        else if ch == b'&' { k = .Amp; }
+        else if ch == b'*' { k = .Star; }
+        else if ch == b'-' { k = .Minus; }
+        else if ch == b'+' || ch == b'/' || ch == b'%' || ch == b'=' || ch == b'<' || ch == b'>' || ch == b'|' || ch == b'^' {
+            k = .BinOp;
+        }
+        try out.push(alloc, FmtTok.{ kind: k, start: p, end: p +% 1_usize });
+        p = p +% 1_usize;
+    }
+    return;
+}
+
+fn needs_space_between(src: *[u8], toks: *[FmtTok], idx: usize) -> bool {
+    if idx == 0_usize || idx >= toks.len {
+        return false;
+    }
+    let prev = toks[idx - 1_usize];
+    let cur = toks[idx];
+    let prev2_exists = idx >= 2_usize;
+    let prev2 = if prev2_exists { toks[idx - 2_usize] } else { prev };
+
+    // Always separate trailing comments from preceding code by 1 space.
+    if cur.kind == .Comment {
+        return true;
+    }
+    if prev.kind == .Comment {
+        return true;
+    }
+    // Never space after opening delimiters or before closing delimiters/semicolons/commas.
+    if prev.kind == .LParen || prev.kind == .LBracket || prev.kind == .DotBracket {
+        return false;
+    }
+    if cur.kind == .RParen || cur.kind == .RBracket || cur.kind == .Comma || cur.kind == .Semi {
+        return false;
+    }
+    // No space inside `::`, `.`, `.*`, `.[`, `..`, `..=`, `@attr`.
+    if prev.kind == .DoubleColon || cur.kind == .DoubleColon {
+        return false;
+    }
+    if prev.kind == .Dot || cur.kind == .Dot || cur.kind == .DotStar || cur.kind == .DotBracket || cur.kind == .DotBrace {
+        return false;
+    }
+    if prev.kind == .Range || cur.kind == .Range {
+        return false;
+    }
+    if prev.kind == .At {
+        return false;
+    }
+    // Always space after `,`, `;`, `:`, `->`, `=>`, `BinOp`.
+    if prev.kind == .Comma || prev.kind == .Semi || prev.kind == .Colon {
+        return true;
+    }
+    if cur.kind == .Colon {
+        return false;
+    }
+    if prev.kind == .Arrow || cur.kind == .Arrow || prev.kind == .FatArrow || cur.kind == .FatArrow {
+        return true;
+    }
+    if prev.kind == .BinOp || cur.kind == .BinOp {
+        return true;
+    }
+    // Braces: space inside single-line `{ x }` / `.{ a: 1 }`, space before `{`.
+    if prev.kind == .LBrace || prev.kind == .DotBrace {
+        return cur.kind != .RBrace;
+    }
+    if cur.kind == .RBrace {
+        return prev.kind != .LBrace && prev.kind != .DotBrace;
+    }
+    if cur.kind == .LBrace {
+        return prev.kind != .LParen && prev.kind != .LBracket && prev.kind != .LBrace;
+    }
+    // Optional prefix `?T` vs error union `T ! E`:
+    if prev.kind == .Question {
+        return false;
+    }
+    if cur.kind == .Question {
+        return is_word_or_val(prev.kind);
+    }
+    // Unary `!x` vs error-union separator `T ! E`:
+    if cur.kind == .Bang {
+        return is_word_or_val(prev.kind);
+    }
+    if prev.kind == .Bang {
+        // Error union `Ret ! Err` (after `->` or word), vs unary `!cond`
+        if prev2_exists && (prev2.kind == .Arrow || is_word_or_val(prev2.kind)) {
+            return true;
+        }
+        return false;
+    }
+    if prev.kind == .Tilde {
+        return false;
+    }
+    // Unary `&x` / `&mut x` vs bitwise `a & b`:
+    if cur.kind == .Amp {
+        return is_word_or_val(prev.kind);
+    }
+    if prev.kind == .Amp {
+        if prev2_exists && is_word_or_val(prev2.kind) && !is_space_after_kw(src, &prev2) {
+            return true;
+        }
+        return false;
+    }
+    // Pointer `*T` / `*mut T` vs multiply `a * b`:
+    if cur.kind == .Star {
+        return is_word_or_val(prev.kind);
+    }
+    if prev.kind == .Star {
+        if prev2_exists && is_word_or_val(prev2.kind) && !is_space_after_kw(src, &prev2) {
+            return true;
+        }
+        return false;
+    }
+    // Unary `-x` vs binary `a - b`:
+    if cur.kind == .Minus {
+        return is_word_or_val(prev.kind);
+    }
+    if prev.kind == .Minus {
+        if prev2_exists && is_word_or_val(prev2.kind) && !is_space_after_kw(src, &prev2) {
+            return true;
+        }
+        return false;
+    }
+    // Function call `foo(x)` / indexing `a[i]` vs keyword `if (x)` / `return [1]`:
+    if cur.kind == .LParen || cur.kind == .LBracket {
+        if prev.kind == .Word && is_space_after_kw(src, &prev) {
+            return true;
+        }
+        return false;
+    }
+    // Attributes `@inline` following something else on same line:
+    if cur.kind == .At {
+        return !is_prefix_prev(prev.kind);
+    }
+    // Word / literal / label adjacency:
+    if prev.kind == .Word || prev.kind == .Str || prev.kind == .Label || prev.kind == .RParen || prev.kind == .RBracket || prev.kind == .RBrace {
+        return cur.kind == .Word || cur.kind == .Str || cur.kind == .Label || cur.kind == .Tilde;
+    }
+    return false;
+}
+
+/// Format an Eon source file into canonical style, preserving all comments, strings,
+/// and semantic blank lines. Guaranteed idempotent: `format(format(x)) == format(x)`.
+pub fn format_eon_source(
+    alloc: *mut AllocCap,
+    src: *[u8],
+    out: *mut str.StrBuf,
+) -> !OutOfMemory {
+    out.clear();
+    var line_toks = try col.DynBuf.[FmtTok].init(alloc, 64_usize);
+    errdefer line_toks.destroy(alloc);
+
+    var brace_depth: usize = 0_usize;
+    var paren_depth: usize = 0_usize;
+    var bracket_depth: usize = 0_usize;
+    var in_block_comment = false;
+    var prev_was_blank = true;
+    var prev_opened_block = false;
+    var pending_blank = false;
+
+    var pos: usize = 0_usize;
+    while pos < src.len {
+        let ls = pos;
+        while pos < src.len && src[pos] != 10_u8 {
+            pos = pos +% 1_usize;
+        }
+        var le = pos;
+        if le > ls {
+            let l1 = le - 1_usize;
+            if l1 < src.len && src[l1] == 13_u8 {
+                le = l1;
+            }
+        }
+        if pos < src.len && src[pos] == 10_u8 {
+            pos = pos +% 1_usize;
+        }
+
+        let was_in_bc = in_block_comment;
+        try tokenize_line(alloc, src, ls, le, &mut in_block_comment, &mut line_toks);
+        let ts = line_toks.as_slice();
+        if ts.len == 0_usize {
+            if !prev_was_blank && !prev_opened_block {
+                pending_blank = true;
+            }
+            prev_was_blank = true;
+            continue;
+        }
+
+        // Count leading closing delimiters to dedent this line cleanly.
+        var lead_close_brace: usize = 0_usize;
+        var lead_close_paren: usize = 0_usize;
+        var lead_close_bracket: usize = 0_usize;
+        var k: usize = 0_usize;
+        while k < ts.len {
+            if ts[k].kind == .RBrace {
+                lead_close_brace = lead_close_brace +% 1_usize;
+            } else if ts[k].kind == .RParen {
+                lead_close_paren = lead_close_paren +% 1_usize;
+            } else if ts[k].kind == .RBracket {
+                lead_close_bracket = lead_close_bracket +% 1_usize;
+            } else {
+                break;
+            }
+            k = k +% 1_usize;
+        }
+
+        // Do not emit blank lines immediately before a closing `}` / `)` / `]`.
+        if pending_blank && lead_close_brace == 0_usize && lead_close_paren == 0_usize && lead_close_bracket == 0_usize {
+            try out.push_byte_grow(alloc, 10_u8);
+        }
+        pending_blank = false;
+
+        let eff_brace = if brace_depth >= lead_close_brace { brace_depth - lead_close_brace } else { 0_usize };
+        let eff_paren = if paren_depth >= lead_close_paren { paren_depth - lead_close_paren } else { 0_usize };
+        let eff_bracket = if bracket_depth >= lead_close_bracket { bracket_depth - lead_close_bracket } else { 0_usize };
+        let indent_level = eff_brace +% eff_paren +% eff_bracket;
+
+        if was_in_bc {
+            // Preserve interior lines of multi-line block comments verbatim (trimmed of trailing spaces).
+            var te = le;
+            while te > ls {
+                let t1 = te - 1_usize;
+                if t1 < src.len && is_ws(src[t1]) { te = t1; } else { break; }
+            }
+            let raw_sl = src.sub(ls, te) catch { "".as_bytes() };
+            try out.push_bytes_grow(alloc, raw_sl);
+            try out.push_byte_grow(alloc, 10_u8);
+        } else {
+            var sp_i: usize = 0_usize;
+            let n_spaces = indent_level *% 4_usize;
+            while sp_i < n_spaces {
+                try out.push_byte_grow(alloc, b' ');
+                sp_i = sp_i +% 1_usize;
+            }
+            var ti: usize = 0_usize;
+            while ti < ts.len {
+                if ti > 0_usize && needs_space_between(src, ts, ti) {
+                    try out.push_byte_grow(alloc, b' ');
+                }
+                let t = ts[ti];
+                let tb = src.sub(t.start, t.end) catch { "".as_bytes() };
+                try out.push_bytes_grow(alloc, tb);
+                ti = ti +% 1_usize;
+            }
+            try out.push_byte_grow(alloc, 10_u8);
+        }
+
+        // Update delimiter depths across all non-comment tokens on this line.
+        var last_non_comment: FmtTokKind = .Other;
+        var ti2: usize = 0_usize;
+        while ti2 < ts.len {
+            let tk = ts[ti2].kind;
+            if tk != .Comment {
+                last_non_comment = tk;
+            }
+            if tk == .LBrace || tk == .DotBrace {
+                brace_depth = brace_depth +% 1_usize;
+            } else if tk == .RBrace {
+                if brace_depth > 0_usize { brace_depth = brace_depth - 1_usize; }
+            } else if tk == .LParen {
+                paren_depth = paren_depth +% 1_usize;
+            } else if tk == .RParen {
+                if paren_depth > 0_usize { paren_depth = paren_depth - 1_usize; }
+            } else if tk == .LBracket || tk == .DotBracket {
+                bracket_depth = bracket_depth +% 1_usize;
+            } else if tk == .RBracket {
+                if bracket_depth > 0_usize { bracket_depth = bracket_depth - 1_usize; }
+            }
+            ti2 = ti2 +% 1_usize;
+        }
+        prev_was_blank = false;
+        prev_opened_block = last_non_comment == .LBrace || last_non_comment == .DotBrace;
+    }
+
+    line_toks.destroy(alloc);
+    return;
+}
