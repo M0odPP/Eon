@@ -1,0 +1,162 @@
+module eon_ui.components.scroll_view;
+
+import core.math_vec;
+import eon_ui.div;
+import eon_ui.theme;
+
+// ============================================================================
+// ScrollView & Virtualized 100k+ Row UniformList (`libs/eon_ui/src/components/scroll_view.eon`)
+// 100% safe, `core/`-only, zero heap allocations.
+// ============================================================================
+
+pub struct ScrollState {
+    pub id: u32;
+    pub offset_y: f32;
+    pub target_y: f32;
+    pub content_h: f32;
+    pub viewport_h: f32;
+}
+
+impl ScrollState {
+    pub fn new(id: u32) -> ScrollState {
+        return ScrollState.{
+            id: id,
+            offset_y: 0.0_f32,
+            target_y: 0.0_f32,
+            content_h: 0.0_f32,
+            viewport_h: 0.0_f32,
+        };
+    }
+
+    pub fn max_scroll(self: *Self) -> f32 {
+        return math_vec.max_f32(self.content_h - self.viewport_h, 0.0_f32);
+    }
+
+    pub fn clamp(self: *mut Self) {
+        let mx = self.max_scroll();
+        self.offset_y = math_vec.clamp_f32(self.offset_y, 0.0_f32, mx);
+        self.target_y = math_vec.clamp_f32(self.target_y, 0.0_f32, mx);
+    }
+
+    pub fn set_metrics(self: *mut Self, content_h: f32, viewport_h: f32) {
+        self.content_h = content_h;
+        self.viewport_h = viewport_h;
+        self.clamp();
+    }
+
+    /// Apply mouse wheel or touch scroll delta (`dy > 0` scrolls down).
+    pub fn scroll_by(self: *mut Self, dy: f32) {
+        let mx = self.max_scroll();
+        self.target_y = math_vec.clamp_f32(self.target_y + dy, 0.0_f32, mx);
+        self.offset_y = self.target_y;
+    }
+
+    pub fn scroll_to_top(self: *mut Self) {
+        self.target_y = 0.0_f32;
+        self.offset_y = 0.0_f32;
+    }
+
+    pub fn scroll_to_bottom(self: *mut Self) {
+        let mx = self.max_scroll();
+        self.target_y = mx;
+        self.offset_y = mx;
+    }
+
+    /// Smooth exponential-decay step for wheel inertia.
+    pub fn step_smooth(self: *mut Self, dt_sec: f32) -> bool {
+        let diff = self.target_y - self.offset_y;
+        if diff > -0.25_f32 && diff < 0.25_f32 {
+            self.offset_y = self.target_y;
+            return false;
+        }
+        let alpha = math_vec.clamp_f32(dt_sec * 18.0_f32, 0.05_f32, 1.0_f32);
+        self.offset_y = self.offset_y + diff * alpha;
+        return true;
+    }
+
+    /// Return a GPUI-style scrollable column container `Div`.
+    pub fn container_div(self: *Self) -> div.Div {
+        return div.div()
+            .flex_col()
+            .scrollable(self.id, 0.0_f32, self.offset_y);
+    }
+
+    /// Compute vertical scrollbar thumb height & top offset (returns empty if no overflow).
+    pub fn thumb_metrics(self: *Self, track_h: f32) -> (f32, f32) {
+        if self.content_h <= self.viewport_h || self.content_h <= 0.1_f32 || track_h <= 4.0_f32 {
+            return (0.0_f32, 0.0_f32);
+        }
+        let ratio = math_vec.clamp_f32(self.viewport_h / self.content_h, 0.06_f32, 1.0_f32);
+        let thumb_h = math_vec.max_f32(track_h * ratio, 20.0_f32);
+        let max_s = self.max_scroll();
+        let frac = if max_s > 0.01_f32 { self.offset_y / max_s } else { 0.0_f32 };
+        let thumb_y = (track_h - thumb_h) * math_vec.clamp_f32(frac, 0.0_f32, 1.0_f32);
+        return (thumb_y, thumb_h);
+    }
+
+    /// Build an overlay scrollbar thumb `Div` anchored on the right edge of the scroll container.
+    pub fn scrollbar_thumb_div(self: *Self, th: *theme.Theme, track_h: f32) -> div.Div {
+        let (ty, th_px) = self.thumb_metrics(track_h);
+        if th_px <= 0.1_f32 {
+            return div.div().hidden();
+        }
+        return div.div()
+            .absolute()
+            .top(ty)
+            .right(2.0_f32)
+            .w(5.0_f32)
+            .h(th_px)
+            .rounded(2.5_f32)
+            .bg(th.text_muted.with_alpha(0.55_f32));
+    }
+}
+
+/// O(1) virtualized visible slice specification for a `UniformList` with 100,000+ rows.
+pub struct UniformListRange {
+    pub start_index: usize;
+    pub end_index: usize;
+    pub top_spacer_h: f32;
+    pub bottom_spacer_h: f32;
+    pub total_h: f32;
+    pub visible_count: usize;
+}
+
+/// Compute the exact visible index window `[start_index .. end_index)` plus top/bottom
+/// spacer heights for `item_count` uniform-height rows in O(1) time (zero allocation!).
+pub fn uniform_list_window(
+    item_count: usize,
+    item_h: f32,
+    scroll_y: f32,
+    viewport_h: f32,
+    overscan: usize,
+) -> UniformListRange {
+    if item_count == 0_usize || item_h <= 0.01_f32 {
+        return UniformListRange.{
+            start_index: 0_usize,
+            end_index: 0_usize,
+            top_spacer_h: 0.0_f32,
+            bottom_spacer_h: 0.0_f32,
+            total_h: 0.0_f32,
+            visible_count: 0_usize,
+        };
+    }
+    let total_h = item_count.to_float.[f32]() * item_h;
+    let clamped_scroll = math_vec.clamp_f32(scroll_y, 0.0_f32, math_vec.max_f32(total_h - viewport_h, 0.0_f32));
+    let raw_start = (clamped_scroll / item_h).trunc_to_int.[i64]();
+    let s0: usize = if raw_start > 0_i64 { raw_start.bitcast.[u64]().trunc.[usize]() } else { 0_usize };
+    let start = if s0 > overscan { s0 - overscan } else { 0_usize };
+    let vis_rows = ((viewport_h / item_h).trunc_to_int.[i64]() +% 2_i64).bitcast.[u64]().trunc.[usize]();
+    let raw_end = s0 +% vis_rows +% overscan;
+    let end = if raw_end < item_count { raw_end } else { item_count };
+    let top_h = start.to_float.[f32]() * item_h;
+    let rem_items = if item_count > end { item_count - end } else { 0_usize };
+    let bot_h = rem_items.to_float.[f32]() * item_h;
+    return UniformListRange.{
+        start_index: start,
+        end_index: end,
+        top_spacer_h: top_h,
+        bottom_spacer_h: bot_h,
+        total_h: total_h,
+        visible_count: if end > start { end - start } else { 0_usize },
+    };
+}

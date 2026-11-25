@@ -3721,7 +3721,25 @@ impl CfgBuilder {
             .Unary => { return try self.lower_expr_unary(e_unary_op, e_a, e_span, ty, expected); }
             .Binary => { return try self.lower_expr_binary(e_bin_op, e_a, e_b, e_span, ty, expected); }
             .Slice => {
-                let b_op = try self.lower_expr_rvalue(e_a, types.TY_NONE);
+                let raw_bty = try self.expr_ty(e_a, types.TY_NONE);
+                let raw_bn = self.env.get(raw_bty);
+                let out_n = self.env.get(ty);
+                let out_mut = out_n.kind == .Borrow && out_n.flag0;
+                var b_op = cfg_ir.op_none();
+                if raw_bn.kind == .Array {
+                    // Borrow array place directly (zero value copy, prevents dangling stack slices in `view fn`).
+                    let place_id = try self.lower_place(e_a);
+                    if !self.has_cur_bb {
+                        return try self.cfg.add_const_op(self.alloc, cfg_ir.const_void());
+                    }
+                    let ptr_ty = try self.env.intern_borrow(self.alloc, out_mut, .Single, raw_bty);
+                    let p_dst = try self.new_temp_place(ptr_ty, e_span);
+                    try self.emit_assign(e_span, p_dst, cfg_ir.rvalue_borrow(out_mut, place_id));
+                    let sl_ty = try self.env.intern_borrow(self.alloc, out_mut, .Slice, raw_bn.primary);
+                    b_op = try self.coerce_operand(cfg_ir.op_copy(p_dst), sl_ty, e_span);
+                } else {
+                    b_op = try self.lower_expr_rvalue(e_a, types.TY_NONE);
+                }
                 let has_lo = e_b != ast.NONE_ID;
                 let lo_op = if has_lo { try self.lower_expr_rvalue(e_b, types.TY_USIZE) } else { cfg_ir.op_none() };
                 let has_hi = e_c != ast.NONE_ID;

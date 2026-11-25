@@ -1,0 +1,138 @@
+module eon_ui.keymap;
+
+import eon_win.events;
+
+// ============================================================================
+// Contextual KeyBinding & Typed Action Dispatch (`libs/eon_ui/src/keymap.eon`)
+// 100% safe, `core/`-only, zero heap allocations (works identically on nostd).
+// ============================================================================
+
+pub const CTX_GLOBAL: u16 = 0_u16;
+pub const ACTION_NONE: u32 = 0_u32;
+
+pub struct KeyBinding {
+    pub key: events.Key;
+    pub mods_req: u8;
+    pub mods_mask: u8;
+    pub context_id: u16;
+    pub action_id: u32;
+}
+
+impl KeyBinding {
+    @inline
+    pub fn simple(key: events.Key, action_id: u32) -> KeyBinding {
+        return KeyBinding.{
+            key: key,
+            mods_req: 0_u8,
+            mods_mask: events.MOD_CTRL | events.MOD_ALT | events.MOD_META,
+            context_id: CTX_GLOBAL,
+            action_id: action_id,
+        };
+    }
+
+    @inline
+    pub fn with_mods(key: events.Key, mods_req: u8, mods_mask: u8, action_id: u32) -> KeyBinding {
+        return KeyBinding.{
+            key: key,
+            mods_req: mods_req,
+            mods_mask: mods_mask,
+            context_id: CTX_GLOBAL,
+            action_id: action_id,
+        };
+    }
+
+    @inline
+    pub fn in_context(key: events.Key, mods_req: u8, mods_mask: u8, context_id: u16, action_id: u32) -> KeyBinding {
+        return KeyBinding.{
+            key: key,
+            mods_req: mods_req,
+            mods_mask: mods_mask,
+            context_id: context_id,
+            action_id: action_id,
+        };
+    }
+}
+
+pub const MAX_KEYBINDINGS: usize = 96_usize;
+
+pub struct Keymap {
+    bindings: [96]KeyBinding;
+    pub len: usize;
+}
+
+impl Keymap {
+    pub fn new() -> Keymap {
+        let empty = KeyBinding.{
+            key: .Unknown,
+            mods_req: 0_u8,
+            mods_mask: 0_u8,
+            context_id: CTX_GLOBAL,
+            action_id: ACTION_NONE,
+        };
+        return Keymap.{
+            bindings: [empty; 96],
+            len: 0_usize,
+        };
+    }
+
+    pub fn clear(self: *mut Self) {
+        self.len = 0_usize;
+    }
+
+    pub fn bind(self: *mut Self, kb: KeyBinding) -> bool {
+        if self.len >= MAX_KEYBINDINGS {
+            return false;
+        }
+        self.bindings[self.len] = kb;
+        self.len = self.len +% 1_usize;
+        return true;
+    }
+
+    pub fn bind_key(self: *mut Self, key: events.Key, action_id: u32) -> bool {
+        return self.bind(KeyBinding.simple(key, action_id));
+    }
+
+    pub fn bind_primary(self: *mut Self, key: events.Key, action_id: u32) -> bool {
+        let prim: u8 = comptime if @target_os() == .MacOS || @target_os() == .IOS {
+            events.MOD_META
+        } else {
+            events.MOD_CTRL
+        };
+        return self.bind(KeyBinding.with_mods(key, prim, prim | events.MOD_ALT, action_id));
+    }
+
+    pub fn bind_shift(self: *mut Self, key: events.Key, action_id: u32) -> bool {
+        return self.bind(KeyBinding.with_mods(
+            key,
+            events.MOD_SHIFT,
+            events.MOD_SHIFT | events.MOD_CTRL | events.MOD_ALT | events.MOD_META,
+            action_id,
+        ));
+    }
+
+    /// Match contextual bindings first (most recent wins), then fall back to `CTX_GLOBAL`.
+    pub fn match_key(self: *Self, key: events.Key, mods: events.Modifiers, active_ctx: u16) -> u32 {
+        let n = if self.len <= MAX_KEYBINDINGS { self.len } else { MAX_KEYBINDINGS };
+        // Pass 1: exact context match (newest first)
+        if active_ctx != CTX_GLOBAL {
+            var i = n;
+            while i > 0_usize {
+                i = i - 1_usize;
+                let b = self.bindings[i];
+                if b.context_id == active_ctx && b.key == key && ((mods.bits & b.mods_mask) == b.mods_req) {
+                    return b.action_id;
+                }
+            }
+        }
+        // Pass 2: global bindings (newest first)
+        var j = n;
+        while j > 0_usize {
+            j = j - 1_usize;
+            let b = self.bindings[j];
+            if b.context_id == CTX_GLOBAL && b.key == key && ((mods.bits & b.mods_mask) == b.mods_req) {
+                return b.action_id;
+            }
+        }
+        return ACTION_NONE;
+    }
+}

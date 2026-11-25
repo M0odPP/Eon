@@ -1,0 +1,347 @@
+module eon_ui.components.text_input;
+
+import core.math_vec;
+import eon_win.events;
+import eon_text.lib;
+import eon_ui.div;
+import eon_ui.theme;
+import eon_ui.input;
+
+// ============================================================================
+// Single-Line Editable TextInput (`libs/eon_ui/src/components/text_input.eon`)
+// Supports cursor, selection range, Backspace/Delete/Home/End/Left/Right,
+// clipboard copy/paste, click-to-place cursor (`hit_test_bytes_x`), and filter.
+// 100% safe, `core/`-only, zero heap allocations.
+// ============================================================================
+
+pub const TEXT_INPUT_MAX: usize = 256_usize;
+
+pub enum InputFilter : u8 {
+    AnyPrintable = 0,
+    Numeric = 1,
+    Hex = 2,
+    Expression = 3,
+}
+
+pub struct TextInputState {
+    pub buf: [256]u8;
+    pub len: usize;
+    pub cursor: usize;
+    pub sel_anchor: usize;
+    pub focus: input.FocusHandle;
+    pub filter: InputFilter;
+    pub font_size: f32;
+    pub font_id: u16;
+}
+
+impl TextInputState {
+    pub fn new(focus: input.FocusHandle) -> TextInputState {
+        return TextInputState.{
+            buf: [0_u8; 256],
+            len: 0_usize,
+            cursor: 0_usize,
+            sel_anchor: 0_usize,
+            focus: focus,
+            filter: .AnyPrintable,
+            font_size: 16.0_f32,
+            font_id: lib.FONT_UI_MONO,
+        };
+    }
+
+    pub view fn as_bytes(self: *Self) -> *[u8] {
+        let n = if self.len <= TEXT_INPUT_MAX { self.len } else { TEXT_INPUT_MAX };
+        return self.buf[0_usize..n];
+    }
+
+    pub fn clear(self: *mut Self) {
+        self.len = 0_usize;
+        self.cursor = 0_usize;
+        self.sel_anchor = 0_usize;
+    }
+
+    pub fn set_bytes(self: *mut Self, src: *[u8]) {
+        let n = if src.len <= TEXT_INPUT_MAX { src.len } else { TEXT_INPUT_MAX };
+        var i: usize = 0_usize;
+        while i < n {
+            self.buf[i] = src[i];
+            i = i +% 1_usize;
+        }
+        self.len = n;
+        self.cursor = n;
+        self.sel_anchor = n;
+    }
+
+    pub fn set_str(self: *mut Self, s: *str) {
+        self.set_bytes(s.as_bytes());
+    }
+
+    pub fn has_selection(self: *Self) -> bool {
+        return self.cursor != self.sel_anchor;
+    }
+
+    pub fn sel_start(self: *Self) -> usize {
+        return if self.cursor < self.sel_anchor { self.cursor } else { self.sel_anchor };
+    }
+
+    pub fn sel_end(self: *Self) -> usize {
+        return if self.cursor > self.sel_anchor { self.cursor } else { self.sel_anchor };
+    }
+
+    pub fn select_all(self: *mut Self) {
+        self.sel_anchor = 0_usize;
+        self.cursor = self.len;
+    }
+
+    pub fn delete_selection(self: *mut Self) -> bool {
+        if !self.has_selection() {
+            return false;
+        }
+        let n = if self.len <= TEXT_INPUT_MAX { self.len } else { TEXT_INPUT_MAX };
+        let s0 = self.sel_start();
+        let e0 = self.sel_end();
+        let s = if s0 <= n { s0 } else { n };
+        let e = if e0 <= n { e0 } else { n };
+        if e <= s {
+            self.sel_anchor = self.cursor;
+            return false;
+        }
+        let del = e - s;
+        var i = e;
+        while i < n {
+            let dst = i - del;
+            if dst < 256_usize && i < 256_usize {
+                self.buf[dst] = self.buf[i];
+            }
+            i = i +% 1_usize;
+        }
+        self.len = n - del;
+        self.cursor = s;
+        self.sel_anchor = s;
+        return true;
+    }
+
+    fn allows_byte(self: *Self, b: u8) -> bool {
+        if b < 0x20_u8 || b > 0x7E_u8 {
+            return false;
+        }
+        match self.filter {
+            .AnyPrintable => { return true; }
+            .Numeric => {
+                return (b >= b'0' && b <= b'9') || b == b'.' || b == b'-';
+            }
+            .Hex => {
+                return (b >= b'0' && b <= b'9')
+                    || (b >= b'a' && b <= b'f')
+                    || (b >= b'A' && b <= b'F');
+            }
+            .Expression => {
+                return (b >= b'0' && b <= b'9')
+                    || (b >= b'a' && b <= b'z')
+                    || (b >= b'A' && b <= b'Z')
+                    || b == b'+' || b == b'-' || b == b'*' || b == b'/'
+                    || b == b'^' || b == b'%' || b == b'(' || b == b')'
+                    || b == b'.' || b == b' ' || b == b'&' || b == b'|'
+                    || b == b'~' || b == b'<' || b == b'>' || b == b'!';
+            }
+        }
+    }
+
+    pub fn insert_byte(self: *mut Self, b: u8) -> bool {
+        if !self.allows_byte(b) {
+            return false;
+        }
+        _ = self.delete_selection();
+        if self.len >= TEXT_INPUT_MAX {
+            return false;
+        }
+        var i = self.len;
+        while i > self.cursor {
+            let prev = i - 1_usize;
+            if i < 256_usize && prev < 256_usize {
+                self.buf[i] = self.buf[prev];
+            }
+            i = prev;
+        }
+        if self.cursor < 256_usize {
+            self.buf[self.cursor] = b;
+            self.len = self.len +% 1_usize;
+            self.cursor = self.cursor +% 1_usize;
+            self.sel_anchor = self.cursor;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn insert_bytes(self: *mut Self, src: *[u8]) -> bool {
+        var changed = false;
+        var i: usize = 0_usize;
+        while i < src.len {
+            if self.insert_byte(src[i]) {
+                changed = true;
+            }
+            i = i +% 1_usize;
+        }
+        return changed;
+    }
+
+    pub fn backspace(self: *mut Self) -> bool {
+        if self.delete_selection() {
+            return true;
+        }
+        if self.cursor == 0_usize || self.len == 0_usize {
+            return false;
+        }
+        let n = if self.len <= TEXT_INPUT_MAX { self.len } else { TEXT_INPUT_MAX };
+        let pos = self.cursor - 1_usize;
+        var i = pos;
+        while i +% 1_usize < n {
+            let nxt = i +% 1_usize;
+            if i < 256_usize && nxt < 256_usize {
+                self.buf[i] = self.buf[nxt];
+            }
+            i = nxt;
+        }
+        self.len = n - 1_usize;
+        self.cursor = pos;
+        self.sel_anchor = pos;
+        return true;
+    }
+
+    pub fn delete_forward(self: *mut Self) -> bool {
+        if self.delete_selection() {
+            return true;
+        }
+        let n = if self.len <= TEXT_INPUT_MAX { self.len } else { TEXT_INPUT_MAX };
+        if self.cursor >= n || n == 0_usize {
+            return false;
+        }
+        var i = self.cursor;
+        while i +% 1_usize < n {
+            let nxt = i +% 1_usize;
+            if i < 256_usize && nxt < 256_usize {
+                self.buf[i] = self.buf[nxt];
+            }
+            i = nxt;
+        }
+        self.len = n - 1_usize;
+        self.sel_anchor = self.cursor;
+        return true;
+    }
+
+    pub fn move_left(self: *mut Self, extend_sel: bool) {
+        if !extend_sel && self.has_selection() {
+            self.cursor = self.sel_start();
+            self.sel_anchor = self.cursor;
+            return;
+        }
+        if self.cursor > 0_usize {
+            self.cursor = self.cursor - 1_usize;
+        }
+        if !extend_sel {
+            self.sel_anchor = self.cursor;
+        }
+    }
+
+    pub fn move_right(self: *mut Self, extend_sel: bool) {
+        if !extend_sel && self.has_selection() {
+            self.cursor = self.sel_end();
+            self.sel_anchor = self.cursor;
+            return;
+        }
+        if self.cursor < self.len {
+            self.cursor = self.cursor +% 1_usize;
+        }
+        if !extend_sel {
+            self.sel_anchor = self.cursor;
+        }
+    }
+
+    pub fn move_home(self: *mut Self, extend_sel: bool) {
+        self.cursor = 0_usize;
+        if !extend_sel {
+            self.sel_anchor = 0_usize;
+        }
+    }
+
+    pub fn move_end(self: *mut Self, extend_sel: bool) {
+        self.cursor = self.len;
+        if !extend_sel {
+            self.sel_anchor = self.len;
+        }
+    }
+
+    /// Position cursor from a local pointer click using `eon_text` hit-testing.
+    pub fn click_at_x(self: *mut Self, text_eng: *lib.TextEngine, local_x: f32) {
+        let pos = text_eng.hit_test_bytes_x(self.font_id, self.as_bytes(), self.font_size, local_x);
+        self.cursor = if pos <= self.len { pos } else { self.len };
+        self.sel_anchor = self.cursor;
+    }
+
+    /// Handle keydown events (arrows, Home/End, Backspace/Delete, Ctrl+A/C/V).
+    pub fn handle_key(
+        self: *mut Self,
+        ke: events.KeyEvent,
+        clipboard_out: *mut events.ClipboardBuf,
+        clipboard_in: *[u8],
+    ) -> bool {
+        let shift = ke.mods.has_shift();
+        let prim = ke.mods.has_primary();
+        if prim {
+            if ke.key == .A {
+                self.select_all();
+                return true;
+            }
+            if ke.key == .C {
+                let s = self.sel_start();
+                let e = self.sel_end();
+                if e > s && e <= 256_usize {
+                    let sub = self.buf[s..e];
+                    clipboard_out.set_bytes(sub);
+                } else {
+                    clipboard_out.set_bytes(self.as_bytes());
+                }
+                return true;
+            }
+            if ke.key == .V {
+                return self.insert_bytes(clipboard_in);
+            }
+        }
+        match ke.key {
+            .Backspace => { return self.backspace(); }
+            .Delete => { return self.delete_forward(); }
+            .Left => { self.move_left(shift); return true; }
+            .Right => { self.move_right(shift); return true; }
+            .Home => { self.move_home(shift); return true; }
+            .End => { self.move_end(shift); return true; }
+            _ => { return false; }
+        }
+    }
+
+    /// Build a styled GPUI `Div` box for this input field.
+    pub fn container_div(self: *Self, th: *theme.Theme, id: u64, action_id: u32) -> div.Div {
+        return div.div()
+            .id(id)
+            .focusable(self.focus, true)
+            .on_click(action_id)
+            .cursor(.Text)
+            .w_full()
+            .h(40.0_f32)
+            .px(12.0_f32)
+            .bg(th.bg_input)
+            .border(1.0_f32, th.border)
+            .focus_border(th.border_focus)
+            .rounded(th.radius_sm)
+            .text_size(self.font_size)
+            .text_color(th.text_primary)
+            .font_mono()
+            .text_left();
+    }
+
+    /// Compute selection highlight rectangle & caret x-coordinate inside `inner` bounds.
+    pub fn caret_bounds(self: *Self, text_eng: *lib.TextEngine, inner: math_vec.Bounds) -> math_vec.Bounds {
+        let cx = text_eng.cursor_bytes_x(self.font_id, self.as_bytes(), self.font_size, self.cursor);
+        let lm = text_eng.line_metrics(self.font_id, self.font_size);
+        let y = inner.origin.y + (inner.size.height - lm.line_height) * 0.5_f32;
+        return math_vec.Bounds.from_xywh(inner.origin.x + cx, y, 2.0_f32, lm.line_height);
+    }
+}

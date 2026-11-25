@@ -1,0 +1,82 @@
+module eon_ui.components.button;
+
+import eon_gpu.scene;
+import eon_ui.div;
+import eon_ui.theme;
+
+// ============================================================================
+// SDF Rounded Button Component (`libs/eon_ui/src/components/button.eon`)
+// Drop shadow, hover/active/focus states, spring press feedback, zero allocs.
+// ============================================================================
+
+pub enum ButtonVariant : u8 {
+    Primary = 0,
+    Secondary = 1,
+    Operator = 2,
+    Accent = 3,
+    Danger = 4,
+    Ghost = 5,
+}
+
+pub fn button(th: *theme.Theme, variant: ButtonVariant, id: u64, action_id: u32) -> div.Div {
+    var d = div.div()
+        .id(id)
+        .on_click(action_id)
+        .press_spring(true)
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(th.radius_md)
+        .border(1.0_f32, th.border_subtle)
+        .focus_border(th.border_focus)
+        .text_size(th.font_md)
+        .text_center();
+
+    match variant {
+        .Primary => {
+            d = d.bg(th.btn_bg)
+                .hover_bg(th.btn_hover)
+                .active_bg(th.btn_active)
+                .text_color(th.text_primary)
+                .shadow(6.0_f32, 2.0_f32, th.shadow_color);
+        }
+        .Secondary => {
+            d = d.bg(th.btn_secondary_bg)
+                .hover_bg(th.btn_secondary_hover)
+                .active_bg(th.btn_secondary_active)
+                .text_color(th.text_secondary)
+                .shadow(4.0_f32, 1.0_f32, th.shadow_color);
+        }
+        .Operator => {
+            d = d.bg(th.btn_operator_bg)
+                .hover_bg(th.btn_operator_hover)
+                .active_bg(th.btn_operator_active)
+                .text_color(th.text_primary)
+                .shadow(6.0_f32, 2.0_f32, th.shadow_color);
+        }
+        .Accent => {
+            d = d.bg_gradient(th.accent, th.accent_end, scene.QUAD_FLAG_GRADIENT_DIAG)
+                .hover_bg(th.accent_hover)
+                .active_bg(th.accent_active)
+                .border(1.0_f32, th.accent_hover)
+                .text_color(th.text_on_accent)
+                .shadow(10.0_f32, 3.0_f32, th.shadow_color);
+        }
+        .Danger => {
+            d = d.bg(th.danger)
+                .hover_bg(th.danger_hover)
+                .active_bg(th.danger)
+                .border(1.0_f32, th.danger_hover)
+                .text_color(th.text_on_accent)
+                .shadow(6.0_f32, 2.0_f32, th.shadow_color);
+        }
+        .Ghost => {
+            d = d.bg(th.bg_panel.with_alpha(0.0_f32))
+                .hover_bg(th.btn_secondary_hover)
+                .active_bg(th.btn_secondary_active)
+                .border(0.0_f32, th.border_subtle)
+                .text_color(th.text_secondary);
+        }
+    }
+    return d;
+}

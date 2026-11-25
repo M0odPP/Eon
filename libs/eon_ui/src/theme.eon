@@ -1,0 +1,200 @@
+module eon_ui.theme;
+
+import core.color;
+
+// ============================================================================
+// Reactive Dark / Light UI Theme System (`libs/eon_ui/src/theme.eon`)
+// 100% safe, `core/`-only, zero heap allocations.
+// ============================================================================
+
+pub enum ThemeMode : u8 {
+    Dark = 0,
+    Light = 1,
+}
+
+pub struct Theme {
+    pub mode: ThemeMode;
+
+    // Surface hierarchy
+    pub bg_window: color.Rgba;
+    pub bg_panel: color.Rgba;
+    pub bg_elevated: color.Rgba;
+    pub bg_input: color.Rgba;
+
+    // Interactive button surfaces
+    pub btn_bg: color.Rgba;
+    pub btn_hover: color.Rgba;
+    pub btn_active: color.Rgba;
+
+    pub btn_secondary_bg: color.Rgba;
+    pub btn_secondary_hover: color.Rgba;
+    pub btn_secondary_active: color.Rgba;
+
+    pub btn_operator_bg: color.Rgba;
+    pub btn_operator_hover: color.Rgba;
+    pub btn_operator_active: color.Rgba;
+
+    // Accent & semantic colors
+    pub accent: color.Rgba;
+    pub accent_end: color.Rgba;
+    pub accent_hover: color.Rgba;
+    pub accent_active: color.Rgba;
+    pub danger: color.Rgba;
+    pub danger_hover: color.Rgba;
+    pub success: color.Rgba;
+
+    // Typography colors
+    pub text_primary: color.Rgba;
+    pub text_secondary: color.Rgba;
+    pub text_muted: color.Rgba;
+    pub text_on_accent: color.Rgba;
+
+    // Borders, shadows & overlays
+    pub border: color.Rgba;
+    pub border_subtle: color.Rgba;
+    pub border_focus: color.Rgba;
+    pub shadow_color: color.Rgba;
+    pub scrim: color.Rgba;
+    pub selection_bg: color.Rgba;
+
+    // Metrics scale
+    pub radius_sm: f32;
+    pub radius_md: f32;
+    pub radius_lg: f32;
+    pub spacing_xs: f32;
+    pub spacing_sm: f32;
+    pub spacing_md: f32;
+    pub spacing_lg: f32;
+    pub font_sm: f32;
+    pub font_md: f32;
+    pub font_lg: f32;
+    pub font_xl: f32;
+}
+
+impl Theme {
+    pub fn dark() -> Theme {
+        return Theme.{
+            mode: .Dark,
+            bg_window: color.Rgba.from_hex_rgb(0x11131A_u32),
+            bg_panel: color.Rgba.from_hex_rgb(0x181B24_u32),
+            bg_elevated: color.Rgba.from_hex_rgb(0x212635_u32),
+            bg_input: color.Rgba.from_hex_rgb(0x141720_u32),
+
+            btn_bg: color.Rgba.from_hex_rgb(0x232836_u32),
+            btn_hover: color.Rgba.from_hex_rgb(0x2E3446_u32),
+            btn_active: color.Rgba.from_hex_rgb(0x1A1E2A_u32),
+
+            btn_secondary_bg: color.Rgba.from_hex_rgb(0x1C202D_u32),
+            btn_secondary_hover: color.Rgba.from_hex_rgb(0x272D3E_u32),
+            btn_secondary_active: color.Rgba.from_hex_rgb(0x161923_u32),
+
+            btn_operator_bg: color.Rgba.from_hex_rgb(0x2B3352_u32),
+            btn_operator_hover: color.Rgba.from_hex_rgb(0x374268_u32),
+            btn_operator_active: color.Rgba.from_hex_rgb(0x222943_u32),
+
+            accent: color.Rgba.from_hex_rgb(0x4F7BFF_u32),
+            accent_end: color.Rgba.from_hex_rgb(0x6D5BFF_u32),
+            accent_hover: color.Rgba.from_hex_rgb(0x668DFF_u32),
+            accent_active: color.Rgba.from_hex_rgb(0x3A62DB_u32),
+            danger: color.Rgba.from_hex_rgb(0xD94E5A_u32),
+            danger_hover: color.Rgba.from_hex_rgb(0xE86470_u32),
+            success: color.Rgba.from_hex_rgb(0x38B884_u32),
+
+            text_primary: color.Rgba.from_hex_rgb(0xF2F5FC_u32),
+            text_secondary: color.Rgba.from_hex_rgb(0xA6B0C8_u32),
+            text_muted: color.Rgba.from_hex_rgb(0x6B758E_u32),
+            text_on_accent: color.Rgba.from_hex_rgb(0xFFFFFF_u32),
+
+            border: color.Rgba.from_hex_rgb(0x2E3548_u32),
+            border_subtle: color.Rgba.from_hex_rgb(0x232838_u32),
+            border_focus: color.Rgba.from_hex_rgb(0x6D94FF_u32),
+            shadow_color: color.Rgba.from_hex_rgba(0x00000078_u32),
+            scrim: color.Rgba.from_hex_rgba(0x05070CA8_u32),
+            selection_bg: color.Rgba.from_hex_rgba(0x4F7BFF55_u32),
+
+            radius_sm: 6.0_f32,
+            radius_md: 10.0_f32,
+            radius_lg: 16.0_f32,
+            spacing_xs: 4.0_f32,
+            spacing_sm: 8.0_f32,
+            spacing_md: 12.0_f32,
+            spacing_lg: 18.0_f32,
+            font_sm: 13.0_f32,
+            font_md: 16.0_f32,
+            font_lg: 22.0_f32,
+            font_xl: 36.0_f32,
+        };
+    }
+
+    pub fn light() -> Theme {
+        return Theme.{
+            mode: .Light,
+            bg_window: color.Rgba.from_hex_rgb(0xF3F5FA_u32),
+            bg_panel: color.Rgba.from_hex_rgb(0xFFFFFF_u32),
+            bg_elevated: color.Rgba.from_hex_rgb(0xE9EDF5_u32),
+            bg_input: color.Rgba.from_hex_rgb(0xFFFFFF_u32),
+
+            btn_bg: color.Rgba.from_hex_rgb(0xFFFFFF_u32),
+            btn_hover: color.Rgba.from_hex_rgb(0xEDF1FA_u32),
+            btn_active: color.Rgba.from_hex_rgb(0xDCE3F2_u32),
+
+            btn_secondary_bg: color.Rgba.from_hex_rgb(0xE6EBF5_u32),
+            btn_secondary_hover: color.Rgba.from_hex_rgb(0xD8E0F0_u32),
+            btn_secondary_active: color.Rgba.from_hex_rgb(0xC9D4E8_u32),
+
+            btn_operator_bg: color.Rgba.from_hex_rgb(0xDFE7FF_u32),
+            btn_operator_hover: color.Rgba.from_hex_rgb(0xCEDBFF_u32),
+            btn_operator_active: color.Rgba.from_hex_rgb(0xBACBFF_u32),
+
+            accent: color.Rgba.from_hex_rgb(0x3366FF_u32),
+            accent_end: color.Rgba.from_hex_rgb(0x5A4BFF_u32),
+            accent_hover: color.Rgba.from_hex_rgb(0x4777FF_u32),
+            accent_active: color.Rgba.from_hex_rgb(0x2551D9_u32),
+            danger: color.Rgba.from_hex_rgb(0xD63E4A_u32),
+            danger_hover: color.Rgba.from_hex_rgb(0xE35560_u32),
+            success: color.Rgba.from_hex_rgb(0x229968_u32),
+
+            text_primary: color.Rgba.from_hex_rgb(0x141824_u32),
+            text_secondary: color.Rgba.from_hex_rgb(0x4C5670_u32),
+            text_muted: color.Rgba.from_hex_rgb(0x7C86A0_u32),
+            text_on_accent: color.Rgba.from_hex_rgb(0xFFFFFF_u32),
+
+            border: color.Rgba.from_hex_rgb(0xCFD6E6_u32),
+            border_subtle: color.Rgba.from_hex_rgb(0xE0E5F0_u32),
+            border_focus: color.Rgba.from_hex_rgb(0x3366FF_u32),
+            shadow_color: color.Rgba.from_hex_rgba(0x141A2E26_u32),
+            scrim: color.Rgba.from_hex_rgba(0x0E132066_u32),
+            selection_bg: color.Rgba.from_hex_rgba(0x3366FF3B_u32),
+
+            radius_sm: 6.0_f32,
+            radius_md: 10.0_f32,
+            radius_lg: 16.0_f32,
+            spacing_xs: 4.0_f32,
+            spacing_sm: 8.0_f32,
+            spacing_md: 12.0_f32,
+            spacing_lg: 18.0_f32,
+            font_sm: 13.0_f32,
+            font_md: 16.0_f32,
+            font_lg: 22.0_f32,
+            font_xl: 36.0_f32,
+        };
+    }
+
+    pub fn for_mode(mode: ThemeMode) -> Theme {
+        match mode {
+            .Dark => { return Theme.dark(); }
+            .Light => { return Theme.light(); }
+        }
+    }
+
+    pub fn is_dark(self: *Self) -> bool {
+        return self.mode == .Dark;
+    }
+
+    pub fn toggled(self: *Self) -> Theme {
+        if self.mode == .Dark {
+            return Theme.light();
+        }
+        return Theme.dark();
+    }
+}

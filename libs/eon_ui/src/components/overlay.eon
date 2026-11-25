@@ -1,0 +1,75 @@
+module eon_ui.components.overlay;
+
+import eon_ui.div;
+import eon_ui.theme;
+
+// ============================================================================
+// Z-Layered Overlay / Modal / Drawer / Tooltip (`libs/eon_ui/src/components/overlay.eon`)
+// 100% safe, `core/`-only, zero heap allocations.
+// ============================================================================
+
+pub const Z_OVERLAY_SCRIM: i16 = 100_i16;
+pub const Z_OVERLAY_MODAL: i16 = 110_i16;
+pub const Z_OVERLAY_TOOLTIP: i16 = 120_i16;
+
+/// Full-viewport translucent scrim behind modals/drawers (clicking dismisses via `dismiss_action`).
+pub fn backdrop(th: *theme.Theme, id: u64, dismiss_action: u32) -> div.Div {
+    return div.div()
+        .id(id)
+        .on_click(dismiss_action)
+        .absolute()
+        .inset_all(0.0_f32)
+        .z_index(Z_OVERLAY_SCRIM)
+        .bg(th.scrim)
+        .flex()
+        .items_center()
+        .justify_center();
+}
+
+/// Elevated centered modal dialog card rendered on top z-layer.
+pub fn modal_card(th: *theme.Theme, width: f32) -> div.Div {
+    return div.div()
+        .z_index(Z_OVERLAY_MODAL)
+        .flex_col()
+        .gap(12.0_f32)
+        .p(18.0_f32)
+        .w(width)
+        .bg(th.bg_elevated)
+        .border(1.0_f32, th.border)
+        .rounded(th.radius_lg)
+        .shadow(22.0_f32, 8.0_f32, th.shadow_color);
+}
+
+/// Right-docked slide-over drawer panel (ideal for mobile/compact History overlay).
+pub fn side_drawer(th: *theme.Theme, width: f32) -> div.Div {
+    return div.div()
+        .absolute()
+        .top(0.0_f32)
+        .right(0.0_f32)
+        .bottom(0.0_f32)
+        .w(width)
+        .z_index(Z_OVERLAY_MODAL)
+        .flex_col()
+        .gap(8.0_f32)
+        .p(14.0_f32)
+        .bg(th.bg_panel)
+        .border(1.0_f32, th.border)
+        .shadow(18.0_f32, 0.0_f32, th.shadow_color);
+}
+
+/// Floating tooltip bubble positioned at `(x, y)` above all UI layers.
+pub fn tooltip(th: *theme.Theme, x: f32, y: f32) -> div.Div {
+    return div.div()
+        .absolute()
+        .left(x)
+        .top(y)
+        .z_index(Z_OVERLAY_TOOLTIP)
+        .px(10.0_f32)
+        .py(6.0_f32)
+        .bg(th.bg_elevated)
+        .border(1.0_f32, th.border)
+        .rounded(th.radius_sm)
+        .shadow(10.0_f32, 3.0_f32, th.shadow_color)
+        .text_size(th.font_sm)
+        .text_color(th.text_primary);
+}

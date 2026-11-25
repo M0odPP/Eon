@@ -1,0 +1,258 @@
+module eon_ui.context;
+
+import eon_ui.theme;
+import eon_ui.animation;
+import eon_ui.input;
+import eon_ui.keymap;
+import eon_ui.entity;
+
+// ============================================================================
+// GPUI-Class Multi-Window Application & View Context (`libs/eon_ui/src/context.eon`)
+// 100% safe. `UiContextCore` is `core/`-only (zero heap allocs, runs on nostd);
+// `AppContext` adds hosted `EntityGraph` (`SlotPool[EntityMeta]`) & dirty scheduler.
+// ============================================================================
+
+pub const MAX_WINDOWS: usize = 8_usize;
+
+pub struct WindowSlot {
+    pub active: bool;
+    pub width: u32;
+    pub height: u32;
+    pub scale_factor: f32;
+    pub dirty: bool;
+    pub frame_index: u64;
+}
+
+impl WindowSlot {
+    @inline
+    pub fn empty() -> WindowSlot {
+        return WindowSlot.{
+            active: false,
+            width: 0_u32,
+            height: 0_u32,
+            scale_factor: 1.0_f32,
+            dirty: false,
+            frame_index: 0_u64,
+        };
+    }
+}
+
+/// Freestanding UI context shared identically between hosted OS apps and bare-metal `nostd`.
+pub struct UiContextCore {
+    pub theme: theme.Theme;
+    pub anim: animation.AnimStore;
+    pub focus: input.FocusTree;
+    pub keymap: keymap.Keymap;
+    pub input: input.InputState;
+    pub windows: [8]WindowSlot;
+    pub active_window: u32;
+    pub dt_sec: f32;
+    pub elapsed_sec: f32;
+}
+
+impl UiContextCore {
+    pub fn new(width: u32, height: u32) -> UiContextCore {
+        var wins: [8]WindowSlot = [WindowSlot.empty(); 8];
+        wins[0_usize] = WindowSlot.{
+            active: true,
+            width: width,
+            height: height,
+            scale_factor: 1.0_f32,
+            dirty: true,
+            frame_index: 0_u64,
+        };
+        return UiContextCore.{
+            theme: theme.Theme.dark(),
+            anim: animation.AnimStore.new(),
+            focus: input.FocusTree.new(),
+            keymap: keymap.Keymap.new(),
+            input: input.InputState.new(),
+            windows: wins,
+            active_window: 0_u32,
+            dt_sec: 1.0_f32 / 120.0_f32,
+            elapsed_sec: 0.0_f32,
+        };
+    }
+
+    pub fn open_window_slot(self: *mut Self, width: u32, height: u32, scale: f32) -> ?u32 {
+        var i: usize = 0_usize;
+        while i < MAX_WINDOWS {
+            if !self.windows[i].active {
+                self.windows[i] = WindowSlot.{
+                    active: true,
+                    width: width,
+                    height: height,
+                    scale_factor: scale,
+                    dirty: true,
+                    frame_index: 0_u64,
+                };
+                return i.trunc.[u32]();
+            }
+            i = i +% 1_usize;
+        }
+        return null;
+    }
+
+    pub fn close_window_slot(self: *mut Self, win_id: u32) {
+        let idx = win_id.widen.[usize]();
+        if idx < MAX_WINDOWS {
+            self.windows[idx].active = false;
+            self.windows[idx].dirty = false;
+        }
+    }
+
+    pub fn mark_dirty(self: *mut Self, win_id: u32) {
+        let idx = win_id.widen.[usize]();
+        if idx < MAX_WINDOWS && self.windows[idx].active {
+            self.windows[idx].dirty = true;
+        }
+    }
+
+    pub fn mark_all_dirty(self: *mut Self) {
+        var i: usize = 0_usize;
+        while i < MAX_WINDOWS {
+            if self.windows[i].active {
+                self.windows[i].dirty = true;
+            }
+            i = i +% 1_usize;
+        }
+    }
+
+    pub fn clear_dirty(self: *mut Self, win_id: u32) {
+        let idx = win_id.widen.[usize]();
+        if idx < MAX_WINDOWS {
+            self.windows[idx].dirty = false;
+            self.windows[idx].frame_index = self.windows[idx].frame_index +% 1_u64;
+        }
+    }
+
+    pub fn is_window_dirty(self: *Self, win_id: u32) -> bool {
+        let idx = win_id.widen.[usize]();
+        if idx < MAX_WINDOWS {
+            return self.windows[idx].active && self.windows[idx].dirty;
+        }
+        return false;
+    }
+
+    pub fn needs_frame(self: *Self) -> bool {
+        if self.anim.is_animating() {
+            return true;
+        }
+        var i: usize = 0_usize;
+        while i < MAX_WINDOWS {
+            if self.windows[i].active && self.windows[i].dirty {
+                return true;
+            }
+            i = i +% 1_usize;
+        }
+        return false;
+    }
+
+    pub fn set_theme_mode(self: *mut Self, mode: theme.ThemeMode) {
+        self.theme = theme.Theme.for_mode(mode);
+        self.mark_all_dirty();
+    }
+
+    pub fn toggle_theme(self: *mut Self) {
+        self.theme = self.theme.toggled();
+        self.mark_all_dirty();
+    }
+
+    pub fn tick_animations(self: *mut Self, dt_sec: f32) -> bool {
+        self.dt_sec = dt_sec;
+        self.elapsed_sec = self.elapsed_sec + dt_sec;
+        let moving = self.anim.tick(dt_sec);
+        if moving {
+            self.mark_all_dirty();
+        }
+        return moving;
+    }
+
+    pub fn viewport_width(self: *Self) -> f32 {
+        let idx = self.active_window.widen.[usize]();
+        if idx < MAX_WINDOWS {
+            return self.windows[idx].width.to_float.[f32]();
+        }
+        return 800.0_f32;
+    }
+
+    pub fn viewport_height(self: *Self) -> f32 {
+        let idx = self.active_window.widen.[usize]();
+        if idx < MAX_WINDOWS && idx < 8_usize {
+            return self.windows[idx].height.to_float.[f32]();
+        }
+        return 600.0_f32;
+    }
+}
+
+/// Full hosted GPUI `AppContext` combining `UiContextCore` with the retained
+/// `SlotPool`-backed `EntityGraph` (`observe` / `subscribe` / `notify` / `emit`).
+pub linear struct AppContext {
+    pub core: UiContextCore;
+    pub entities: entity.EntityGraph;
+}
+
+impl AppContext {
+    pub fn init(alloc: *mut AllocCap, width: u32, height: u32) -> AppContext ! OutOfMemory {
+        let entities = try entity.EntityGraph.init(alloc, 32_usize);
+        return AppContext.{
+            core: UiContextCore.new(width, height),
+            entities: entities,
+        };
+    }
+
+    pub fn destroy(self: AppContext, alloc: *mut AllocCap) {
+        let AppContext.{ core: _, entities } = self;
+        entities.destroy(alloc);
+    }
+
+    pub fn notify(self: *mut Self, alloc: *mut AllocCap, e: GenId[entity.EntityMeta]) -> !OutOfMemory {
+        try self.entities.notify(alloc, e);
+        return;
+    }
+
+    pub fn observe(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        source: GenId[entity.EntityMeta],
+        observer: GenId[entity.EntityMeta],
+        callback_tag: u32,
+    ) -> usize ! OutOfMemory {
+        return try self.entities.observe(alloc, source, observer, callback_tag);
+    }
+
+    pub fn subscribe(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        emitter: GenId[entity.EntityMeta],
+        subscriber: GenId[entity.EntityMeta],
+        event_kind: u32,
+        callback_tag: u32,
+    ) -> usize ! OutOfMemory {
+        return try self.entities.subscribe(alloc, emitter, subscriber, event_kind, callback_tag);
+    }
+
+    pub fn emit(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        emitter: GenId[entity.EntityMeta],
+        event_kind: u32,
+        payload_u64: u64,
+    ) -> !OutOfMemory {
+        try self.entities.emit(alloc, emitter, event_kind, payload_u64);
+        return;
+    }
+
+    /// Flush all deferred entity notifications & events and mark affected windows dirty.
+    pub fn flush_effects(self: *mut Self, alloc: *mut AllocCap) -> usize ! OutOfMemory {
+        let mask = try self.entities.flush_effects(alloc);
+        var wi: u32 = 0_u32;
+        while wi < 8_u32 {
+            if ((mask >> wi.widen.[u64]()) & 1_u64) != 0_u64 {
+                self.core.mark_dirty(wi);
+            }
+            wi = wi +% 1_u32;
+        }
+        return self.entities.dispatched.len();
+    }
+}

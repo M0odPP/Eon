@@ -1,0 +1,82 @@
+module eon_ui.components.toggle;
+
+import core.color;
+import eon_ui.div;
+import eon_ui.theme;
+import eon_ui.animation;
+
+// ============================================================================
+// Animated Pill Toggle Switch & Segmented Tab Bar (`libs/eon_ui/src/components/toggle.eon`)
+// 100% safe, `core/`-only, zero heap allocations.
+// ============================================================================
+
+/// Pill toggle track `Div` with spring-animated color blend between off & on.
+pub fn toggle_track(th: *theme.Theme, id: u64, action_id: u32, checked: bool, anim_t: f32) -> div.Div {
+    let t = animation.clamp01(anim_t);
+    let bg = animation.lerp_rgba(th.btn_secondary_bg, th.accent, t);
+    let hover = if checked { th.accent_hover } else { th.btn_secondary_hover };
+    return div.div()
+        .id(id)
+        .on_click(action_id)
+        .w(44.0_f32)
+        .h(24.0_f32)
+        .rounded(12.0_f32)
+        .bg(bg)
+        .hover_bg(hover)
+        .border(1.0_f32, th.border);
+}
+
+/// Sliding circular knob inside `toggle_track`, positioned at `anim_t in [0..1]`.
+pub fn toggle_knob(th: *theme.Theme, anim_t: f32) -> div.Div {
+    let t = animation.clamp01(anim_t);
+    let x = 3.0_f32 + t * 20.0_f32;
+    return div.div()
+        .absolute()
+        .left(x)
+        .top(2.5_f32)
+        .w(18.0_f32)
+        .h(18.0_f32)
+        .rounded(9.0_f32)
+        .bg(color.Rgba.white())
+        .shadow(3.0_f32, 1.0_f32, th.shadow_color);
+}
+
+/// Segmented pill group container (e.g. `Standard | Scientific | Programmer`).
+pub fn segmented_group(th: *theme.Theme) -> div.Div {
+    return div.div()
+        .flex_row()
+        .gap(4.0_f32)
+        .p(3.0_f32)
+        .bg(th.bg_panel)
+        .border(1.0_f32, th.border_subtle)
+        .rounded(th.radius_md);
+}
+
+/// Individual segment button inside `segmented_group`.
+pub fn segment_item(th: *theme.Theme, id: u64, action_id: u32, selected: bool) -> div.Div {
+    if selected {
+        return div.div()
+            .id(id)
+            .on_click(action_id)
+            .px(10.0_f32)
+            .py(5.0_f32)
+            .rounded(th.radius_sm)
+            .bg(th.accent)
+            .hover_bg(th.accent_hover)
+            .text_size(th.font_sm)
+            .text_color(th.text_on_accent)
+            .text_center();
+    }
+    return div.div()
+        .id(id)
+        .on_click(action_id)
+        .px(10.0_f32)
+        .py(5.0_f32)
+        .rounded(th.radius_sm)
+        .bg(th.bg_panel.with_alpha(0.0_f32))
+        .hover_bg(th.btn_hover)
+        .active_bg(th.btn_active)
+        .text_size(th.font_sm)
+        .text_color(th.text_secondary)
+        .text_center();
+}

@@ -1,0 +1,446 @@
+module eon_ui.entity;
+
+import core.col;
+
+// ============================================================================
+// Retained Generational Entity Store on Eon's `SlotPool` (`libs/eon_ui/src/entity.eon`)
+// Zero `Rc<RefCell>`, zero borrow-checker conflicts, O(1) generation validation,
+// deferred reactive effect queue (`notify` / `observe` / `subscribe` / `emit`).
+// ============================================================================
+
+/// Native SoA `pool` stored inside Eon's built-in `SlotPool[EntityMeta]` for
+/// retained reactive UI entity metadata, dirty propagation, and parent/child graph.
+pub pool EntityMeta {
+    pub type_tag: u32;
+    pub version: u64;
+    pub dirty: u8;
+    pub window_id: u32;
+    pub parent: ?Link[Self];
+    pub first_child: ?Link[Self];
+    pub next_sibling: ?Link[Self];
+}
+
+/// Strongly typed generational handle to a retained entity inside `EntityStore[T]`.
+pub struct Entity[T] {
+    pub slot: u32;
+    pub gen: u32;
+    pub meta: GenId[EntityMeta];
+}
+
+/// Non-owning weak generational handle upgraded safely via `upgrade()`.
+pub struct WeakEntity[T] {
+    pub slot: u32;
+    pub gen: u32;
+    pub meta: GenId[EntityMeta];
+}
+
+impl[T] Entity[T] {
+    @inline
+    pub fn downgrade(self: Self) -> WeakEntity[T] {
+        return WeakEntity.[T].{
+            slot: self.slot,
+            gen: self.gen,
+            meta: self.meta,
+        };
+    }
+
+    @inline
+    pub fn raw_key(self: Self) -> u64 {
+        return self.slot.widen.[u64]() | (self.gen.widen.[u64]() <<% 32_u64);
+    }
+}
+
+/// Generic retained entity storage for any user state type `T`, paired with
+/// generational validation (reuses freed slots without ABA bugs).
+pub linear struct EntityStore[T] {
+    items: Buf[T];
+    gens: col.DynBuf[u32];
+    alive: col.DynBuf[u8];
+    free_list: col.DynBuf[u32];
+    live_count: usize;
+}
+
+impl[T] EntityStore[T] {
+    pub fn init(alloc: *mut AllocCap, cap: usize) -> EntityStore[T] ! OutOfMemory {
+        let c = if cap < 8_usize { 8_usize } else { cap };
+        let items = try Buf.[T].init(alloc, c);
+        errdefer items.destroy(alloc);
+        let gens = try col.DynBuf.[u32].init(alloc, c);
+        errdefer gens.destroy(alloc);
+        let alive = try col.DynBuf.[u8].init(alloc, c);
+        errdefer alive.destroy(alloc);
+        let free_list = try col.DynBuf.[u32].init(alloc, 8_usize);
+        errdefer free_list.destroy(alloc);
+        return EntityStore.[T].{
+            items: items,
+            gens: gens,
+            alive: alive,
+            free_list: free_list,
+            live_count: 0_usize,
+        };
+    }
+
+    pub fn destroy(self: EntityStore[T], alloc: *mut AllocCap) {
+        let EntityStore.{ items, gens, alive, free_list, live_count: _ } = self;
+        items.destroy(alloc);
+        gens.destroy(alloc);
+        alive.destroy(alloc);
+        free_list.destroy(alloc);
+    }
+
+    pub fn len(self: *Self) -> usize {
+        return self.live_count;
+    }
+
+    pub fn insert(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        meta_pool: *mut SlotPool[EntityMeta],
+        type_tag: u32,
+        window_id: u32,
+        val: T,
+    ) -> Entity[T] ! OutOfMemory {
+        let meta = try meta_pool.insert(alloc, .{
+            type_tag: type_tag,
+            version: 1_u64,
+            dirty: 1_u8,
+            window_id: window_id,
+            parent: null,
+            first_child: null,
+            next_sibling: null,
+        });
+        if let free_slot = self.free_list.pop() {
+            let idx = free_slot.widen.[usize]();
+            let its = self.items.as_mut_slice();
+            let gs = self.gens.as_mut_slice();
+            let al = self.alive.as_mut_slice();
+            if idx < its.len && idx < gs.len && idx < al.len {
+                its[idx] = val;
+                let next_gen = gs[idx] +% 1_u32;
+                gs[idx] = if next_gen == 0_u32 { 1_u32 } else { next_gen };
+                al[idx] = 1_u8;
+                self.live_count = self.live_count +% 1_usize;
+                return Entity.[T].{ slot: free_slot, gen: gs[idx], meta: meta };
+            }
+        }
+        if self.items.len() >= self.items.cap() {
+            let cur_cap = self.items.cap();
+            let new_cap = if cur_cap < 8_usize { 8_usize } else { cur_cap *% 2_usize };
+            var new_items = try Buf.[T].init(alloc, new_cap);
+            errdefer new_items.destroy(alloc);
+            try new_items.push_slice(self.items.as_slice());
+            self.items.destroy(alloc);
+            self.items = new_items;
+        }
+        let slot = self.items.len().trunc.[u32]();
+        try self.items.push(val);
+        try self.gens.push(alloc, 1_u32);
+        try self.alive.push(alloc, 1_u8);
+        self.live_count = self.live_count +% 1_usize;
+        return Entity.[T].{ slot: slot, gen: 1_u32, meta: meta };
+    }
+
+    pub fn is_alive(self: *Self, slot: u32, gen: u32) -> bool {
+        let idx = slot.widen.[usize]();
+        let gs = self.gens.as_slice();
+        let al = self.alive.as_slice();
+        if idx < gs.len && idx < al.len {
+            return al[idx] != 0_u8 && gs[idx] == gen;
+        }
+        return false;
+    }
+
+    pub fn upgrade(self: *Self, weak: WeakEntity[T]) -> ?Entity[T] {
+        if self.is_alive(weak.slot, weak.gen) {
+            return Entity.[T].{ slot: weak.slot, gen: weak.gen, meta: weak.meta };
+        }
+        return null;
+    }
+
+    pub view fn read(self: *Self, h: Entity[T]) -> ?*T {
+        if !self.is_alive(h.slot, h.gen) {
+            return null;
+        }
+        return self.items.get(h.slot.widen.[usize]());
+    }
+
+    pub view fn update_mut(self: *mut Self, h: Entity[T]) -> ?*mut T {
+        if !self.is_alive(h.slot, h.gen) {
+            return null;
+        }
+        return self.items.get_mut(h.slot.widen.[usize]());
+    }
+
+    pub fn remove(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        meta_pool: *mut SlotPool[EntityMeta],
+        h: Entity[T],
+    ) -> bool ! OutOfMemory {
+        if !self.is_alive(h.slot, h.gen) {
+            return false;
+        }
+        let idx = h.slot.widen.[usize]();
+        let al = self.alive.as_mut_slice();
+        let gs = self.gens.as_mut_slice();
+        if idx < al.len && idx < gs.len {
+            al[idx] = 0_u8;
+            gs[idx] = gs[idx] +% 1_u32;
+        }
+        if self.live_count > 0_usize {
+            self.live_count = self.live_count - 1_usize;
+        }
+        try self.free_list.push(alloc, h.slot);
+        _ = meta_pool.remove(h.meta) catch { return true; };
+        return true;
+    }
+}
+
+/// Reactive subscription & observer bindings (flushed safely after state updates).
+pub struct ObserverEntry {
+    pub source: GenId[EntityMeta];
+    pub observer: GenId[EntityMeta];
+    pub callback_tag: u32;
+    pub active: bool;
+}
+
+pub struct SubscriptionEntry {
+    pub emitter: GenId[EntityMeta];
+    pub subscriber: GenId[EntityMeta];
+    pub event_kind: u32;
+    pub callback_tag: u32;
+    pub active: bool;
+}
+
+pub enum EffectKind : u8 {
+    Notify = 0,
+    Emit = 1,
+    MarkWindowDirty = 2,
+    RequestClose = 3,
+}
+
+pub struct DeferredEffect {
+    pub kind: EffectKind;
+    pub entity: GenId[EntityMeta];
+    pub event_kind: u32;
+    pub payload_u64: u64;
+    pub window_id: u32;
+}
+
+pub struct DispatchedNotification {
+    pub target: GenId[EntityMeta];
+    pub source: GenId[EntityMeta];
+    pub callback_tag: u32;
+    pub event_kind: u32;
+    pub payload_u64: u64;
+}
+
+/// Core reactive graph & deferred effect queue over `SlotPool[EntityMeta]`.
+/// Guarantees zero re-entrant mutable aliasing (no `Rc<RefCell>` panics ever!).
+pub linear struct EntityGraph {
+    pub meta: SlotPool[EntityMeta];
+    pub observers: col.DynBuf[ObserverEntry];
+    pub subscriptions: col.DynBuf[SubscriptionEntry];
+    pub pending_effects: col.DynBuf[DeferredEffect];
+    pub dispatched: col.DynBuf[DispatchedNotification];
+    pub total_notifications: u64;
+    pub total_emissions: u64;
+}
+
+impl EntityGraph {
+    pub fn init(alloc: *mut AllocCap, initial_cap: usize) -> EntityGraph ! OutOfMemory {
+        let cap = if initial_cap < 16_usize { 16_usize } else { initial_cap };
+        let meta = try SlotPool.[EntityMeta].init(alloc, cap);
+        errdefer meta.destroy(alloc);
+        let observers = try col.DynBuf.[ObserverEntry].init(alloc, 16_usize);
+        errdefer observers.destroy(alloc);
+        let subscriptions = try col.DynBuf.[SubscriptionEntry].init(alloc, 16_usize);
+        errdefer subscriptions.destroy(alloc);
+        let pending_effects = try col.DynBuf.[DeferredEffect].init(alloc, 32_usize);
+        errdefer pending_effects.destroy(alloc);
+        let dispatched = try col.DynBuf.[DispatchedNotification].init(alloc, 32_usize);
+        errdefer dispatched.destroy(alloc);
+        return EntityGraph.{
+            meta: meta,
+            observers: observers,
+            subscriptions: subscriptions,
+            pending_effects: pending_effects,
+            dispatched: dispatched,
+            total_notifications: 0_u64,
+            total_emissions: 0_u64,
+        };
+    }
+
+    pub fn destroy(self: EntityGraph, alloc: *mut AllocCap) {
+        let EntityGraph.{
+            meta,
+            observers,
+            subscriptions,
+            pending_effects,
+            dispatched,
+            total_notifications: _,
+            total_emissions: _,
+        } = self;
+        meta.destroy(alloc);
+        observers.destroy(alloc);
+        subscriptions.destroy(alloc);
+        pending_effects.destroy(alloc);
+        dispatched.destroy(alloc);
+    }
+
+    pub fn observe(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        source: GenId[EntityMeta],
+        observer: GenId[EntityMeta],
+        callback_tag: u32,
+    ) -> usize ! OutOfMemory {
+        let idx = self.observers.len();
+        try self.observers.push(alloc, ObserverEntry.{
+            source: source,
+            observer: observer,
+            callback_tag: callback_tag,
+            active: true,
+        });
+        return idx;
+    }
+
+    pub fn subscribe(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        emitter: GenId[EntityMeta],
+        subscriber: GenId[EntityMeta],
+        event_kind: u32,
+        callback_tag: u32,
+    ) -> usize ! OutOfMemory {
+        let idx = self.subscriptions.len();
+        try self.subscriptions.push(alloc, SubscriptionEntry.{
+            emitter: emitter,
+            subscriber: subscriber,
+            event_kind: event_kind,
+            callback_tag: callback_tag,
+            active: true,
+        });
+        return idx;
+    }
+
+    pub fn notify(self: *mut Self, alloc: *mut AllocCap, entity: GenId[EntityMeta]) -> !OutOfMemory {
+        var win_id: u32 = 0_u32;
+        if let row = self.meta.get(entity) {
+            win_id = row.window_id;
+            let next_v = row.version +% 1_u64;
+            self.meta.version[entity] = next_v;
+            self.meta.dirty[entity] = 1_u8;
+        }
+        try self.pending_effects.push(alloc, DeferredEffect.{
+            kind: .Notify,
+            entity: entity,
+            event_kind: 0_u32,
+            payload_u64: 0_u64,
+            window_id: win_id,
+        });
+        return;
+    }
+
+    pub fn emit(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        emitter: GenId[EntityMeta],
+        event_kind: u32,
+        payload_u64: u64,
+    ) -> !OutOfMemory {
+        var win_id: u32 = 0_u32;
+        if let row = self.meta.get(emitter) {
+            win_id = row.window_id;
+        }
+        try self.pending_effects.push(alloc, DeferredEffect.{
+            kind: .Emit,
+            entity: emitter,
+            event_kind: event_kind,
+            payload_u64: payload_u64,
+            window_id: win_id,
+        });
+        return;
+    }
+
+    /// Flush all deferred effects into `self.dispatched` and return bitmask of dirty windows.
+    pub fn flush_effects(self: *mut Self, alloc: *mut AllocCap) -> u64 ! OutOfMemory {
+        self.dispatched.clear();
+        var dirty_win_mask: u64 = 0_u64;
+        var idx: usize = 0_usize;
+        while idx < self.pending_effects.len() {
+            let pe_sl = self.pending_effects.as_slice();
+            if idx >= pe_sl.len { break; }
+            let eff = pe_sl[idx];
+            match eff.kind {
+                .Notify => {
+                    self.total_notifications = self.total_notifications +% 1_u64;
+                    if eff.window_id < 64_u32 {
+                        dirty_win_mask = dirty_win_mask | (1_u64 <<% eff.window_id.widen.[u64]());
+                    }
+                    let obs = self.observers.as_slice();
+                    var oi: usize = 0_usize;
+                    while oi < obs.len {
+                        let o = obs[oi];
+                        if o.active && o.source == eff.entity {
+                            if let orow = self.meta.get(o.observer) {
+                                self.meta.dirty[o.observer] = 1_u8;
+                                if orow.window_id < 64_u32 {
+                                    dirty_win_mask = dirty_win_mask | (1_u64 <<% orow.window_id.widen.[u64]());
+                                }
+                                try self.dispatched.push(alloc, DispatchedNotification.{
+                                    target: o.observer,
+                                    source: eff.entity,
+                                    callback_tag: o.callback_tag,
+                                    event_kind: 0_u32,
+                                    payload_u64: 0_u64,
+                                });
+                            }
+                        }
+                        oi = oi +% 1_usize;
+                    }
+                }
+                .Emit => {
+                    self.total_emissions = self.total_emissions +% 1_u64;
+                    let subs = self.subscriptions.as_slice();
+                    var si: usize = 0_usize;
+                    while si < subs.len {
+                        let s = subs[si];
+                        if s.active && s.emitter == eff.entity && (s.event_kind == 0_u32 || s.event_kind == eff.event_kind) {
+                            if let srow = self.meta.get(s.subscriber) {
+                                self.meta.dirty[s.subscriber] = 1_u8;
+                                if srow.window_id < 64_u32 {
+                                    dirty_win_mask = dirty_win_mask | (1_u64 <<% srow.window_id.widen.[u64]());
+                                }
+                                try self.dispatched.push(alloc, DispatchedNotification.{
+                                    target: s.subscriber,
+                                    source: eff.entity,
+                                    callback_tag: s.callback_tag,
+                                    event_kind: eff.event_kind,
+                                    payload_u64: eff.payload_u64,
+                                });
+                            }
+                        }
+                        si = si +% 1_usize;
+                    }
+                }
+                .MarkWindowDirty => {
+                    if eff.window_id < 64_u32 {
+                        dirty_win_mask = dirty_win_mask | (1_u64 <<% eff.window_id.widen.[u64]());
+                    }
+                }
+                .RequestClose => {}
+            }
+            idx = idx +% 1_usize;
+        }
+        self.pending_effects.clear();
+        return dirty_win_mask;
+    }
+
+    pub fn version_of(self: *Self, entity: GenId[EntityMeta]) -> u64 {
+        if let row = self.meta.get(entity) {
+            return row.version;
+        }
+        return 0_u64;
+    }
+}

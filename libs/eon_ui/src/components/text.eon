@@ -1,0 +1,77 @@
+module eon_ui.components.text;
+
+import core.color;
+import eon_text.lib;
+import eon_ui.div;
+import eon_ui.theme;
+
+// ============================================================================
+// Text Widget Helpers (`libs/eon_ui/src/components/text.eon`)
+// 100% safe, `core/`-only, zero heap allocations.
+// ============================================================================
+
+/// Single-line label with theme typography defaults.
+pub fn label(th: *theme.Theme, size_px: f32) -> div.Div {
+    return div.div()
+        .text_size(size_px)
+        .text_color(th.text_primary)
+        .font_sans()
+        .text_left();
+}
+
+/// Secondary / muted caption label.
+pub fn caption(th: *theme.Theme) -> div.Div {
+    return div.div()
+        .text_size(th.font_sm)
+        .text_color(th.text_secondary)
+        .font_sans()
+        .text_left();
+}
+
+/// Monospace numeric / code readout (auto-aligned right or left).
+pub fn mono_label(_th: *theme.Theme, size_px: f32, col: color.Rgba) -> div.Div {
+    return div.div()
+        .text_size(size_px)
+        .text_color(col)
+        .font_mono()
+        .text_right();
+}
+
+/// Multi-line wrapped paragraph text container.
+pub fn paragraph(th: *theme.Theme, size_px: f32) -> div.Div {
+    return div.div()
+        .w_full()
+        .text_size(size_px)
+        .text_color(th.text_primary)
+        .font_sans()
+        .text_wrap();
+}
+
+/// Ellipsized single-line text label (`…` truncation when wider than container).
+pub fn ellipsis_label(_th: *theme.Theme, size_px: f32, col: color.Rgba) -> div.Div {
+    return div.div()
+        .text_size(size_px)
+        .text_color(col)
+        .font_sans()
+        .text_ellipsis();
+}
+
+/// Choose the largest font size from `[max_px .. min_px]` so `text` fits inside `max_w`.
+pub fn fit_font_size(
+    text_eng: *lib.TextEngine,
+    font_id: u16,
+    text: *[u8],
+    max_w: f32,
+    max_px: f32,
+    min_px: f32,
+) -> f32 {
+    if max_w <= 1.0_f32 || text.len == 0_usize {
+        return max_px;
+    }
+    let m = text_eng.measure_bytes(font_id, text, max_px);
+    if m.width <= max_w || m.width <= 0.1_f32 {
+        return max_px;
+    }
+    let scaled = max_px * (max_w / m.width) * 0.96_f32;
+    return if scaled < min_px { min_px } else { scaled };
+}

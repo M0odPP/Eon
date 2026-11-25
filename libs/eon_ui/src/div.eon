@@ -1,0 +1,449 @@
+module eon_ui.div;
+
+import core.color;
+import core.math_vec;
+import eon_win.events;
+import eon_gpu.scene;
+import eon_text.lib;
+import eon_ui.style;
+import eon_ui.input;
+import eon_ui.keymap;
+
+// ============================================================================
+// GPUI-Style Fluent `div()` Element Builder (`libs/eon_ui/src/div.eon`)
+// 100% safe, `core/`-only, zero heap allocations, identical expressiveness to GPUI.
+// ============================================================================
+
+pub struct Div {
+    pub style: style.Style;
+    pub element_id: u64;
+    pub action_id: u32;
+    pub focus_id: u32;
+    pub focus_ctx: u16;
+    pub tab_stop: bool;
+    pub scroll_id: u32;
+    pub scroll_x: f32;
+    pub scroll_y: f32;
+    pub underline_enabled: bool;
+    pub underline_wavy: bool;
+    pub underline_color: color.Rgba;
+}
+
+/// Create a new fluent `Div` builder (GPUI entry point: `div().flex().flex_col()...`).
+pub fn div() -> Div {
+    return Div.{
+        style: style.Style.default(),
+        element_id: 0_u64,
+        action_id: keymap.ACTION_NONE,
+        focus_id: input.FOCUS_NONE,
+        focus_ctx: keymap.CTX_GLOBAL,
+        tab_stop: false,
+        scroll_id: 0_u32,
+        scroll_x: 0.0_f32,
+        scroll_y: 0.0_f32,
+        underline_enabled: false,
+        underline_wavy: false,
+        underline_color: color.Rgba.transparent(),
+    };
+}
+
+impl Div {
+    // --- Identity & Interaction ---
+    pub fn id(mut self: Self, id: u64) -> Div {
+        self.element_id = id;
+        return self;
+    }
+
+    pub fn on_click(mut self: Self, action_id: u32) -> Div {
+        self.action_id = action_id;
+        if self.style.cursor == .Default {
+            self.style.cursor = .Pointer;
+        }
+        return self;
+    }
+
+    pub fn focusable(mut self: Self, handle: input.FocusHandle, tab_stop: bool) -> Div {
+        self.focus_id = handle.id;
+        self.tab_stop = tab_stop;
+        return self;
+    }
+
+    pub fn key_context(mut self: Self, ctx_id: u16) -> Div {
+        self.focus_ctx = ctx_id;
+        return self;
+    }
+
+    pub fn scrollable(mut self: Self, scroll_id: u32, scroll_x: f32, scroll_y: f32) -> Div {
+        self.scroll_id = scroll_id;
+        self.scroll_x = scroll_x;
+        self.scroll_y = scroll_y;
+        self.style.overflow = .Scroll;
+        return self;
+    }
+
+    pub fn cursor(mut self: Self, shape: events.CursorShape) -> Div {
+        self.style.cursor = shape;
+        return self;
+    }
+
+    pub fn disabled(mut self: Self, flag: bool) -> Div {
+        self.style.disabled = flag;
+        return self;
+    }
+
+    pub fn press_spring(mut self: Self, enabled: bool) -> Div {
+        self.style.press_spring = enabled;
+        return self;
+    }
+
+    // --- Display & Position ---
+    pub fn flex(mut self: Self) -> Div {
+        self.style.display = .Flex;
+        return self;
+    }
+
+    pub fn flex_row(mut self: Self) -> Div {
+        self.style.display = .Flex;
+        self.style.flex_dir = .Row;
+        return self;
+    }
+
+    pub fn flex_col(mut self: Self) -> Div {
+        self.style.display = .Flex;
+        self.style.flex_dir = .Column;
+        return self;
+    }
+
+    pub fn flex_row_reverse(mut self: Self) -> Div {
+        self.style.display = .Flex;
+        self.style.flex_dir = .RowReverse;
+        return self;
+    }
+
+    pub fn flex_col_reverse(mut self: Self) -> Div {
+        self.style.display = .Flex;
+        self.style.flex_dir = .ColumnReverse;
+        return self;
+    }
+
+    pub fn flex_wrap(mut self: Self) -> Div {
+        self.style.flex_wrap = .Wrap;
+        return self;
+    }
+
+    pub fn hidden(mut self: Self) -> Div {
+        self.style.display = .None;
+        return self;
+    }
+
+    pub fn absolute(mut self: Self) -> Div {
+        self.style.position = .Absolute;
+        return self;
+    }
+
+    pub fn inset_all(mut self: Self, v: f32) -> Div {
+        self.style.inset = math_vec.Edges.all(v);
+        self.style.inset_mask = 0x0F_u8;
+        return self;
+    }
+
+    pub fn top(mut self: Self, v: f32) -> Div {
+        self.style.inset.top = v;
+        self.style.inset_mask = self.style.inset_mask | 1_u8;
+        return self;
+    }
+
+    pub fn right(mut self: Self, v: f32) -> Div {
+        self.style.inset.right = v;
+        self.style.inset_mask = self.style.inset_mask | 2_u8;
+        return self;
+    }
+
+    pub fn bottom(mut self: Self, v: f32) -> Div {
+        self.style.inset.bottom = v;
+        self.style.inset_mask = self.style.inset_mask | 4_u8;
+        return self;
+    }
+
+    pub fn left(mut self: Self, v: f32) -> Div {
+        self.style.inset.left = v;
+        self.style.inset_mask = self.style.inset_mask | 8_u8;
+        return self;
+    }
+
+    pub fn z_index(mut self: Self, z: i16) -> Div {
+        self.style.z_index = z;
+        return self;
+    }
+
+    pub fn overflow_hidden(mut self: Self) -> Div {
+        self.style.overflow = .Hidden;
+        return self;
+    }
+
+    // --- 2D CSS Grid ---
+    pub fn grid_cols(mut self: Self, cols: u8) -> Div {
+        self.style.display = .Grid;
+        let c = if cols > 8_u8 { 8_u8 } else if cols == 0_u8 { 1_u8 } else { cols };
+        self.style.grid_col_count = c;
+        var i: usize = 0_usize;
+        while i < 8_usize {
+            self.style.grid_cols[i] = style.TrackSize.fr(1.0_f32);
+            i = i +% 1_usize;
+        }
+        return self;
+    }
+
+    pub fn grid_rows(mut self: Self, rows: u8) -> Div {
+        self.style.display = .Grid;
+        let r = if rows > 8_u8 { 8_u8 } else { rows };
+        self.style.grid_row_count = r;
+        var i: usize = 0_usize;
+        while i < 8_usize {
+            self.style.grid_rows[i] = style.TrackSize.fr(1.0_f32);
+            i = i +% 1_usize;
+        }
+        return self;
+    }
+
+    pub fn grid_col_track(mut self: Self, idx: usize, track: style.TrackSize) -> Div {
+        self.style.display = .Grid;
+        if idx < 8_usize {
+            self.style.grid_cols[idx] = track;
+            if idx +% 1_usize > self.style.grid_col_count.widen.[usize]() {
+                self.style.grid_col_count = (idx +% 1_usize).trunc.[u8]();
+            }
+        }
+        return self;
+    }
+
+    pub fn grid_row_track(mut self: Self, idx: usize, track: style.TrackSize) -> Div {
+        self.style.display = .Grid;
+        if idx < 8_usize {
+            self.style.grid_rows[idx] = track;
+            if idx +% 1_usize > self.style.grid_row_count.widen.[usize]() {
+                self.style.grid_row_count = (idx +% 1_usize).trunc.[u8]();
+            }
+        }
+        return self;
+    }
+
+    pub fn col_span(mut self: Self, span: u8) -> Div {
+        self.style.col_span = if span == 0_u8 { 1_u8 } else { span };
+        return self;
+    }
+
+    pub fn row_span(mut self: Self, span: u8) -> Div {
+        self.style.row_span = if span == 0_u8 { 1_u8 } else { span };
+        return self;
+    }
+
+    // --- Alignment & Justification ---
+    pub fn justify_start(mut self: Self) -> Div { self.style.justify = .Start; return self; }
+    pub fn justify_center(mut self: Self) -> Div { self.style.justify = .Center; return self; }
+    pub fn justify_end(mut self: Self) -> Div { self.style.justify = .End; return self; }
+    pub fn justify_between(mut self: Self) -> Div { self.style.justify = .SpaceBetween; return self; }
+    pub fn justify_around(mut self: Self) -> Div { self.style.justify = .SpaceAround; return self; }
+    pub fn justify_evenly(mut self: Self) -> Div { self.style.justify = .SpaceEvenly; return self; }
+
+    pub fn items_stretch(mut self: Self) -> Div { self.style.align_items = .Stretch; return self; }
+    pub fn items_start(mut self: Self) -> Div { self.style.align_items = .Start; return self; }
+    pub fn items_center(mut self: Self) -> Div { self.style.align_items = .Center; return self; }
+    pub fn items_end(mut self: Self) -> Div { self.style.align_items = .End; return self; }
+
+    pub fn self_center(mut self: Self) -> Div { self.style.align_self = .Center; return self; }
+    pub fn self_stretch(mut self: Self) -> Div { self.style.align_self = .Stretch; return self; }
+    pub fn self_start(mut self: Self) -> Div { self.style.align_self = .Start; return self; }
+    pub fn self_end(mut self: Self) -> Div { self.style.align_self = .End; return self; }
+
+    // --- Flex Sizing & Gaps ---
+    pub fn flex_1(mut self: Self) -> Div {
+        self.style.flex_grow = 1.0_f32;
+        self.style.flex_shrink = 1.0_f32;
+        self.style.flex_basis = style.Length.px(0.0_f32);
+        return self;
+    }
+
+    pub fn flex_grow(mut self: Self, g: f32) -> Div {
+        self.style.flex_grow = g;
+        return self;
+    }
+
+    pub fn flex_shrink(mut self: Self, s: f32) -> Div {
+        self.style.flex_shrink = s;
+        return self;
+    }
+
+    pub fn flex_none(mut self: Self) -> Div {
+        self.style.flex_grow = 0.0_f32;
+        self.style.flex_shrink = 0.0_f32;
+        return self;
+    }
+
+    pub fn gap(mut self: Self, px: f32) -> Div {
+        self.style.col_gap = px;
+        self.style.row_gap = px;
+        return self;
+    }
+
+    pub fn col_gap(mut self: Self, px: f32) -> Div {
+        self.style.col_gap = px;
+        return self;
+    }
+
+    pub fn row_gap(mut self: Self, px: f32) -> Div {
+        self.style.row_gap = px;
+        return self;
+    }
+
+    // --- Box Dimensions ---
+    pub fn w(mut self: Self, px: f32) -> Div { self.style.width = style.Length.px(px); return self; }
+    pub fn h(mut self: Self, px: f32) -> Div { self.style.height = style.Length.px(px); return self; }
+    pub fn w_pct(mut self: Self, p: f32) -> Div { self.style.width = style.Length.pct(p); return self; }
+    pub fn h_pct(mut self: Self, p: f32) -> Div { self.style.height = style.Length.pct(p); return self; }
+    pub fn w_full(mut self: Self) -> Div { self.style.width = style.Length.pct(100.0_f32); return self; }
+    pub fn h_full(mut self: Self) -> Div { self.style.height = style.Length.pct(100.0_f32); return self; }
+    pub fn size(mut self: Self, w: f32, h: f32) -> Div {
+        self.style.width = style.Length.px(w);
+        self.style.height = style.Length.px(h);
+        return self;
+    }
+    pub fn min_w(mut self: Self, px: f32) -> Div { self.style.min_w = style.Length.px(px); return self; }
+    pub fn max_w(mut self: Self, px: f32) -> Div { self.style.max_w = style.Length.px(px); return self; }
+    pub fn min_h(mut self: Self, px: f32) -> Div { self.style.min_h = style.Length.px(px); return self; }
+    pub fn max_h(mut self: Self, px: f32) -> Div { self.style.max_h = style.Length.px(px); return self; }
+    pub fn aspect_ratio(mut self: Self, r: f32) -> Div { self.style.aspect_ratio = r; return self; }
+
+    // --- Padding & Margin ---
+    pub fn p(mut self: Self, v: f32) -> Div { self.style.padding = math_vec.Edges.all(v); return self; }
+    pub fn px(mut self: Self, v: f32) -> Div {
+        self.style.padding.left = v;
+        self.style.padding.right = v;
+        return self;
+    }
+    pub fn py(mut self: Self, v: f32) -> Div {
+        self.style.padding.top = v;
+        self.style.padding.bottom = v;
+        return self;
+    }
+    pub fn padding(mut self: Self, e: math_vec.Edges) -> Div { self.style.padding = e; return self; }
+
+    pub fn m(mut self: Self, v: f32) -> Div { self.style.margin = math_vec.Edges.all(v); return self; }
+    pub fn mx(mut self: Self, v: f32) -> Div {
+        self.style.margin.left = v;
+        self.style.margin.right = v;
+        return self;
+    }
+    pub fn my(mut self: Self, v: f32) -> Div {
+        self.style.margin.top = v;
+        self.style.margin.bottom = v;
+        return self;
+    }
+    pub fn margin(mut self: Self, e: math_vec.Edges) -> Div { self.style.margin = e; return self; }
+
+    // --- Visual Appearance ---
+    pub fn bg(mut self: Self, c: color.Rgba) -> Div {
+        self.style.bg = c;
+        self.style.bg_end = c;
+        self.style.grad_flag = 0_u32;
+        return self;
+    }
+
+    pub fn bg_gradient(mut self: Self, c0: color.Rgba, c1: color.Rgba, flag: u32) -> Div {
+        self.style.bg = c0;
+        self.style.bg_end = c1;
+        self.style.grad_flag = flag & scene.QUAD_FLAG_GRADIENT_MASK;
+        return self;
+    }
+
+    pub fn border(mut self: Self, width: f32, col: color.Rgba) -> Div {
+        self.style.border_widths = math_vec.Edges.all(width);
+        self.style.border_color = col;
+        return self;
+    }
+
+    pub fn border_edges(mut self: Self, widths: math_vec.Edges, col: color.Rgba) -> Div {
+        self.style.border_widths = widths;
+        self.style.border_color = col;
+        return self;
+    }
+
+    pub fn rounded(mut self: Self, r: f32) -> Div {
+        self.style.radii = math_vec.Corners.all(r);
+        return self;
+    }
+
+    pub fn rounded_corners(mut self: Self, c: math_vec.Corners) -> Div {
+        self.style.radii = c;
+        return self;
+    }
+
+    pub fn shadow(mut self: Self, blur: f32, offset_y: f32, col: color.Rgba) -> Div {
+        self.style.shadow = style.ShadowSpec.drop(blur, offset_y, col);
+        return self;
+    }
+
+    pub fn opacity(mut self: Self, a: f32) -> Div {
+        self.style.opacity = math_vec.clamp_f32(a, 0.0_f32, 1.0_f32);
+        return self;
+    }
+
+    // --- Interactive State Styles (`.hover()` / `.active()` / `.focus()`) ---
+    pub fn hover_bg(mut self: Self, c: color.Rgba) -> Div {
+        self.style.has_hover_bg = true;
+        self.style.hover_bg = c;
+        return self;
+    }
+
+    pub fn active_bg(mut self: Self, c: color.Rgba) -> Div {
+        self.style.has_active_bg = true;
+        self.style.active_bg = c;
+        return self;
+    }
+
+    pub fn focus_border(mut self: Self, c: color.Rgba) -> Div {
+        self.style.has_focus_border = true;
+        self.style.focus_border = c;
+        return self;
+    }
+
+    pub fn hover_border(mut self: Self, c: color.Rgba) -> Div {
+        self.style.has_hover_border = true;
+        self.style.hover_border = c;
+        return self;
+    }
+
+    // --- Typography ---
+    pub fn text_size(mut self: Self, px: f32) -> Div {
+        self.style.font_size = px;
+        return self;
+    }
+
+    pub fn text_color(mut self: Self, c: color.Rgba) -> Div {
+        self.style.text_color = c;
+        return self;
+    }
+
+    pub fn font_sans(mut self: Self) -> Div {
+        self.style.font_id = lib.FONT_UI_SANS;
+        return self;
+    }
+
+    pub fn font_mono(mut self: Self) -> Div {
+        self.style.font_id = lib.FONT_UI_MONO;
+        return self;
+    }
+
+    pub fn text_left(mut self: Self) -> Div { self.style.text_align = .Left; return self; }
+    pub fn text_center(mut self: Self) -> Div { self.style.text_align = .Center; return self; }
+    pub fn text_right(mut self: Self) -> Div { self.style.text_align = .Right; return self; }
+    pub fn text_wrap(mut self: Self) -> Div { self.style.text_wrap = true; return self; }
+    pub fn text_ellipsis(mut self: Self) -> Div { self.style.text_ellipsis = true; return self; }
+
+    pub fn underline(mut self: Self, col: color.Rgba, wavy: bool) -> Div {
+        self.underline_enabled = true;
+        self.underline_wavy = wavy;
+        self.underline_color = col;
+        return self;
+    }
+}

@@ -1,0 +1,1044 @@
+module eon_ui.layout;
+
+import core.math_vec;
+import eon_ui.style;
+
+// ============================================================================
+// Taffy-Class Flexbox + 2D CSS Grid Layout Engine (`libs/eon_ui/src/layout.eon`)
+// 100% safe, `core/`-only, zero heap allocations per frame (flat SoA slices +
+// iterative BFS/post-order passes + native `ArenaPool` fast-path).
+// ============================================================================
+
+pub const NODE_NONE: u32 = 0xFFFFFFFF_u32;
+
+/// Compact tree topology + hot cached fixed-box layout fields + intrinsic measurements (48 bytes).
+pub struct LayoutNode {
+    pub parent: u32;
+    pub first_child: u32;
+    pub last_child: u32;
+    pub next_sibling: u32;
+    pub child_count: u32;
+    pub fast_flags: u8; // bit0: relative flex leaf/box with fixed Px w & h, zero margin, zero grow, no min/max/aspect/align_self
+    pub content_w: f32;
+    pub content_h: f32;
+    pub intrinsic_w: f32;
+    pub intrinsic_h: f32;
+    pub fast_w: f32;
+    pub fast_h: f32;
+}
+
+impl LayoutNode {
+    @inline
+    pub fn empty() -> LayoutNode {
+        return LayoutNode.{
+            parent: NODE_NONE,
+            first_child: NODE_NONE,
+            last_child: NODE_NONE,
+            next_sibling: NODE_NONE,
+            child_count: 0_u32,
+            fast_flags: 0_u8,
+            content_w: 0.0_f32,
+            content_h: 0.0_f32,
+            intrinsic_w: 0.0_f32,
+            intrinsic_h: 0.0_f32,
+            fast_w: 0.0_f32,
+            fast_h: 0.0_f32,
+        };
+    }
+
+    @inline
+    pub fn from_style(st: *style.Style, content_w: f32, content_h: f32) -> LayoutNode {
+        let is_fast = st.display != .None
+            && st.position == .Relative
+            && st.width.kind == .Px
+            && st.height.kind == .Px
+            && st.flex_basis.kind == .Auto
+            && st.min_w.kind == .Auto && st.max_w.kind == .Auto
+            && st.min_h.kind == .Auto && st.max_h.kind == .Auto
+            && st.flex_grow == 0.0_f32
+            && st.aspect_ratio == 0.0_f32
+            && st.align_self == .Auto
+            && st.margin.top == 0.0_f32 && st.margin.right == 0.0_f32
+            && st.margin.bottom == 0.0_f32 && st.margin.left == 0.0_f32;
+        return LayoutNode.{
+            parent: NODE_NONE,
+            first_child: NODE_NONE,
+            last_child: NODE_NONE,
+            next_sibling: NODE_NONE,
+            child_count: 0_u32,
+            fast_flags: if is_fast { 1_u8 } else { 0_u8 },
+            content_w: content_w,
+            content_h: content_h,
+            intrinsic_w: if is_fast { st.width.val } else { 0.0_f32 },
+            intrinsic_h: if is_fast { st.height.val } else { 0.0_f32 },
+            fast_w: if is_fast { st.width.val } else { 0.0_f32 },
+            fast_h: if is_fast { st.height.val } else { 0.0_f32 },
+        };
+    }
+}
+
+@inline
+fn clamp_dim(val: f32, min_l: style.Length, max_l: style.Length, parent_sz: f32) -> f32 {
+    var v = if val < 0.0_f32 { 0.0_f32 } else { val };
+    if !min_l.is_auto() {
+        let mn = min_l.resolve(parent_sz, 0.0_f32);
+        if v < mn { v = mn; }
+    }
+    if !max_l.is_auto() {
+        let mx = max_l.resolve(parent_sz, v);
+        if v > mx { v = mx; }
+    }
+    return v;
+}
+
+@inline
+fn is_flex_row(dir: style.FlexDirection) -> bool {
+    return dir == .Row || dir == .RowReverse;
+}
+
+@inline
+fn is_flex_reverse(dir: style.FlexDirection) -> bool {
+    return dir == .RowReverse || dir == .ColumnReverse;
+}
+
+@inline
+fn effective_align(parent_align: style.AlignItems, child_self: style.AlignSelf) -> style.AlignItems {
+    match child_self {
+        .Auto => { return parent_align; }
+        .Stretch => { return .Stretch; }
+        .Start => { return .Start; }
+        .Center => { return .Center; }
+        .End => { return .End; }
+    }
+}
+
+/// Link `child` at the end of `parent`'s child list in O(1).
+pub fn attach_child(nodes: *mut [LayoutNode], parent: u32, child: u32) {
+    let pi = parent.widen.[usize]();
+    let ci = child.widen.[usize]();
+    if pi >= nodes.len || ci >= nodes.len {
+        return;
+    }
+    nodes[ci].parent = parent;
+    nodes[ci].next_sibling = NODE_NONE;
+    let prev_last = nodes[pi].last_child;
+    if prev_last == NODE_NONE {
+        nodes[pi].first_child = child;
+        nodes[pi].last_child = child;
+    } else {
+        let li = prev_last.widen.[usize]();
+        if li < nodes.len {
+            nodes[li].next_sibling = child;
+        }
+        nodes[pi].last_child = child;
+    }
+    nodes[pi].child_count = nodes[pi].child_count +% 1_u32;
+}
+
+/// Compute intrinsic width & height for node `ni` given its already-measured children.
+fn measure_node(nodes: *mut [LayoutNode], styles: *[style.Style], ni: usize) {
+    if ni >= nodes.len || ni >= styles.len {
+        return;
+    }
+    let st = &styles[ni];
+    if st.display == .None {
+        nodes[ni].intrinsic_w = 0.0_f32;
+        nodes[ni].intrinsic_h = 0.0_f32;
+        return;
+    }
+    let pad_h = st.padding.horizontal() + st.border_widths.horizontal();
+    let pad_v = st.padding.vertical() + st.border_widths.vertical();
+
+    // Fast path: fixed explicit Px dimensions on leaf or container
+    if st.width.kind == .Px && st.height.kind == .Px {
+        nodes[ni].intrinsic_w = clamp_dim(st.width.val, st.min_w, st.max_w, 0.0_f32);
+        nodes[ni].intrinsic_h = clamp_dim(st.height.val, st.min_h, st.max_h, 0.0_f32);
+        return;
+    }
+
+    var inner_w = nodes[ni].content_w;
+    var inner_h = nodes[ni].content_h;
+
+    if nodes[ni].child_count > 0_u32 {
+        if st.display == .Grid {
+            let ncols: usize = if st.grid_col_count > 0_u8 {
+                st.grid_col_count.widen.[usize]()
+            } else {
+                1_usize
+            };
+            var col_w: [8]f32 = [0.0_f32; 8];
+            var cur_col: usize = 0_usize;
+            var cur_row_h: f32 = 0.0_f32;
+            var total_h: f32 = 0.0_f32;
+            var row_count: usize = 0_usize;
+            var ch = nodes[ni].first_child;
+            while ch != NODE_NONE {
+                let ci = ch.widen.[usize]();
+                if ci >= nodes.len || ci >= styles.len { break; }
+                let cst = &styles[ci];
+                if cst.display != .None && cst.position == .Relative {
+                    let cw = nodes[ci].intrinsic_w + cst.margin.horizontal();
+                    let ch_h = nodes[ci].intrinsic_h + cst.margin.vertical();
+                    let span: usize = if cst.col_span > 0_u8 { cst.col_span.widen.[usize]() } else { 1_usize };
+                    if cur_col +% span > ncols && cur_col > 0_usize {
+                        if row_count > 0_usize { total_h = total_h + st.row_gap; }
+                        total_h = total_h + cur_row_h;
+                        row_count = row_count +% 1_usize;
+                        cur_col = 0_usize;
+                        cur_row_h = 0.0_f32;
+                    }
+                    if span == 1_usize && cur_col < 8_usize {
+                        col_w[cur_col] = math_vec.max_f32(col_w[cur_col], cw);
+                    }
+                    cur_row_h = math_vec.max_f32(cur_row_h, ch_h);
+                    cur_col = cur_col +% span;
+                    if cur_col >= ncols {
+                        if row_count > 0_usize { total_h = total_h + st.row_gap; }
+                        total_h = total_h + cur_row_h;
+                        row_count = row_count +% 1_usize;
+                        cur_col = 0_usize;
+                        cur_row_h = 0.0_f32;
+                    }
+                }
+                ch = nodes[ci].next_sibling;
+            }
+            if cur_col > 0_usize {
+                if row_count > 0_usize { total_h = total_h + st.row_gap; }
+                total_h = total_h + cur_row_h;
+            }
+            var sum_w: f32 = 0.0_f32;
+            var k: usize = 0_usize;
+            while k < ncols && k < 8_usize {
+                if k > 0_usize { sum_w = sum_w + st.col_gap; }
+                let tr = st.grid_cols[k];
+                let tw = match tr.kind {
+                    .Fixed => tr.a,
+                    .MinMax => math_vec.max_f32(tr.a, col_w[k]),
+                    _ => col_w[k],
+                };
+                sum_w = sum_w + tw;
+                k = k +% 1_usize;
+            }
+            inner_w = math_vec.max_f32(inner_w, sum_w);
+            inner_h = math_vec.max_f32(inner_h, total_h);
+        } else {
+            let row = is_flex_row(st.flex_dir);
+            let gap = if row { st.col_gap } else { st.row_gap };
+            var main_sum: f32 = 0.0_f32;
+            var cross_max: f32 = 0.0_f32;
+            var flow_count: u32 = 0_u32;
+            var ch = nodes[ni].first_child;
+            while ch != NODE_NONE {
+                let ci = ch.widen.[usize]();
+                if ci >= nodes.len || ci >= styles.len { break; }
+                let cst = &styles[ci];
+                if cst.display != .None && cst.position == .Relative {
+                    let cw = nodes[ci].intrinsic_w + cst.margin.horizontal();
+                    let ch_h = nodes[ci].intrinsic_h + cst.margin.vertical();
+                    if flow_count > 0_u32 {
+                        main_sum = main_sum + gap;
+                    }
+                    if row {
+                        main_sum = main_sum + cw;
+                        cross_max = math_vec.max_f32(cross_max, ch_h);
+                    } else {
+                        main_sum = main_sum + ch_h;
+                        cross_max = math_vec.max_f32(cross_max, cw);
+                    }
+                    flow_count = flow_count +% 1_u32;
+                }
+                ch = nodes[ci].next_sibling;
+            }
+            if row {
+                inner_w = math_vec.max_f32(inner_w, main_sum);
+                inner_h = math_vec.max_f32(inner_h, cross_max);
+            } else {
+                inner_w = math_vec.max_f32(inner_w, cross_max);
+                inner_h = math_vec.max_f32(inner_h, main_sum);
+            }
+        }
+    }
+
+    var out_w = if st.width.kind == .Px { st.width.val } else { inner_w + pad_h };
+    var out_h = if st.height.kind == .Px { st.height.val } else { inner_h + pad_v };
+    if st.aspect_ratio > 0.0_f32 {
+        if st.width.kind == .Px && st.height.kind == .Auto {
+            out_h = out_w / st.aspect_ratio;
+        } else if st.height.kind == .Px && st.width.kind == .Auto {
+            out_w = out_h * st.aspect_ratio;
+        }
+    }
+    nodes[ni].intrinsic_w = clamp_dim(out_w, st.min_w, st.max_w, 0.0_f32);
+    nodes[ni].intrinsic_h = clamp_dim(out_h, st.min_h, st.max_h, 0.0_f32);
+}
+
+/// Place all `Position.Absolute` children inside `pbox` (border-box / padding-box).
+fn place_absolute_child(
+    nodes: *[LayoutNode],
+    styles: *[style.Style],
+    rects: *mut [math_vec.Bounds],
+    pbox: math_vec.Bounds,
+    ci: usize,
+) {
+    if ci >= nodes.len || ci >= styles.len || ci >= rects.len {
+        return;
+    }
+    let cst = &styles[ci];
+    let has_t = (cst.inset_mask & 1_u8) != 0_u8;
+    let has_r = (cst.inset_mask & 2_u8) != 0_u8;
+    let has_b = (cst.inset_mask & 4_u8) != 0_u8;
+    let has_l = (cst.inset_mask & 8_u8) != 0_u8;
+
+    var w = if !cst.width.is_auto() {
+        cst.width.resolve(pbox.size.width, nodes[ci].intrinsic_w)
+    } else if has_l && has_r {
+        math_vec.max_f32(pbox.size.width - cst.inset.left - cst.inset.right, 0.0_f32)
+    } else {
+        nodes[ci].intrinsic_w
+    };
+    var h = if !cst.height.is_auto() {
+        cst.height.resolve(pbox.size.height, nodes[ci].intrinsic_h)
+    } else if has_t && has_b {
+        math_vec.max_f32(pbox.size.height - cst.inset.top - cst.inset.bottom, 0.0_f32)
+    } else {
+        nodes[ci].intrinsic_h
+    };
+    w = clamp_dim(w, cst.min_w, cst.max_w, pbox.size.width);
+    h = clamp_dim(h, cst.min_h, cst.max_h, pbox.size.height);
+
+    let x = if has_l {
+        pbox.origin.x + cst.inset.left + cst.margin.left
+    } else if has_r {
+        pbox.right() - cst.inset.right - cst.margin.right - w
+    } else {
+        pbox.origin.x + cst.margin.left
+    };
+    let y = if has_t {
+        pbox.origin.y + cst.inset.top + cst.margin.top
+    } else if has_b {
+        pbox.bottom() - cst.inset.bottom - cst.margin.bottom - h
+    } else {
+        pbox.origin.y + cst.margin.top
+    };
+    rects[ci] = math_vec.Bounds.from_xywh(x, y, w, h);
+}
+
+/// Place children of a 2D CSS Grid container (supports Fixed/Fr/Auto/MinMax tracks + col_span/row_span).
+fn place_grid_children(
+    nodes: *[LayoutNode],
+    styles: *[style.Style],
+    rects: *mut [math_vec.Bounds],
+    ni: usize,
+) {
+    if ni >= nodes.len || ni >= styles.len || ni >= rects.len {
+        return;
+    }
+    let st = &styles[ni];
+    let pbox = rects[ni];
+    let content_x = pbox.origin.x + st.padding.left + st.border_widths.left;
+    let content_y = pbox.origin.y + st.padding.top + st.border_widths.top;
+    let avail_w = math_vec.max_f32(pbox.size.width - st.padding.horizontal() - st.border_widths.horizontal(), 0.0_f32);
+    let avail_h = math_vec.max_f32(pbox.size.height - st.padding.vertical() - st.border_widths.vertical(), 0.0_f32);
+
+    let ncols: usize = if st.grid_col_count > 0_u8 && st.grid_col_count <= 8_u8 {
+        st.grid_col_count.widen.[usize]()
+    } else {
+        1_usize
+    };
+
+    // Pass A: Place flow items onto a 2D cell grid (up to 64 rows x 8 cols) respecting col_span/row_span.
+    var occ: [64]u8 = [0_u8; 64]; // bitmask of occupied columns per row
+    var item_col: [128]u8 = [0_u8; 128];
+    var item_row: [128]u8 = [0_u8; 128];
+    var item_cspan: [128]u8 = [1_u8; 128];
+    var item_rspan: [128]u8 = [1_u8; 128];
+    var item_idx: [128]u32 = [NODE_NONE; 128];
+    var flow_n: usize = 0_usize;
+
+    var auto_col_w: [8]f32 = [0.0_f32; 8];
+    var auto_row_h: [64]f32 = [0.0_f32; 64];
+    var max_row_used: usize = if st.grid_row_count > 0_u8 { st.grid_row_count.widen.[usize]() } else { 0_usize };
+
+    var cur_r: usize = 0_usize;
+    var cur_c: usize = 0_usize;
+    var ch = nodes[ni].first_child;
+    while ch != NODE_NONE {
+        let ci = ch.widen.[usize]();
+        if ci >= nodes.len || ci >= styles.len || ci >= rects.len { break; }
+        let cst = &styles[ci];
+        if cst.display == .None {
+            rects[ci] = math_vec.Bounds.zero();
+        } else if cst.position == .Absolute {
+            place_absolute_child(nodes, styles, rects, pbox, ci);
+        } else if flow_n < 128_usize {
+            let cs: usize = if cst.col_span > 0_u8 {
+                let s = cst.col_span.widen.[usize]();
+                if s > ncols { ncols } else { s }
+            } else {
+                1_usize
+            };
+            let rs: usize = if cst.row_span > 0_u8 { cst.row_span.widen.[usize]() } else { 1_usize };
+
+            // Find next free (cur_r, cur_c) slot fitting cs x rs
+            while cur_r < 64_usize {
+                if cur_c +% cs > ncols {
+                    cur_c = 0_usize;
+                    cur_r = cur_r +% 1_usize;
+                    continue;
+                }
+                let mask: u8 = (((1_u32 <<% cs.trunc.[u32]()) -% 1_u32) <<% cur_c.trunc.[u32]()).trunc.[u8]();
+                var fits = true;
+                var rr: usize = 0_usize;
+                while rr < rs {
+                    let ri_occ = cur_r +% rr;
+                    if ri_occ >= 64_usize { break; }
+                    if (occ[ri_occ] & mask) != 0_u8 {
+                        fits = false;
+                        break;
+                    }
+                    rr = rr +% 1_usize;
+                }
+                if fits {
+                    var wr: usize = 0_usize;
+                    while wr < rs {
+                        let wi_occ = cur_r +% wr;
+                        if wi_occ >= 64_usize { break; }
+                        occ[wi_occ] = occ[wi_occ] | mask;
+                        wr = wr +% 1_usize;
+                    }
+                    break;
+                }
+                cur_c = cur_c +% 1_usize;
+            }
+
+            item_idx[flow_n] = ch;
+            item_col[flow_n] = cur_c.trunc.[u8]();
+            item_row[flow_n] = cur_r.trunc.[u8]();
+            item_cspan[flow_n] = cs.trunc.[u8]();
+            item_rspan[flow_n] = rs.trunc.[u8]();
+            flow_n = flow_n +% 1_usize;
+
+            let end_r = cur_r +% rs;
+            if end_r > max_row_used { max_row_used = end_r; }
+            if cs == 1_usize && cur_c < 8_usize {
+                auto_col_w[cur_c] = math_vec.max_f32(auto_col_w[cur_c], nodes[ci].intrinsic_w + cst.margin.horizontal());
+            }
+            if rs == 1_usize && cur_r < 64_usize {
+                auto_row_h[cur_r] = math_vec.max_f32(auto_row_h[cur_r], nodes[ci].intrinsic_h + cst.margin.vertical());
+            }
+
+            cur_c = cur_c +% cs;
+            if cur_c >= ncols {
+                cur_c = 0_usize;
+                cur_r = cur_r +% 1_usize;
+            }
+        }
+        ch = nodes[ci].next_sibling;
+    }
+
+    if max_row_used == 0_usize {
+        return;
+    }
+    let nrows = if max_row_used <= 64_usize { max_row_used } else { 64_usize };
+
+    // Pass B: Resolve column track sizes (`Fixed`, `Auto`, `MinMax`, `Fr`)
+    var col_sizes: [8]f32 = [0.0_f32; 8];
+    var col_offsets: [8]f32 = [0.0_f32; 8];
+    let total_col_gaps = if ncols > 1_usize { (ncols - 1_usize).to_float.[f32]() * st.col_gap } else { 0.0_f32 };
+    var used_col_w: f32 = total_col_gaps;
+    var total_col_fr: f32 = 0.0_f32;
+    var c: usize = 0_usize;
+    while c < ncols {
+        let tr = st.grid_cols[c];
+        match tr.kind {
+            .Fixed => {
+                col_sizes[c] = tr.a;
+                used_col_w = used_col_w + tr.a;
+            }
+            .Auto => {
+                col_sizes[c] = auto_col_w[c];
+                used_col_w = used_col_w + auto_col_w[c];
+            }
+            .MinMax => {
+                let sz = math_vec.clamp_f32(auto_col_w[c], tr.a, tr.b);
+                col_sizes[c] = sz;
+                used_col_w = used_col_w + sz;
+            }
+            .Fr => {
+                total_col_fr = total_col_fr + math_vec.max_f32(tr.a, 0.001_f32);
+            }
+        }
+        c = c +% 1_usize;
+    }
+    let rem_col_w = math_vec.max_f32(avail_w - used_col_w, 0.0_f32);
+    var cx: f32 = 0.0_f32;
+    c = 0_usize;
+    while c < ncols {
+        let tr = st.grid_cols[c];
+        if tr.kind == .Fr && total_col_fr > 0.0_f32 {
+            col_sizes[c] = rem_col_w * (math_vec.max_f32(tr.a, 0.001_f32) / total_col_fr);
+        }
+        col_offsets[c] = cx;
+        cx = cx + col_sizes[c] + st.col_gap;
+        c = c +% 1_usize;
+    }
+
+    // Pass C: Resolve row track sizes (`Fixed`, `Auto`, `MinMax`, `Fr`)
+    var row_sizes: [64]f32 = [0.0_f32; 64];
+    var row_offsets: [64]f32 = [0.0_f32; 64];
+    let total_row_gaps = if nrows > 1_usize { (nrows - 1_usize).to_float.[f32]() * st.row_gap } else { 0.0_f32 };
+    var used_row_h: f32 = total_row_gaps;
+    var total_row_fr: f32 = 0.0_f32;
+    var r: usize = 0_usize;
+    while r < nrows {
+        let tr = if r < st.grid_row_count.widen.[usize]() && r < 8_usize {
+            st.grid_rows[r]
+        } else if st.grid_row_count > 0_u8 {
+            style.TrackSize.fr(1.0_f32)
+        } else {
+            style.TrackSize.fr(1.0_f32)
+        };
+        match tr.kind {
+            .Fixed => {
+                row_sizes[r] = tr.a;
+                used_row_h = used_row_h + tr.a;
+            }
+            .Auto => {
+                row_sizes[r] = auto_row_h[r];
+                used_row_h = used_row_h + auto_row_h[r];
+            }
+            .MinMax => {
+                let sz = math_vec.clamp_f32(auto_row_h[r], tr.a, tr.b);
+                row_sizes[r] = sz;
+                used_row_h = used_row_h + sz;
+            }
+            .Fr => {
+                total_row_fr = total_row_fr + math_vec.max_f32(tr.a, 0.001_f32);
+            }
+        }
+        r = r +% 1_usize;
+    }
+    let rem_row_h = math_vec.max_f32(avail_h - used_row_h, 0.0_f32);
+    var cy: f32 = 0.0_f32;
+    r = 0_usize;
+    while r < nrows {
+        let tr = if r < st.grid_row_count.widen.[usize]() && r < 8_usize {
+            st.grid_rows[r]
+        } else {
+            style.TrackSize.fr(1.0_f32)
+        };
+        if tr.kind == .Fr && total_row_fr > 0.0_f32 {
+            row_sizes[r] = rem_row_h * (math_vec.max_f32(tr.a, 0.001_f32) / total_row_fr);
+        }
+        row_offsets[r] = cy;
+        cy = cy + row_sizes[r] + st.row_gap;
+        r = r +% 1_usize;
+    }
+
+    // Pass D: Position every grid item inside its spanned cell rect
+    var i: usize = 0_usize;
+    while i < flow_n && i < 128_usize {
+        let ci = item_idx[i].widen.[usize]();
+        if ci >= nodes.len || ci >= styles.len || ci >= rects.len {
+            i = i +% 1_usize;
+            continue;
+        }
+        let cst = &styles[ci];
+        let c0 = item_col[i].widen.[usize]();
+        let r0 = item_row[i].widen.[usize]();
+        let cs = item_cspan[i].widen.[usize]();
+        let rs = item_rspan[i].widen.[usize]();
+
+        var cell_w: f32 = 0.0_f32;
+        var k: usize = 0_usize;
+        while k < cs && c0 +% k < ncols {
+            if k > 0_usize { cell_w = cell_w + st.col_gap; }
+            cell_w = cell_w + col_sizes[c0 +% k];
+            k = k +% 1_usize;
+        }
+        var cell_h: f32 = 0.0_f32;
+        k = 0_usize;
+        while k < rs && r0 +% k < nrows {
+            if k > 0_usize { cell_h = cell_h + st.row_gap; }
+            cell_h = cell_h + row_sizes[r0 +% k];
+            k = k +% 1_usize;
+        }
+
+        let cell_x = content_x + (if c0 < 8_usize { col_offsets[c0] } else { 0.0_f32 });
+        let cell_y = content_y + (if r0 < 64_usize { row_offsets[r0] } else { 0.0_f32 });
+        let align = effective_align(st.align_items, cst.align_self);
+
+        var iw = if !cst.width.is_auto() {
+            cst.width.resolve(cell_w, cell_w - cst.margin.horizontal())
+        } else if align == .Stretch {
+            cell_w - cst.margin.horizontal()
+        } else {
+            nodes[ci].intrinsic_w
+        };
+        var ih = if !cst.height.is_auto() {
+            cst.height.resolve(cell_h, cell_h - cst.margin.vertical())
+        } else if align == .Stretch {
+            cell_h - cst.margin.vertical()
+        } else {
+            nodes[ci].intrinsic_h
+        };
+        iw = clamp_dim(iw, cst.min_w, cst.max_w, cell_w);
+        ih = clamp_dim(ih, cst.min_h, cst.max_h, cell_h);
+
+        let ox = match align {
+            .Center => cell_x + (cell_w - iw) * 0.5_f32,
+            .End => cell_x + cell_w - iw - cst.margin.right,
+            _ => cell_x + cst.margin.left,
+        };
+        let oy = match align {
+            .Center => cell_y + (cell_h - ih) * 0.5_f32,
+            .End => cell_y + cell_h - ih - cst.margin.bottom,
+            _ => cell_y + cst.margin.top,
+        };
+        rects[ci] = math_vec.Bounds.from_xywh(ox, oy, iw, ih);
+        i = i +% 1_usize;
+    }
+}
+
+/// Place children of a Flexbox container (`Row`/`Column`/`RowReverse`/`ColumnReverse`, `NoWrap`/`Wrap`,
+/// `flex_grow`/`flex_shrink`/`flex_basis`, `JustifyContent`, `AlignItems`/`AlignSelf`).
+fn place_flex_children(
+    nodes: *[LayoutNode],
+    styles: *[style.Style],
+    rects: *mut [math_vec.Bounds],
+    ni: usize,
+) {
+    if ni >= nodes.len || ni >= styles.len || ni >= rects.len {
+        return;
+    }
+    let st = &styles[ni];
+    let pbox = rects[ni];
+    let content_x = pbox.origin.x + st.padding.left + st.border_widths.left;
+    let content_y = pbox.origin.y + st.padding.top + st.border_widths.top;
+    let avail_w = math_vec.max_f32(pbox.size.width - st.padding.horizontal() - st.border_widths.horizontal(), 0.0_f32);
+    let avail_h = math_vec.max_f32(pbox.size.height - st.padding.vertical() - st.border_widths.vertical(), 0.0_f32);
+
+    let row = is_flex_row(st.flex_dir);
+    let rev = is_flex_reverse(st.flex_dir);
+    let main_avail = if row { avail_w } else { avail_h };
+    let cross_avail = if row { avail_h } else { avail_w };
+    let main_gap = if row { st.col_gap } else { st.row_gap };
+    let cross_gap = if row { st.row_gap } else { st.col_gap };
+
+    // Fast streaming path for `NoWrap` containers (handles arbitrarily large child counts — including 100,000!)
+    if st.flex_wrap == .NoWrap {
+        // Ultra-fast single-pass SoA streaming path for scroll containers with standard Start justification:
+        // Never touches the cold visual `styles` array for fixed-size (`fast_flags == 1`) children!
+        if st.overflow == .Scroll && !rev && st.justify == .Start {
+            var cursor: f32 = 0.0_f32;
+            var all_fast = true;
+            var ch = nodes[ni].first_child;
+            while ch != NODE_NONE {
+                let ci = ch.widen.[usize]();
+                if ci >= nodes.len || ci >= rects.len { break; }
+                let nd = &nodes[ci];
+                if nd.fast_flags != 0_u8 {
+                    let iw = nd.fast_w;
+                    let ih = nd.fast_h;
+                    if row {
+                        let cross_off = match st.align_items {
+                            .Center => (avail_h - ih) * 0.5_f32,
+                            .End => avail_h - ih,
+                            _ => 0.0_f32,
+                        };
+                        rects[ci] = math_vec.Bounds.from_xywh(content_x + cursor, content_y + cross_off, iw, ih);
+                        cursor = cursor + iw + main_gap;
+                    } else {
+                        let cross_off = match st.align_items {
+                            .Center => (avail_w - iw) * 0.5_f32,
+                            .End => avail_w - iw,
+                            _ => 0.0_f32,
+                        };
+                        rects[ci] = math_vec.Bounds.from_xywh(content_x + cross_off, content_y + cursor, iw, ih);
+                        cursor = cursor + ih + main_gap;
+                    }
+                    ch = nd.next_sibling;
+                } else {
+                    all_fast = false;
+                    break;
+                }
+            }
+            if all_fast {
+                return;
+            }
+        }
+
+        var total_base: f32 = 0.0_f32;
+        var total_grow: f32 = 0.0_f32;
+        var total_shrink_w: f32 = 0.0_f32;
+        var flow_count: u32 = 0_u32;
+
+        // Pass 1: Aggregate flow sizes, flex_grow, flex_shrink, and place Absolute children
+        var ch = nodes[ni].first_child;
+        while ch != NODE_NONE {
+            let ci = ch.widen.[usize]();
+            if ci >= nodes.len || ci >= styles.len || ci >= rects.len { break; }
+            let cst = &styles[ci];
+            if cst.display == .None {
+                rects[ci] = math_vec.Bounds.zero();
+            } else if cst.position == .Absolute {
+                place_absolute_child(nodes, styles, rects, pbox, ci);
+            } else {
+                let main_margin = if row { cst.margin.horizontal() } else { cst.margin.vertical() };
+                let main_len = if !cst.flex_basis.is_auto() {
+                    cst.flex_basis
+                } else if row {
+                    cst.width
+                } else {
+                    cst.height
+                };
+                let base_sz = if !main_len.is_auto() {
+                    main_len.resolve(main_avail, 0.0_f32)
+                } else if row {
+                    nodes[ci].intrinsic_w
+                } else {
+                    nodes[ci].intrinsic_h
+                };
+                if flow_count > 0_u32 {
+                    total_base = total_base + main_gap;
+                }
+                total_base = total_base + base_sz + main_margin;
+                total_grow = total_grow + math_vec.max_f32(cst.flex_grow, 0.0_f32);
+                total_shrink_w = total_shrink_w + math_vec.max_f32(cst.flex_shrink, 0.0_f32) * math_vec.max_f32(base_sz, 1.0_f32);
+                flow_count = flow_count +% 1_u32;
+            }
+            ch = nodes[ci].next_sibling;
+        }
+
+        if flow_count == 0_u32 {
+            return;
+        }
+
+        let allow_shrink = st.overflow != .Scroll;
+        let free_space = main_avail - total_base;
+        let distribute_free = if free_space > 0.0_f32 && total_grow == 0.0_f32 { free_space } else { 0.0_f32 };
+        let fc_f = flow_count.to_float.[f32]();
+
+        var start_offset: f32 = 0.0_f32;
+        var extra_gap: f32 = 0.0_f32;
+        if distribute_free > 0.0_f32 {
+            match st.justify {
+                .Start => {}
+                .Center => { start_offset = distribute_free * 0.5_f32; }
+                .End => { start_offset = distribute_free; }
+                .SpaceBetween => {
+                    if flow_count > 1_u32 {
+                        extra_gap = distribute_free / (flow_count - 1_u32).to_float.[f32]();
+                    }
+                }
+                .SpaceAround => {
+                    extra_gap = distribute_free / fc_f;
+                    start_offset = extra_gap * 0.5_f32;
+                }
+                .SpaceEvenly => {
+                    extra_gap = distribute_free / (fc_f + 1.0_f32);
+                    start_offset = extra_gap;
+                }
+            }
+        }
+
+        // Pass 2: Place each flow child in a single cache-friendly linear scan
+        let apply_grow = free_space > 0.0_f32 && total_grow > 0.0_f32;
+        let apply_shrink = allow_shrink && free_space < 0.0_f32 && total_shrink_w > 0.0_f32;
+        var cursor: f32 = if rev { main_avail - start_offset } else { start_offset };
+        ch = nodes[ni].first_child;
+        while ch != NODE_NONE {
+            let ci = ch.widen.[usize]();
+            if ci >= nodes.len || ci >= styles.len || ci >= rects.len { break; }
+            let cst = &styles[ci];
+            if cst.display != .None && cst.position == .Relative {
+                let main_len = if !cst.flex_basis.is_auto() {
+                    cst.flex_basis
+                } else if row {
+                    cst.width
+                } else {
+                    cst.height
+                };
+                var main_sz = if !main_len.is_auto() {
+                    main_len.resolve(main_avail, 0.0_f32)
+                } else if row {
+                    nodes[ci].intrinsic_w
+                } else {
+                    nodes[ci].intrinsic_h
+                };
+
+                if apply_grow && cst.flex_grow > 0.0_f32 {
+                    main_sz = main_sz + free_space * (cst.flex_grow / total_grow);
+                } else if apply_shrink && cst.flex_shrink > 0.0_f32 {
+                    let sh = (-free_space) * ((cst.flex_shrink * math_vec.max_f32(main_sz, 1.0_f32)) / total_shrink_w);
+                    main_sz = math_vec.max_f32(main_sz - sh, 0.0_f32);
+                }
+
+                let align = effective_align(st.align_items, cst.align_self);
+                let cross_len = if row { cst.height } else { cst.width };
+                let cross_margin = if row { cst.margin.vertical() } else { cst.margin.horizontal() };
+                var cross_sz = if !cross_len.is_auto() {
+                    cross_len.resolve(cross_avail, 0.0_f32)
+                } else if align == .Stretch {
+                    math_vec.max_f32(cross_avail - cross_margin, 0.0_f32)
+                } else if row {
+                    nodes[ci].intrinsic_h
+                } else {
+                    nodes[ci].intrinsic_w
+                };
+
+                if row {
+                    main_sz = clamp_dim(main_sz, cst.min_w, cst.max_w, avail_w);
+                    cross_sz = clamp_dim(cross_sz, cst.min_h, cst.max_h, avail_h);
+                    if cst.aspect_ratio > 0.0_f32 && cst.height.is_auto() && align != .Stretch {
+                        cross_sz = main_sz / cst.aspect_ratio;
+                    }
+                    let cross_off = match align {
+                        .Center => (avail_h - cross_sz) * 0.5_f32,
+                        .End => avail_h - cross_sz - cst.margin.bottom,
+                        _ => cst.margin.top,
+                    };
+                    let rx = if rev {
+                        cursor = cursor - cst.margin.right - main_sz;
+                        let out_x = content_x + cursor;
+                        cursor = cursor - cst.margin.left - main_gap - extra_gap;
+                        out_x
+                    } else {
+                        let out_x = content_x + cursor + cst.margin.left;
+                        cursor = cursor + cst.margin.left + main_sz + cst.margin.right + main_gap + extra_gap;
+                        out_x
+                    };
+                    rects[ci] = math_vec.Bounds.from_xywh(rx, content_y + cross_off, main_sz, cross_sz);
+                } else {
+                    main_sz = clamp_dim(main_sz, cst.min_h, cst.max_h, avail_h);
+                    cross_sz = clamp_dim(cross_sz, cst.min_w, cst.max_w, avail_w);
+                    if cst.aspect_ratio > 0.0_f32 && cst.width.is_auto() && align != .Stretch {
+                        cross_sz = main_sz * cst.aspect_ratio;
+                    }
+                    let cross_off = match align {
+                        .Center => (avail_w - cross_sz) * 0.5_f32,
+                        .End => avail_w - cross_sz - cst.margin.right,
+                        _ => cst.margin.left,
+                    };
+                    let ry = if rev {
+                        cursor = cursor - cst.margin.bottom - main_sz;
+                        let out_y = content_y + cursor;
+                        cursor = cursor - cst.margin.top - main_gap - extra_gap;
+                        out_y
+                    } else {
+                        let out_y = content_y + cursor + cst.margin.top;
+                        cursor = cursor + cst.margin.top + main_sz + cst.margin.bottom + main_gap + extra_gap;
+                        out_y
+                    };
+                    rects[ci] = math_vec.Bounds.from_xywh(content_x + cross_off, ry, cross_sz, main_sz);
+                }
+            }
+            ch = nodes[ci].next_sibling;
+        }
+        return;
+    }
+
+    // Multi-line FlexWrap placement
+    var line_main: f32 = 0.0_f32;
+    var line_cross: f32 = 0.0_f32;
+    var cross_cursor: f32 = 0.0_f32;
+    var on_line: u32 = 0_u32;
+    var ch = nodes[ni].first_child;
+    while ch != NODE_NONE {
+        let ci = ch.widen.[usize]();
+        if ci >= nodes.len || ci >= styles.len || ci >= rects.len { break; }
+        let cst = &styles[ci];
+        if cst.display == .None {
+            rects[ci] = math_vec.Bounds.zero();
+        } else if cst.position == .Absolute {
+            place_absolute_child(nodes, styles, rects, pbox, ci);
+        } else {
+            let iw = clamp_dim(
+                if !cst.width.is_auto() { cst.width.resolve(avail_w, nodes[ci].intrinsic_w) } else { nodes[ci].intrinsic_w },
+                cst.min_w, cst.max_w, avail_w,
+            );
+            let ih = clamp_dim(
+                if !cst.height.is_auto() { cst.height.resolve(avail_h, nodes[ci].intrinsic_h) } else { nodes[ci].intrinsic_h },
+                cst.min_h, cst.max_h, avail_h,
+            );
+            let im = if row { iw + cst.margin.horizontal() } else { ih + cst.margin.vertical() };
+            let ic = if row { ih + cst.margin.vertical() } else { iw + cst.margin.horizontal() };
+            let next_m = if on_line > 0_u32 { line_main + main_gap + im } else { im };
+            if on_line > 0_u32 && next_m > main_avail {
+                cross_cursor = cross_cursor + line_cross + cross_gap;
+                line_main = 0.0_f32;
+                line_cross = 0.0_f32;
+                on_line = 0_u32;
+            }
+            let m_pos = if on_line > 0_u32 { line_main + main_gap } else { 0.0_f32 };
+            if row {
+                rects[ci] = math_vec.Bounds.from_xywh(
+                    content_x + m_pos + cst.margin.left,
+                    content_y + cross_cursor + cst.margin.top,
+                    iw,
+                    ih,
+                );
+            } else {
+                rects[ci] = math_vec.Bounds.from_xywh(
+                    content_x + cross_cursor + cst.margin.left,
+                    content_y + m_pos + cst.margin.top,
+                    iw,
+                    ih,
+                );
+            }
+            line_main = m_pos + im;
+            line_cross = math_vec.max_f32(line_cross, ic);
+            on_line = on_line +% 1_u32;
+        }
+        ch = nodes[ci].next_sibling;
+    }
+}
+
+/// Iterative 3-pass Flexbox + 2D CSS Grid solver (ZERO recursion, ZERO heap allocations).
+/// `order_buf` must have length >= `node_count`.
+pub fn compute_layout(
+    nodes: *mut [LayoutNode],
+    styles: *[style.Style],
+    rects: *mut [math_vec.Bounds],
+    order_buf: *mut [u32],
+    node_count: usize,
+    root: u32,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> usize {
+    if node_count == 0_usize || root == NODE_NONE {
+        return 0_usize;
+    }
+    let ri = root.widen.[usize]();
+    if ri >= node_count || ri >= nodes.len || ri >= styles.len || ri >= rects.len || order_buf.len < node_count {
+        return 0_usize;
+    }
+
+    // Pass 1: Breadth-first discovery into contiguous `order_buf[0..visited]`
+    order_buf[0_usize] = root;
+    var visited: usize = 1_usize;
+    var q_head: usize = 0_usize;
+    while q_head < visited && q_head < order_buf.len {
+        let cur = order_buf[q_head].widen.[usize]();
+        q_head = q_head +% 1_usize;
+        if cur >= styles.len || cur >= nodes.len {
+            continue;
+        }
+        if nodes[cur].child_count == 0_u32 {
+            continue;
+        }
+        if styles[cur].display == .None {
+            continue;
+        }
+        var ch = nodes[cur].first_child;
+        while ch != NODE_NONE && visited < node_count && visited < order_buf.len {
+            let ci = ch.widen.[usize]();
+            if ci >= node_count || ci >= nodes.len { break; }
+            order_buf[visited] = ch;
+            visited = visited +% 1_usize;
+            ch = nodes[ci].next_sibling;
+        }
+    }
+
+    // Pass 2: Bottom-up intrinsic sizing (children strictly before parents)
+    // Skip reading cold `styles[ni]` completely when hot `fast_flags` already cached `(fast_w, fast_h)`.
+    var bi = visited;
+    while bi > 0_usize {
+        bi = bi - 1_usize;
+        if bi < order_buf.len {
+            let ni = order_buf[bi].widen.[usize]();
+            if ni < nodes.len {
+                if nodes[ni].fast_flags != 0_u8 {
+                    nodes[ni].intrinsic_w = nodes[ni].fast_w;
+                    nodes[ni].intrinsic_h = nodes[ni].fast_h;
+                } else {
+                    measure_node(nodes, styles, ni);
+                }
+            }
+        }
+    }
+
+    // Resolve root box against viewport
+    let rst = &styles[ri];
+    let rw = clamp_dim(
+        if !rst.width.is_auto() { rst.width.resolve(viewport_w, viewport_w) } else { viewport_w },
+        rst.min_w, rst.max_w, viewport_w,
+    );
+    let rh = clamp_dim(
+        if !rst.height.is_auto() { rst.height.resolve(viewport_h, viewport_h) } else { viewport_h },
+        rst.min_h, rst.max_h, viewport_h,
+    );
+    rects[ri] = math_vec.Bounds.from_xywh(0.0_f32, 0.0_f32, rw, rh);
+
+    // Pass 3: Top-down Flexbox & 2D CSS Grid placement
+    var ti: usize = 0_usize;
+    while ti < visited && ti < order_buf.len {
+        let ni = order_buf[ti].widen.[usize]();
+        if ni < nodes.len && ni < styles.len && nodes[ni].child_count > 0_u32 {
+            let st = &styles[ni];
+            if st.display == .Grid {
+                place_grid_children(nodes, styles, rects, ni);
+            } else if st.display == .Flex {
+                place_flex_children(nodes, styles, rects, ni);
+            }
+        }
+        ti = ti +% 1_usize;
+    }
+
+    return visited;
+}
+
+/// Native Eon SoA `pool` layout descriptor for ultra-fast `ArenaPool`-backed
+/// 100,000-node frame layout (zero heap allocs per frame via `arena.reset()`).
+pub pool ArenaLayoutBox {
+    pub x: f32;
+    pub y: f32;
+    pub w: f32;
+    pub h: f32;
+    pub flags: u32;
+    pub parent: ?Link[Self];
+}
+
+/// Lay out `count` widgets in a frame-scoped `ArenaPool[ArenaLayoutBox]` grid/list
+/// (demonstrating Eon's first-class SoA `ArenaPool` zero-overhead layout path).
+pub fn layout_arena_grid(
+    arena: *mut Arena,
+    count: usize,
+    cols: u32,
+    cell_w: f32,
+    cell_h: f32,
+    gap: f32,
+) -> f32 ! MemError {
+    var ap = try ArenaPool.[ArenaLayoutBox].init(arena, count +% 1_usize);
+    let root = try ap.push(.{
+        x: 0.0_f32,
+        y: 0.0_f32,
+        w: cols.to_float.[f32]() * (cell_w + gap),
+        h: 0.0_f32,
+        flags: 1_u32,
+        parent: null,
+    });
+    var acc_x: f32 = 0.0_f32;
+    var i: usize = 0_usize;
+    let c_u = if cols > 0_u32 { cols.widen.[usize]() } else { 1_usize };
+    let step_x = cell_w + gap;
+    let step_y = cell_h + gap;
+    while i < count {
+        let col = (i % c_u).to_float.[f32]();
+        let row = (i / c_u).to_float.[f32]();
+        let px = col * step_x;
+        let py = row * step_y;
+        let id = try ap.push(.{
+            x: px,
+            y: py,
+            w: cell_w,
+            h: cell_h,
+            flags: 0_u32,
+            parent: root,
+        });
+        acc_x = acc_x + ap.x[id];
+        i = i +% 1_usize;
+    }
+    ap = ap.reset();
+    return acc_x;
+}

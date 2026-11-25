@@ -1,0 +1,133 @@
+module eon_ui.platform_rt @hal;
+
+// ============================================================================
+// Portable Frame Timing, Idle Sleep & Bare-Metal `nostd` Scratchpad Allocator
+// (`libs/eon_ui/src/platform_rt.hal.eon`) — ZERO C Toolchain, ZERO unused imports.
+// Keeps user apps (`apps/*`) 100% free of `@hal`, `raw`, and `@target_*`.
+// ============================================================================
+
+extern "C" fn Sleep(ms: u32);
+
+@layout(c)
+struct LinuxTimespec {
+    tv_sec: i64;
+    tv_nsec: i64;
+}
+
+@naked
+fn linux_nanosleep_sys(_nr: u64, _req: *LinuxTimespec, _rem: u64) -> i64 {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x8, x0; mov x0, x1; mov x1, x2; svc #0; ret", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv a7, a0; mv a0, a1; mv a1, a2; ecall; ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; mov rdi, rsi; mov rsi, rdx; syscall; ret", options(noreturn)); }
+    }
+    return 0_i64;
+}
+
+/// Read monotonic timestamp in nanoseconds across all 6 OSes.
+pub fn now_ns_portable(clock: *ClockCap) -> u64 {
+    comptime if @target_os() == .NoStd {
+        _ = clock;
+        return 0_u64;
+    } else {
+        return clock.now_ns();
+    }
+}
+
+/// Sleep for `ms` milliseconds on idle frames (0% CPU when UI is not dirty or animating).
+pub fn sleep_ms_portable(ms: u32) {
+    if ms == 0_u32 {
+        return;
+    }
+    comptime if @target_os() == .Linux || @target_os() == .Android {
+        let nr: u64 = comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+            101_u64
+        } else {
+            35_u64
+        };
+        let ts = LinuxTimespec.{
+            tv_sec: (ms / 1000_u32).widen.[i64](),
+            tv_nsec: ((ms % 1000_u32).widen.[u64]() *% 1000000_u64).bitcast.[i64](),
+        };
+        _ = linux_nanosleep_sys(nr, &ts, 0_u64);
+    } else comptime if @target_os() == .Windows {
+        raw { Sleep(ms); }
+    } else {
+        _ = ms;
+    }
+}
+
+/// Return base physical RAM address for bare-metal `nostd` static UI working arena (32 MiB).
+pub fn nostd_arena_base() -> u64 {
+    comptime if @target_os() == .NoStd {
+        comptime if @target_arch() == .X86_64 {
+            return 0x02000000_u64; // 32 MiB mark in QEMU PC RAM (below 128 MiB)
+        } else comptime if @target_arch() == .AArch64 {
+            return 0x41000000_u64; // 16 MiB above QEMU virt RAM base (below 0x43E00000 stack)
+        } else comptime if @target_arch() == .RiscV64 {
+            return 0x81000000_u64; // 16 MiB above QEMU virt RAM base (below 0x83E00000 stack)
+        } else {
+            return 0_u64;
+        }
+    } else {
+        return 0_u64;
+    }
+}
+
+/// Bump allocator carving aligned typed slices out of bare-metal physical RAM on `nostd`.
+pub struct NoStdScratch {
+    pub cursor: u64;
+    pub end: u64;
+}
+
+@naked
+view fn raw_slice_from_addr[T](_anchor: *mut NoStdScratch, _addr: u64, _len: usize) -> *mut [T] {
+    comptime if @target_arch() == .AArch64 {
+        raw { asm("mov x0, x1; mov x1, x2; ret", options(noreturn)); }
+    } else comptime if @target_arch() == .RiscV64 {
+        raw { asm("mv a0, a1; mv a1, a2; ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rsi; ret", options(noreturn)); }
+    }
+    loop {}
+}
+
+impl NoStdScratch {
+    pub fn init_default() -> NoStdScratch {
+        let base = nostd_arena_base();
+        let size: u64 = 32_u64 *% 1024_u64 *% 1024_u64; // 32 MiB
+        return NoStdScratch.{
+            cursor: base,
+            end: base +% size,
+        };
+    }
+}
+
+pub view fn alloc_nostd_slice[T](scratch: *mut NoStdScratch, count: usize) -> *mut [T] {
+    let elem_sz = @size_of(T).widen.[u64]();
+    let aligned = (scratch.cursor +% 15_u64) & (~15_u64);
+    let bytes = elem_sz *% count.widen.[u64]();
+    if aligned +% bytes > scratch.end || aligned == 0_u64 {
+        return raw_slice_from_addr.[T](scratch, 0_u64, 0_usize);
+    }
+    scratch.cursor = aligned +% bytes;
+    comptime if @target_os() == .NoStd {
+        var p = aligned;
+        let lim = aligned +% bytes;
+        while p +% 8_u64 <= lim {
+            raw {
+                rawptr_mut.[u64].from_usize(p.trunc.[usize]()).* = 0_u64;
+            }
+            p = p +% 8_u64;
+        }
+        while p < lim {
+            raw {
+                rawptr_mut.[u8].from_usize(p.trunc.[usize]()).* = 0_u8;
+            }
+            p = p +% 1_u64;
+        }
+    }
+    return raw_slice_from_addr.[T](scratch, aligned, count);
+}

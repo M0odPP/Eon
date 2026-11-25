@@ -1,0 +1,322 @@
+module eon_ui.style;
+
+import core.color;
+import core.math_vec;
+import eon_win.events;
+import eon_text.lib;
+
+// ============================================================================
+// GPUI / Taffy-Class Style & Layout Specification (`libs/eon_ui/src/style.eon`)
+// 100% safe, `core/`-only, zero heap allocations.
+// ============================================================================
+
+pub enum Display : u8 {
+    Flex = 0,
+    Grid = 1,
+    None = 2,
+}
+
+pub enum Position : u8 {
+    Relative = 0,
+    Absolute = 1,
+}
+
+pub enum FlexDirection : u8 {
+    Row = 0,
+    Column = 1,
+    RowReverse = 2,
+    ColumnReverse = 3,
+}
+
+pub enum FlexWrap : u8 {
+    NoWrap = 0,
+    Wrap = 1,
+}
+
+pub enum JustifyContent : u8 {
+    Start = 0,
+    Center = 1,
+    End = 2,
+    SpaceBetween = 3,
+    SpaceAround = 4,
+    SpaceEvenly = 5,
+}
+
+pub enum AlignItems : u8 {
+    Stretch = 0,
+    Start = 1,
+    Center = 2,
+    End = 3,
+}
+
+pub enum AlignSelf : u8 {
+    Auto = 0,
+    Stretch = 1,
+    Start = 2,
+    Center = 3,
+    End = 4,
+}
+
+pub enum Overflow : u8 {
+    Visible = 0,
+    Hidden = 1,
+    Scroll = 2,
+}
+
+pub enum LengthKind : u8 {
+    Auto = 0,
+    Px = 1,
+    Pct = 2,
+}
+
+pub struct Length {
+    pub kind: LengthKind;
+    pub val: f32;
+}
+
+impl Length {
+    @inline
+    pub fn auto() -> Length {
+        return Length.{ kind: .Auto, val: 0.0_f32 };
+    }
+
+    @inline
+    pub fn px(v: f32) -> Length {
+        return Length.{ kind: .Px, val: v };
+    }
+
+    @inline
+    pub fn pct(v: f32) -> Length {
+        return Length.{ kind: .Pct, val: v };
+    }
+
+    @inline
+    pub fn resolve(self: Self, parent_size: f32, fallback: f32) -> f32 {
+        match self.kind {
+            .Px => { return self.val; }
+            .Pct => { return parent_size * self.val * 0.01_f32; }
+            .Auto => { return fallback; }
+        }
+    }
+
+    @inline
+    pub fn is_auto(self: Self) -> bool {
+        return self.kind == .Auto;
+    }
+}
+
+pub enum TrackKind : u8 {
+    Fr = 0,
+    Fixed = 1,
+    Auto = 2,
+    MinMax = 3,
+}
+
+pub struct TrackSize {
+    pub kind: TrackKind;
+    pub a: f32; // px / fr / min_px
+    pub b: f32; // max_px (for MinMax)
+}
+
+impl TrackSize {
+    @inline
+    pub fn fr(v: f32) -> TrackSize {
+        return TrackSize.{ kind: .Fr, a: v, b: 0.0_f32 };
+    }
+
+    @inline
+    pub fn fixed(px: f32) -> TrackSize {
+        return TrackSize.{ kind: .Fixed, a: px, b: 0.0_f32 };
+    }
+
+    @inline
+    pub fn auto() -> TrackSize {
+        return TrackSize.{ kind: .Auto, a: 0.0_f32, b: 0.0_f32 };
+    }
+
+    @inline
+    pub fn minmax(min_px: f32, max_px: f32) -> TrackSize {
+        return TrackSize.{ kind: .MinMax, a: min_px, b: max_px };
+    }
+}
+
+pub const MAX_GRID_TRACKS: usize = 8_usize;
+
+pub struct ShadowSpec {
+    pub enabled: bool;
+    pub blur: f32;
+    pub spread: f32;
+    pub offset_x: f32;
+    pub offset_y: f32;
+    pub color: color.Rgba;
+}
+
+impl ShadowSpec {
+    @inline
+    pub fn none() -> ShadowSpec {
+        return ShadowSpec.{
+            enabled: false,
+            blur: 0.0_f32,
+            spread: 0.0_f32,
+            offset_x: 0.0_f32,
+            offset_y: 0.0_f32,
+            color: color.Rgba.transparent(),
+        };
+    }
+
+    @inline
+    pub fn drop(blur: f32, offset_y: f32, col: color.Rgba) -> ShadowSpec {
+        return ShadowSpec.{
+            enabled: true,
+            blur: blur,
+            spread: 0.0_f32,
+            offset_x: 0.0_f32,
+            offset_y: offset_y,
+            color: col,
+        };
+    }
+}
+
+/// Complete compact Flexbox + 2D CSS Grid + visual + typography + interaction style.
+pub struct Style {
+    pub display: Display;
+    pub position: Position;
+    pub flex_dir: FlexDirection;
+    pub flex_wrap: FlexWrap;
+    pub justify: JustifyContent;
+    pub align_items: AlignItems;
+    pub align_self: AlignSelf;
+    pub overflow: Overflow;
+
+    pub width: Length;
+    pub height: Length;
+    pub min_w: Length;
+    pub max_w: Length;
+    pub min_h: Length;
+    pub max_h: Length;
+    pub aspect_ratio: f32;
+
+    pub flex_grow: f32;
+    pub flex_shrink: f32;
+    pub flex_basis: Length;
+
+    pub padding: math_vec.Edges;
+    pub margin: math_vec.Edges;
+    pub border_widths: math_vec.Edges;
+    pub inset: math_vec.Edges;
+    pub inset_mask: u8; // bit0=top, bit1=right, bit2=bottom, bit3=left
+
+    pub col_gap: f32;
+    pub row_gap: f32;
+
+    // 2D CSS Grid container & item properties
+    pub grid_col_count: u8;
+    pub grid_row_count: u8;
+    pub grid_cols: [8]TrackSize;
+    pub grid_rows: [8]TrackSize;
+    pub col_span: u8;
+    pub row_span: u8;
+
+    // Visual styling
+    pub bg: color.Rgba;
+    pub bg_end: color.Rgba;
+    pub grad_flag: u32;
+    pub border_color: color.Rgba;
+    pub radii: math_vec.Corners;
+    pub shadow: ShadowSpec;
+    pub opacity: f32;
+    pub z_index: i16;
+    pub cursor: events.CursorShape;
+
+    // Typography
+    pub text_color: color.Rgba;
+    pub font_size: f32;
+    pub font_id: u16;
+    pub text_align: lib.TextAlign;
+    pub text_wrap: bool;
+    pub text_ellipsis: bool;
+
+    // Interactive state overrides (hover / active / focus / disabled)
+    pub has_hover_bg: bool;
+    pub hover_bg: color.Rgba;
+    pub has_active_bg: bool;
+    pub active_bg: color.Rgba;
+    pub has_focus_border: bool;
+    pub focus_border: color.Rgba;
+    pub has_hover_border: bool;
+    pub hover_border: color.Rgba;
+    pub disabled: bool;
+    pub press_spring: bool;
+}
+
+impl Style {
+    pub fn default() -> Style {
+        let tr_fr = TrackSize.fr(1.0_f32);
+        return Style.{
+            display: .Flex,
+            position: .Relative,
+            flex_dir: .Row,
+            flex_wrap: .NoWrap,
+            justify: .Start,
+            align_items: .Stretch,
+            align_self: .Auto,
+            overflow: .Visible,
+
+            width: Length.auto(),
+            height: Length.auto(),
+            min_w: Length.auto(),
+            max_w: Length.auto(),
+            min_h: Length.auto(),
+            max_h: Length.auto(),
+            aspect_ratio: 0.0_f32,
+
+            flex_grow: 0.0_f32,
+            flex_shrink: 1.0_f32,
+            flex_basis: Length.auto(),
+
+            padding: math_vec.Edges.zero(),
+            margin: math_vec.Edges.zero(),
+            border_widths: math_vec.Edges.zero(),
+            inset: math_vec.Edges.zero(),
+            inset_mask: 0_u8,
+
+            col_gap: 0.0_f32,
+            row_gap: 0.0_f32,
+
+            grid_col_count: 0_u8,
+            grid_row_count: 0_u8,
+            grid_cols: [tr_fr; 8],
+            grid_rows: [tr_fr; 8],
+            col_span: 1_u8,
+            row_span: 1_u8,
+
+            bg: color.Rgba.transparent(),
+            bg_end: color.Rgba.transparent(),
+            grad_flag: 0_u32,
+            border_color: color.Rgba.transparent(),
+            radii: math_vec.Corners.zero(),
+            shadow: ShadowSpec.none(),
+            opacity: 1.0_f32,
+            z_index: 0_i16,
+            cursor: .Default,
+
+            text_color: color.Rgba.white(),
+            font_size: 16.0_f32,
+            font_id: lib.FONT_UI_SANS,
+            text_align: .Left,
+            text_wrap: false,
+            text_ellipsis: false,
+
+            has_hover_bg: false,
+            hover_bg: color.Rgba.transparent(),
+            has_active_bg: false,
+            active_bg: color.Rgba.transparent(),
+            has_focus_border: false,
+            focus_border: color.Rgba.transparent(),
+            has_hover_border: false,
+            hover_border: color.Rgba.transparent(),
+            disabled: false,
+            press_spring: false,
+        };
+    }
+}

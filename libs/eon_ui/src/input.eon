@@ -1,0 +1,631 @@
+module eon_ui.input;
+
+import core.math_vec;
+import eon_win.events;
+import eon_ui.keymap;
+
+// ============================================================================
+// Focus Tree, Hitbox Registry & Capture/Bubble Event Dispatch (`libs/eon_ui/src/input.eon`)
+// 100% safe, `core/`-only, zero heap allocations (works identically on nostd).
+// ============================================================================
+
+pub const FOCUS_NONE: u32 = 0_u32;
+pub const MAX_FOCUS_HANDLES: usize = 64_usize;
+pub const MAX_HITBOXES: usize = 256_usize;
+pub const MAX_DISPATCH_ACTIONS: usize = 32_usize;
+
+pub struct FocusHandle {
+    pub id: u32;
+}
+
+impl FocusHandle {
+    @inline
+    pub fn none() -> FocusHandle {
+        return FocusHandle.{ id: FOCUS_NONE };
+    }
+
+    @inline
+    pub fn new(id: u32) -> FocusHandle {
+        return FocusHandle.{ id: id };
+    }
+
+    @inline
+    pub fn is_valid(self: Self) -> bool {
+        return self.id != FOCUS_NONE;
+    }
+}
+
+pub struct FocusNode {
+    pub id: u32;
+    pub parent_id: u32;
+    pub context_id: u16;
+    pub tab_stop: bool;
+}
+
+pub struct FocusTree {
+    nodes: [64]FocusNode;
+    pub len: usize;
+    pub focused_id: u32;
+    next_id: u32;
+}
+
+impl FocusTree {
+    pub fn new() -> FocusTree {
+        let empty = FocusNode.{
+            id: FOCUS_NONE,
+            parent_id: FOCUS_NONE,
+            context_id: keymap.CTX_GLOBAL,
+            tab_stop: false,
+        };
+        return FocusTree.{
+            nodes: [empty; 64],
+            len: 0_usize,
+            focused_id: FOCUS_NONE,
+            next_id: 1_u32,
+        };
+    }
+
+    pub fn create_handle(self: *mut Self) -> FocusHandle {
+        let id = self.next_id;
+        self.next_id = self.next_id +% 1_u32;
+        return FocusHandle.{ id: id };
+    }
+
+    pub fn begin_frame(self: *mut Self) {
+        self.len = 0_usize;
+    }
+
+    pub fn register(self: *mut Self, id: u32, parent_id: u32, context_id: u16, tab_stop: bool) {
+        if id == FOCUS_NONE || self.len >= MAX_FOCUS_HANDLES {
+            return;
+        }
+        self.nodes[self.len] = FocusNode.{
+            id: id,
+            parent_id: parent_id,
+            context_id: context_id,
+            tab_stop: tab_stop,
+        };
+        self.len = self.len +% 1_usize;
+    }
+
+    pub fn focus(self: *mut Self, id: u32) {
+        self.focused_id = id;
+    }
+
+    pub fn blur(self: *mut Self) {
+        self.focused_id = FOCUS_NONE;
+    }
+
+    pub fn is_focused(self: *Self, id: u32) -> bool {
+        return id != FOCUS_NONE && self.focused_id == id;
+    }
+
+    pub fn active_context(self: *Self) -> u16 {
+        if self.focused_id == FOCUS_NONE {
+            return keymap.CTX_GLOBAL;
+        }
+        var i: usize = 0_usize;
+        while i < self.len && i < MAX_FOCUS_HANDLES {
+            if self.nodes[i].id == self.focused_id {
+                return self.nodes[i].context_id;
+            }
+            i = i +% 1_usize;
+        }
+        return keymap.CTX_GLOBAL;
+    }
+
+    pub fn focus_next(self: *mut Self) -> u32 {
+        let n = if self.len <= MAX_FOCUS_HANDLES { self.len } else { MAX_FOCUS_HANDLES };
+        if n == 0_usize {
+            return FOCUS_NONE;
+        }
+        var cur_idx: usize = n;
+        var i: usize = 0_usize;
+        while i < n {
+            if self.nodes[i].id == self.focused_id {
+                cur_idx = i;
+                break;
+            }
+            i = i +% 1_usize;
+        }
+        var step: usize = 1_usize;
+        while step <= n {
+            let idx = if cur_idx < n {
+                (cur_idx +% step) % n
+            } else {
+                (step - 1_usize) % n
+            };
+            if idx < 64_usize && self.nodes[idx].tab_stop {
+                self.focused_id = self.nodes[idx].id;
+                return self.focused_id;
+            }
+            step = step +% 1_usize;
+        }
+        return self.focused_id;
+    }
+
+    pub fn focus_prev(self: *mut Self) -> u32 {
+        let n = if self.len <= MAX_FOCUS_HANDLES { self.len } else { MAX_FOCUS_HANDLES };
+        if n == 0_usize {
+            return FOCUS_NONE;
+        }
+        var cur_idx: usize = n;
+        var i: usize = 0_usize;
+        while i < n {
+            if self.nodes[i].id == self.focused_id {
+                cur_idx = i;
+                break;
+            }
+            i = i +% 1_usize;
+        }
+        var step: usize = 1_usize;
+        while step <= n {
+            let idx = if cur_idx < n {
+                (cur_idx +% n - step) % n
+            } else {
+                (n - step) % n
+            };
+            if idx < 64_usize && self.nodes[idx].tab_stop {
+                self.focused_id = self.nodes[idx].id;
+                return self.focused_id;
+            }
+            step = step +% 1_usize;
+        }
+        return self.focused_id;
+    }
+}
+
+pub struct Hitbox {
+    pub element_id: u64;
+    pub parent_element_id: u64;
+    pub action_id: u32;
+    pub focus_id: u32;
+    pub scroll_id: u32;
+    pub bounds: math_vec.Bounds;
+    pub clip: math_vec.Bounds;
+    pub z_index: i16;
+    pub cursor: events.CursorShape;
+    pub disabled: bool;
+    pub blocks_behind: bool;
+}
+
+impl Hitbox {
+    @inline
+    pub fn empty() -> Hitbox {
+        return Hitbox.{
+            element_id: 0_u64,
+            parent_element_id: 0_u64,
+            action_id: keymap.ACTION_NONE,
+            focus_id: FOCUS_NONE,
+            scroll_id: 0_u32,
+            bounds: math_vec.Bounds.zero(),
+            clip: math_vec.Bounds.zero(),
+            z_index: 0_i16,
+            cursor: .Default,
+            disabled: false,
+            blocks_behind: false,
+        };
+    }
+
+    @inline
+    pub fn hit_test(self: *Self, p: math_vec.Point) -> bool {
+        return self.bounds.contains(p) && self.clip.contains(p);
+    }
+}
+
+pub enum EventPhase : u8 {
+    Capture = 0,
+    Target = 1,
+    Bubble = 2,
+}
+
+pub struct DispatchedEvent {
+    pub action_id: u32;
+    pub element_id: u64;
+    pub scroll_id: u32;
+    pub scroll_dx: f32;
+    pub scroll_dy: f32;
+    pub text_codepoint: u32;
+    pub pointer_x: f32;
+    pub pointer_y: f32;
+    pub phase: EventPhase;
+}
+
+pub struct InputState {
+    pub pointer_x: f32;
+    pub pointer_y: f32;
+    pub pointer_down: bool;
+    pub hovered_id: u64;
+    pub active_id: u64;
+    pub pressed_id: u64;
+    pub active_cursor: events.CursorShape;
+    pub mods: events.Modifiers;
+
+    hitboxes: [256]Hitbox;
+    pub hitbox_len: usize;
+
+    actions: [32]DispatchedEvent;
+    pub action_len: usize;
+}
+
+impl InputState {
+    pub fn new() -> InputState {
+        let eh = Hitbox.empty();
+        let ea = DispatchedEvent.{
+            action_id: keymap.ACTION_NONE,
+            element_id: 0_u64,
+            scroll_id: 0_u32,
+            scroll_dx: 0.0_f32,
+            scroll_dy: 0.0_f32,
+            text_codepoint: 0_u32,
+            pointer_x: 0.0_f32,
+            pointer_y: 0.0_f32,
+            phase: .Target,
+        };
+        return InputState.{
+            pointer_x: -10000.0_f32,
+            pointer_y: -10000.0_f32,
+            pointer_down: false,
+            hovered_id: 0_u64,
+            active_id: 0_u64,
+            pressed_id: 0_u64,
+            active_cursor: .Default,
+            mods: events.Modifiers.none(),
+            hitboxes: [eh; 256],
+            hitbox_len: 0_usize,
+            actions: [ea; 32],
+            action_len: 0_usize,
+        };
+    }
+
+    pub fn clear_hitboxes(self: *mut Self) {
+        self.hitbox_len = 0_usize;
+    }
+
+    pub fn clear_actions(self: *mut Self) {
+        self.action_len = 0_usize;
+    }
+
+    pub fn push_hitbox(self: *mut Self, hb: Hitbox) {
+        if self.hitbox_len < MAX_HITBOXES {
+            self.hitboxes[self.hitbox_len] = hb;
+            self.hitbox_len = self.hitbox_len +% 1_usize;
+        }
+    }
+
+    pub fn push_action(self: *mut Self, ev: DispatchedEvent) {
+        if self.action_len < MAX_DISPATCH_ACTIONS {
+            self.actions[self.action_len] = ev;
+            self.action_len = self.action_len +% 1_usize;
+        }
+    }
+
+    pub view fn dispatched_actions(self: *Self) -> *[DispatchedEvent] {
+        let n = if self.action_len <= MAX_DISPATCH_ACTIONS { self.action_len } else { MAX_DISPATCH_ACTIONS };
+        return self.actions[0_usize..n];
+    }
+
+    /// Find the topmost hitbox under `p` respecting `z_index` and paint order.
+    pub fn find_top_hitbox(self: *Self, p: math_vec.Point) -> ?usize {
+        var best_found = false;
+        var best_idx: usize = 0_usize;
+        var best_z: i16 = -32768_i16;
+        var i: usize = 0_usize;
+        while i < self.hitbox_len && i < MAX_HITBOXES {
+            let hb = &self.hitboxes[i];
+            if hb.hit_test(p) {
+                if !best_found || hb.z_index >= best_z {
+                    best_found = true;
+                    best_idx = i;
+                    best_z = hb.z_index;
+                }
+            }
+            i = i +% 1_usize;
+        }
+        if best_found {
+            return best_idx;
+        }
+        return null;
+    }
+
+    /// Find the deepest scrollable hitbox under `p` (for wheel / touch scroll).
+    pub fn find_scroll_hitbox(self: *Self, p: math_vec.Point) -> u32 {
+        var best_scroll: u32 = 0_u32;
+        var best_z: i16 = -32768_i16;
+        var found = false;
+        var i: usize = 0_usize;
+        while i < self.hitbox_len && i < MAX_HITBOXES {
+            let hb = &self.hitboxes[i];
+            if hb.scroll_id != 0_u32 && hb.hit_test(p) {
+                if !found || hb.z_index >= best_z {
+                    found = true;
+                    best_z = hb.z_index;
+                    best_scroll = hb.scroll_id;
+                }
+            }
+            i = i +% 1_usize;
+        }
+        return best_scroll;
+    }
+
+    /// Find hitbox index by `element_id` for capture/bubble ancestor traversal.
+    fn find_by_elem(self: *Self, eid: u64) -> ?usize {
+        if eid == 0_u64 {
+            return null;
+        }
+        var i: usize = 0_usize;
+        while i < self.hitbox_len && i < MAX_HITBOXES {
+            if self.hitboxes[i].element_id == eid {
+                return i;
+            }
+            i = i +% 1_usize;
+        }
+        return null;
+    }
+
+    pub fn update_hover(self: *mut Self) {
+        let p = math_vec.Point.new(self.pointer_x, self.pointer_y);
+        if let hi = self.find_top_hitbox(p) {
+            if hi < MAX_HITBOXES {
+                let hb = self.hitboxes[hi];
+                self.hovered_id = if hb.disabled { 0_u64 } else { hb.element_id };
+                self.active_cursor = if hb.disabled { .NotAllowed } else { hb.cursor };
+                return;
+            }
+        }
+        self.hovered_id = 0_u64;
+        self.active_cursor = .Default;
+    }
+
+    /// Dispatch a platform input event through FocusTree, Keymap, and Hitbox Capture/Target/Bubble.
+    /// Returns `true` if UI state changed and a redraw is needed.
+    pub fn handle_event(
+        self: *mut Self,
+        ev: events.PlatformEvent,
+        focus: *mut FocusTree,
+        km: *keymap.Keymap,
+    ) -> bool {
+        match ev {
+            .MouseMove(m) => {
+                self.pointer_x = m.x;
+                self.pointer_y = m.y;
+                self.mods = m.mods;
+                let prev = self.hovered_id;
+                self.update_hover();
+                return self.hovered_id != prev;
+            }
+            .MouseDown(mb) => {
+                self.pointer_x = mb.x;
+                self.pointer_y = mb.y;
+                self.mods = mb.mods;
+                self.update_hover();
+                if mb.button == .Left {
+                    self.pointer_down = true;
+                    let p = math_vec.Point.new(mb.x, mb.y);
+                    if let hi = self.find_top_hitbox(p) {
+                        if hi < MAX_HITBOXES {
+                            let hb = self.hitboxes[hi];
+                            if !hb.disabled {
+                                self.pressed_id = hb.element_id;
+                                self.active_id = hb.element_id;
+                                if hb.focus_id != FOCUS_NONE {
+                                    focus.focus(hb.focus_id);
+                                }
+                            }
+                        }
+                    } else {
+                        self.pressed_id = 0_u64;
+                        self.active_id = 0_u64;
+                    }
+                    return true;
+                }
+                return false;
+            }
+            .MouseUp(mb) => {
+                self.pointer_x = mb.x;
+                self.pointer_y = mb.y;
+                self.mods = mb.mods;
+                self.update_hover();
+                if mb.button == .Left {
+                    let was_pressed = self.pressed_id;
+                    self.pointer_down = false;
+                    self.pressed_id = 0_u64;
+                    self.active_id = 0_u64;
+                    let p = math_vec.Point.new(mb.x, mb.y);
+                    if let hi = self.find_top_hitbox(p) {
+                        if hi < MAX_HITBOXES {
+                            let target_hb = self.hitboxes[hi];
+                            if !target_hb.disabled && was_pressed == target_hb.element_id {
+                                // Capture -> Target -> Bubble dispatch along parent chain
+                                if target_hb.action_id != keymap.ACTION_NONE {
+                                    self.push_action(DispatchedEvent.{
+                                        action_id: target_hb.action_id,
+                                        element_id: target_hb.element_id,
+                                        scroll_id: 0_u32,
+                                        scroll_dx: 0.0_f32,
+                                        scroll_dy: 0.0_f32,
+                                        text_codepoint: 0_u32,
+                                        pointer_x: mb.x,
+                                        pointer_y: mb.y,
+                                        phase: .Target,
+                                    });
+                                } else {
+                                    // Bubble up to nearest clickable ancestor hitbox
+                                    var cur_parent = target_hb.parent_element_id;
+                                    var depth: u32 = 0_u32;
+                                    while cur_parent != 0_u64 && depth < 16_u32 {
+                                        if let pi = self.find_by_elem(cur_parent) {
+                                            if pi >= MAX_HITBOXES { break; }
+                                            let phb = self.hitboxes[pi];
+                                            if !phb.disabled && phb.action_id != keymap.ACTION_NONE {
+                                                self.push_action(DispatchedEvent.{
+                                                    action_id: phb.action_id,
+                                                    element_id: phb.element_id,
+                                                    scroll_id: 0_u32,
+                                                    scroll_dx: 0.0_f32,
+                                                    scroll_dy: 0.0_f32,
+                                                    text_codepoint: 0_u32,
+                                                    pointer_x: mb.x,
+                                                    pointer_y: mb.y,
+                                                    phase: .Bubble,
+                                                });
+                                                break;
+                                            }
+                                            cur_parent = phb.parent_element_id;
+                                        } else {
+                                            break;
+                                        }
+                                        depth = depth +% 1_u32;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return true;
+                }
+                return false;
+            }
+            .MouseWheel(mw) => {
+                self.pointer_x = mw.x;
+                self.pointer_y = mw.y;
+                self.mods = mw.mods;
+                let p = math_vec.Point.new(mw.x, mw.y);
+                let sid = self.find_scroll_hitbox(p);
+                if sid != 0_u32 {
+                    self.push_action(DispatchedEvent.{
+                        action_id: keymap.ACTION_NONE,
+                        element_id: 0_u64,
+                        scroll_id: sid,
+                        scroll_dx: mw.dx,
+                        scroll_dy: mw.dy,
+                        text_codepoint: 0_u32,
+                        pointer_x: mw.x,
+                        pointer_y: mw.y,
+                        phase: .Bubble,
+                    });
+                    return true;
+                }
+                return false;
+            }
+            .Touch(te) => {
+                self.pointer_x = te.x;
+                self.pointer_y = te.y;
+                self.update_hover();
+                let p = math_vec.Point.new(te.x, te.y);
+                match te.phase {
+                    .Started => {
+                        self.pointer_down = true;
+                        if let hi = self.find_top_hitbox(p) {
+                            if hi < MAX_HITBOXES {
+                                let hb = self.hitboxes[hi];
+                                if !hb.disabled {
+                                    self.pressed_id = hb.element_id;
+                                    self.active_id = hb.element_id;
+                                    if hb.focus_id != FOCUS_NONE {
+                                        focus.focus(hb.focus_id);
+                                    }
+                                }
+                            }
+                        }
+                        return true;
+                    }
+                    .Ended => {
+                        let was = self.pressed_id;
+                        self.pointer_down = false;
+                        self.pressed_id = 0_u64;
+                        self.active_id = 0_u64;
+                        if let hi = self.find_top_hitbox(p) {
+                            if hi < MAX_HITBOXES {
+                                let hb = self.hitboxes[hi];
+                                if !hb.disabled && was == hb.element_id && hb.action_id != keymap.ACTION_NONE {
+                                    self.push_action(DispatchedEvent.{
+                                        action_id: hb.action_id,
+                                        element_id: hb.element_id,
+                                        scroll_id: 0_u32,
+                                        scroll_dx: 0.0_f32,
+                                        scroll_dy: 0.0_f32,
+                                        text_codepoint: 0_u32,
+                                        pointer_x: te.x,
+                                        pointer_y: te.y,
+                                        phase: .Target,
+                                    });
+                                }
+                            }
+                        }
+                        return true;
+                    }
+                    .Cancelled => {
+                        self.pointer_down = false;
+                        self.pressed_id = 0_u64;
+                        self.active_id = 0_u64;
+                        return true;
+                    }
+                    .Moved => {
+                        return false;
+                    }
+                }
+            }
+            .KeyDown(ke) => {
+                self.mods = ke.mods;
+                if ke.key == .Tab {
+                    if ke.mods.has_shift() {
+                        _ = focus.focus_prev();
+                    } else {
+                        _ = focus.focus_next();
+                    }
+                    return true;
+                }
+                let ctx = focus.active_context();
+                let act = km.match_key(ke.key, ke.mods, ctx);
+                if act != keymap.ACTION_NONE {
+                    self.push_action(DispatchedEvent.{
+                        action_id: act,
+                        element_id: 0_u64,
+                        scroll_id: 0_u32,
+                        scroll_dx: 0.0_f32,
+                        scroll_dy: 0.0_f32,
+                        text_codepoint: 0_u32,
+                        pointer_x: self.pointer_x,
+                        pointer_y: self.pointer_y,
+                        phase: .Target,
+                    });
+                    return true;
+                }
+                return false;
+            }
+            .TextInput(cp) => {
+                if cp != 0_u32 {
+                    self.push_action(DispatchedEvent.{
+                        action_id: keymap.ACTION_NONE,
+                        element_id: 0_u64,
+                        scroll_id: 0_u32,
+                        scroll_dx: 0.0_f32,
+                        scroll_dy: 0.0_f32,
+                        text_codepoint: cp,
+                        pointer_x: self.pointer_x,
+                        pointer_y: self.pointer_y,
+                        phase: .Target,
+                    });
+                    return true;
+                }
+                return false;
+            }
+            .Resized(_) => { return true; }
+            .ScaleFactorChanged(_) => { return true; }
+            .FocusChanged(_) => { return true; }
+            .RedrawRequested => { return true; }
+            _ => { return false; }
+        }
+        return false;
+    }
+
+    @inline
+    pub fn is_hovered(self: *Self, element_id: u64) -> bool {
+        return element_id != 0_u64 && self.hovered_id == element_id;
+    }
+
+    @inline
+    pub fn is_active(self: *Self, element_id: u64) -> bool {
+        return element_id != 0_u64 && self.active_id == element_id;
+    }
+}

@@ -1,0 +1,916 @@
+module eon_ui.element;
+
+import core.col;
+import core.color;
+import core.math_vec;
+import eon_gpu.scene;
+import eon_text.atlas;
+import eon_text.lib;
+import eon_text.shaper;
+import eon_ui.style;
+import eon_ui.layout;
+import eon_ui.div;
+import eon_ui.input;
+import eon_ui.keymap;
+import eon_ui.context;
+
+// ============================================================================
+// 3-Phase GPUI Element Lifecycle (`request_layout` -> `prepaint` -> `paint`)
+// `libs/eon_ui/src/element.eon` — 100% safe.
+//
+// Core passes operate over flat slices (`UiSliceStorage`) so the EXACT SAME
+// builder, layout, prepaint, and paint code executes on BOTH hosted OSes
+// (`UiTree` backed by `DynBuf` — zero allocs/frame after warmup, 100k+ nodes!)
+// and bare-metal `nostd` (caller-owned fixed slices — zero heap syscalls!).
+// ============================================================================
+
+/// Per-element interaction, text span, scroll, and visual metadata.
+pub struct ElemMeta {
+    pub element_id: u64;
+    pub action_id: u32;
+    pub focus_id: u32;
+    pub focus_ctx: u16;
+    pub tab_stop: bool;
+    pub scroll_id: u32;
+    pub scroll_x: f32;
+    pub scroll_y: f32;
+    pub text_off: u32;
+    pub text_len: u32;
+    pub underline_enabled: bool;
+    pub underline_wavy: bool;
+    pub underline_color: color.Rgba;
+}
+
+impl ElemMeta {
+    @inline
+    pub fn empty() -> ElemMeta {
+        return ElemMeta.{
+            element_id: 0_u64,
+            action_id: keymap.ACTION_NONE,
+            focus_id: input.FOCUS_NONE,
+            focus_ctx: keymap.CTX_GLOBAL,
+            tab_stop: false,
+            scroll_id: 0_u32,
+            scroll_x: 0.0_f32,
+            scroll_y: 0.0_f32,
+            text_off: 0_u32,
+            text_len: 0_u32,
+            underline_enabled: false,
+            underline_wavy: false,
+            underline_color: color.Rgba.transparent(),
+        };
+    }
+}
+
+/// Prepaint result computed in Phase 2 (`prepaint`) and consumed in Phase 3 (`paint`).
+pub struct PrepaintItem {
+    pub screen_bounds: math_vec.Bounds;
+    pub clip_bounds: math_vec.Bounds;
+    pub z_index: i16;
+    pub visible: bool;
+    pub hovered: bool;
+    pub active: bool;
+    pub focused: bool;
+}
+
+impl PrepaintItem {
+    @inline
+    pub fn empty() -> PrepaintItem {
+        return PrepaintItem.{
+            screen_bounds: math_vec.Bounds.zero(),
+            clip_bounds: math_vec.Bounds.zero(),
+            z_index: 0_i16,
+            visible: false,
+            hovered: false,
+            active: false,
+            focused: false,
+        };
+    }
+}
+
+/// Flat slice-based builder state shared across hosted (`UiTree`) and `nostd` (`UiNoStd`).
+pub struct UiTreeMeta {
+    pub node_count: usize;
+    pub text_len: usize;
+    pub root: u32;
+    pub next_auto_id: u64;
+    pub visited_count: usize;
+    pub visible_count: usize;
+    pub has_overlays: bool;
+}
+
+impl UiTreeMeta {
+    pub fn new() -> UiTreeMeta {
+        return UiTreeMeta.{
+            node_count: 0_usize,
+            text_len: 0_usize,
+            root: layout.NODE_NONE,
+            next_auto_id: 1_u64,
+            visited_count: 0_usize,
+            visible_count: 0_usize,
+            has_overlays: false,
+        };
+    }
+
+    pub fn clear(self: *mut Self) {
+        self.node_count = 0_usize;
+        self.text_len = 0_usize;
+        self.root = layout.NODE_NONE;
+        self.next_auto_id = 1_u64;
+        self.visited_count = 0_usize;
+        self.visible_count = 0_usize;
+        self.has_overlays = false;
+    }
+}
+
+/// Push a `Div` element + optional UTF-8 text into pre-allocated flat slices.
+pub fn push_into_slices(
+    meta: *mut UiTreeMeta,
+    nodes: *mut [layout.LayoutNode],
+    styles: *mut [style.Style],
+    elems: *mut [ElemMeta],
+    text_pool: *mut [u8],
+    parent: u32,
+    d: div.Div,
+    text_bytes: *[u8],
+    content_w: f32,
+    content_h: f32,
+) -> u32 {
+    let idx = meta.node_count;
+    if idx >= nodes.len || idx >= styles.len || idx >= elems.len {
+        return layout.NODE_NONE;
+    }
+    var eid = d.element_id;
+    if eid == 0_u64 && (d.action_id != keymap.ACTION_NONE || d.focus_id != input.FOCUS_NONE || d.scroll_id != 0_u32 || d.style.has_hover_bg || d.style.has_active_bg) {
+        eid = 0x80000000_u64 | meta.next_auto_id;
+        meta.next_auto_id = meta.next_auto_id +% 1_u64;
+    }
+
+    var toff: u32 = 0_u32;
+    var tlen: u32 = 0_u32;
+    if text_bytes.len > 0_usize && meta.text_len < text_pool.len {
+        toff = meta.text_len.trunc.[u32]();
+        let avail = text_pool.len - meta.text_len;
+        let cp = if text_bytes.len <= avail { text_bytes.len } else { avail };
+        var k: usize = 0_usize;
+        while k < cp {
+            let dst_i = meta.text_len +% k;
+            if dst_i < text_pool.len && k < text_bytes.len {
+                text_pool[dst_i] = text_bytes[k];
+            }
+            k = k +% 1_usize;
+        }
+        meta.text_len = meta.text_len +% cp;
+        tlen = cp.trunc.[u32]();
+    }
+
+    let ln = layout.LayoutNode.from_style(&d.style, content_w, content_h);
+    nodes[idx] = ln;
+    styles[idx] = d.style;
+    elems[idx] = ElemMeta.{
+        element_id: eid,
+        action_id: d.action_id,
+        focus_id: d.focus_id,
+        focus_ctx: d.focus_ctx,
+        tab_stop: d.tab_stop,
+        scroll_id: d.scroll_id,
+        scroll_x: d.scroll_x,
+        scroll_y: d.scroll_y,
+        text_off: toff,
+        text_len: tlen,
+        underline_enabled: d.underline_enabled,
+        underline_wavy: d.underline_wavy,
+        underline_color: d.underline_color,
+    };
+
+    let nid = idx.trunc.[u32]();
+    meta.node_count = idx +% 1_usize;
+    if parent == layout.NODE_NONE {
+        meta.root = nid;
+    } else {
+        layout.attach_child(nodes, parent, nid);
+    }
+    return nid;
+}
+
+/// Phase 1 (`request_layout`): Run Taffy-class Flexbox + 2D CSS Grid over the flat slices.
+pub fn phase_request_layout(
+    meta: *mut UiTreeMeta,
+    nodes: *mut [layout.LayoutNode],
+    styles: *[style.Style],
+    rects: *mut [math_vec.Bounds],
+    order_buf: *mut [u32],
+    viewport_w: f32,
+    viewport_h: f32,
+) -> usize {
+    let vis = layout.compute_layout(
+        nodes, styles, rects, order_buf, meta.node_count, meta.root, viewport_w, viewport_h,
+    );
+    meta.visited_count = vis;
+    return vis;
+}
+
+/// Phase 2 (`prepaint`): Compute final screen bounds, apply scroll offsets, intersect
+/// `ContentMask` clips, update spring press offsets, cull offscreen nodes in-place
+/// (compacting visible node IDs into `order_buf[0..visible_count]` for O(visible) paint!),
+/// and register visible `FocusTree` handles & `Hitbox`es.
+pub fn phase_prepaint(
+    meta: *mut UiTreeMeta,
+    nodes: *[layout.LayoutNode],
+    styles: *[style.Style],
+    elems: *[ElemMeta],
+    rects: *[math_vec.Bounds],
+    order_buf: *mut [u32],
+    prepaint: *mut [PrepaintItem],
+    cx: *mut context.UiContextCore,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> usize {
+    cx.focus.begin_frame();
+    cx.input.clear_hitboxes();
+
+    let vp = math_vec.Bounds.from_xywh(0.0_f32, 0.0_f32, viewport_w, viewport_h);
+    let vis_n = meta.visited_count;
+    var visible_cnt: usize = 0_usize;
+    var any_overlays = false;
+
+    // Cache parent scroll/clip metadata across sibling runs (hits 99.9% on large lists!)
+    var cached_parent: u32 = layout.NODE_NONE;
+    var cached_clip = vp;
+    var cached_dx: f32 = 0.0_f32;
+    var cached_dy: f32 = 0.0_f32;
+    var cached_eid: u64 = 0_u64;
+    var cached_z: i16 = 0_i16;
+
+    var i: usize = 0_usize;
+    while i < vis_n && i < order_buf.len {
+        let nid = order_buf[i];
+        let ni = nid.widen.[usize]();
+        if ni >= nodes.len || ni >= styles.len || ni >= elems.len || ni >= rects.len || ni >= prepaint.len {
+            break;
+        }
+        let parent_id = nodes[ni].parent;
+        var parent_clip = vp;
+        var scroll_dx: f32 = 0.0_f32;
+        var scroll_dy: f32 = 0.0_f32;
+        var parent_eid: u64 = 0_u64;
+        var inherited_z: i16 = 0_i16;
+
+        if parent_id != layout.NODE_NONE {
+            if parent_id == cached_parent {
+                parent_clip = cached_clip;
+                scroll_dx = cached_dx;
+                scroll_dy = cached_dy;
+                parent_eid = cached_eid;
+                inherited_z = cached_z;
+            } else {
+                let pi = parent_id.widen.[usize]();
+                if pi < prepaint.len && pi < elems.len && pi < styles.len && pi < rects.len {
+                    let pp = &prepaint[pi];
+                    let pe = &elems[pi];
+                    let pst = &styles[pi];
+                    parent_clip = pp.clip_bounds;
+                    if pst.overflow == .Hidden || pst.overflow == .Scroll {
+                        parent_clip = parent_clip.intersect(pp.screen_bounds);
+                    }
+                    if pe.scroll_id != 0_u32 {
+                        scroll_dx = -pe.scroll_x;
+                        scroll_dy = -pe.scroll_y;
+                    }
+                    let pdx = pp.screen_bounds.origin.x - rects[pi].origin.x;
+                    let pdy = pp.screen_bounds.origin.y - rects[pi].origin.y;
+                    scroll_dx = scroll_dx + pdx;
+                    scroll_dy = scroll_dy + pdy;
+                    parent_eid = pe.element_id;
+                    inherited_z = pp.z_index;
+                    cached_parent = parent_id;
+                    cached_clip = parent_clip;
+                    cached_dx = scroll_dx;
+                    cached_dy = scroll_dy;
+                    cached_eid = parent_eid;
+                    cached_z = inherited_z;
+                }
+            }
+        }
+
+        // Ultra-fast offscreen culling for leaf widgets (skips reading Style & ElemMeta completely!)
+        var sb = rects[ni].translate(scroll_dx, scroll_dy);
+        let is_leaf = nodes[ni].child_count == 0_u32;
+        let is_vis_raw = !sb.is_empty() && sb.intersects(parent_clip);
+        if is_leaf && !is_vis_raw {
+            i = i +% 1_usize;
+            continue;
+        }
+
+        let st = &styles[ni];
+        if st.display == .None {
+            if !is_leaf {
+                prepaint[ni] = PrepaintItem.empty();
+            }
+            i = i +% 1_usize;
+            continue;
+        }
+
+        let em = &elems[ni];
+        let z_eff = if st.z_index != 0_i16 { st.z_index } else { inherited_z };
+        if z_eff > 0_i16 {
+            any_overlays = true;
+        }
+
+        let hovered = !st.disabled && cx.input.is_hovered(em.element_id);
+        let active = !st.disabled && cx.input.is_active(em.element_id);
+        let focused = cx.focus.is_focused(em.focus_id);
+
+        if st.press_spring && em.element_id != 0_u64 {
+            let target_press = if active { 1.0_f32 } else { 0.0_f32 };
+            let pv = cx.anim.set_spring_target(em.element_id, target_press, target_press, 500.0_f32, 36.0_f32);
+            if pv > 0.01_f32 {
+                let shrink = pv * 1.5_f32;
+                sb = math_vec.Bounds.from_xywh(
+                    sb.origin.x + shrink,
+                    sb.origin.y + shrink + pv * 0.8_f32,
+                    math_vec.max_f32(sb.size.width - shrink * 2.0_f32, 0.0_f32),
+                    math_vec.max_f32(sb.size.height - shrink * 2.0_f32, 0.0_f32),
+                );
+            }
+        }
+
+        let is_vis = !sb.is_empty() && sb.intersects(parent_clip);
+        prepaint[ni] = PrepaintItem.{
+            screen_bounds: sb,
+            clip_bounds: parent_clip,
+            z_index: z_eff,
+            visible: is_vis,
+            hovered: hovered,
+            active: active,
+            focused: focused,
+        };
+
+        if is_vis {
+            // In-place compaction: `visible_cnt <= i` is guaranteed!
+            if visible_cnt < order_buf.len {
+                order_buf[visible_cnt] = nid;
+            }
+            visible_cnt = visible_cnt +% 1_usize;
+            if em.focus_id != input.FOCUS_NONE {
+                cx.focus.register(em.focus_id, input.FOCUS_NONE, em.focus_ctx, em.tab_stop);
+            }
+            if em.action_id != keymap.ACTION_NONE
+                || em.focus_id != input.FOCUS_NONE
+                || em.scroll_id != 0_u32
+                || st.has_hover_bg
+                || st.has_active_bg
+            {
+                cx.input.push_hitbox(input.Hitbox.{
+                    element_id: em.element_id,
+                    parent_element_id: parent_eid,
+                    action_id: em.action_id,
+                    focus_id: em.focus_id,
+                    scroll_id: em.scroll_id,
+                    bounds: sb,
+                    clip: parent_clip,
+                    z_index: z_eff,
+                    cursor: st.cursor,
+                    disabled: st.disabled,
+                    blocks_behind: z_eff > 0_i16,
+                });
+            }
+        }
+        i = i +% 1_usize;
+    }
+    meta.visible_count = visible_cnt;
+    meta.has_overlays = any_overlays;
+    return visible_cnt;
+}
+
+@inline
+fn resolve_bg(st: *style.Style, pp: *PrepaintItem) -> color.Rgba {
+    var c = st.bg;
+    if pp.active && st.has_active_bg {
+        c = st.active_bg;
+    } else if pp.hovered && st.has_hover_bg {
+        c = st.hover_bg;
+    }
+    let alpha_mul = if st.disabled { st.opacity * 0.45_f32 } else { st.opacity };
+    return c.with_alpha(c.a * alpha_mul);
+}
+
+@inline
+fn resolve_border_color(st: *style.Style, pp: *PrepaintItem) -> color.Rgba {
+    var c = st.border_color;
+    if pp.focused && st.has_focus_border {
+        c = st.focus_border;
+    } else if pp.hovered && st.has_hover_border {
+        c = st.hover_border;
+    }
+    let alpha_mul = if st.disabled { st.opacity * 0.45_f32 } else { st.opacity };
+    return c.with_alpha(c.a * alpha_mul);
+}
+
+/// Phase 3 (`paint` — Hosted `Scene`): Emit culled SDF quads, drop shadows, underlines,
+/// and anti-aliased TrueType text into `eon_gpu.scene.Scene` (grouped cleanly by z-layer).
+pub fn phase_paint_scene(
+    alloc: *mut AllocCap,
+    meta: *UiTreeMeta,
+    styles: *[style.Style],
+    elems: *[ElemMeta],
+    text_pool: *[u8],
+    order_buf: *[u32],
+    prepaint: *[PrepaintItem],
+    sc: *mut scene.Scene,
+    text_eng: *mut lib.TextEngine,
+) -> !OutOfMemory {
+    // Render base layer (`z <= 0`), then overlay layers (`z > 0`) — O(visible) compacted scan!
+    let pass_lim: u8 = if meta.has_overlays { 2_u8 } else { 1_u8 };
+    var pass: u8 = 0_u8;
+    while pass < pass_lim {
+        var i: usize = 0_usize;
+        while i < meta.visible_count && i < order_buf.len {
+            let ni = order_buf[i].widen.[usize]();
+            if ni >= prepaint.len || ni >= styles.len || ni >= elems.len { break; }
+            let pp = &prepaint[ni];
+            if !pp.visible {
+                i = i +% 1_usize;
+                continue;
+            }
+            let is_overlay = pp.z_index > 0_i16;
+            if (pass == 0_u8 && is_overlay) || (pass == 1_u8 && !is_overlay) {
+                i = i +% 1_usize;
+                continue;
+            }
+
+            let st = &styles[ni];
+            let em = &elems[ni];
+            let b = pp.screen_bounds;
+
+            sc.push_clip(pp.clip_bounds);
+
+            // 1. Optional analytical Gaussian drop shadow
+            if st.shadow.enabled && st.shadow.color.a > 0.001_f32 {
+                let sb = b.translate(st.shadow.offset_x, st.shadow.offset_y);
+                let scol = st.shadow.color.with_alpha(st.shadow.color.a * st.opacity);
+                try sc.push_shadow(alloc, sb, scol, st.radii, st.shadow.blur, st.shadow.spread);
+            }
+
+            // 2. Rounded SDF background quad (solid or gradient) + per-edge border
+            let bg = resolve_bg(st, pp);
+            let bc = resolve_border_color(st, pp);
+            let has_border = bc.a > 0.001_f32 && (
+                st.border_widths.top > 0.0_f32
+                || st.border_widths.right > 0.0_f32
+                || st.border_widths.bottom > 0.0_f32
+                || st.border_widths.left > 0.0_f32
+            );
+            let eff_bw = if pp.focused && st.has_focus_border && !has_border {
+                math_vec.Edges.all(2.0_f32)
+            } else {
+                st.border_widths
+            };
+            let draw_border = has_border || (pp.focused && st.has_focus_border);
+            if bg.a > 0.001_f32 || draw_border {
+                if st.grad_flag != 0_u32 && !(pp.active && st.has_active_bg) && !(pp.hovered && st.has_hover_bg) {
+                    let bg_end = st.bg_end.with_alpha(st.bg_end.a * st.opacity);
+                    try sc.push_gradient_rect(alloc, b, bg, bg_end, st.grad_flag, st.radii, bc, eff_bw);
+                } else {
+                    try sc.push_rect(alloc, b, bg, st.radii, bc, eff_bw);
+                }
+            }
+
+            // 3. Optional solid/wavy underline
+            if em.underline_enabled && em.underline_color.a > 0.001_f32 {
+                let ub = math_vec.Bounds.from_xywh(
+                    b.origin.x + st.padding.left,
+                    b.bottom() - st.padding.bottom - 2.0_f32,
+                    math_vec.max_f32(b.size.width - st.padding.horizontal(), 0.0_f32),
+                    2.0_f32,
+                );
+                try sc.push_underline(alloc, ub, em.underline_color, 1.5_f32, em.underline_wavy);
+            }
+
+            // 4. Optional TrueType text run (aligned, ellipsis, or wrapped)
+            if em.text_len > 0_u32 {
+                let t0 = em.text_off.widen.[usize]();
+                let t1 = t0 +% em.text_len.widen.[usize]();
+                let tslice = text_pool.sub(t0, t1) catch { "".as_bytes() };
+                if tslice.len > 0_usize {
+                    let inner = b.inset(st.padding).inset(st.border_widths);
+                    let tc_mul = if st.disabled { st.opacity * 0.45_f32 } else { st.opacity };
+                    let tcol = st.text_color.with_alpha(st.text_color.a * tc_mul);
+                    sc.push_clip(b);
+                    if st.text_wrap {
+                        _ = try text_eng.push_text_wrapped(
+                            alloc, sc, st.font_id, tslice, inner.origin.x, inner.origin.y,
+                            inner.size.width, st.font_size, tcol,
+                        );
+                    } else if st.text_ellipsis {
+                        let m = text_eng.measure_bytes(st.font_id, tslice, st.font_size);
+                        let dy = inner.origin.y + (inner.size.height - m.line_height) * 0.5_f32;
+                        _ = try text_eng.push_text_ellipsis(
+                            alloc, sc, st.font_id, tslice, inner.origin.x, dy,
+                            inner.size.width, st.font_size, tcol,
+                        );
+                    } else {
+                        _ = try text_eng.push_text_aligned(
+                            alloc, sc, st.font_id, tslice, inner.origin.x, inner.origin.y,
+                            inner.size.width, inner.size.height, st.font_size, st.text_align, tcol,
+                        );
+                    }
+                    sc.pop_clip();
+                }
+            }
+
+            sc.pop_clip();
+            i = i +% 1_usize;
+        }
+        pass = pass +% 1_u8;
+    }
+    return;
+}
+
+/// Phase 3 (`paint` — Zero-Heap Freestanding Slices for bare-metal `nostd`):
+/// Identical rendering semantics emitting into caller-owned slices + `TextEngineCore`!
+pub struct SliceSceneCounts {
+    pub quads: usize;
+    pub shadows: usize;
+    pub underlines: usize;
+    pub sprites: usize;
+    pub next_order: u32;
+}
+
+pub fn phase_paint_slices(
+    meta: *UiTreeMeta,
+    styles: *[style.Style],
+    elems: *[ElemMeta],
+    text_pool: *[u8],
+    order_buf: *[u32],
+    prepaint: *[PrepaintItem],
+    out_quads: *mut [scene.Quad],
+    out_shadows: *mut [scene.Shadow],
+    out_underlines: *mut [scene.Underline],
+    out_sprites: *mut [scene.MonoSprite],
+    text_core: *mut lib.TextEngineCore,
+    sans_ttf: *[u8],
+    mono_ttf: *[u8],
+    atlas_pixels: *mut [u8],
+    atlas_entries: *mut [atlas.GlyphEntry],
+) -> SliceSceneCounts {
+    var cnt = SliceSceneCounts.{
+        quads: 0_usize,
+        shadows: 0_usize,
+        underlines: 0_usize,
+        sprites: 0_usize,
+        next_order: 0_u32,
+    };
+    let pass_lim: u8 = if meta.has_overlays { 2_u8 } else { 1_u8 };
+    var pass: u8 = 0_u8;
+    while pass < pass_lim {
+        var i: usize = 0_usize;
+        while i < meta.visible_count && i < order_buf.len {
+            let ni = order_buf[i].widen.[usize]();
+            if ni >= prepaint.len || ni >= styles.len || ni >= elems.len { break; }
+            let pp = &prepaint[ni];
+            if !pp.visible {
+                i = i +% 1_usize;
+                continue;
+            }
+            let is_overlay = pp.z_index > 0_i16;
+            if (pass == 0_u8 && is_overlay) || (pass == 1_u8 && !is_overlay) {
+                i = i +% 1_usize;
+                continue;
+            }
+            let st = &styles[ni];
+            let em = &elems[ni];
+            let b = pp.screen_bounds;
+            let clip_v = pp.clip_bounds.to_clip_f32x4();
+
+            if st.shadow.enabled && st.shadow.color.a > 0.001_f32 && cnt.shadows < out_shadows.len {
+                let sb = b.translate(st.shadow.offset_x, st.shadow.offset_y);
+                let scol = st.shadow.color.with_alpha(st.shadow.color.a * st.opacity);
+                out_shadows[cnt.shadows] = scene.Shadow.{
+                    bounds: sb.to_f32x4(),
+                    clip_mask: clip_v,
+                    color: scol.to_f32x4(),
+                    corner_radii: st.radii.to_f32x4(),
+                    blur_radius: st.shadow.blur,
+                    spread: st.shadow.spread,
+                    order: cnt.next_order,
+                    _pad0: 0_u32,
+                };
+                cnt.shadows = cnt.shadows +% 1_usize;
+                cnt.next_order = cnt.next_order +% 1_u32;
+            }
+
+            let bg = resolve_bg(st, pp);
+            let bc = resolve_border_color(st, pp);
+            let has_border = bc.a > 0.001_f32 && (
+                st.border_widths.top > 0.0_f32
+                || st.border_widths.right > 0.0_f32
+                || st.border_widths.bottom > 0.0_f32
+                || st.border_widths.left > 0.0_f32
+            );
+            let eff_bw = if pp.focused && st.has_focus_border && !has_border {
+                math_vec.Edges.all(2.0_f32)
+            } else {
+                st.border_widths
+            };
+            if (bg.a > 0.001_f32 || has_border || (pp.focused && st.has_focus_border)) && cnt.quads < out_quads.len {
+                let use_grad = st.grad_flag != 0_u32 && !(pp.active && st.has_active_bg) && !(pp.hovered && st.has_hover_bg);
+                let bg_end = if use_grad { st.bg_end.with_alpha(st.bg_end.a * st.opacity) } else { bg };
+                out_quads[cnt.quads] = scene.Quad.{
+                    bounds: b.to_f32x4(),
+                    clip_mask: clip_v,
+                    bg_color: bg.to_f32x4(),
+                    bg_color_end: bg_end.to_f32x4(),
+                    border_color: bc.to_f32x4(),
+                    corner_radii: st.radii.to_f32x4(),
+                    border_widths: eff_bw.to_f32x4(),
+                    order: cnt.next_order,
+                    flags: if use_grad { st.grad_flag & scene.QUAD_FLAG_GRADIENT_MASK } else { 0_u32 },
+                    _pad0: 0_u32,
+                    _pad1: 0_u32,
+                };
+                cnt.quads = cnt.quads +% 1_usize;
+                cnt.next_order = cnt.next_order +% 1_u32;
+            }
+
+            if em.underline_enabled && em.underline_color.a > 0.001_f32 && cnt.underlines < out_underlines.len {
+                let ub = math_vec.Bounds.from_xywh(
+                    b.origin.x + st.padding.left,
+                    b.bottom() - st.padding.bottom - 2.0_f32,
+                    math_vec.max_f32(b.size.width - st.padding.horizontal(), 0.0_f32),
+                    2.0_f32,
+                );
+                out_underlines[cnt.underlines] = scene.Underline.{
+                    bounds: ub.to_f32x4(),
+                    clip_mask: clip_v,
+                    color: em.underline_color.to_f32x4(),
+                    thickness: 1.5_f32,
+                    wavy: if em.underline_wavy { 1_u32 } else { 0_u32 },
+                    order: cnt.next_order,
+                    _pad0: 0_u32,
+                };
+                cnt.underlines = cnt.underlines +% 1_usize;
+                cnt.next_order = cnt.next_order +% 1_u32;
+            }
+
+            if em.text_len > 0_u32 {
+                let t0 = em.text_off.widen.[usize]();
+                let t1 = t0 +% em.text_len.widen.[usize]();
+                let tslice = text_pool.sub(t0, t1) catch { "".as_bytes() };
+                if tslice.len > 0_usize {
+                    let inner = b.inset(st.padding).inset(st.border_widths);
+                    let tc_mul = if st.disabled { st.opacity * 0.45_f32 } else { st.opacity };
+                    let tcol = st.text_color.with_alpha(st.text_color.a * tc_mul);
+                    let fdata = if st.font_id == lib.FONT_UI_MONO { mono_ttf } else { sans_ttf };
+                    let font_ref = if st.font_id == lib.FONT_UI_MONO { text_core.mono } else { text_core.sans };
+                    let m = shaper.measure_line(&font_ref, fdata, tslice, st.font_size);
+                    let draw_x = match st.text_align {
+                        .Left => inner.origin.x,
+                        .Center => inner.origin.x + (inner.size.width - m.width) * 0.5_f32,
+                        .Right => inner.origin.x + (inner.size.width - m.width),
+                    };
+                    let draw_y = inner.origin.y + (inner.size.height - m.line_height) * 0.5_f32;
+                    let text_clip = pp.clip_bounds.intersect(b).to_clip_f32x4();
+                    _ = shaper.push_line_to_slice(
+                        out_sprites, &mut cnt.sprites, &mut cnt.next_order, text_clip,
+                        &font_ref, fdata, st.font_id, &mut text_core.atlas, atlas_pixels, atlas_entries,
+                        tslice, draw_x, draw_y, st.font_size, tcol,
+                    );
+                }
+            }
+            i = i +% 1_usize;
+        }
+        pass = pass +% 1_u8;
+    }
+    return cnt;
+}
+
+/// Hosted dynamically growable GPUI `UiTree` (zero heap allocations per frame after warmup!).
+pub linear struct UiTree {
+    pub meta: UiTreeMeta;
+    pub nodes: col.DynBuf[layout.LayoutNode];
+    pub styles: col.DynBuf[style.Style];
+    pub elems: col.DynBuf[ElemMeta];
+    pub rects: col.DynBuf[math_vec.Bounds];
+    pub order_buf: col.DynBuf[u32];
+    pub prepaint: col.DynBuf[PrepaintItem];
+    pub text_pool: col.DynBuf[u8];
+}
+
+impl UiTree {
+    pub fn init(alloc: *mut AllocCap, initial_nodes: usize) -> UiTree ! OutOfMemory {
+        let cap = if initial_nodes < 64_usize { 64_usize } else { initial_nodes };
+        let nodes = try col.DynBuf.[layout.LayoutNode].init(alloc, cap);
+        errdefer nodes.destroy(alloc);
+        let styles = try col.DynBuf.[style.Style].init(alloc, cap);
+        errdefer styles.destroy(alloc);
+        let elems = try col.DynBuf.[ElemMeta].init(alloc, cap);
+        errdefer elems.destroy(alloc);
+        let rects = try col.DynBuf.[math_vec.Bounds].init(alloc, cap);
+        errdefer rects.destroy(alloc);
+        let order_buf = try col.DynBuf.[u32].init(alloc, cap);
+        errdefer order_buf.destroy(alloc);
+        let prepaint = try col.DynBuf.[PrepaintItem].init(alloc, cap);
+        errdefer prepaint.destroy(alloc);
+        let text_pool = try col.DynBuf.[u8].init(alloc, 4096_usize);
+        errdefer text_pool.destroy(alloc);
+        return UiTree.{
+            meta: UiTreeMeta.new(),
+            nodes: nodes,
+            styles: styles,
+            elems: elems,
+            rects: rects,
+            order_buf: order_buf,
+            prepaint: prepaint,
+            text_pool: text_pool,
+        };
+    }
+
+    pub fn destroy(self: UiTree, alloc: *mut AllocCap) {
+        let UiTree.{
+            meta: _,
+            nodes,
+            styles,
+            elems,
+            rects,
+            order_buf,
+            prepaint,
+            text_pool,
+        } = self;
+        nodes.destroy(alloc);
+        styles.destroy(alloc);
+        elems.destroy(alloc);
+        rects.destroy(alloc);
+        order_buf.destroy(alloc);
+        prepaint.destroy(alloc);
+        text_pool.destroy(alloc);
+    }
+
+    pub fn reserve(self: *mut Self, alloc: *mut AllocCap, target_nodes: usize) -> !OutOfMemory {
+        try self.nodes.reserve_exact(alloc, target_nodes);
+        try self.styles.reserve_exact(alloc, target_nodes);
+        try self.elems.reserve_exact(alloc, target_nodes);
+        try self.rects.reserve_exact(alloc, target_nodes);
+        try self.order_buf.reserve_exact(alloc, target_nodes);
+        try self.prepaint.reserve_exact(alloc, target_nodes);
+        return;
+    }
+
+    /// Reset for a new frame (keeps all backing capacity — ZERO heap allocations!).
+    pub fn begin_frame(self: *mut Self) {
+        self.meta.clear();
+        self.nodes.clear();
+        self.styles.clear();
+        self.elems.clear();
+        self.rects.clear();
+        self.order_buf.clear();
+        self.prepaint.clear();
+        self.text_pool.clear();
+    }
+
+    pub fn push_node(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        parent: u32,
+        d: div.Div,
+        text_bytes: *[u8],
+        content_w: f32,
+        content_h: f32,
+    ) -> u32 ! OutOfMemory {
+        let idx = self.nodes.len();
+        var eid = d.element_id;
+        if eid == 0_u64 && (d.action_id != keymap.ACTION_NONE || d.focus_id != input.FOCUS_NONE || d.scroll_id != 0_u32 || d.style.has_hover_bg || d.style.has_active_bg) {
+            eid = 0x80000000_u64 | self.meta.next_auto_id;
+            self.meta.next_auto_id = self.meta.next_auto_id +% 1_u64;
+        }
+        let toff = self.text_pool.len().trunc.[u32]();
+        let tlen = text_bytes.len.trunc.[u32]();
+        if text_bytes.len > 0_usize {
+            try self.text_pool.push_slice(alloc, text_bytes);
+        }
+        let ln = layout.LayoutNode.from_style(&d.style, content_w, content_h);
+        try self.nodes.push(alloc, ln);
+        try self.styles.push(alloc, d.style);
+        try self.elems.push(alloc, ElemMeta.{
+            element_id: eid,
+            action_id: d.action_id,
+            focus_id: d.focus_id,
+            focus_ctx: d.focus_ctx,
+            tab_stop: d.tab_stop,
+            scroll_id: d.scroll_id,
+            scroll_x: d.scroll_x,
+            scroll_y: d.scroll_y,
+            text_off: toff,
+            text_len: tlen,
+            underline_enabled: d.underline_enabled,
+            underline_wavy: d.underline_wavy,
+            underline_color: d.underline_color,
+        });
+        try self.rects.push(alloc, math_vec.Bounds.zero());
+        try self.order_buf.push(alloc, 0_u32);
+        try self.prepaint.push(alloc, PrepaintItem.empty());
+
+        let nid = idx.trunc.[u32]();
+        self.meta.node_count = self.nodes.len();
+        self.meta.text_len = self.text_pool.len();
+        if parent == layout.NODE_NONE {
+            self.meta.root = nid;
+        } else {
+            layout.attach_child(self.nodes.as_mut_slice(), parent, nid);
+        }
+        return nid;
+    }
+
+    pub fn push_root(self: *mut Self, alloc: *mut AllocCap, d: div.Div) -> u32 ! OutOfMemory {
+        return try self.push_node(alloc, layout.NODE_NONE, d, "".as_bytes(), 0.0_f32, 0.0_f32);
+    }
+
+    pub fn push(self: *mut Self, alloc: *mut AllocCap, parent: u32, d: div.Div) -> u32 ! OutOfMemory {
+        return try self.push_node(alloc, parent, d, "".as_bytes(), 0.0_f32, 0.0_f32);
+    }
+
+    pub fn push_text(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        text_eng: *lib.TextEngine,
+        parent: u32,
+        d: div.Div,
+        text: *str,
+    ) -> u32 ! OutOfMemory {
+        return try self.push_text_bytes(alloc, text_eng, parent, d, text.as_bytes());
+    }
+
+    pub fn push_text_bytes(
+        self: *mut Self,
+        alloc: *mut AllocCap,
+        text_eng: *lib.TextEngine,
+        parent: u32,
+        d: div.Div,
+        text_bytes: *[u8],
+    ) -> u32 ! OutOfMemory {
+        var cw: f32 = 0.0_f32;
+        var ch: f32 = 0.0_f32;
+        if text_bytes.len > 0_usize && (d.style.width.is_auto() || d.style.height.is_auto()) {
+            let m = text_eng.measure_bytes(d.style.font_id, text_bytes, d.style.font_size);
+            cw = m.width;
+            ch = m.line_height;
+        }
+        return try self.push_node(alloc, parent, d, text_bytes, cw, ch);
+    }
+
+    pub fn request_layout(self: *mut Self, viewport_w: f32, viewport_h: f32) -> usize {
+        return phase_request_layout(
+            &mut self.meta,
+            self.nodes.as_mut_slice(),
+            self.styles.as_slice(),
+            self.rects.as_mut_slice(),
+            self.order_buf.as_mut_slice(),
+            viewport_w,
+            viewport_h,
+        );
+    }
+
+    pub fn run_prepaint(self: *mut Self, cx: *mut context.UiContextCore, viewport_w: f32, viewport_h: f32) -> usize {
+        return phase_prepaint(
+            &mut self.meta,
+            self.nodes.as_slice(),
+            self.styles.as_slice(),
+            self.elems.as_slice(),
+            self.rects.as_slice(),
+            self.order_buf.as_mut_slice(),
+            self.prepaint.as_mut_slice(),
+            cx,
+            viewport_w,
+            viewport_h,
+        );
+    }
+
+    pub fn paint(
+        self: *Self,
+        alloc: *mut AllocCap,
+        sc: *mut scene.Scene,
+        text_eng: *mut lib.TextEngine,
+    ) -> !OutOfMemory {
+        try phase_paint_scene(
+            alloc,
+            &self.meta,
+            self.styles.as_slice(),
+            self.elems.as_slice(),
+            self.text_pool.as_slice(),
+            self.order_buf.as_slice(),
+            self.prepaint.as_slice(),
+            sc,
+            text_eng,
+        );
+        return;
+    }
+
+    pub fn rect_of(self: *Self, node_id: u32) -> math_vec.Bounds {
+        let idx = node_id.widen.[usize]();
+        let rs = self.rects.as_slice();
+        if idx < rs.len {
+            return rs[idx];
+        }
+        return math_vec.Bounds.zero();
+    }
+}

@@ -1,0 +1,272 @@
+module eon_ui.animation;
+
+import core.math;
+import core.math_vec;
+import core.color;
+
+// ============================================================================
+// Physics-Based Spring & Easing Animation Engine (`libs/eon_ui/src/animation.eon`)
+// 100% safe, `core/`-only, zero heap allocations.
+// ============================================================================
+
+@inline
+pub fn clamp01(t: f32) -> f32 {
+    return math_vec.clamp_f32(t, 0.0_f32, 1.0_f32);
+}
+
+@inline
+pub fn ease_linear(t: f32) -> f32 {
+    return clamp01(t);
+}
+
+@inline
+pub fn ease_out_cubic(t: f32) -> f32 {
+    let x = 1.0_f32 - clamp01(t);
+    return 1.0_f32 - x * x * x;
+}
+
+@inline
+pub fn ease_in_out(t: f32) -> f32 {
+    let x = clamp01(t);
+    if x < 0.5_f32 {
+        return 4.0_f32 * x * x * x;
+    }
+    let y = -2.0_f32 * x + 2.0_f32;
+    return 1.0_f32 - (y * y * y) * 0.5_f32;
+}
+
+@inline
+pub fn ease_out_back(t: f32) -> f32 {
+    let x = clamp01(t) - 1.0_f32;
+    let c1 = 1.70158_f32;
+    let c3 = c1 + 1.0_f32;
+    return 1.0_f32 + c3 * x * x * x + c1 * x * x;
+}
+
+@inline
+pub fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
+    return math_vec.lerp_f32(a, b, t);
+}
+
+@inline
+pub fn lerp_rgba(a: color.Rgba, b: color.Rgba, t: f32) -> color.Rgba {
+    return a.lerp(b, clamp01(t));
+}
+
+pub enum EasingKind : u8 {
+    Linear = 0,
+    EaseOutCubic = 1,
+    EaseInOut = 2,
+    EaseOutBack = 3,
+}
+
+@inline
+pub fn eval_easing(kind: EasingKind, t: f32) -> f32 {
+    match kind {
+        .Linear => { return ease_linear(t); }
+        .EaseOutCubic => { return ease_out_cubic(t); }
+        .EaseInOut => { return ease_in_out(t); }
+        .EaseOutBack => { return ease_out_back(t); }
+    }
+}
+
+/// Second-order damped harmonic oscillator spring for crisp 120 FPS UI micro-interactions.
+pub struct Spring {
+    pub value: f32;
+    pub velocity: f32;
+    pub target: f32;
+    pub stiffness: f32;
+    pub damping: f32;
+}
+
+impl Spring {
+    pub fn new(initial: f32, stiffness: f32, damping: f32) -> Spring {
+        return Spring.{
+            value: initial,
+            velocity: 0.0_f32,
+            target: initial,
+            stiffness: stiffness,
+            damping: damping,
+        };
+    }
+
+    pub fn snappy(initial: f32) -> Spring {
+        return Spring.new(initial, 420.0_f32, 34.0_f32);
+    }
+
+    pub fn gentle(initial: f32) -> Spring {
+        return Spring.new(initial, 220.0_f32, 26.0_f32);
+    }
+
+    pub fn set_target(self: *mut Self, target: f32) {
+        self.target = target;
+    }
+
+    pub fn impulse(self: *mut Self, dv: f32) {
+        self.velocity = self.velocity + dv;
+    }
+
+    pub fn is_settled(self: *Self) -> bool {
+        let disp = math.abs_f32(self.target - self.value);
+        let spd = math.abs_f32(self.velocity);
+        return disp < 0.001_f32 && spd < 0.005_f32;
+    }
+
+    /// Semi-implicit Euler sub-stepping (stable even under large frame dt spikes).
+    pub fn step(self: *mut Self, dt_sec: f32) -> f32 {
+        if dt_sec <= 0.0_f32 {
+            return self.value;
+        }
+        var rem = math_vec.min_f32(dt_sec, 0.05_f32);
+        let max_sub = 0.004_f32;
+        var steps: u32 = 0_u32;
+        while rem > 0.00001_f32 && steps < 16_u32 {
+            let h = if rem > max_sub { max_sub } else { rem };
+            let force = (self.target - self.value) * self.stiffness - self.velocity * self.damping;
+            self.velocity = self.velocity + force * h;
+            self.value = self.value + self.velocity * h;
+            rem = rem - h;
+            steps = steps +% 1_u32;
+        }
+        if self.is_settled() {
+            self.value = self.target;
+            self.velocity = 0.0_f32;
+        }
+        return self.value;
+    }
+}
+
+/// Time-bounded eased tween.
+pub struct Tween {
+    pub start_val: f32;
+    pub end_val: f32;
+    pub duration: f32;
+    pub elapsed: f32;
+    pub easing: EasingKind;
+    pub active: bool;
+}
+
+impl Tween {
+    pub fn new(start_val: f32, end_val: f32, duration: f32, easing: EasingKind) -> Tween {
+        let dur = if duration > 0.001_f32 { duration } else { 0.001_f32 };
+        return Tween.{
+            start_val: start_val,
+            end_val: end_val,
+            duration: dur,
+            elapsed: 0.0_f32,
+            easing: easing,
+            active: true,
+        };
+    }
+
+    pub fn step(self: *mut Self, dt_sec: f32) -> f32 {
+        if !self.active {
+            return self.end_val;
+        }
+        self.elapsed = self.elapsed + math_vec.max_f32(dt_sec, 0.0_f32);
+        let raw_t = self.elapsed / self.duration;
+        if raw_t >= 1.0_f32 {
+            self.elapsed = self.duration;
+            self.active = false;
+            return self.end_val;
+        }
+        let e = eval_easing(self.easing, raw_t);
+        return lerp_f32(self.start_val, self.end_val, e);
+    }
+}
+
+/// Fixed-capacity allocation-free spring registry keyed by `ElementId` (`u64`),
+/// usable identically on hosted OSes and bare-metal `nostd`.
+pub const MAX_SPRINGS: usize = 64_usize;
+
+pub struct SpringSlot {
+    pub key: u64;
+    pub spring: Spring;
+    pub used: bool;
+}
+
+pub struct AnimStore {
+    slots: [64]SpringSlot;
+    pub active_count: usize;
+}
+
+impl AnimStore {
+    pub fn new() -> AnimStore {
+        let empty = SpringSlot.{
+            key: 0_u64,
+            spring: Spring.snappy(0.0_f32),
+            used: false,
+        };
+        return AnimStore.{
+            slots: [empty; 64],
+            active_count: 0_usize,
+        };
+    }
+
+    pub fn clear(self: *mut Self) {
+        var i: usize = 0_usize;
+        while i < MAX_SPRINGS {
+            self.slots[i].used = false;
+            i = i +% 1_usize;
+        }
+        self.active_count = 0_usize;
+    }
+
+    pub fn set_spring_target(self: *mut Self, key: u64, initial: f32, target: f32, stiffness: f32, damping: f32) -> f32 {
+        var free_idx: usize = MAX_SPRINGS;
+        var i: usize = 0_usize;
+        while i < MAX_SPRINGS {
+            if self.slots[i].used {
+                if self.slots[i].key == key {
+                    self.slots[i].spring.target = target;
+                    self.slots[i].spring.stiffness = stiffness;
+                    self.slots[i].spring.damping = damping;
+                    return self.slots[i].spring.value;
+                }
+            } else if free_idx == MAX_SPRINGS {
+                free_idx = i;
+            }
+            i = i +% 1_usize;
+        }
+        if free_idx < MAX_SPRINGS {
+            var sp = Spring.new(initial, stiffness, damping);
+            sp.target = target;
+            let val = sp.value;
+            self.slots[free_idx] = SpringSlot.{ key: key, spring: sp, used: true };
+            return val;
+        }
+        return target;
+    }
+
+    pub fn get_value(self: *Self, key: u64, fallback: f32) -> f32 {
+        var i: usize = 0_usize;
+        while i < MAX_SPRINGS {
+            if self.slots[i].used && self.slots[i].key == key {
+                return self.slots[i].spring.value;
+            }
+            i = i +% 1_usize;
+        }
+        return fallback;
+    }
+
+    /// Advance all active springs by `dt_sec`; returns `true` while any animation is in motion.
+    pub fn tick(self: *mut Self, dt_sec: f32) -> bool {
+        var active: usize = 0_usize;
+        var i: usize = 0_usize;
+        while i < MAX_SPRINGS {
+            if self.slots[i].used {
+                _ = self.slots[i].spring.step(dt_sec);
+                if !self.slots[i].spring.is_settled() {
+                    active = active +% 1_usize;
+                }
+            }
+            i = i +% 1_usize;
+        }
+        self.active_count = active;
+        return active > 0_usize;
+    }
+
+    pub fn is_animating(self: *Self) -> bool {
+        return self.active_count > 0_usize;
+    }
+}

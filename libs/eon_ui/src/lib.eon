@@ -1,0 +1,653 @@
+module eon_ui.lib;
+
+import core.col;
+import core.math_vec;
+import eon_win.events;
+import eon_win.lib as win_lib;
+import eon_gpu.scene;
+import eon_gpu.lib as gpu_lib;
+import eon_gpu.backends.soft;
+import eon_text.embedded_font;
+import eon_text.ttf;
+import eon_text.atlas;
+import eon_text.shaper;
+import eon_text.lib as text_lib;
+import eon_ui.style;
+import eon_ui.layout;
+import eon_ui.input;
+import eon_ui.context;
+import eon_ui.div;
+import eon_ui.element;
+import eon_ui.platform_rt;
+
+// ============================================================================
+// Safe Unified GPUI-Class UI Framework Facade (`libs/eon_ui/src/lib.eon`)
+// Zero `@hal`/`raw` in this facade and ZERO `@target_*` needed in user apps!
+// Same `UiCanvas` builder code runs identically on Linux (Wayland/X11+Vulkan),
+// Windows (Win32+Vulkan), macOS/iOS (Cocoa/UIKit+Metal), Android (Vulkan),
+// headless golden tests (`eon_gpu_soft`), and bare-metal QEMU `nostd`!
+// ============================================================================
+
+/// Second-class `view struct` canvas passed to application view functions.
+/// Zero heap allocations, zero copies, identical API on hosted OSes and `nostd`!
+pub view struct UiCanvas {
+    pub meta: *mut element.UiTreeMeta;
+    pub nodes: *mut [layout.LayoutNode];
+    pub styles: *mut [style.Style];
+    pub elems: *mut [element.ElemMeta];
+    pub text_pool: *mut [u8];
+    pub sans: *ttf.TtfFont;
+    pub mono: *ttf.TtfFont;
+    pub sans_data: *[u8];
+    pub mono_data: *[u8];
+}
+
+impl UiCanvas {
+    pub fn push_root(self: *mut Self, d: div.Div) -> u32 {
+        return element.push_into_slices(
+            self.meta, self.nodes, self.styles, self.elems, self.text_pool,
+            layout.NODE_NONE, d, "".as_bytes(), 0.0_f32, 0.0_f32,
+        );
+    }
+
+    pub fn push(self: *mut Self, parent: u32, d: div.Div) -> u32 {
+        return element.push_into_slices(
+            self.meta, self.nodes, self.styles, self.elems, self.text_pool,
+            parent, d, "".as_bytes(), 0.0_f32, 0.0_f32,
+        );
+    }
+
+    pub fn measure_bytes(self: *Self, font_id: u16, bytes: *[u8], px_size: f32) -> shaper.TextMetrics {
+        if font_id == text_lib.FONT_UI_MONO {
+            return shaper.measure_line(self.mono, self.mono_data, bytes, px_size);
+        }
+        return shaper.measure_line(self.sans, self.sans_data, bytes, px_size);
+    }
+
+    pub fn fit_font_size(self: *Self, font_id: u16, bytes: *[u8], max_w: f32, max_px: f32, min_px: f32) -> f32 {
+        if max_w <= 1.0_f32 || bytes.len == 0_usize {
+            return max_px;
+        }
+        let m = self.measure_bytes(font_id, bytes, max_px);
+        if m.width <= max_w || m.width <= 0.1_f32 {
+            return max_px;
+        }
+        let scaled = max_px * (max_w / m.width) * 0.94_f32;
+        return if scaled < min_px { min_px } else { scaled };
+    }
+
+    pub fn push_text(self: *mut Self, parent: u32, d: div.Div, s: *str) -> u32 {
+        return self.push_text_bytes(parent, d, s.as_bytes());
+    }
+
+    pub fn push_text_bytes(self: *mut Self, parent: u32, d: div.Div, bytes: *[u8]) -> u32 {
+        var cw: f32 = 0.0_f32;
+        var ch: f32 = 0.0_f32;
+        if bytes.len > 0_usize && (d.style.width.is_auto() || d.style.height.is_auto()) {
+            let m = self.measure_bytes(d.style.font_id, bytes, d.style.font_size);
+            cw = m.width;
+            ch = m.line_height;
+        }
+        return element.push_into_slices(
+            self.meta, self.nodes, self.styles, self.elems, self.text_pool,
+            parent, d, bytes, cw, ch,
+        );
+    }
+}
+
+/// First-class application startup configuration shared across hosted OSes and `nostd`.
+pub struct AppConfig {
+    pub title: [64]u8;
+    pub title_len: usize;
+    pub width: u32;
+    pub height: u32;
+    pub headless: bool;
+    pub force_software: bool;
+    pub max_frames: u64; // 0 = run interactively until window close
+    pub max_nodes: usize;
+}
+
+impl AppConfig {
+    pub fn desktop(title: *str, width: u32, height: u32) -> AppConfig {
+        var tb: [64]u8 = [0_u8; 64];
+        let bs = title.as_bytes();
+        let n = if bs.len < 63_usize { bs.len } else { 63_usize };
+        var i: usize = 0_usize;
+        while i < n {
+            tb[i] = bs[i];
+            i = i +% 1_usize;
+        }
+        return AppConfig.{
+            title: tb,
+            title_len: n,
+            width: width,
+            height: height,
+            headless: false,
+            force_software: false,
+            max_frames: 0_u64,
+            max_nodes: 512_usize,
+        };
+    }
+
+    pub fn headless_test(title: *str, width: u32, height: u32) -> AppConfig {
+        var c = AppConfig.desktop(title, width, height);
+        c.headless = true;
+        c.force_software = true;
+        c.max_frames = 1_u64;
+        return c;
+    }
+
+    pub fn to_window_options(self: *Self) -> events.WindowOptions {
+        var o = if self.headless {
+            events.WindowOptions.headless("EonUI", self.width, self.height)
+        } else {
+            events.WindowOptions.new("EonUI", self.width, self.height)
+        };
+        let n = if self.title_len <= 64_usize { self.title_len } else { 64_usize };
+        var i: usize = 0_usize;
+        while i < n {
+            o.title[i] = self.title[i];
+            i = i +% 1_usize;
+        }
+        o.title[n] = 0_u8;
+        o.title_len = n;
+        return o;
+    }
+}
+
+/// Hosted multi-backend UI runtime owning window, GPU/soft renderer, TrueType engine,
+/// GPUI `Scene`, reusable slice-backed `UiTree` (0 allocs/frame after warmup), and `AppContext`.
+pub linear struct UiHost {
+    pub win: win_lib.PlatformWindow;
+    pub renderer: gpu_lib.Renderer;
+    pub text: text_lib.TextEngine;
+    pub scene: scene.Scene;
+    pub app: context.AppContext;
+    pub tree: element.UiTree;
+    pub soft_fb: col.DynBuf[u8];
+    pub fb_w: u32;
+    pub fb_h: u32;
+    pub max_nodes: usize;
+    pub last_frame_ns: u64;
+    pub frames_rendered: u64;
+}
+
+impl UiHost {
+    pub fn init(alloc: *mut AllocCap, cfg: *AppConfig) -> UiHost ! OutOfMemory {
+        let max_n = if cfg.max_nodes < 256_usize { 256_usize } else { cfg.max_nodes };
+        let text = try text_lib.TextEngine.init(alloc, 512_u32, 512_u32);
+        errdefer text.destroy(alloc);
+        let sc = try scene.Scene.init(alloc);
+        errdefer sc.destroy(alloc);
+        let app = try context.AppContext.init(alloc, cfg.width, cfg.height);
+        errdefer app.destroy(alloc);
+        var tree = try element.UiTree.init(alloc, max_n);
+        errdefer tree.destroy(alloc);
+
+        // Pre-populate fixed reusable node & text storage for zero-alloc `UiCanvas` frames
+        var i: usize = 0_usize;
+        while i < max_n {
+            try tree.nodes.push(alloc, layout.LayoutNode.empty());
+            try tree.styles.push(alloc, style.Style.default());
+            try tree.elems.push(alloc, element.ElemMeta.empty());
+            try tree.rects.push(alloc, math_vec.Bounds.zero());
+            try tree.order_buf.push(alloc, 0_u32);
+            try tree.prepaint.push(alloc, element.PrepaintItem.empty());
+            i = i +% 1_usize;
+        }
+        var ti: usize = 0_usize;
+        while ti < 16384_usize {
+            try tree.text_pool.push(alloc, 0_u8);
+            ti = ti +% 1_usize;
+        }
+
+        let fb_bytes = cfg.width.widen.[usize]() *% cfg.height.widen.[usize]() *% 4_usize;
+        var soft_fb = try col.DynBuf.[u8].init(alloc, fb_bytes);
+        errdefer soft_fb.destroy(alloc);
+        var bi: usize = 0_usize;
+        while bi < fb_bytes {
+            try soft_fb.push(alloc, 0_u8);
+            bi = bi +% 1_usize;
+        }
+
+        return UiHost.{
+            win: win_lib.PlatformWindow.uninit(),
+            renderer: gpu_lib.Renderer.uninit(),
+            text: text,
+            scene: sc,
+            app: app,
+            tree: tree,
+            soft_fb: soft_fb,
+            fb_w: cfg.width,
+            fb_h: cfg.height,
+            max_nodes: max_n,
+            last_frame_ns: 0_u64,
+            frames_rendered: 0_u64,
+        };
+    }
+
+    pub fn open_window(self: *mut Self, cfg: *AppConfig) -> bool {
+        let opts = cfg.to_window_options();
+        if !self.win.open_in_place(&opts) {
+            return false;
+        }
+        let surf = self.win.surface_info();
+        self.renderer.init_in_place(&surf, cfg.headless || cfg.force_software);
+        self.app.core.windows[0_usize].width = self.win.width;
+        self.app.core.windows[0_usize].height = self.win.height;
+        self.app.core.windows[0_usize].scale_factor = self.win.scale_factor;
+        self.app.core.windows[0_usize].dirty = true;
+        return true;
+    }
+
+    pub fn ensure_fb_size(self: *mut Self, alloc: *mut AllocCap) -> !OutOfMemory {
+        let w = if self.win.width > 0_u32 { self.win.width } else { 1_u32 };
+        let h = if self.win.height > 0_u32 { self.win.height } else { 1_u32 };
+        if w == self.fb_w && h == self.fb_h {
+            return;
+        }
+        let need = w.widen.[usize]() *% h.widen.[usize]() *% 4_usize;
+        self.soft_fb.clear();
+        try self.soft_fb.reserve_exact(alloc, need);
+        var i: usize = 0_usize;
+        while i < need {
+            try self.soft_fb.push(alloc, 0_u8);
+            i = i +% 1_usize;
+        }
+        self.fb_w = w;
+        self.fb_h = h;
+        return;
+    }
+
+    /// Poll OS window events and dispatch them through `FocusTree`, `Keymap`, and `Hitbox`.
+    pub fn poll_events(self: *mut Self) -> bool {
+        self.app.core.input.clear_actions();
+        self.win.poll_events();
+        var changed = false;
+        loop {
+            let ev = self.win.next_event() orelse break;
+            match ev {
+                .Resized(sz) => {
+                    self.app.core.windows[0_usize].width = sz.width;
+                    self.app.core.windows[0_usize].height = sz.height;
+                    changed = true;
+                }
+                .ScaleFactorChanged(sc) => {
+                    self.app.core.windows[0_usize].scale_factor = sc;
+                    changed = true;
+                }
+                .CloseRequested => {
+                    self.win.should_close = true;
+                }
+                _ => {}
+            }
+            if self.app.core.input.handle_event(ev, &mut self.app.core.focus, &self.app.core.keymap) {
+                changed = true;
+            }
+        }
+        self.win.set_cursor(self.app.core.input.active_cursor);
+        if changed {
+            self.app.core.mark_dirty(0_u32);
+        }
+        return changed;
+    }
+
+    /// Execute the 3-phase GPUI frame (`request_layout -> prepaint -> paint`) and present.
+    pub fn finish_and_render(self: *mut Self, alloc: *mut AllocCap) -> bool ! OutOfMemory {
+        try self.ensure_fb_size(alloc);
+        let vw = self.win.width.to_float.[f32]();
+        let vh = self.win.height.to_float.[f32]();
+
+        self.text.begin_frame();
+        self.scene.clear(self.app.core.theme.bg_window);
+
+        _ = element.phase_request_layout(
+            &mut self.tree.meta,
+            self.tree.nodes.as_mut_slice(),
+            self.tree.styles.as_slice(),
+            self.tree.rects.as_mut_slice(),
+            self.tree.order_buf.as_mut_slice(),
+            vw,
+            vh,
+        );
+        _ = element.phase_prepaint(
+            &mut self.tree.meta,
+            self.tree.nodes.as_slice(),
+            self.tree.styles.as_slice(),
+            self.tree.elems.as_slice(),
+            self.tree.rects.as_slice(),
+            self.tree.order_buf.as_mut_slice(),
+            self.tree.prepaint.as_mut_slice(),
+            &mut self.app.core,
+            vw,
+            vh,
+        );
+        try element.phase_paint_scene(
+            alloc,
+            &self.tree.meta,
+            self.tree.styles.as_slice(),
+            self.tree.elems.as_slice(),
+            self.tree.text_pool.as_slice(),
+            self.tree.order_buf.as_slice(),
+            self.tree.prepaint.as_slice(),
+            &mut self.scene,
+            &mut self.text,
+        );
+
+        let empty_rgba: [4]u8 = [255_u8, 255_u8, 255_u8, 255_u8];
+        let ok = self.renderer.render_scene(
+            &mut self.win,
+            &self.scene,
+            self.soft_fb.as_mut_slice(),
+            self.text.atlas_pixels(),
+            self.text.atlas_width(),
+            self.text.atlas_height(),
+            self.text.atlas_generation(),
+            &empty_rgba,
+            1_u32,
+            1_u32,
+            1_u64,
+        );
+        self.app.core.clear_dirty(0_u32);
+        self.frames_rendered = self.frames_rendered +% 1_u64;
+        return ok;
+    }
+
+    /// Deterministic FNV-1a hash of the software RGBA8 framebuffer for golden regression tests.
+    pub fn soft_frame_hash(self: *Self) -> u64 {
+        let fb = self.soft_fb.as_slice();
+        var h: u64 = 14695981039346656037_u64;
+        var i: usize = 0_usize;
+        while i < fb.len {
+            h = (h ^ fb[i].widen.[u64]()) *% 1099511628211_u64;
+            i = i +% 4_usize;
+        }
+        return h;
+    }
+
+    pub fn encode_png(self: *Self, alloc: *mut AllocCap) -> col.DynBuf[u8] ! OutOfMemory {
+        return try soft.encode_png(alloc, self.soft_fb.as_slice(), self.fb_w, self.fb_h);
+    }
+
+    pub fn destroy(mut self: UiHost, alloc: *mut AllocCap) {
+        self.renderer.destroy();
+        self.win.close();
+        let UiHost.{
+            win: _,
+            renderer: _,
+            text,
+            scene: sc,
+            app,
+            tree,
+            soft_fb,
+            fb_w: _,
+            fb_h: _,
+            max_nodes: _,
+            last_frame_ns: _,
+            frames_rendered: _,
+        } = self;
+        text.destroy(alloc);
+        sc.destroy(alloc);
+        app.destroy(alloc);
+        tree.destroy(alloc);
+        soft_fb.destroy(alloc);
+    }
+}
+
+/// Execute `on_render` on `host`, then run the 3-phase GPUI frame (`request_layout -> prepaint -> paint`) and present.
+pub fn render_host_frame[S](
+    host: *mut UiHost,
+    alloc: *mut AllocCap,
+    state: *mut S,
+    on_render: fn(*mut UiCanvas, *mut context.UiContextCore, *mut S),
+) -> bool ! OutOfMemory {
+    host.tree.meta.clear();
+    var canvas = UiCanvas.{
+        meta: &mut host.tree.meta,
+        nodes: host.tree.nodes.as_mut_slice(),
+        styles: host.tree.styles.as_mut_slice(),
+        elems: host.tree.elems.as_mut_slice(),
+        text_pool: host.tree.text_pool.as_mut_slice(),
+        sans: &host.text.sans,
+        mono: &host.text.mono,
+        sans_data: host.text.sans_data.as_slice(),
+        mono_data: host.text.mono_data.as_slice(),
+    };
+    on_render(&mut canvas, &mut host.app.core, state);
+    return try host.finish_and_render(alloc);
+}
+
+fn parse_u32_bytes(bs: *[u8]) -> u32 {
+    var acc: u32 = 0_u32;
+    var i: usize = 0_usize;
+    while i < bs.len {
+        let b = bs[i];
+        if b < b'0' || b > b'9' {
+            break;
+        }
+        acc = acc *% 10_u32 +% (b - b'0').widen.[u32]();
+        i = i +% 1_usize;
+    }
+    return acc;
+}
+
+fn bytes_eq_lit(bs: *[u8], lit: *str) -> bool {
+    let lb = lit.as_bytes();
+    if bs.len != lb.len {
+        return false;
+    }
+    var i: usize = 0_usize;
+    while i < lb.len {
+        if bs[i] != lb[i] {
+            return false;
+        }
+        i = i +% 1_usize;
+    }
+    return true;
+}
+
+fn bytes_starts_with(bs: *[u8], pfx: *str) -> bool {
+    let pb = pfx.as_bytes();
+    if bs.len < pb.len {
+        return false;
+    }
+    var i: usize = 0_usize;
+    while i < pb.len {
+        if bs[i] != pb[i] {
+            return false;
+        }
+        i = i +% 1_usize;
+    }
+    return true;
+}
+
+/// Apply standard hosted runtime CLI overrides (`--headless`, `--software`, `--frames=N`, `--width=W`, `--height=H`).
+fn apply_runtime_args(args: *ArgsCap, cfg: *mut AppConfig) {
+    let n = args.len();
+    var i: usize = 1_usize;
+    while i < n {
+        if let a = args.get(i) {
+            let bs = a.as_bytes();
+            if bytes_eq_lit(bs, "--headless") {
+                cfg.headless = true;
+                cfg.force_software = true;
+                if cfg.max_frames == 0_u64 { cfg.max_frames = 2_u64; }
+            } else if bytes_eq_lit(bs, "--software") {
+                cfg.force_software = true;
+            } else if bytes_starts_with(bs, "--frames=") {
+                let tail = bs.sub(9_usize, bs.len) catch { "".as_bytes() };
+                cfg.max_frames = parse_u32_bytes(tail).widen.[u64]();
+            } else if bytes_starts_with(bs, "--width=") {
+                let tail = bs.sub(8_usize, bs.len) catch { "".as_bytes() };
+                let w = parse_u32_bytes(tail);
+                if w >= 200_u32 && w <= 4096_u32 { cfg.width = w; }
+            } else if bytes_starts_with(bs, "--height=") {
+                let tail = bs.sub(9_usize, bs.len) catch { "".as_bytes() };
+                let h = parse_u32_bytes(tail);
+                if h >= 200_u32 && h <= 4096_u32 { cfg.height = h; }
+            }
+        }
+        i = i +% 1_usize;
+    }
+}
+
+/// Universal cross-platform app runner (`x86_64`/`aarch64`/`riscv64` x `linux`/`windows`/
+/// `macos`/`android`/`ios`/`nostd`).
+/// Applications call `eon_ui.lib.run_app(...)` with ZERO `@hal`, ZERO `raw`, and ZERO `@target_*`!
+pub fn run_app[S](
+    env: *mut Env,
+    cfg_in: *AppConfig,
+    state: *mut S,
+    on_init: fn(*mut context.UiContextCore, *mut S),
+    on_action: fn(*mut context.UiContextCore, *mut S, *input.DispatchedEvent) -> bool,
+    on_render: fn(*mut UiCanvas, *mut context.UiContextCore, *mut S),
+) -> i32 {
+    var cfg = cfg_in.*;
+    comptime if @target_os() == .NoStd {
+        _ = env;
+        _ = bytes_eq_lit("".as_bytes(), "");
+        _ = bytes_starts_with("".as_bytes(), "");
+        _ = parse_u32_bytes("".as_bytes());
+        var scratch = platform_rt.NoStdScratch.init_default();
+        let max_n = if cfg.max_nodes < 128_usize { 128_usize } else { cfg.max_nodes };
+        let nodes = platform_rt.alloc_nostd_slice.[layout.LayoutNode](&mut scratch, max_n);
+        let styles = platform_rt.alloc_nostd_slice.[style.Style](&mut scratch, max_n);
+        let elems = platform_rt.alloc_nostd_slice.[element.ElemMeta](&mut scratch, max_n);
+        let rects = platform_rt.alloc_nostd_slice.[math_vec.Bounds](&mut scratch, max_n);
+        let order_buf = platform_rt.alloc_nostd_slice.[u32](&mut scratch, max_n);
+        let prepaint = platform_rt.alloc_nostd_slice.[element.PrepaintItem](&mut scratch, max_n);
+        let text_pool = platform_rt.alloc_nostd_slice.[u8](&mut scratch, 16384_usize);
+        let out_quads = platform_rt.alloc_nostd_slice.[scene.Quad](&mut scratch, 512_usize);
+        let out_shadows = platform_rt.alloc_nostd_slice.[scene.Shadow](&mut scratch, 256_usize);
+        let out_underlines = platform_rt.alloc_nostd_slice.[scene.Underline](&mut scratch, 64_usize);
+        let out_sprites = platform_rt.alloc_nostd_slice.[scene.MonoSprite](&mut scratch, 2048_usize);
+        let sans_ttf = platform_rt.alloc_nostd_slice.[u8](&mut scratch, embedded_font.FONT_UI_SANS_LEN);
+        let mono_ttf = platform_rt.alloc_nostd_slice.[u8](&mut scratch, embedded_font.FONT_UI_MONO_LEN);
+        let atlas_w: u32 = 512_u32;
+        let atlas_h: u32 = 512_u32;
+        let atlas_pixels = platform_rt.alloc_nostd_slice.[u8](&mut scratch, (atlas_w *% atlas_h).widen.[usize]());
+        let atlas_entries = platform_rt.alloc_nostd_slice.[atlas.GlyphEntry](&mut scratch, 2048_usize);
+        let fb_w = cfg.width;
+        let fb_h = cfg.height;
+        let soft_fb = platform_rt.alloc_nostd_slice.[u8](&mut scratch, fb_w.widen.[usize]() *% fb_h.widen.[usize]() *% 4_usize);
+
+        _ = embedded_font.decode_b64(embedded_font.FONT_UI_SANS_B64, sans_ttf);
+        _ = embedded_font.decode_b64(embedded_font.FONT_UI_MONO_B64, mono_ttf);
+        var text_core = text_lib.TextEngineCore.new(sans_ttf, mono_ttf, atlas_w, atlas_h);
+
+        var win = win_lib.PlatformWindow.uninit();
+        let opts = cfg.to_window_options();
+        _ = win.open_in_place(&opts);
+
+        var cx = context.UiContextCore.new(fb_w, fb_h);
+        on_init(&mut cx, state);
+
+        var meta = element.UiTreeMeta.new();
+        let vw = fb_w.to_float.[f32]();
+        let vh = fb_h.to_float.[f32]();
+        let empty_poly: [0]scene.PolySprite = [];
+        let empty_path: [0]scene.PathVertex = [];
+        let empty_rgba: [4]u8 = [255_u8, 255_u8, 255_u8, 255_u8];
+
+        let target_frames: u64 = if cfg.max_frames > 0_u64 { cfg.max_frames } else { 2_u64 };
+        var frame: u64 = 0_u64;
+        while frame < target_frames {
+            win.poll_events();
+            cx.input.clear_actions();
+            loop {
+                let ev = win.next_event() orelse break;
+                _ = cx.input.handle_event(ev, &mut cx.focus, &cx.keymap);
+            }
+            let acts = cx.input.dispatched_actions();
+            var ai: usize = 0_usize;
+            while ai < acts.len {
+                _ = on_action(&mut cx, state, &acts[ai]);
+                ai = ai +% 1_usize;
+            }
+            _ = cx.tick_animations(1.0_f32 / 60.0_f32);
+
+            meta.clear();
+            var canvas = UiCanvas.{
+                meta: &mut meta,
+                nodes: nodes,
+                styles: styles,
+                elems: elems,
+                text_pool: text_pool,
+                sans: &text_core.sans,
+                mono: &text_core.mono,
+                sans_data: sans_ttf,
+                mono_data: mono_ttf,
+            };
+            on_render(&mut canvas, &mut cx, state);
+
+            _ = element.phase_request_layout(&mut meta, nodes, styles, rects, order_buf, vw, vh);
+            _ = element.phase_prepaint(&mut meta, nodes, styles, elems, rects, order_buf, prepaint, &mut cx, vw, vh);
+            let cnt = element.phase_paint_slices(
+                &meta, styles, elems, text_pool, order_buf, prepaint,
+                out_quads, out_shadows, out_underlines, out_sprites,
+                &mut text_core, sans_ttf, mono_ttf, atlas_pixels, atlas_entries,
+            );
+            soft.render_batches(
+                soft_fb, fb_w, fb_h, cx.theme.bg_window,
+                out_quads[0_usize..cnt.quads],
+                out_shadows[0_usize..cnt.shadows],
+                out_underlines[0_usize..cnt.underlines],
+                out_sprites[0_usize..cnt.sprites],
+                &empty_poly,
+                &empty_path,
+                atlas_pixels, atlas_w, atlas_h,
+                &empty_rgba, 1_u32, 1_u32,
+            );
+            win.present_rgba8(soft_fb, fb_w, fb_h);
+            frame = frame +% 1_u64;
+        }
+        win_lib.nostd_log("EON_UI_NOSTD_OK\n");
+        win_lib.nostd_exit(true);
+        return 0_i32;
+    } else {
+        _ = embedded_font.FONT_UI_SANS_LEN;
+        _ = atlas.GlyphEntry.empty();
+        apply_runtime_args(&env.args, &mut cfg);
+        let alloc = &mut env.alloc;
+        var host = UiHost.init(alloc, &cfg) catch { return 1_i32; };
+        defer host.destroy(alloc);
+        if !host.open_window(&cfg) {
+            return 2_i32;
+        }
+        on_init(&mut host.app.core, state);
+        host.last_frame_ns = platform_rt.now_ns_portable(&env.clock);
+
+        var frame: u64 = 0_u64;
+        while !host.win.should_close {
+            if cfg.max_frames > 0_u64 && frame >= cfg.max_frames {
+                break;
+            }
+            _ = host.poll_events();
+            var ai: usize = 0_usize;
+            while ai < host.app.core.input.action_len {
+                let ev_copy = host.app.core.input.dispatched_actions()[ai];
+                if on_action(&mut host.app.core, state, &ev_copy) {
+                    host.app.core.mark_dirty(0_u32);
+                }
+                ai = ai +% 1_usize;
+            }
+            let now_ns = platform_rt.now_ns_portable(&env.clock);
+            let dt_ns = if now_ns >= host.last_frame_ns { now_ns - host.last_frame_ns } else { 8333333_u64 };
+            host.last_frame_ns = now_ns;
+            var dt_sec = dt_ns.to_float.[f32]() * 1.0e-9_f32;
+            if dt_sec <= 0.0001_f32 || dt_sec > 0.05_f32 {
+                dt_sec = 1.0_f32 / 120.0_f32;
+            }
+            _ = host.app.core.tick_animations(dt_sec);
+
+            if host.app.core.needs_frame() || cfg.max_frames > 0_u64 {
+                _ = render_host_frame.[S](&mut host, alloc, state, on_render) catch { return 3_i32; };
+                frame = frame +% 1_u64;
+            } else {
+                // Idle scheduler: ~0% CPU until next OS event or animation
+                platform_rt.sleep_ms_portable(8_u32);
+            }
+        }
+        return 0_i32;
+    }
+}
