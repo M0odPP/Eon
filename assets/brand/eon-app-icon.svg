@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <linearGradient id="eonBg" x1="0" y1="0" x2="128" y2="128" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#111827"/>
+      <stop offset="100%" stop-color="#090D16"/>
+    </linearGradient>
+    <linearGradient id="eonStroke" x1="0" y1="0" x2="128" y2="128" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#334155"/>
+      <stop offset="100%" stop-color="#1E293B"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#eonBg)" stroke="url(#eonStroke)" stroke-width="2"/>
+  <g transform="translate(8, 6) scale(0.88)">
+    <path d="M 18 82 C 42 54 70 34 108 24 C 86 52 68 70 50 84 L 56 64 C 42 70 30 76 18 82 Z" fill="#FFFFFF"/>
+    <path d="M 57 88 C 72 76 86 62 100 44 C 92 70 80 90 62 106 L 57 88 Z" fill="#FFFFFF"/>
+  </g>
+</svg>

@@ -3,6 +3,7 @@ module eon_ui.element;
 import core.col;
 import core.color;
 import core.math_vec;
+import eon_win.icon;
 import eon_gpu.scene;
 import eon_text.atlas;
 import eon_text.lib;
@@ -39,6 +40,7 @@ pub struct ElemMeta {
     pub underline_enabled: bool;
     pub underline_wavy: bool;
     pub underline_color: color.Rgba;
+    pub brand_logo: bool;
 }
 
 impl ElemMeta {
@@ -58,6 +60,7 @@ impl ElemMeta {
             underline_enabled: false,
             underline_wavy: false,
             underline_color: color.Rgba.transparent(),
+            brand_logo: false,
         };
     }
 }
@@ -181,6 +184,7 @@ pub fn push_into_slices(
         underline_enabled: d.underline_enabled,
         underline_wavy: d.underline_wavy,
         underline_color: d.underline_color,
+        brand_logo: d.brand_logo,
     };
 
     let nid = idx.trunc.[u32]();
@@ -487,7 +491,21 @@ pub fn phase_paint_scene(
                 try sc.push_underline(alloc, ub, em.underline_color, 1.5_f32, em.underline_wavy);
             }
 
-            // 4. Optional TrueType text run (aligned, ellipsis, or wrapped)
+            // 4. Optional native vector Eon wing logo (`div().eon_logo()`)
+            if em.brand_logo {
+                let inner = b.inset(st.padding).inset(st.border_widths);
+                let lcol = st.text_color.with_alpha(st.text_color.a * st.opacity);
+                var pts: [210]math_vec.Point = [math_vec.Point.zero(); 210];
+                let nv = icon.tessellate_wing_logo(&mut pts, inner);
+                let nlim = if nv <= 210_usize { nv } else { 210_usize };
+                var vi: usize = 0_usize;
+                while nlim >= 3_usize && vi <= nlim - 3_usize {
+                    try sc.push_path_tri(alloc, pts[vi], pts[vi + 1_usize], pts[vi + 2_usize], lcol);
+                    vi = vi +% 3_usize;
+                }
+            }
+
+            // 5. Optional TrueType text run (aligned, ellipsis, or wrapped)
             if em.text_len > 0_u32 {
                 let t0 = em.text_off.widen.[usize]();
                 let t1 = t0 +% em.text_len.widen.[usize]();
@@ -534,6 +552,7 @@ pub struct SliceSceneCounts {
     pub shadows: usize;
     pub underlines: usize;
     pub sprites: usize;
+    pub paths: usize;
     pub next_order: u32;
 }
 
@@ -548,6 +567,7 @@ pub fn phase_paint_slices(
     out_shadows: *mut [scene.Shadow],
     out_underlines: *mut [scene.Underline],
     out_sprites: *mut [scene.MonoSprite],
+    out_paths: *mut [scene.PathVertex],
     text_core: *mut lib.TextEngineCore,
     sans_ttf: *[u8],
     mono_ttf: *[u8],
@@ -559,6 +579,7 @@ pub fn phase_paint_slices(
         shadows: 0_usize,
         underlines: 0_usize,
         sprites: 0_usize,
+        paths: 0_usize,
         next_order: 0_u32,
     };
     let pass_lim: u8 = if meta.has_overlays { 2_u8 } else { 1_u8 };
@@ -651,6 +672,24 @@ pub fn phase_paint_slices(
                 };
                 cnt.underlines = cnt.underlines +% 1_usize;
                 cnt.next_order = cnt.next_order +% 1_u32;
+            }
+
+            if em.brand_logo {
+                let inner = b.inset(st.padding).inset(st.border_widths);
+                let lcol = st.text_color.with_alpha(st.text_color.a * st.opacity).to_f32x4();
+                var pts: [210]math_vec.Point = [math_vec.Point.zero(); 210];
+                let nv = icon.tessellate_wing_logo(&mut pts, inner);
+                let nlim = if nv <= 210_usize { nv } else { 210_usize };
+                var vi: usize = 0_usize;
+                while nlim >= 3_usize && vi <= nlim - 3_usize && out_paths.len >= 3_usize && cnt.paths <= out_paths.len - 3_usize {
+                    let cp = cnt.paths;
+                    out_paths[cp] = scene.PathVertex.{ pos: .{ pts[vi].x, pts[vi].y }, uv: .{ 0.0_f32, 0.0_f32 }, color: lcol, clip_mask: clip_v };
+                    out_paths[cp + 1_usize] = scene.PathVertex.{ pos: .{ pts[vi + 1_usize].x, pts[vi + 1_usize].y }, uv: .{ 1.0_f32, 0.0_f32 }, color: lcol, clip_mask: clip_v };
+                    out_paths[cp + 2_usize] = scene.PathVertex.{ pos: .{ pts[vi + 2_usize].x, pts[vi + 2_usize].y }, uv: .{ 0.0_f32, 1.0_f32 }, color: lcol, clip_mask: clip_v };
+                    cnt.paths = cp + 3_usize;
+                    cnt.next_order = cnt.next_order +% 1_u32;
+                    vi = vi +% 3_usize;
+                }
             }
 
             if em.text_len > 0_u32 {
@@ -805,6 +844,7 @@ impl UiTree {
             underline_enabled: d.underline_enabled,
             underline_wavy: d.underline_wavy,
             underline_color: d.underline_color,
+            brand_logo: d.brand_logo,
         });
         try self.rects.push(alloc, math_vec.Bounds.zero());
         try self.order_buf.push(alloc, 0_u32);

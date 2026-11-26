@@ -2825,6 +2825,37 @@ fn rewrite_regular_inst(
         return;
     }
 
+    // Track all physical registers currently holding live source operands for this instruction
+    var busy_gprs: u32 = 0_u32;
+    var busy_xmms: u32 = 0_u32;
+    if src0_loc.present {
+        if mach_ir.reg_class_is_vec(src0_loc.cls) {
+            busy_xmms = busy_xmms | mach_ir.phys_bit(inst.src0_phys);
+        } else {
+            busy_gprs = busy_gprs | mach_ir.phys_bit(inst.src0_phys);
+        }
+    }
+    if src1_loc.present {
+        if mach_ir.reg_class_is_vec(src1_loc.cls) {
+            busy_xmms = busy_xmms | mach_ir.phys_bit(inst.src1_phys);
+        } else {
+            busy_gprs = busy_gprs | mach_ir.phys_bit(inst.src1_phys);
+        }
+    }
+    if src2_loc.present {
+        if mach_ir.reg_class_is_vec(src2_loc.cls) {
+            busy_xmms = busy_xmms | mach_ir.phys_bit(inst.src2_phys);
+        } else {
+            busy_gprs = busy_gprs | mach_ir.phys_bit(inst.src2_phys);
+        }
+    }
+    if (inst.mem.kind == .BaseDisp || inst.mem.kind == .Sib) && inst.mem.base_phys < 32_u8 {
+        busy_gprs = busy_gprs | mach_ir.phys_bit(inst.mem.base_phys);
+    }
+    if inst.mem.kind == .Sib && inst.mem.idx_phys < 32_u8 {
+        busy_gprs = busy_gprs | mach_ir.phys_bit(inst.mem.idx_phys);
+    }
+
     // Resolve destination register
     if dst_loc.present {
         if !dst_loc.spilled {
@@ -2835,17 +2866,40 @@ fn rewrite_regular_inst(
         } else {
             let is_vec_dst = mach_ir.reg_class_is_vec(dst_loc.cls);
             if is_vec_dst {
-                // Pick scratch vec not colliding with src1/src2 if tied_src0
-                if inst.tied_src0 && (inst.src1_phys == sc_vec0 || inst.src2_phys == sc_vec0) {
+                if !inst.tied_src0 {
+                    inst.dst_phys = sc_vec0;
+                } else if (busy_xmms & mach_ir.phys_bit(sc_vec0)) == 0_u32 {
+                    inst.dst_phys = sc_vec0;
+                } else if (busy_xmms & mach_ir.phys_bit(sc_vec1)) == 0_u32 {
                     inst.dst_phys = sc_vec1;
                 } else {
-                    inst.dst_phys = sc_vec0;
+                    let em = pick_emergency_reg(&mf.reg_file, true, avoid_xmms | busy_xmms);
+                    if em_slots.vec_off == 0_i32 {
+                        em_slots.vec_off = mf.alloc_stack_slot(32_usize, 16_usize);
+                    }
+                    let em_cls: mach_ir.RegClass = if is_x64_isa { .Vec256 } else { .Vec128 };
+                    try emit_store_spill(alloc, out, em_slots.vec_off, em, em_cls, sp);
+                    st.em_vec_active = true;
+                    st.em_vec_phys = em;
+                    st.em_vec_l256 = is_x64_isa;
+                    inst.dst_phys = em;
                 }
             } else {
-                if inst.tied_src0 && inst.src1_phys == sc_gpr0 {
+                if !inst.tied_src0 {
+                    inst.dst_phys = sc_gpr0;
+                } else if (busy_gprs & mach_ir.phys_bit(sc_gpr0)) == 0_u32 {
+                    inst.dst_phys = sc_gpr0;
+                } else if (busy_gprs & mach_ir.phys_bit(sc_gpr1)) == 0_u32 {
                     inst.dst_phys = sc_gpr1;
                 } else {
-                    inst.dst_phys = sc_gpr0;
+                    let em = pick_emergency_reg(&mf.reg_file, false, avoid_gprs | busy_gprs);
+                    if em_slots.gpr_off == 0_i32 {
+                        em_slots.gpr_off = mf.alloc_stack_slot(8_usize, 8_usize);
+                    }
+                    try emit_store_spill(alloc, out, em_slots.gpr_off, em, .Gpr, sp);
+                    st.em_gpr_active = true;
+                    st.em_gpr_phys = em;
+                    inst.dst_phys = em;
                 }
             }
         }
@@ -2859,18 +2913,20 @@ fn rewrite_regular_inst(
     }
 
     // Special Case 2: x86_64 Variable shifts (shift count in RCX/CL!)
-    var post_shift_move_dst: u8 = mach_ir.PHYS_NONE;
+    var post_move_dst: u8 = mach_ir.PHYS_NONE;
     if is_x64_isa && mach_ir.op_is_var_shift(inst.op) && src1_loc.present {
         if inst.src1_phys != mach_ir.PHYS_RCX {
             if src0_loc.present && inst.src0_phys == mach_ir.PHYS_RCX {
                 try emit_reg_move(alloc, out, sc_gpr1, mach_ir.PHYS_RCX, .Gpr, sp);
                 inst.src0_phys = sc_gpr1;
+                busy_gprs = busy_gprs | mach_ir.phys_bit(sc_gpr1);
             }
             try emit_reg_move(alloc, out, mach_ir.PHYS_RCX, inst.src1_phys, .Gpr, sp);
             inst.src1_phys = mach_ir.PHYS_RCX;
+            busy_gprs = busy_gprs | mach_ir.phys_bit(mach_ir.PHYS_RCX);
         }
         if dst_loc.present && inst.dst_phys == mach_ir.PHYS_RCX && inst.src0_phys != mach_ir.PHYS_RCX {
-            post_shift_move_dst = mach_ir.PHYS_RCX;
+            post_move_dst = mach_ir.PHYS_RCX;
             inst.dst_phys = sc_gpr0;
         }
     }
@@ -2878,71 +2934,82 @@ fn rewrite_regular_inst(
     // Handle 2-address tied_src0 constraint cleanly (GPR ALU, Cmov, VFmadd231*, VFnMadd231PS)
     if inst.tied_src0 && dst_loc.present && src0_loc.present && inst.dst_phys != inst.src0_phys {
         let is_vec_dst = mach_ir.reg_class_is_vec(dst_loc.cls);
-        if !is_vec_dst {
-            // Protect any other GPR source operand that currently sits in inst.dst_phys!
-            if src1_loc.present && !mach_ir.reg_class_is_vec(src1_loc.cls) && inst.src1_phys == inst.dst_phys {
-                let sc = if inst.src0_phys != sc_gpr0
-                    && inst.mem.base_phys != sc_gpr0
-                    && inst.mem.idx_phys != sc_gpr0
-                {
-                    sc_gpr0
-                } else {
-                    sc_gpr1
-                };
-                try emit_reg_move(alloc, out, sc, inst.src1_phys, .Gpr, sp);
-                inst.src1_phys = sc;
+        if src0_loc.spilled {
+            // src0 was reloaded into a dedicated scratch register that is dead after this instruction:
+            // execute in-place on inst.src0_phys and copy to inst.dst_phys afterwards so src1/src2/mem
+            // are never clobbered even when both scratch registers hold reloaded spill values.
+            if post_move_dst >= 32_u8 && !dst_loc.spilled {
+                post_move_dst = inst.dst_phys;
             }
-            if src2_loc.present && !mach_ir.reg_class_is_vec(src2_loc.cls) && inst.src2_phys == inst.dst_phys {
-                let sc = if inst.src0_phys != sc_gpr0 && inst.src1_phys != sc_gpr0 {
-                    sc_gpr0
-                } else {
-                    sc_gpr1
-                };
-                try emit_reg_move(alloc, out, sc, inst.src2_phys, .Gpr, sp);
-                inst.src2_phys = sc;
-            }
-            if (inst.mem.kind == .BaseDisp || inst.mem.kind == .Sib) && inst.mem.base_phys == inst.dst_phys {
-                let sc = if inst.src0_phys != sc_gpr0 && inst.mem.idx_phys != sc_gpr0 {
-                    sc_gpr0
-                } else {
-                    sc_gpr1
-                };
-                try emit_reg_move(alloc, out, sc, inst.mem.base_phys, .Gpr, sp);
-                inst.mem.base_phys = sc;
-            }
-            if inst.mem.kind == .Sib && inst.mem.idx_phys == inst.dst_phys {
-                let sc = if inst.src0_phys != sc_gpr0 && inst.mem.base_phys != sc_gpr0 {
-                    sc_gpr0
-                } else {
-                    sc_gpr1
-                };
-                try emit_reg_move(alloc, out, sc, inst.mem.idx_phys, .Gpr, sp);
-                inst.mem.idx_phys = sc;
-            }
-            try emit_reg_move(alloc, out, inst.dst_phys, inst.src0_phys, .Gpr, sp);
-            inst.src0_phys = inst.dst_phys;
+            inst.dst_phys = inst.src0_phys;
         } else {
-            // Vector tied_src0 (VFmadd231*, VFnMadd231PS): protect src1/src2 if equal to dst_phys
-            if src1_loc.present && mach_ir.reg_class_is_vec(src1_loc.cls) && inst.src1_phys == inst.dst_phys {
-                let sc = if inst.src0_phys != sc_vec0 && inst.src2_phys != sc_vec0 {
-                    sc_vec0
-                } else {
-                    sc_vec1
-                };
-                try emit_reg_move(alloc, out, sc, inst.src1_phys, dst_loc.cls, sp);
-                inst.src1_phys = sc;
+            var dst_collides = false;
+            if is_vec_dst {
+                if src1_loc.present && mach_ir.reg_class_is_vec(src1_loc.cls) && inst.src1_phys == inst.dst_phys {
+                    dst_collides = true;
+                }
+                if src2_loc.present && mach_ir.reg_class_is_vec(src2_loc.cls) && inst.src2_phys == inst.dst_phys {
+                    dst_collides = true;
+                }
+            } else {
+                if src1_loc.present && !mach_ir.reg_class_is_vec(src1_loc.cls) && inst.src1_phys == inst.dst_phys {
+                    dst_collides = true;
+                }
+                if src2_loc.present && !mach_ir.reg_class_is_vec(src2_loc.cls) && inst.src2_phys == inst.dst_phys {
+                    dst_collides = true;
+                }
+                if (inst.mem.kind == .BaseDisp || inst.mem.kind == .Sib) && inst.mem.base_phys == inst.dst_phys {
+                    dst_collides = true;
+                }
+                if inst.mem.kind == .Sib && inst.mem.idx_phys == inst.dst_phys {
+                    dst_collides = true;
+                }
             }
-            if src2_loc.present && mach_ir.reg_class_is_vec(src2_loc.cls) && inst.src2_phys == inst.dst_phys {
-                let sc = if inst.src0_phys != sc_vec0 && inst.src1_phys != sc_vec0 {
-                    sc_vec0
+            if !dst_collides {
+                try emit_reg_move(alloc, out, inst.dst_phys, inst.src0_phys, dst_loc.cls, sp);
+                inst.src0_phys = inst.dst_phys;
+            } else {
+                var tmp_r: u8 = mach_ir.PHYS_NONE;
+                if is_vec_dst {
+                    if (busy_xmms & mach_ir.phys_bit(sc_vec0)) == 0_u32 {
+                        tmp_r = sc_vec0;
+                    } else if (busy_xmms & mach_ir.phys_bit(sc_vec1)) == 0_u32 {
+                        tmp_r = sc_vec1;
+                    } else {
+                        let em = pick_emergency_reg(&mf.reg_file, true, avoid_xmms | busy_xmms);
+                        if em_slots.vec_off == 0_i32 {
+                            em_slots.vec_off = mf.alloc_stack_slot(32_usize, 16_usize);
+                        }
+                        let em_cls: mach_ir.RegClass = if is_x64_isa { .Vec256 } else { .Vec128 };
+                        try emit_store_spill(alloc, out, em_slots.vec_off, em, em_cls, sp);
+                        st.em_vec_active = true;
+                        st.em_vec_phys = em;
+                        st.em_vec_l256 = is_x64_isa;
+                        tmp_r = em;
+                    }
                 } else {
-                    sc_vec1
-                };
-                try emit_reg_move(alloc, out, sc, inst.src2_phys, dst_loc.cls, sp);
-                inst.src2_phys = sc;
+                    if (busy_gprs & mach_ir.phys_bit(sc_gpr0)) == 0_u32 {
+                        tmp_r = sc_gpr0;
+                    } else if (busy_gprs & mach_ir.phys_bit(sc_gpr1)) == 0_u32 {
+                        tmp_r = sc_gpr1;
+                    } else {
+                        let em = pick_emergency_reg(&mf.reg_file, false, avoid_gprs | busy_gprs);
+                        if em_slots.gpr_off == 0_i32 {
+                            em_slots.gpr_off = mf.alloc_stack_slot(8_usize, 8_usize);
+                        }
+                        try emit_store_spill(alloc, out, em_slots.gpr_off, em, .Gpr, sp);
+                        st.em_gpr_active = true;
+                        st.em_gpr_phys = em;
+                        tmp_r = em;
+                    }
+                }
+                try emit_reg_move(alloc, out, tmp_r, inst.src0_phys, dst_loc.cls, sp);
+                if post_move_dst >= 32_u8 && !dst_loc.spilled {
+                    post_move_dst = inst.dst_phys;
+                }
+                inst.dst_phys = tmp_r;
+                inst.src0_phys = tmp_r;
             }
-            try emit_reg_move(alloc, out, inst.dst_phys, inst.src0_phys, dst_loc.cls, sp);
-            inst.src0_phys = inst.dst_phys;
         }
     }
 
@@ -2951,14 +3018,14 @@ fn rewrite_regular_inst(
     let final_dst2_phys = inst.dst2_phys;
     try out.push(alloc, inst);
 
-    // Post-shift fixup if dst wanted RCX
-    if post_shift_move_dst < 32_u8 {
-        try emit_reg_move(alloc, out, post_shift_move_dst, final_dst_phys, .Gpr, sp);
+    // Post-instruction move fixup (variable shift into RCX or tied_src0 non-clobbering temp)
+    if post_move_dst < 32_u8 {
+        try emit_reg_move(alloc, out, post_move_dst, final_dst_phys, dst_loc.cls, sp);
     }
 
     // Emit spill store(s) for spilled destination(s)
     if dst_loc.present && dst_loc.spilled {
-        let src_r = if post_shift_move_dst < 32_u8 { post_shift_move_dst } else { final_dst_phys };
+        let src_r = if post_move_dst < 32_u8 { post_move_dst } else { final_dst_phys };
         try emit_store_spill(alloc, out, dst_loc.spill_off, src_r, dst_loc.cls, sp);
     }
     if dst2_loc.present && dst2_loc.spilled {

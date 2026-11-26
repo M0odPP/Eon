@@ -463,9 +463,21 @@ pub fn on_render(ui: *mut ui_lib.UiCanvas, cx: *mut context.UiContextCore, st: *
     // Main left/primary calculator column
     let main_col = ui.push(root, div.div().flex_col().gap(10.0_f32).flex_1().h_full());
 
-    // 1. Top Header Bar: Mode Segmented Control + History Toggle + Dark/Light Theme Toggle
+    // 1. Top Header Bar: Official Eon Wing Mark + Mode Segmented Control + History + Theme Toggle
     let hdr = ui.push(main_col, div.div().flex_row().justify_between().items_center().h(36.0_f32).gap(8.0_f32));
-    let seg = ui.push(hdr, toggle.segmented_group(th));
+    let left_hdr = ui.push(hdr, div.div().flex_row().items_center().gap(8.0_f32));
+    let logo_badge = ui.push(
+        left_hdr,
+        div.div()
+            .w(30.0_f32)
+            .h(30.0_f32)
+            .p(4.0_f32)
+            .rounded(8.0_f32)
+            .bg(th.bg_panel)
+            .border(1.0_f32, th.border),
+    );
+    _ = ui.push(logo_badge, div.div().w_full().h_full().eon_logo().text_color(th.text_primary));
+    let seg = ui.push(left_hdr, toggle.segmented_group(th));
     _ = ui.push_text(seg, toggle.segment_item(th, 101_u64, ACT_MODE_STD, st.calc.mode == .Standard), if compact { "Std" } else { "Standard" });
     _ = ui.push_text(seg, toggle.segment_item(th, 102_u64, ACT_MODE_SCI, st.calc.mode == .Scientific), if compact { "Sci" } else { "Scientific" });
     _ = ui.push_text(seg, toggle.segment_item(th, 103_u64, ACT_MODE_PROG, st.calc.mode == .Programmer), if compact { "Prog" } else { "Programmer" });

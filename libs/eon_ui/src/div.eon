@@ -27,6 +27,7 @@ pub struct Div {
     pub underline_enabled: bool;
     pub underline_wavy: bool;
     pub underline_color: color.Rgba;
+    pub brand_logo: bool;
 }
 
 /// Create a new fluent `Div` builder (GPUI entry point: `div().flex().flex_col()...`).
@@ -44,10 +45,18 @@ pub fn div() -> Div {
         underline_enabled: false,
         underline_wavy: false,
         underline_color: color.Rgba.transparent(),
+        brand_logo: false,
     };
 }
 
 impl Div {
+    /// Render the official Eon vector wing mark inside this element's content box
+    /// (foreground color taken from `.text_color(...)`).
+    pub fn eon_logo(mut self: Self) -> Div {
+        self.brand_logo = true;
+        return self;
+    }
+
     // --- Identity & Interaction ---
     pub fn id(mut self: Self, id: u64) -> Div {
         self.element_id = id;

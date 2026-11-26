@@ -1,0 +1,32 @@
+{
+  "iconDefinitions": {
+    "eon-dark": { "iconPath": "./eon-file-dark.svg" },
+    "eon-light": { "iconPath": "./eon-file-light.svg" },
+    "eon-hal-dark": { "iconPath": "./eon-hal-dark.svg" },
+    "eon-hal-light": { "iconPath": "./eon-hal-light.svg" }
+  },
+  "fileExtensions": {
+    "eon": "eon-dark",
+    "hal.eon": "eon-hal-dark"
+  },
+  "fileNames": {
+    "build.eon": "eon-dark",
+    "eon.lock": "eon-dark"
+  },
+  "languageIds": {
+    "eon": "eon-dark"
+  },
+  "light": {
+    "fileExtensions": {
+      "eon": "eon-light",
+      "hal.eon": "eon-hal-light"
+    },
+    "fileNames": {
+      "build.eon": "eon-light",
+      "eon.lock": "eon-light"
+    },
+    "languageIds": {
+      "eon": "eon-light"
+    }
+  }
+}

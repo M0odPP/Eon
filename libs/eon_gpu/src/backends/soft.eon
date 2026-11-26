@@ -536,23 +536,28 @@ fn raster_path_tri(fb: *mut [u8], w: u32, h: u32, v0: *scene.PathVertex, v1: *sc
     let y1 = clamp_i32(ceil_to_i32(max_y), 0_i32, h.bitcast.[i32]());
     if x0 >= x1 || y0 >= y1 { return; }
 
-    let a = v0.color[3_usize];
-    let pr = v0.color[0_usize] * a;
-    let pg = v0.color[1_usize] * a;
-    let pb = v0.color[2_usize] * a;
+    let base_a = v0.color[3_usize];
     var y = y0;
     while y < y1 {
-        let py = y.to_float.[f32]() + 0.5_f32;
+        let fy = y.to_float.[f32]();
         let row = (y.bitcast.[u32]() *% w).widen.[usize]();
         var x = x0;
         while x < x1 {
-            let px = x.to_float.[f32]() + 0.5_f32;
-            let e0 = edge_fn(ax, ay, bx, by, px, py) * sign;
-            let e1 = edge_fn(bx, by, cx, cy, px, py) * sign;
-            let e2 = edge_fn(cx, cy, ax, ay, px, py) * sign;
-            if e0 >= 0.0_f32 && e1 >= 0.0_f32 && e2 >= 0.0_f32 {
+            let fx = x.to_float.[f32]();
+            // 2x2 rotated-grid subpixel coverage anti-aliasing for crisp vector curves
+            var hits: u32 = 0_u32;
+            let p0x = fx + 0.25_f32; let p0y = fy + 0.25_f32;
+            if edge_fn(ax, ay, bx, by, p0x, p0y) * sign >= 0.0_f32 && edge_fn(bx, by, cx, cy, p0x, p0y) * sign >= 0.0_f32 && edge_fn(cx, cy, ax, ay, p0x, p0y) * sign >= 0.0_f32 { hits = hits +% 1_u32; }
+            let p1x = fx + 0.75_f32; let p1y = fy + 0.25_f32;
+            if edge_fn(ax, ay, bx, by, p1x, p1y) * sign >= 0.0_f32 && edge_fn(bx, by, cx, cy, p1x, p1y) * sign >= 0.0_f32 && edge_fn(cx, cy, ax, ay, p1x, p1y) * sign >= 0.0_f32 { hits = hits +% 1_u32; }
+            let p2x = fx + 0.25_f32; let p2y = fy + 0.75_f32;
+            if edge_fn(ax, ay, bx, by, p2x, p2y) * sign >= 0.0_f32 && edge_fn(bx, by, cx, cy, p2x, p2y) * sign >= 0.0_f32 && edge_fn(cx, cy, ax, ay, p2x, p2y) * sign >= 0.0_f32 { hits = hits +% 1_u32; }
+            let p3x = fx + 0.75_f32; let p3y = fy + 0.75_f32;
+            if edge_fn(ax, ay, bx, by, p3x, p3y) * sign >= 0.0_f32 && edge_fn(bx, by, cx, cy, p3x, p3y) * sign >= 0.0_f32 && edge_fn(cx, cy, ax, ay, p3x, p3y) * sign >= 0.0_f32 { hits = hits +% 1_u32; }
+            if hits > 0_u32 {
+                let a = base_a * (hits.to_float.[f32]() * 0.25_f32);
                 let off = (row +% x.bitcast.[u32]().widen.[usize]()) *% 4_usize;
-                blend_premul_px(fb, off, pr, pg, pb, a);
+                blend_premul_px(fb, off, v0.color[0_usize] * a, v0.color[1_usize] * a, v0.color[2_usize] * a, a);
             }
             x = x +% 1_i32;
         }

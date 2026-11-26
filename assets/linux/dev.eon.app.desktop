@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=EonCalc
+Comment=Cross-platform pure-Eon GUI calculator (Standard, Scientific, Programmer)
+Exec=eon_calc
+Icon=dev.eon.app
+Terminal=false
+Categories=Utility;Calculator;
+StartupWMClass=dev.eon.app
+Keywords=calculator;math;hex;binary;scientific;eon;

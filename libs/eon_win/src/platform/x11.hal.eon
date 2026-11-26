@@ -1,6 +1,7 @@
 module eon_win.platform.x11 @hal;
 
 import eon_win.events;
+import eon_win.icon;
 
 // ============================================================================
 // Linux X11 Fallback Window Adapter (Dynamic `libX11.so.6` + `libX11-xcb.so.1`)
@@ -61,6 +62,16 @@ pub fn call1(_fp: u64, _a0: u64) -> u64 {
         raw { asm("mv t1, a0; mv a0, a1; jr t1", options(noreturn)); }
     } else {
         raw { asm("mov rax, rdi; mov rdi, rsi; jmp rax", options(noreturn)); }
+    }
+    return 0_u64;
+}
+
+@naked
+pub fn u64_slice_ptr(_s: *[u64]) -> u64 {
+    comptime if @target_arch() == .AArch64 || @target_arch() == .RiscV64 {
+        raw { asm("ret", options(noreturn)); }
+    } else {
+        raw { asm("mov rax, rdi; ret", options(noreturn)); }
     }
     return 0_u64;
 }
@@ -267,6 +278,30 @@ impl X11Window {
                     ((wm_del >> 56_u64) & 0xFF_u64).trunc.[u8](),
                 ];
                 _ = call4(f_proto, dpy, win, slice_ptr(&atom_bytes), 1_u64);
+                // Attach official 32x32 Eon wing icon to _NET_WM_ICON
+                let f_change_prop = dl_sym(lib, "XChangeProperty\0".as_bytes());
+                if f_change_prop != 0_u64 {
+                    let atom_icon = call3(f_atom, dpy, slice_ptr("_NET_WM_ICON\0".as_bytes()), 0_u64);
+                    let atom_card = call3(f_atom, dpy, slice_ptr("CARDINAL\0".as_bytes()), 0_u64);
+                    if atom_icon != 0_u64 && atom_card != 0_u64 {
+                        var icon_prop: [1026]u64 = [0_u64; 1026];
+                        let n_elems = icon.build_x11_net_wm_icon_32(&mut icon_prop);
+                        if n_elems == 1026_usize {
+                            _ = call9(
+                                f_change_prop,
+                                dpy,
+                                win,
+                                atom_icon,
+                                atom_card,
+                                32_u64,
+                                0_u64, // PropModeReplace
+                                u64_slice_ptr(&icon_prop),
+                                1026_u64,
+                                0_u64,
+                            );
+                        }
+                    }
+                }
             }
             self.lib_x11 = lib;
             self.display = dpy;
@@ -285,6 +320,7 @@ impl X11Window {
             self.opened = true;
             return true;
         } else {
+            _ = icon.WING_STEPS;
             return false;
         }
     }

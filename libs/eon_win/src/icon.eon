@@ -1,0 +1,347 @@
+module eon_win.icon;
+
+import core.math;
+import core.math_vec;
+
+// ============================================================================
+// Official Eon Wing Vector Logo Geometry & Pure-Eon App Icon Rasterizer
+// (`libs/eon_win/src/icon.eon`) — 100% safe, `core/`-only, ZERO heap allocs!
+//
+// Exact SVG geometry (`assets/brand/eon-mark-white.svg`, viewBox 0 0 128 128):
+//   Wing 1: M 18 82 C 42 54 70 34 108 24 C 86 52 68 70 50 84 L 56 64 C 42 70 30 76 18 82 Z
+//   Wing 2: M 57 88 C 72 76 86 62 100 44 C 92 70 80 90 62 106 L 57 88 Z
+// ============================================================================
+
+pub const WING_STEPS: usize = 12_usize;
+pub const EON_LOGO_TRIS: usize = 70_usize;
+pub const EON_LOGO_VERTS: usize = 210_usize;
+
+@inline
+pub fn cubic_pt(
+    x0: f32, y0: f32,
+    x1: f32, y1: f32,
+    x2: f32, y2: f32,
+    x3: f32, y3: f32,
+    t: f32,
+) -> math_vec.Point {
+    let u = 1.0_f32 - t;
+    let u2 = u * u;
+    let t2 = t * t;
+    let b0 = u2 * u;
+    let b1 = 3.0_f32 * u2 * t;
+    let b2 = 3.0_f32 * u * t2;
+    let b3 = t2 * t;
+    return math_vec.Point.new(
+        b0 * x0 + b1 * x1 + b2 * x2 + b3 * x3,
+        b0 * y0 + b1 * y1 + b2 * y2 + b3 * y3,
+    );
+}
+
+@inline
+fn map_logo_pt(p: math_vec.Point, ox: f32, oy: f32, scale: f32) -> math_vec.Point {
+    return math_vec.Point.new(ox + p.x * scale, oy + p.y * scale);
+}
+
+@inline
+fn push_tri(
+    out: *mut [math_vec.Point],
+    cnt: *mut usize,
+    a: math_vec.Point,
+    b: math_vec.Point,
+    c: math_vec.Point,
+) {
+    let n = cnt.*;
+    if out.len >= 3_usize && n <= out.len - 3_usize {
+        out[n] = a;
+        out[n + 1_usize] = b;
+        out[n + 2_usize] = c;
+        cnt.* = n + 3_usize;
+    }
+}
+
+/// Tessellate the exact Eon wing logo (`70` non-overlapping triangles = `210` vertices)
+/// centered with preserved `1:1` aspect ratio inside `bounds`.
+pub fn tessellate_wing_logo(out_pts: *mut [math_vec.Point], bounds: math_vec.Bounds) -> usize {
+    let side = math_vec.min_f32(bounds.size.width, bounds.size.height);
+    if side <= 0.5_f32 || out_pts.len < 3_usize {
+        return 0_usize;
+    }
+    let scale = side / 128.0_f32;
+    let ox = bounds.origin.x + (bounds.size.width - side) * 0.5_f32;
+    let oy = bounds.origin.y + (bounds.size.height - side) * 0.5_f32;
+
+    var cnt: usize = 0_usize;
+    let inv_n = 1.0_f32 / WING_STEPS.to_float.[f32]();
+    let ts: f32 = 0.42_f32;
+
+    // Wing 1 left strip: C0(0..ts) vs C3(1..0)
+    var i: usize = 0_usize;
+    while i < WING_STEPS {
+        let u0 = i.to_float.[f32]() * inv_n;
+        let u1 = (i +% 1_usize).to_float.[f32]() * inv_n;
+        let a = map_logo_pt(cubic_pt(18.0_f32, 82.0_f32, 42.0_f32, 54.0_f32, 70.0_f32, 34.0_f32, 108.0_f32, 24.0_f32, u0 * ts), ox, oy, scale);
+        let b = map_logo_pt(cubic_pt(18.0_f32, 82.0_f32, 42.0_f32, 54.0_f32, 70.0_f32, 34.0_f32, 108.0_f32, 24.0_f32, u1 * ts), ox, oy, scale);
+        let c = map_logo_pt(cubic_pt(56.0_f32, 64.0_f32, 42.0_f32, 70.0_f32, 30.0_f32, 76.0_f32, 18.0_f32, 82.0_f32, 1.0_f32 - u1), ox, oy, scale);
+        let d = map_logo_pt(cubic_pt(56.0_f32, 64.0_f32, 42.0_f32, 70.0_f32, 30.0_f32, 76.0_f32, 18.0_f32, 82.0_f32, 1.0_f32 - u0), ox, oy, scale);
+        if i > 0_usize {
+            push_tri(out_pts, &mut cnt, a, b, d);
+        }
+        push_tri(out_pts, &mut cnt, b, c, d);
+        i = i +% 1_usize;
+    }
+
+    // Wing 1 center notch bridge triangle (consistent positive winding)
+    let p_split = map_logo_pt(cubic_pt(18.0_f32, 82.0_f32, 42.0_f32, 54.0_f32, 70.0_f32, 34.0_f32, 108.0_f32, 24.0_f32, ts), ox, oy, scale);
+    let p_notch_top = map_logo_pt(math_vec.Point.new(56.0_f32, 64.0_f32), ox, oy, scale);
+    let p_notch_bot = map_logo_pt(math_vec.Point.new(50.0_f32, 84.0_f32), ox, oy, scale);
+    push_tri(out_pts, &mut cnt, p_split, p_notch_top, p_notch_bot);
+
+    // Wing 1 right strip: C0(ts..1) vs C1(1..0)
+    i = 0_usize;
+    while i < WING_STEPS {
+        let v0 = i.to_float.[f32]() * inv_n;
+        let v1 = (i +% 1_usize).to_float.[f32]() * inv_n;
+        let t0 = ts + v0 * (1.0_f32 - ts);
+        let t1 = ts + v1 * (1.0_f32 - ts);
+        let a = map_logo_pt(cubic_pt(18.0_f32, 82.0_f32, 42.0_f32, 54.0_f32, 70.0_f32, 34.0_f32, 108.0_f32, 24.0_f32, t0), ox, oy, scale);
+        let b = map_logo_pt(cubic_pt(18.0_f32, 82.0_f32, 42.0_f32, 54.0_f32, 70.0_f32, 34.0_f32, 108.0_f32, 24.0_f32, t1), ox, oy, scale);
+        let c = map_logo_pt(cubic_pt(108.0_f32, 24.0_f32, 86.0_f32, 52.0_f32, 68.0_f32, 70.0_f32, 50.0_f32, 84.0_f32, 1.0_f32 - v1), ox, oy, scale);
+        let d = map_logo_pt(cubic_pt(108.0_f32, 24.0_f32, 86.0_f32, 52.0_f32, 68.0_f32, 70.0_f32, 50.0_f32, 84.0_f32, 1.0_f32 - v0), ox, oy, scale);
+        push_tri(out_pts, &mut cnt, a, b, d);
+        if i +% 1_usize < WING_STEPS {
+            push_tri(out_pts, &mut cnt, b, c, d);
+        }
+        i = i +% 1_usize;
+    }
+
+    // Wing 2 strip: W2A(0..1) vs W2B(1..0)
+    i = 0_usize;
+    while i < WING_STEPS {
+        let v0 = i.to_float.[f32]() * inv_n;
+        let v1 = (i +% 1_usize).to_float.[f32]() * inv_n;
+        let a = map_logo_pt(cubic_pt(57.0_f32, 88.0_f32, 72.0_f32, 76.0_f32, 86.0_f32, 62.0_f32, 100.0_f32, 44.0_f32, v0), ox, oy, scale);
+        let b = map_logo_pt(cubic_pt(57.0_f32, 88.0_f32, 72.0_f32, 76.0_f32, 86.0_f32, 62.0_f32, 100.0_f32, 44.0_f32, v1), ox, oy, scale);
+        let c = map_logo_pt(cubic_pt(100.0_f32, 44.0_f32, 92.0_f32, 70.0_f32, 80.0_f32, 90.0_f32, 62.0_f32, 106.0_f32, 1.0_f32 - v1), ox, oy, scale);
+        let d = map_logo_pt(cubic_pt(100.0_f32, 44.0_f32, 92.0_f32, 70.0_f32, 80.0_f32, 90.0_f32, 62.0_f32, 106.0_f32, 1.0_f32 - v0), ox, oy, scale);
+        push_tri(out_pts, &mut cnt, a, b, d);
+        if i +% 1_usize < WING_STEPS {
+            push_tri(out_pts, &mut cnt, b, c, d);
+        }
+        i = i +% 1_usize;
+    }
+
+    return cnt;
+}
+
+@inline
+fn edge2(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
+    return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+}
+
+fn point_in_tris(pts: *[math_vec.Point], nverts: usize, px: f32, py: f32) -> bool {
+    let lim = if nverts <= pts.len { nverts } else { pts.len };
+    if lim < 3_usize {
+        return false;
+    }
+    let max_i = lim - 3_usize;
+    var i: usize = 0_usize;
+    while i <= max_i {
+        let a = pts[i];
+        let b = pts[i + 1_usize];
+        let c = pts[i + 2_usize];
+        let area = edge2(a.x, a.y, b.x, b.y, c.x, c.y);
+        let s: f32 = if area >= 0.0_f32 { 1.0_f32 } else { -1.0_f32 };
+        if edge2(a.x, a.y, b.x, b.y, px, py) * s >= 0.0_f32
+            && edge2(b.x, b.y, c.x, c.y, px, py) * s >= 0.0_f32
+            && edge2(c.x, c.y, a.x, a.y, px, py) * s >= 0.0_f32
+        {
+            return true;
+        }
+        i = i +% 3_usize;
+    }
+    return false;
+}
+
+@inline
+fn clamp_u8_f32(v: f32) -> u8 {
+    let c = math_vec.clamp_f32(v, 0.0_f32, 1.0_f32);
+    return (c * 255.0_f32 + 0.5_f32).trunc_to_int.[u32]().trunc.[u8]();
+}
+
+/// Pure-Eon 4x4 supersampled rasterizer for the official Eon squircle app icon (`assets/brand/eon-app-icon.svg`).
+/// Writes `size * size * 4` RGBA8 bytes (top-to-bottom).
+pub fn rasterize_app_icon_rgba(dst_rgba: *mut [u8], size: u32) {
+    if size == 0_u32 {
+        return;
+    }
+    let sf = size.to_float.[f32]();
+    var pts: [210]math_vec.Point = [math_vec.Point.zero(); 210];
+    let pad = sf * 0.06_f32;
+    let logo_b = math_vec.Bounds.from_xywh(pad, pad * 0.8_f32, sf - pad * 2.0_f32, sf - pad * 2.0_f32);
+    let nverts = tessellate_wing_logo(&mut pts, logo_b);
+
+    let half = sf * 0.5_f32;
+    let box_half = sf * 0.468_f32;
+    let corner = sf * 0.218_f32;
+    let border_w = math_vec.max_f32(sf * 0.022_f32, 0.75_f32);
+    let inv_s = 1.0_f32 / sf;
+
+    var y: u32 = 0_u32;
+    while y < size {
+        var x: u32 = 0_u32;
+        while x < size {
+            let off = ((y *% size) +% x).widen.[usize]() *% 4_usize;
+            if dst_rgba.len >= 4_usize && off <= dst_rgba.len - 4_usize {
+                let fx = x.to_float.[f32]() + 0.5_f32;
+                let fy = y.to_float.[f32]() + 0.5_f32;
+
+                // Rounded squircle SDF
+                let qx = math.abs_f32(fx - half) - box_half + corner;
+                let qy = math.abs_f32(fy - half) - box_half + corner;
+                let ox = math_vec.max_f32(qx, 0.0_f32);
+                let oy = math_vec.max_f32(qy, 0.0_f32);
+                let d = @sqrt(@fma(ox, ox, oy * oy)) + math_vec.min_f32(math_vec.max_f32(qx, qy), 0.0_f32) - corner;
+                let bg_cov = 1.0_f32 - math_vec.smoothstep_f32(-0.6_f32, 0.6_f32, d);
+
+                if bg_cov <= 0.002_f32 {
+                    dst_rgba[off] = 0_u8;
+                    dst_rgba[off + 1_usize] = 0_u8;
+                    dst_rgba[off + 2_usize] = 0_u8;
+                    dst_rgba[off + 3_usize] = 0_u8;
+                } else {
+                    let grad_t = math_vec.clamp_f32((fx + fy) * inv_s * 0.5_f32, 0.0_f32, 1.0_f32);
+                    // Background gradient #111827 -> #090D16
+                    var r = math_vec.lerp_f32(17.0_f32 / 255.0_f32, 9.0_f32 / 255.0_f32, grad_t);
+                    var g = math_vec.lerp_f32(24.0_f32 / 255.0_f32, 13.0_f32 / 255.0_f32, grad_t);
+                    var b = math_vec.lerp_f32(39.0_f32 / 255.0_f32, 22.0_f32 / 255.0_f32, grad_t);
+
+                    // Subtle border #334155 -> #1E293B
+                    let b_mix = math_vec.smoothstep_f32(-border_w - 0.5_f32, -border_w + 0.5_f32, d);
+                    if b_mix > 0.001_f32 {
+                        let br = math_vec.lerp_f32(51.0_f32 / 255.0_f32, 30.0_f32 / 255.0_f32, grad_t);
+                        let bg = math_vec.lerp_f32(65.0_f32 / 255.0_f32, 41.0_f32 / 255.0_f32, grad_t);
+                        let bb = math_vec.lerp_f32(85.0_f32 / 255.0_f32, 59.0_f32 / 255.0_f32, grad_t);
+                        r = math_vec.lerp_f32(r, br, b_mix);
+                        g = math_vec.lerp_f32(g, bg, b_mix);
+                        b = math_vec.lerp_f32(b, bb, b_mix);
+                    }
+
+                    // 4x4 supersampled crisp white wing coverage
+                    var hits: u32 = 0_u32;
+                    var sy: u32 = 0_u32;
+                    while sy < 4_u32 {
+                        let py = y.to_float.[f32]() + (sy.to_float.[f32]() + 0.5_f32) * 0.25_f32;
+                        var sx: u32 = 0_u32;
+                        while sx < 4_u32 {
+                            let px = x.to_float.[f32]() + (sx.to_float.[f32]() + 0.5_f32) * 0.25_f32;
+                            if point_in_tris(&pts, nverts, px, py) {
+                                hits = hits +% 1_u32;
+                            }
+                            sx = sx +% 1_u32;
+                        }
+                        sy = sy +% 1_u32;
+                    }
+                    let wing_cov = hits.to_float.[f32]() * (1.0_f32 / 16.0_f32);
+                    r = math_vec.lerp_f32(r, 1.0_f32, wing_cov);
+                    g = math_vec.lerp_f32(g, 1.0_f32, wing_cov);
+                    b = math_vec.lerp_f32(b, 1.0_f32, wing_cov);
+
+                    dst_rgba[off] = clamp_u8_f32(r);
+                    dst_rgba[off + 1_usize] = clamp_u8_f32(g);
+                    dst_rgba[off + 2_usize] = clamp_u8_f32(b);
+                    dst_rgba[off + 3_usize] = clamp_u8_f32(bg_cov);
+                }
+            }
+            x = x +% 1_u32;
+        }
+        y = y +% 1_u32;
+    }
+}
+
+/// Build an X11 `_NET_WM_ICON` `CARDINAL` property payload (64-bit `unsigned long` entries)
+/// for a `32x32` Eon app icon (`dst` must have len >= 1026).
+pub fn build_x11_net_wm_icon_32(dst: *mut [u64]) -> usize {
+    if dst.len < 1026_usize {
+        return 0_usize;
+    }
+    var rgba: [4096]u8 = [0_u8; 4096];
+    rasterize_app_icon_rgba(&mut rgba, 32_u32);
+    dst[0_usize] = 32_u64;
+    dst[1_usize] = 32_u64;
+    var i: usize = 0_usize;
+    while i < 1024_usize {
+        let p = i *% 4_usize;
+        if p <= 4092_usize {
+            let r = rgba[p].widen.[u64]();
+            let g = rgba[p + 1_usize].widen.[u64]();
+            let b = rgba[p + 2_usize].widen.[u64]();
+            let a = rgba[p + 3_usize].widen.[u64]();
+            dst[2_usize + i] = (a << 24_u64) | (r << 16_u64) | (g << 8_u64) | b;
+        }
+        i = i +% 1_usize;
+    }
+    return 1026_usize;
+}
+
+@inline
+fn put_u32_le(dst: *mut [u8], off: usize, v: u32) {
+    if dst.len >= 4_usize && off <= dst.len - 4_usize {
+        dst[off] = (v & 0xFF_u32).trunc.[u8]();
+        dst[off + 1_usize] = ((v >> 8_u32) & 0xFF_u32).trunc.[u8]();
+        dst[off + 2_usize] = ((v >> 16_u32) & 0xFF_u32).trunc.[u8]();
+        dst[off + 3_usize] = ((v >> 24_u32) & 0xFF_u32).trunc.[u8]();
+    }
+}
+
+@inline
+fn put_u16_le(dst: *mut [u8], off: usize, v: u16) {
+    if dst.len >= 2_usize && off <= dst.len - 2_usize {
+        dst[off] = (v & 0xFF_u16).trunc.[u8]();
+        dst[off + 1_usize] = ((v >> 8_u16) & 0xFF_u16).trunc.[u8]();
+    }
+}
+
+/// Build a `4264`-byte Win32 `BITMAPINFOHEADER` + 32x32 bottom-up BGRA XOR bitmap + 1bpp AND mask
+/// ready to pass directly to `CreateIconFromResourceEx` (`dst` must have len >= 4264).
+pub fn build_win32_icon_dib_32(dst: *mut [u8]) -> usize {
+    if dst.len < 4264_usize {
+        return 0_usize;
+    }
+    var i: usize = 0_usize;
+    while i < 4264_usize {
+        dst[i] = 0_u8;
+        i = i +% 1_usize;
+    }
+    // 40-byte BITMAPINFOHEADER (biHeight = 64 = 2 * 32 for XOR + AND masks)
+    put_u32_le(dst, 0_usize, 40_u32);
+    put_u32_le(dst, 4_usize, 32_u32);
+    put_u32_le(dst, 8_usize, 64_u32);
+    put_u16_le(dst, 12_usize, 1_u16);
+    put_u16_le(dst, 14_usize, 32_u16);
+    put_u32_le(dst, 16_usize, 0_u32);    // BI_RGB
+    put_u32_le(dst, 20_usize, 4096_u32); // biSizeImage
+
+    var rgba: [4096]u8 = [0_u8; 4096];
+    rasterize_app_icon_rgba(&mut rgba, 32_u32);
+
+    // Bottom-up 32x32 BGRA pixels starting at offset 40
+    var y: usize = 0_usize;
+    while y < 32_usize {
+        let src_y = 31_usize - y;
+        var x: usize = 0_usize;
+        while x < 32_usize {
+            let si = (src_y *% 32_usize +% x) *% 4_usize;
+            let di = 40_usize +% (y *% 32_usize +% x) *% 4_usize;
+            if si <= 4092_usize && di <= dst.len - 4_usize {
+                dst[di] = rgba[si + 2_usize];     // B
+                dst[di + 1_usize] = rgba[si + 1_usize]; // G
+                dst[di + 2_usize] = rgba[si];     // R
+                dst[di + 3_usize] = rgba[si + 3_usize]; // A
+            }
+            x = x +% 1_usize;
+        }
+        y = y +% 1_usize;
+    }
+    // 128-byte AND mask at offset 4136 remains 0 (alpha channel drives per-pixel transparency)
+    return 4264_usize;
+}

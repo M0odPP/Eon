@@ -4,7 +4,7 @@ lock_version = 1
 [[dep]]
 name = "eon_gpu"
 path = "../../libs/eon_gpu"
-sha256 = "da9615197091bb711f9f0d6882bca69fd4e63a740f9a8ad7a7351d3e6554993a"
+sha256 = "b14ae39d34bf30949ed43837abfd9cba2e9ed503d6ae2dfc67d507a41d6e5c49"
 
 [[dep]]
 name = "eon_text"
@@ -14,9 +14,9 @@ sha256 = "990793ae1a495e6f1bb5b785cbaf58082444f0a864c6f999fa6c6e8fb6af84f5"
 [[dep]]
 name = "eon_ui"
 path = "../../libs/eon_ui"
-sha256 = "be6f9b2b53abfa3735b724cda9e7db1475b331960e56f3f05b98970bd2943f70"
+sha256 = "24b8e4dfae488a738e166a8d8dcd42d7beff2cc632f5dbe62929be5d7db5ba69"
 
 [[dep]]
 name = "eon_win"
 path = "../../libs/eon_win"
-sha256 = "6049f204ac727c24db6685590f9a321b04dd9e64d596af20d6e11ca5db83bf89"
+sha256 = "53d1e4baf5ae56fbdb04d0cdb292cfe4e5ff23855831ffde17c38a88b93e7d9e"

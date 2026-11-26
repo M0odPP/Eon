@@ -1,6 +1,7 @@
 module eon_win.platform.win32 @hal;
 
 import eon_win.events;
+import eon_win.icon;
 
 // ============================================================================
 // Windows Win32 Windowing & Input Adapter (`user32.dll`, `gdi32.dll`,
@@ -161,6 +162,9 @@ extern "C" fn GetDC(hwnd: u64) -> u64;
 extern "C" fn ReleaseDC(hwnd: u64, hdc: u64) -> i32;
 extern "C" fn LoadCursorW(hinst: u64, name: u64) -> u64;
 extern "C" fn SetCursor(hcur: u64) -> u64;
+extern "C" fn CreateIconFromResourceEx(presbits: u64, dw_res_size: u32, f_icon: i32, dw_ver: u32, cx: i32, cy: i32, flags: u32) -> u64;
+extern "C" fn DestroyIcon(hicon: u64) -> i32;
+extern "C" fn SendMessageW(hwnd: u64, msg: u32, wp: u64, lp: i64) -> i64;
 extern "C" fn GetKeyState(vk: i32) -> i16;
 extern "C" fn SetProcessDpiAwarenessContext(ctx: i64) -> i32;
 extern "C" fn GetDpiForWindow(hwnd: u64) -> u32;
@@ -447,6 +451,7 @@ pub fn eon_win32_wndproc(hwnd: u64, msg: u32, wp: u64, lp: i64) -> i64 {
 
 pub struct Win32Window {
     pub state: Win32State;
+    pub hicon: u64;
     pub opened: bool;
 }
 
@@ -462,6 +467,7 @@ impl Win32Window {
                 should_close: false,
                 queue_ptr: 0_u64,
             },
+            hicon: 0_u64,
             opened: false,
         };
     }
@@ -476,11 +482,18 @@ impl Win32Window {
             var title_w: [256]u16 = [0_u16; 256];
             _ = utf8_to_utf16_z("EonWin32Window".as_bytes(), &mut cls_w);
             _ = utf8_to_utf16_z(opts.title_bytes(), &mut title_w);
+            var icon_dib: [4264]u8 = [0_u8; 4264];
+            let icon_len = icon.build_win32_icon_dib_32(&mut icon_dib);
             raw {
                 // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
                 _ = SetProcessDpiAwarenessContext(-4_i64);
                 let hinst = GetModuleHandleW(0_u64);
                 self.state.hinstance = hinst;
+                var hi: u64 = 0_u64;
+                if icon_len == 4264_usize {
+                    hi = CreateIconFromResourceEx(u8_slice_addr(&icon_dib), 4264_u32, 1_i32, 0x00030000_u32, 32_i32, 32_i32, 0_u32);
+                }
+                self.hicon = hi;
                 let wc = WndClassExW.{
                     cb_size: 80_u32,
                     style: CS_HREDRAW | CS_VREDRAW | CS_OWNDC,
@@ -488,12 +501,12 @@ impl Win32Window {
                     cb_cls_extra: 0_i32,
                     cb_wnd_extra: 0_i32,
                     h_instance: hinst,
-                    h_icon: 0_u64,
+                    h_icon: hi,
                     h_cursor: LoadCursorW(0_u64, IDC_ARROW),
                     hbr_background: 0_u64,
                     lpsz_menu_name: 0_u64,
                     lpsz_class_name: u16_slice_addr(&cls_w),
-                    h_icon_sm: 0_u64,
+                    h_icon_sm: hi,
                 };
                 _ = RegisterClassExW(&wc);
                 var style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
@@ -527,6 +540,11 @@ impl Win32Window {
                     return false;
                 }
                 self.state.hwnd = hwnd;
+                if self.hicon != 0_u64 {
+                    // WM_SETICON (0x0080): ICON_SMALL=0, ICON_BIG=1
+                    _ = SendMessageW(hwnd, 0x0080_u32, 0_u64, self.hicon.bitcast.[i64]());
+                    _ = SendMessageW(hwnd, 0x0080_u32, 1_u64, self.hicon.bitcast.[i64]());
+                }
                 let dpi = GetDpiForWindow(hwnd);
                 if dpi >= 48_u32 {
                     self.state.scale_factor = dpi.to_float.[f32]() / 96.0_f32;
@@ -537,6 +555,7 @@ impl Win32Window {
             self.opened = true;
             return true;
         } else {
+            _ = icon.WING_STEPS;
             return false;
         }
     }
@@ -788,6 +807,10 @@ impl Win32Window {
             if self.state.hwnd != 0_u64 {
                 raw { _ = DestroyWindow(self.state.hwnd); }
                 self.state.hwnd = 0_u64;
+            }
+            if self.hicon != 0_u64 {
+                raw { _ = DestroyIcon(self.hicon); }
+                self.hicon = 0_u64;
             }
         }
         self.opened = false;

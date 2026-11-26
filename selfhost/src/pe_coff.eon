@@ -158,6 +158,7 @@ fn resolve_win_dll_kind(name: *[u8]) -> u8 {
         || eq_s(name, "ReleaseCapture") || eq_s(name, "TrackMouseEvent")
         || eq_s(name, "SetTimer") || eq_s(name, "KillTimer")
         || eq_s(name, "GetSystemMetrics") || eq_s(name, "ScreenToClient")
+        || eq_s(name, "CreateIconFromResourceEx") || eq_s(name, "DestroyIcon")
         || eq_s(name, "ClientToScreen") || eq_s(name, "MapVirtualKeyW")
         || eq_s(name, "ToUnicode")
     {

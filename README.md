@@ -1,7 +1,17 @@
-# Eon Programming Language
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/eon-wordmark-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/brand/eon-wordmark-light.svg">
+    <img alt="Eon Programming Language" src="assets/brand/eon-wordmark-dark.svg" height="84">
+  </picture>
+</p>
 
-[![CI](https://github.com/M0odPP/Eon/actions/workflows/ci.yml/badge.svg)](https://github.com/M0odPP/Eon/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+<p align="center">
+  <a href="https://github.com/M0odPP/Eon/actions/workflows/ci.yml"><img src="https://github.com/M0odPP/Eon/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="assets/brand/README.md"><img src="https://img.shields.io/badge/Brand-Assets-111827.svg" alt="Brand Assets"></a>
+  <a href="editors/vscode/README.md"><img src="https://img.shields.io/badge/Editor-VS%20Code%20%2B%20LSP-6366F1.svg" alt="VS Code + LSP"></a>
+</p>
 
 **Eon** is a self-hosted systems programming language designed around explicit cost, static memory and resource proofs, and a **zero-C, zero-LLVM** native compilation pipeline across **3 CPU architectures × 6 OS targets**, unified `@gpu` shaders (`SPIR-V 1.3` + `MSL 2.4`), and a pure-Eon GPUI-class cross-platform UI stack (`eon_win`, `eon_gpu`, `eon_text`, `eon_ui`).
 

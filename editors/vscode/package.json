@@ -1,0 +1,84 @@
+{
+  "name": "eon-lang",
+  "displayName": "Eon Language",
+  "description": "Official Eon programming language support: syntax highlighting, wing file icons (.eon / .hal.eon / eon.lock), formatting, and incremental eonc lsp integration.",
+  "version": "0.2.0",
+  "publisher": "M0odPP",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/M0odPP/Eon.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Themes",
+    "Formatters",
+    "Linters"
+  ],
+  "keywords": [
+    "eon",
+    "systems",
+    "lsp",
+    "zero-c",
+    "icons"
+  ],
+  "icon": "icons/eon-app-icon.svg",
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:eon"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "eon",
+        "aliases": [
+          "Eon",
+          "eon"
+        ],
+        "extensions": [
+          ".eon"
+        ],
+        "filenames": [
+          "build.eon"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/eon-file-light.svg",
+          "dark": "./icons/eon-file-dark.svg"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "eon",
+        "scopeName": "source.eon",
+        "path": "./syntaxes/eon.tmLanguage.json"
+      }
+    ],
+    "iconThemes": [
+      {
+        "id": "eon-icons",
+        "label": "Eon Wing File Icons",
+        "path": "./icons/eon-icon-theme.json"
+      }
+    ],
+    "configuration": {
+      "title": "Eon",
+      "properties": {
+        "eon.compilerPath": {
+          "type": "string",
+          "default": "eonc",
+          "description": "Path to the self-hosted `eonc` compiler binary used for `eonc lsp` and `eonc fmt`."
+        },
+        "eon.lsp.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the built-in `eonc lsp` language server."
+        }
+      }
+    }
+  }
+}

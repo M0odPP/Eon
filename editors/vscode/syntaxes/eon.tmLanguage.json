@@ -1,0 +1,116 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Eon",
+  "scopeName": "source.eon",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#attributes" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#functions" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "name": "comment.line.documentation.eon", "match": "///.*$" },
+        { "name": "comment.line.double-slash.eon", "match": "//.*$" },
+        { "name": "comment.block.eon", "begin": "/\\*", "end": "\\*/" }
+      ]
+    },
+    "attributes": {
+      "patterns": [
+        {
+          "name": "entity.other.attribute-name.eon",
+          "match": "@(?:hal|gpu|noalloc|noblock|interrupt|stack|inline|naked|recursive|layout|align|packed|target_arch|target_os|target_is_nostd|size_of|align_of|embed_gpu_spirv|embed_gpu_msl|fma|sqrt|workgroup_barrier|storage_barrier)\\b"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.eon",
+          "begin": "b?\"",
+          "end": "\"",
+          "patterns": [
+            { "name": "constant.character.escape.eon", "match": "\\\\(?:[ntr0\\\\\"']|x[0-9a-fA-F]{2}|u\\{[0-9a-fA-F]+\\})" }
+          ]
+        },
+        {
+          "name": "string.quoted.single.eon",
+          "match": "b?'(?:[^'\\\\]|\\\\(?:[ntr0\\\\\"']|x[0-9a-fA-F]{2}))'"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.eon",
+          "match": "\\b0x[0-9a-fA-F_]+(?:_(?:u8|u16|u32|u64|usize|i8|i16|i32|i64|isize))?\\b"
+        },
+        {
+          "name": "constant.numeric.binary.eon",
+          "match": "\\b0b[01_]+(?:_(?:u8|u16|u32|u64|usize|i8|i16|i32|i64|isize))?\\b"
+        },
+        {
+          "name": "constant.numeric.float.eon",
+          "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*(?:[eE][+-]?[0-9_]+)?(?:_(?:f16|f32|f64))?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.eon",
+          "match": "\\b[0-9][0-9_]*(?:_(?:u8|u16|u32|u64|u128|usize|i8|i16|i32|i64|i128|isize|f16|f32|f64))?\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.eon",
+          "match": "\\b(?:if|else|match|while|for|in|loop|break|continue|return|try|catch|orelse|defer|errdefer|comptime|par|sys|where)\\b"
+        },
+        {
+          "name": "keyword.declaration.eon",
+          "match": "\\b(?:module|import|as|pub|fn|struct|enum|union|error|iface|impl|type|const|let|var|mut|view|linear|pool|bitfield|extern|raw|copy)\\b"
+        },
+        {
+          "name": "constant.language.eon",
+          "match": "\\b(?:true|false|null|Self|self)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "storage.type.primitive.eon",
+          "match": "\\b(?:bool|u8|u16|u32|u64|u128|usize|i8|i16|i32|i64|i128|isize|f16|f32|f64|char|str|void|never|f32x2|f32x4|f32x8|f64x2|f64x4|i32x4|i32x8|u32x4|u8x16|u8x32)\\b"
+        },
+        {
+          "name": "support.type.builtin.eon",
+          "match": "\\b(?:Env|AllocCap|FsCap|DirCap|ClockCap|IoCap|ArgsCap|BuildCap|ArenaPool|SlotPool|Buf|Id|GenId|OutOfMemory|IoError|Utf8Error)\\b"
+        },
+        {
+          "name": "entity.name.type.eon",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        {
+          "name": "entity.name.function.eon",
+          "match": "\\b([a-z_][a-zA-Z0-9_]*)\\s*(?=\\(|\\.\\[)"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.eon",
+          "match": "(\\+%|-%|\\*%|\\+\\?|-\\?|\\*\\?|/\\?|%\\?|\\+\\||-\\||\\*\\||<<%|=>|->|\\.\\.=|\\.\\.|==|!=|<=|>=|&&|\\|\\||[+\\-*/%&|^~!<>?=])"
+        }
+      ]
+    }
+  }
+}

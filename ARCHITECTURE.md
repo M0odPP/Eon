@@ -21,6 +21,9 @@ Eon/
 │   └── eon_ui/          # GPUI-class UI framework (SlotPool Entities, Flexbox + 2D Grid, widgets, animations)
 ├── apps/                # Cross-platform Eon applications
 │   └── eon_calc/        # Cross-platform GUI calculator (0 @hal/raw/@target_*, builds for all 10 targets)
+├── assets/              # Official Eon brand SVG kit (assets/brand/) and Linux XDG icons/MIME (assets/linux/)
+├── editors/             # Official IDE integrations
+│   └── vscode/          # VS Code / Cursor / VSCodium extension (TextMate grammar, wing file icons, eonc lsp)
 ├── kernel/              # EonOS-Micro: freestanding x86_64 microkernel (QEMU SMP + 4-level paging)
 ├── utils/               # Zero-libc Linux utilities (ewc, egrep, ehttpd on io_uring) + Rust refs
 ├── examples/            # End-to-end sample applications (layout_proto, json_parser, compiler_spike)

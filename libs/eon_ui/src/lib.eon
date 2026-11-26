@@ -572,6 +572,7 @@ pub fn run_app[S](
         let a_shadows = scratch.alloc_range(@size_of(scene.Shadow), 256_usize);
         let a_underlines = scratch.alloc_range(@size_of(scene.Underline), 64_usize);
         let a_sprites = scratch.alloc_range(@size_of(scene.MonoSprite), 2048_usize);
+        let a_paths = scratch.alloc_range(@size_of(scene.PathVertex), 512_usize);
         let a_sans = scratch.alloc_range(1_usize, embedded_font.FONT_UI_SANS_LEN);
         let a_mono = scratch.alloc_range(1_usize, embedded_font.FONT_UI_MONO_LEN);
         let atlas_px_n = (atlas_w *% atlas_h).widen.[usize]();
@@ -596,6 +597,7 @@ pub fn run_app[S](
         var t13: u8 = 0_u8;
         var t14: u8 = 0_u8;
         var t15: u8 = 0_u8;
+        var t16: u8 = 0_u8;
 
         let nodes = platform_rt.slice_from_addr.[layout.LayoutNode](&mut t0, a_nodes, if a_nodes != 0_u64 { max_n } else { 0_usize });
         let styles = platform_rt.slice_from_addr.[style.Style](&mut t1, a_styles, if a_styles != 0_u64 { max_n } else { 0_usize });
@@ -608,6 +610,7 @@ pub fn run_app[S](
         let out_shadows = platform_rt.slice_from_addr.[scene.Shadow](&mut t8, a_shadows, if a_shadows != 0_u64 { 256_usize } else { 0_usize });
         let out_underlines = platform_rt.slice_from_addr.[scene.Underline](&mut t9, a_underlines, if a_underlines != 0_u64 { 64_usize } else { 0_usize });
         let out_sprites = platform_rt.slice_from_addr.[scene.MonoSprite](&mut t10, a_sprites, if a_sprites != 0_u64 { 2048_usize } else { 0_usize });
+        let out_paths = platform_rt.slice_from_addr.[scene.PathVertex](&mut t16, a_paths, if a_paths != 0_u64 { 512_usize } else { 0_usize });
         let sans_ttf = platform_rt.slice_from_addr.[u8](&mut t11, a_sans, if a_sans != 0_u64 { embedded_font.FONT_UI_SANS_LEN } else { 0_usize });
         let mono_ttf = platform_rt.slice_from_addr.[u8](&mut t12, a_mono, if a_mono != 0_u64 { embedded_font.FONT_UI_MONO_LEN } else { 0_usize });
         let atlas_pixels = platform_rt.slice_from_addr.[u8](&mut t13, a_atlas_px, if a_atlas_px != 0_u64 { atlas_px_n } else { 0_usize });
@@ -625,7 +628,6 @@ pub fn run_app[S](
         let vw = fb_w.to_float.[f32]();
         let vh = fb_h.to_float.[f32]();
         let empty_poly: [0]scene.PolySprite = [];
-        let empty_path: [0]scene.PathVertex = [];
         let empty_rgba: [4]u8 = [255_u8, 255_u8, 255_u8, 255_u8];
 
         let target_frames: u64 = if cfg.max_frames > 0_u64 { cfg.max_frames } else { 2_u64 };
@@ -667,13 +669,14 @@ pub fn run_app[S](
             _ = element.phase_prepaint(&mut meta, nodes, styles, elems, rects, order_buf, prepaint, &mut cx, vw, vh);
             let cnt = element.phase_paint_slices(
                 &meta, styles, elems, text_pool, order_buf, prepaint,
-                out_quads, out_shadows, out_underlines, out_sprites,
+                out_quads, out_shadows, out_underlines, out_sprites, out_paths,
                 &mut text_core, sans_ttf, mono_ttf, atlas_pixels, atlas_entries,
             );
             let nq = if cnt.quads <= out_quads.len { cnt.quads } else { out_quads.len };
             let ns = if cnt.shadows <= out_shadows.len { cnt.shadows } else { out_shadows.len };
             let nu = if cnt.underlines <= out_underlines.len { cnt.underlines } else { out_underlines.len };
             let nsp = if cnt.sprites <= out_sprites.len { cnt.sprites } else { out_sprites.len };
+            let np = if cnt.paths <= out_paths.len { cnt.paths } else { out_paths.len };
             soft.render_batches(
                 soft_fb, fb_w, fb_h, cx.theme.bg_window,
                 out_quads[0_usize..nq],
@@ -681,7 +684,7 @@ pub fn run_app[S](
                 out_underlines[0_usize..nu],
                 out_sprites[0_usize..nsp],
                 &empty_poly,
-                &empty_path,
+                out_paths[0_usize..np],
                 atlas_pixels, atlas_w, atlas_h,
                 &empty_rgba, 1_u32, 1_u32,
             );
